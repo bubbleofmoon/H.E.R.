@@ -263,15 +263,19 @@ fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path
     context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
 }
 
+fn resolve_store_db_checked(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
+    check_gate_file(context)?;
+    context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())
+}
+
 /// The store's path for a restore's file set: the gate and store pass containment (no link; a
 /// plain file or missing), and the sidecar checks retry transient concurrent-writer transitions up
 /// to `WAL_SWITCH_WAIT`, without taking the store gate. A missing store is a path that does not
 /// exist.
 pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    check_gate_file(context)?;
-    let path = context
-        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let path = resolve_store_db_checked(context)?;
     retry_sidecars(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
     Ok(path)
 }
@@ -297,10 +301,7 @@ pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connectio
     if !context.is_isolated() {
         return Ok(None);
     }
-    check_gate_file(context)?;
-    let path = context
-        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let path = resolve_store_db_checked(context)?;
     if file_len(&path)?.is_none() {
         return Ok(None);
     }
@@ -383,27 +384,35 @@ fn resolve_optional_store_file(
         })
 }
 
-/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or missing.
+fn check_optional_store_file(
+    context: &RuntimeContext,
+    name: &str,
+) -> Result<(std::path::PathBuf, Option<u64>), InspectError> {
+    let sidecar = resolve_optional_store_file(context, name)?;
+    let len = file_len_checked(&sidecar)?;
+    refuse_hard_links_checked(&sidecar)?;
+    Ok((sidecar, len))
+}
+
+/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or
+/// missing.
 fn check_sidecars(
     context: &RuntimeContext,
 ) -> Result<[(std::path::PathBuf, Option<u64>); 3], InspectError> {
-    let mut checked = Vec::with_capacity(SIDECARS.len());
-    for name in SIDECARS {
-        let sidecar = resolve_optional_store_file(context, name)?;
-        let len = file_len_checked(&sidecar)?;
-        refuse_hard_links_checked(&sidecar)?;
-        checked.push((sidecar, len));
-    }
-    Ok(checked.try_into().expect("three settings sidecars"))
+    Ok([
+        check_optional_store_file(context, SIDECARS[0])?,
+        check_optional_store_file(context, SIDECARS[1])?,
+        check_optional_store_file(context, SIDECARS[2])?,
+    ])
 }
 
-fn retry_sidecars(
-    context: &RuntimeContext,
+fn retry_until<T>(
     deadline: std::time::Instant,
-) -> Result<(), String> {
+    mut attempt: impl FnMut() -> Result<T, InspectError>,
+) -> Result<T, String> {
     loop {
-        match check_sidecars(context) {
-            Ok(_) => return Ok(()),
+        match attempt() {
+            Ok(value) => return Ok(value),
             Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -412,7 +421,14 @@ fn retry_sidecars(
     }
 }
 
-fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
+fn retry_sidecars(
+    context: &RuntimeContext,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    retry_until(deadline, || check_sidecars(context).map(|_| ()))
+}
+
+pub(super) fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(InspectError::from_sqlite)
 }
@@ -585,19 +601,8 @@ fn inspect_at(
     context: &RuntimeContext,
     deadline: std::time::Instant,
 ) -> Result<Inspection, String> {
-    check_gate_file(context)?;
-    let path = context
-        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    loop {
-        match inspect_attempt(context, &path, deadline) {
-            Ok(inspection) => return Ok(inspection),
-            Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err(error.into_message()),
-        }
-    }
+    let path = resolve_store_db_checked(context)?;
+    retry_until(deadline, || inspect_attempt(context, &path, deadline))
 }
 
 fn inspect_attempt(
@@ -639,13 +644,11 @@ fn inspect_attempt(
         // A read-only connection would create a missing index; wait for a closing connection to finish instead.
         let settled = deadline.min(std::time::Instant::now() + SIDECAR_SETTLE);
         loop {
-            if file_len_checked(&wal_path)?.is_none() {
+            if file_len_checked(&wal_path)?.unwrap_or(0) == 0 {
                 return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
             }
             if file_len_checked(&shm_path)?.is_some() {
-                let checked = resolve_optional_store_file(context, SIDECARS[1])?;
-                file_len_checked(&checked)?;
-                refuse_hard_links_checked(&checked)?;
+                check_optional_store_file(context, SIDECARS[1])?;
                 break;
             }
             if std::time::Instant::now() >= settled {
@@ -677,20 +680,15 @@ pub(super) fn read_store<T>(
     context: &RuntimeContext,
     mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
 ) -> Result<T, String> {
+    let path = resolve_store_db_checked(context)?;
     let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
-    loop {
-        let conn = match inspect_at(context, deadline)? {
+    retry_until(deadline, || {
+        let conn = match inspect_attempt(context, &path, deadline)? {
             Inspection::Missing | Inspection::Fresh => None,
             Inspection::Ready(conn) => Some(conn),
         };
-        match read(conn.as_ref()) {
-            Ok(value) => return Ok(value),
-            Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err(error.into_message()),
-        }
-    }
+        read(conn.as_ref())
+    })
 }
 
 /// The schema version in a SQLite file's header (bytes 60-63); a file without the SQLite magic is refused.
@@ -841,7 +839,7 @@ fn administrator_password(
     })
 }
 
-fn administrator_password_checked(
+pub(super) fn administrator_password_checked(
     conn: &Connection,
 ) -> Result<Option<AdministratorPasswordHash>, InspectError> {
     let Some((text, _)) = stored_row_sqlite(conn, ADMINISTRATOR_PASSWORD.key)

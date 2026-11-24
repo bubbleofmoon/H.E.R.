@@ -467,7 +467,8 @@ pub(super) fn undo_entry(
 /// is 503. It never reads the store through the overlay, so it is safe inside the store transaction.
 fn held_configuration(conn: &Connection, context: &RuntimeContext) -> Result<Option<(Value, Value)>, (u16, String)> {
     let file = raw_config(context).map_err(|_| (503, CONFIG_ERROR.to_string()))?;
-    let held = read_stored_values(conn).map_err(|error| (503, error))?;
+    let held = read_stored_values_checked(conn)
+        .map_err(|error| (503, error.into_message()))?;
     let access: Vec<(&'static Setting, Option<Value>)> = registry()
         .filter(|setting| setting.access())
         .map(|setting| {
