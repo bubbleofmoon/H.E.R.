@@ -1,0 +1,26 @@
+{
+  "name": "her-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Embedded Vite + React + Tailwind web console for HER.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5179",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.4",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "tailwindcss": "^4.1.4",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3"
+  }
+}

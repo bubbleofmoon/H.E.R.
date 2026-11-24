@@ -897,7 +897,7 @@ pub struct TurnBudget {
 fn observation_with_quiet_ms(cfg: &Value) -> i64 {
     prompt_pre_sleep_wait_ms(cfg)
         .max(pre_sleep_wait_ms(cfg))
-        .saturating_add(crate::console::wait_max_quiet_ms(cfg))
+        .saturating_add(crate::social_state::wait_max_quiet_ms(cfg))
         .saturating_add(WAIT_QUIET_SLACK_MS)
 }
 

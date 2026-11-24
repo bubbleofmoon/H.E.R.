@@ -51,6 +51,18 @@ pub fn utf16_take(s: &str, max: usize) -> String {
     out
 }
 
+/// 人格名清洗：与 JS 的 `/[^\w\u4e00-\u9fff-]/g` **同义**。
+pub(crate) fn sanitize_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == '_'
+                || *c == '-'
+                || (0x4e00..=0x9fff).contains(&(*c as u32))
+        })
+        .collect()
+}
+
 // ── 模式标记 ────────────────────────────────────────────────────────────────
 // JS: /[\[〔（(]\s*(?:二代|2\s*代|v2|reserved2)\s*[\]〕）)]/gi
 

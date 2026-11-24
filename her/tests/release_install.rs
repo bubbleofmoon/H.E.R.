@@ -883,12 +883,6 @@ impl Fixture {
         fs::write(path, config.to_string()).unwrap();
     }
     fn console(&self) -> (Child, u16) {
-        fs::create_dir_all(self.root.join("runtime/resources/public")).unwrap();
-        fs::write(
-            self.root.join("runtime/resources/public/console.html"),
-            "<!doctype html><body>fixture console</body>",
-        )
-        .unwrap();
         let (child, port) = crate::support::ports::start_console(Duration::from_secs(15), |port| {
             self.command(&[
                 "--console-serve",
@@ -925,6 +919,8 @@ impl Fixture {
                 "watchdog",
                 "start-all",
                 "backup",
+                "memory-backup",
+                "memory-restore-test",
                 "memory-digest",
                 "memory-digest-check",
                 "upstream-check",
@@ -992,7 +988,8 @@ fn http(
         ""
     };
     let agent = if agent { "x-agent-call: true\r\n" } else { "" };
-    write!(socket,"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n{token}{agent}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") { "her.localhost" } else { "127.0.0.1" };
+    write!(socket,"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n{token}{agent}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes).unwrap();
     let response = String::from_utf8(bytes).unwrap();
@@ -1060,16 +1057,13 @@ fn console_policy_defaults_to_notify_and_only_administrators_can_save_it() {
             before
         );
     }
-    assert!(http(port, "GET", "/tasks", "", true, false)
-        .1
-        .contains("id=\"update-settings\""));
-    assert!(http(port, "GET", "/", "", true, false)
-        .1
-        .contains("her-update-banner"));
-    let tasks = http(port,"GET","/tasks","",true,false).1;
-    assert!(tasks.contains("id=\"approve-update\""),"tasks page needs an approval button");
-    assert!(tasks.contains("/api/releases/approve"));
-    assert!(http(port,"GET","/","",true,false).1.contains("/api/releases/approve"),"the app banner must approve too");
+    assert_eq!(http(port, "GET", "/tasks", "", true, false).0, 302);
+    let root_page = http(port, "GET", "/", "", true, false);
+    assert_eq!(root_page.0, 200);
+    assert!(root_page.1.to_ascii_lowercase().contains("<!doctype html>"));
+    let schedule_page = http(port, "GET", "/schedule", "", true, false);
+    assert_eq!(schedule_page.0, 200);
+    assert!(schedule_page.1.to_ascii_lowercase().contains("<!doctype html>"));
 }
 #[cfg(feature = "parity-clock")]
 #[test]

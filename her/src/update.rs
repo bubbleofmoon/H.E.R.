@@ -338,34 +338,44 @@ pub(crate) fn signature_refusal(
     save_alert(root, &alert)
 }
 
-/// Only HER images in the same physical release can authorize each other.
-pub fn same_release_image(expected: &str, observed: &str) -> bool {
-    let (Ok(a), Ok(b)) = (fs::canonicalize(expected), fs::canonicalize(observed)) else {
-        return false;
-    };
-    let her = |p: &Path| {
-        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            ["her", "her-cli", "her.exe", "her-cli.exe"]
-                .iter()
-                .any(|s| n.eq_ignore_ascii_case(s))
-        })
-    };
-    her(&a) && her(&b) && a.parent() == b.parent()
-}
-
-/// Release membership for retiring recorded owners even after an image is lost.
-/// This alone grants no process authority: callers must still verify PID/start/exe.
-pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) -> bool {
-    let image = Path::new(image);
-    if !image
-        .file_name()
+fn is_her_binary_name(path: &Path) -> bool {
+    path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             ["her", "her-cli", "her.exe", "her-cli.exe"]
                 .iter()
                 .any(|her| name.eq_ignore_ascii_case(her))
         })
-    {
+}
+
+/// Only HER images in the same physical release can authorize each other.
+#[allow(dead_code)]
+pub fn same_release_image(expected: &str, observed: &str) -> bool {
+    let (Ok(a), Ok(b)) = (fs::canonicalize(expected), fs::canonicalize(observed)) else {
+        return false;
+    };
+    is_her_binary_name(&a) && is_her_binary_name(&b) && a.parent() == b.parent()
+}
+
+/// Exact caller/owner executable (including normalized Windows case/separators or canonical
+/// resolution) or same-directory `her`/`her-cli` sibling twin.
+#[allow(dead_code)]
+pub fn same_release_twin(expected: &str, observed: &str) -> bool {
+    if crate_identity_equal(expected, observed) || same_release_image(expected, observed) {
+        return true;
+    }
+    fs::canonicalize(expected)
+        .ok()
+        .zip(fs::canonicalize(observed).ok())
+        .is_some_and(|(a, b)| a == b)
+}
+
+/// Release membership for retiring recorded owners even after an image is lost.
+/// This alone grants no process authority: callers must still verify PID/start/exe.
+#[allow(dead_code)]
+pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) -> bool {
+    let image = Path::new(image);
+    if !is_her_binary_name(image) {
         return false;
     }
     let (Some(parent), Ok(release)) = (image.parent(), release_path(root, tag)) else {
@@ -379,8 +389,9 @@ pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) ->
 
 /// Trial authority is read-only and restricted to the installed current release.
 /// It never participates in process adoption or termination authorization.
+#[allow(dead_code)]
 pub fn health_image(caller: &str, owner: &str) -> bool {
-    if same_release_image(caller, owner) || crate_identity_equal(caller, owner) {
+    if same_release_twin(caller, owner) {
         return true;
     }
     let Some(selected) = std::env::var_os("HER_TRIAL_CURRENT") else {
@@ -389,17 +400,46 @@ pub fn health_image(caller: &str, owner: &str) -> bool {
     let Ok(root) = InstallRoot::configured() else {
         return false;
     };
-    if root.require_release_image(Path::new(caller)).is_err() {
+    let caller_path = Path::new(caller);
+    if root.require_release_image(caller_path).is_err() {
         return false;
     }
-    let (Ok(selected), Ok(current)) = (
-        fs::canonicalize(selected),
-        fs::canonicalize(root.root().join("current")),
-    ) else {
+    let Ok(caller_canonical) = fs::canonicalize(caller_path) else {
         return false;
     };
-    selected == current && same_release_image(&selected.join("her.exe").to_string_lossy(), owner)
+    let Some(caller_tag) = caller_canonical
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    if !is_her_binary_name(&caller_canonical)
+        || release_store::version(caller_tag).is_none()
+        || release_path(&root, caller_tag)
+            .and_then(|dir| fs::canonicalize(dir).map_err(|_| String::new()))
+            .ok()
+            .as_deref()
+            != caller_canonical.parent()
+    {
+        return false;
+    }
+    let Ok(Some(current_tag)) = link_tag(&root, "current") else {
+        return false;
+    };
+    let Ok(current_release) = release_path(&root, &current_tag)
+        .and_then(|dir| fs::canonicalize(dir).map_err(|_| String::new()))
+    else {
+        return false;
+    };
+    let Ok(selected_canonical) = fs::canonicalize(selected) else {
+        return false;
+    };
+    selected_canonical == current_release
+        && release_owner_image(&root, &current_tag, owner)
+        && same_release_image(&current_release.join("her.exe").to_string_lossy(), owner)
 }
+#[allow(dead_code)]
 fn crate_identity_equal(a: &str, b: &str) -> bool {
     if cfg!(windows) {
         a.replace('/', "\\")
@@ -409,17 +449,45 @@ fn crate_identity_equal(a: &str, b: &str) -> bool {
     }
 }
 
+/// Probe an existing owner gate without creating files or following links.
+/// Returns `Some(identity)` only when the OS lock is actively held and its
+/// bounded, non-redirected `.owner.json` marker matches `v == 1` and `expected_role`.
+#[allow(dead_code)]
+pub(crate) fn probe_held_owner_identity(
+    lock_path: &Path,
+    expected_role: &str,
+) -> Option<ProcessIdentity> {
+    let lock = crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
+    match lock.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => {}
+        _ => return None,
+    }
+    drop(lock);
+    let mut marker_os = lock_path.as_os_str().to_os_string();
+    marker_os.push(".owner.json");
+    let marker_path = PathBuf::from(marker_os);
+    let bytes = crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
+    let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if marker["v"].as_u64() != Some(1) || marker["role"].as_str() != Some(expected_role) {
+        return None;
+    }
+    serde_json::from_value::<ProcessIdentity>(marker["identity"].clone()).ok()
+}
+
 /// Publish the verified helper outside releases and run it hidden. The helper
 /// judges the trial before it retires the existing supervisor.
 pub fn launch(root: &InstallRoot, target: &str, old: &ProcessIdentity) -> Result<u32, String> {
     launch_mode(root, target, old, false, false)
 }
-pub fn launch_automatic(
+#[allow(dead_code)]
+pub fn launch_with_gate(
     root: &InstallRoot,
     target: &str,
     old: &ProcessIdentity,
+    automatic: bool,
+    gate: fs::File,
 ) -> Result<u32, String> {
-    launch_mode(root, target, old, false, true)
+    launch_mode_with_gate(root, target, old, false, automatic, gate)
 }
 pub fn launch_recovery(
     root: &InstallRoot,
@@ -435,10 +503,20 @@ fn launch_mode(
     recovery: bool,
     automatic: bool,
 ) -> Result<u32, String> {
-    use std::process::Stdio;
     let gate = release_store::installation_gate(
         &root.root().join("runtime/data/locks/update-restore.lock"),
     )?;
+    launch_mode_with_gate(root, target, old, recovery, automatic, gate)
+}
+fn launch_mode_with_gate(
+    root: &InstallRoot,
+    target: &str,
+    old: &ProcessIdentity,
+    recovery: bool,
+    automatic: bool,
+    gate: fs::File,
+) -> Result<u32, String> {
+    use std::process::Stdio;
     // Publish exactly the helper bytes that were verified; never reread the file.
     let bytes = if recovery {
         let (current, last_good, _) = startup_selection(root)?;

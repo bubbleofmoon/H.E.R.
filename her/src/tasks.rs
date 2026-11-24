@@ -566,7 +566,24 @@ pub struct CommandExecutor {
     running_allowed: Option<Box<dyn Fn(&TaskDef) -> bool + Send + Sync>>,
 }
 
-pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<std::fs::File>, String> + Send + Sync>;
+pub struct AdmissionGuard(#[allow(dead_code)] AdmissionLock);
+
+enum AdmissionLock {
+    Scheduled(std::fs::File),
+    Manual(crate::conversation_state::Gate),
+}
+
+impl AdmissionGuard {
+    pub(crate) fn scheduled(lock: std::fs::File) -> Self {
+        Self(AdmissionLock::Scheduled(lock))
+    }
+
+    pub(crate) fn manual(gate: crate::conversation_state::Gate) -> Self {
+        Self(AdmissionLock::Manual(gate))
+    }
+}
+
+pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<AdmissionGuard>, String> + Send + Sync>;
 
 struct TaskChild {
     #[cfg(windows)]

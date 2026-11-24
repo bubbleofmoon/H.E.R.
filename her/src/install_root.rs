@@ -21,6 +21,7 @@ macro_rules! legacy_path {
 /// One production root: everything production runs lives inside it (`layout`).
 pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { legacy_path!() } else { "/qqbot" };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRoot {
     lexical: PathBuf,
     resolved: PathBuf,
