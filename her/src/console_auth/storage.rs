@@ -1,24 +1,27 @@
 //! Durable browser authentication state and the settings archive boundary.
 
 use super::{
-    administrator_password_checked, administrator_password_in, check_schema, migrate,
-    open_for_write, read_store, record_change, schema_version, schema_version_checked, store_gate,
-    stored_row, InspectError, Inspection, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, SIDECARS,
-    STORAGE_ERROR, WAL_SWITCH_WAIT, WEB_SEARCH_API_KEY,
-};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use crate::console_auth::{
-    digests_equal, new_generation, restore_generation, AdministratorPasswordHash, BrowserProof, Generation,
-    BROWSER_IDLE_MS, MAX_BROWSER_SESSIONS,
+    canonical_origin, digests_equal, new_generation, restore_generation, rotate_restore_generation,
+    AdministratorPasswordHash, BrowserProof, Generation, BROWSER_IDLE_MS, MAX_BROWSER_SESSIONS,
 };
 use crate::runtime::RuntimeContext;
+use crate::settings::{
+    check_store_schema, has_endpoint_credentials, has_stored_setting, inspect_store,
+    migrate_store_v2, open_store_for_write, read_store, record_setting_change, restore_gate,
+    schema_version_checked, store_schema_version, stored_setting_row, stored_setting_row_checked,
+    InspectError, StoreInspection, ADMINISTRATOR_PASSWORD, LEGACY_ERROR, STORAGE_ERROR,
+    STORE_SIDECARS,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Instant;
 
-pub(super) const SCHEMA_V3_ADDED: [(&str, &str, &str, &str); 2] = [
+const PASSWORD_UNAVAILABLE: &str = "administrator password is unavailable";
+
+pub(crate) const SCHEMA_V3_ADDED: [(&str, &str, &str, &str); 2] = [
     (
         "table",
         "console_browser_sessions",
@@ -49,7 +52,7 @@ pub(super) const SCHEMA_V3_ADDED: [(&str, &str, &str, &str); 2] = [
     ),
 ];
 
-pub(super) const SCHEMA_V3_IMPLICIT: [(&str, &str, &str, Option<&str>); 2] = [
+pub(crate) const SCHEMA_V3_IMPLICIT: [(&str, &str, &str, Option<&str>); 2] = [
     (
         "index",
         "sqlite_autoindex_console_browser_sessions_1",
@@ -73,12 +76,48 @@ fn storage_error(_: rusqlite::Error) -> String {
     STORAGE_ERROR.to_string()
 }
 
+fn administrator_password_checked(
+    conn: &Connection,
+) -> Result<Option<AdministratorPasswordHash>, InspectError> {
+    let Some((text, _)) = stored_setting_row_checked(conn, ADMINISTRATOR_PASSWORD.key)? else {
+        return Ok(None);
+    };
+    let phc: String = serde_json::from_str(&text)
+        .map_err(|_| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))?;
+    AdministratorPasswordHash::parse(&phc)
+        .map(Some)
+        .ok_or_else(|| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))
+}
+
+pub(super) fn administrator_password_in(
+    conn: &Connection,
+) -> Result<Option<AdministratorPasswordHash>, String> {
+    administrator_password_checked(conn).map_err(InspectError::into_message)
+}
+
+pub(crate) fn administrator_password_is_set(context: &RuntimeContext) -> Result<bool, String> {
+    read_store(context, |conn| match conn {
+        None => Ok(false),
+        Some(conn) => Ok(administrator_password_checked(conn)?.is_some()),
+    })
+}
+
+#[cfg(test)]
+fn administrator_password(
+    context: &RuntimeContext,
+) -> Result<Option<AdministratorPasswordHash>, String> {
+    read_store(context, |conn| match conn {
+        None => Ok(None),
+        Some(conn) => administrator_password_checked(conn),
+    })
+}
+
 /// Run within the credential writer's immediate transaction, including any required v2 migration.
 fn migrate_auth(conn: &Connection) -> Result<(), String> {
-    if schema_version(conn)? == 3 {
+    if store_schema_version(conn)? == 3 {
         return Ok(());
     }
-    migrate(conn)?;
+    migrate_store_v2(conn)?;
     for (_, _, _, sql) in SCHEMA_V3_ADDED {
         conn.execute_batch(sql).map_err(storage_error)?;
     }
@@ -86,26 +125,25 @@ fn migrate_auth(conn: &Connection) -> Result<(), String> {
         .map_err(storage_error)
 }
 
-/// A password or auth mutation owns its SQLite transaction. The caller holds the configuration gate.
+/// A password or auth mutation owns its SQLite transaction. The caller holds the config gate.
 fn write_administrator_password<T>(
     context: &RuntimeContext,
     existing_only: bool,
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<Option<T>, (u16, String)> {
     if !context.is_isolated() {
-        return Err((503, super::LEGACY_ERROR.to_string()));
+        return Err((503, LEGACY_ERROR.to_string()));
     }
-    let unavailable = |error| (503, error);
-    let _gate = store_gate(context, Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+    let _gate = restore_gate(context).map_err(unavailable)?;
     if existing_only
         && matches!(
-            super::inspect(context).map_err(unavailable)?,
-            Inspection::Missing | Inspection::Fresh
+            inspect_store(context).map_err(unavailable)?,
+            StoreInspection::Missing | StoreInspection::Fresh
         )
     {
         return Ok(None);
     }
-    let mut conn = open_for_write(context).map_err(unavailable)?;
+    let mut conn = open_store_for_write(context).map_err(unavailable)?;
     conn.execute_batch("PRAGMA secure_delete=ON;")
         .map_err(storage_error)
         .map_err(unavailable)?;
@@ -114,7 +152,7 @@ fn write_administrator_password<T>(
         .map_err(storage_error)
         .map_err(unavailable)?;
     #[cfg(test)]
-    let previous = schema_version(&tx).map_err(unavailable)?;
+    let previous = store_schema_version(&tx).map_err(unavailable)?;
     let result = write(&tx)?;
     #[cfg(test)]
     if previous < 3 && FAIL_AUTH_MIGRATION.with(|fail| fail.replace(false)) {
@@ -136,7 +174,7 @@ fn initialize_auth_state(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn set_initial_administrator_password_with_session(
+pub(super) fn set_initial_administrator_password_with_session(
     context: &RuntimeContext,
     hash: &AdministratorPasswordHash,
     actor: &str,
@@ -146,15 +184,20 @@ pub(crate) fn set_initial_administrator_password_with_session(
     let restore = ensure_restore_generation(context)?;
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let issued = write_administrator_password(context, false, |conn| {
-        let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
+        let old = stored_setting_row(conn, ADMINISTRATOR_PASSWORD.key)?;
         if old.is_some() {
             return Err((409, "administrator password is already set".to_string()));
         }
         migrate_auth(conn).map_err(|error| (503, error))?;
         initialize_auth_state(conn).map_err(|error| (503, error))?;
         let text = json!(hash.as_str()).to_string();
-        record_change(
+        record_setting_change(
             conn,
             &ADMINISTRATOR_PASSWORD,
             old,
@@ -165,29 +208,24 @@ pub(crate) fn set_initial_administrator_password_with_session(
         insert_browser_session_tx(conn, origin, token_digest, restore, now)
     })?
     .ok_or_else(|| unavailable(STORAGE_ERROR.to_string()))?;
-    let mut anchors = context
-        .browser_anchors
-        .0
-        .lock()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     anchors.insert(issued.id_digest, (now, monotonic));
     Ok(issued)
 }
 
-pub(crate) fn set_initial_administrator_password(
+pub(super) fn set_initial_administrator_password(
     context: &RuntimeContext,
     hash: &AdministratorPasswordHash,
     actor: &str,
 ) -> Result<(), (u16, String)> {
     write_administrator_password(context, false, |conn| {
-        let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
+        let old = stored_setting_row(conn, ADMINISTRATOR_PASSWORD.key)?;
         if old.is_some() {
             return Err((409, "administrator password is already set".to_string()));
         }
         migrate_auth(conn).map_err(|error| (503, error))?;
         initialize_auth_state(conn).map_err(|error| (503, error))?;
         let text = json!(hash.as_str()).to_string();
-        record_change(
+        record_setting_change(
             conn,
             &ADMINISTRATOR_PASSWORD,
             old,
@@ -215,23 +253,20 @@ fn reset_auth_state(conn: &Connection) -> Result<(), String> {
 }
 
 pub(crate) fn reset_administrator_password(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     write_administrator_password(context, true, |conn| {
-        let unavailable = |error| (503, error);
         // Reset also removes rows whose value cannot be decoded as text or a supported PHC.
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
-                [ADMINISTRATOR_PASSWORD.key],
-                |r| r.get(0),
-            )
-            .map_err(storage_error)
-            .map_err(unavailable)?;
-        if exists || schema_version(conn).map_err(unavailable)? == 3 {
+        let exists = has_stored_setting(conn, ADMINISTRATOR_PASSWORD.key)?;
+        if exists || store_schema_version(conn).map_err(unavailable)? == 3 {
             migrate_auth(conn).map_err(unavailable)?;
             reset_auth_state(conn).map_err(unavailable)?;
         }
         if exists {
-            record_change(
+            record_setting_change(
                 conn,
                 &ADMINISTRATOR_PASSWORD,
                 None,
@@ -242,14 +277,12 @@ pub(crate) fn reset_administrator_password(context: &RuntimeContext) -> Result<(
         }
         Ok(())
     })?;
-    if let Ok(mut anchors) = context.browser_anchors.0.lock() {
-        anchors.clear();
-    }
+    anchors.clear();
     Ok(())
 }
 
-pub(crate) const THROTTLE_THRESHOLD: i64 = 5;
-pub(crate) const THROTTLE_BASE_MS: i64 = 60_000;
+pub(super) const THROTTLE_THRESHOLD: i64 = 5;
+pub(super) const THROTTLE_BASE_MS: i64 = 60_000;
 pub(crate) const THROTTLE_MAX_MS: i64 = 15 * 60 * 1000;
 
 pub(crate) fn throttle_delay_ms(consecutive_failures: i64) -> i64 {
@@ -268,14 +301,16 @@ pub(crate) struct AuthStatusSnapshot {
     pub(crate) consecutive_failures: i64,
 }
 
-pub(crate) enum LoginChallenge {
+pub(super) enum LoginChallenge {
     NotSet,
     Throttled {
         retry_after_ms: i64,
         consecutive_failures: i64,
         needs_clamp: bool,
     },
-    Ready { hash: AdministratorPasswordHash },
+    Ready {
+        hash: AdministratorPasswordHash,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -284,17 +319,20 @@ pub(crate) struct IssuedSession {
     pub(crate) id_digest: Generation,
 }
 
-pub(crate) struct LoginFailureState {
-    pub(crate) throttled_before: bool,
-    pub(crate) retry_after_ms: i64,
-    pub(crate) consecutive_failures: i64,
+pub(super) struct LoginFailureState {
+    pub(super) throttled_before: bool,
+    pub(super) retry_after_ms: i64,
+    pub(super) consecutive_failures: i64,
 }
 
-pub(crate) enum LoginOutcome {
+pub(super) enum LoginOutcome {
     Issued(IssuedSession),
     NotSet,
     PasswordChanged,
-    Throttled { retry_after_ms: i64, consecutive_failures: i64 },
+    Throttled {
+        retry_after_ms: i64,
+        consecutive_failures: i64,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -322,16 +360,19 @@ fn session_write<T>(
     operation: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<Option<T>, (u16, String)> {
     if !context.is_isolated() {
-        return Err((503, super::LEGACY_ERROR.to_string()));
+        return Err((503, LEGACY_ERROR.to_string()));
     }
-    if matches!(super::inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
+    if matches!(
+        inspect_store(context).map_err(unavailable)?,
+        StoreInspection::Missing | StoreInspection::Fresh
+    ) {
         return Ok(None);
     }
-    let _gate = store_gate(context, Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
-    let Inspection::Ready(conn) = super::inspect(context).map_err(unavailable)? else {
+    let _gate = restore_gate(context).map_err(unavailable)?;
+    let StoreInspection::Ready(conn) = inspect_store(context).map_err(unavailable)? else {
         return Ok(None);
     };
-    if schema_version(&conn).map_err(unavailable)? != 3 {
+    if store_schema_version(&conn).map_err(unavailable)? != 3 {
         return Ok(None);
     }
     if !auth_rows_exist(&conn, "console_auth_state").map_err(unavailable)? {
@@ -341,10 +382,14 @@ fn session_write<T>(
         return Ok(None);
     }
     drop(conn);
-    let mut conn = open_for_write(context).map_err(unavailable)?;
-    conn.execute_batch("PRAGMA secure_delete=ON;").map_err(storage_error).map_err(unavailable)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(storage_error).map_err(unavailable)?;
+    let mut conn = open_store_for_write(context).map_err(unavailable)?;
+    conn.execute_batch("PRAGMA secure_delete=ON;")
+        .map_err(storage_error)
+        .map_err(unavailable)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)
+        .map_err(unavailable)?;
     let result = operation(&tx).map_err(unavailable)?;
     tx.commit().map_err(storage_error).map_err(unavailable)?;
     Ok(Some(result))
@@ -352,18 +397,25 @@ fn session_write<T>(
 
 fn invalidate_sessions(conn: &Connection, clock: Option<i64>) -> Result<(), String> {
     let generation = new_generation().map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.execute("DELETE FROM console_browser_sessions", []).map_err(storage_error)?;
+    conn.execute("DELETE FROM console_browser_sessions", [])
+        .map_err(storage_error)?;
     conn.execute(
         "UPDATE console_auth_state SET auth_generation=?1,
          clock_high_water_ms=coalesce(?2,clock_high_water_ms) WHERE id=1",
         params![generation.as_slice(), clock],
-    ).map_err(storage_error)?;
+    )
+    .map_err(storage_error)?;
     Ok(())
 }
 
 pub(crate) fn revoke_browser_sessions(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     session_write(context, |conn| invalidate_sessions(conn, None))?;
-    context.browser_anchors.0.lock().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?.clear();
+    anchors.clear();
     Ok(())
 }
 
@@ -392,20 +444,28 @@ fn browser_clock_state(conn: &Connection) -> Result<(Generation, i64), String> {
 /// The clock transition commits even if there is no valid authority in the request.
 fn observe_browser_clock(conn: &Connection, now: i64) -> Result<Option<(Generation, i64)>, String> {
     let (generation, mark) = browser_clock_state(conn)?;
-    if now < 0 { return Err(STORAGE_ERROR.to_string()); }
+    if now < 0 {
+        return Err(STORAGE_ERROR.to_string());
+    }
     if now < mark.saturating_sub(60_000) {
         invalidate_sessions(conn, Some(now))?;
         return Ok(None);
     }
     if now > mark {
-        conn.execute("UPDATE console_auth_state SET clock_high_water_ms=?1 WHERE id=1", [now])
-            .map_err(storage_error)?;
+        conn.execute(
+            "UPDATE console_auth_state SET clock_high_water_ms=?1 WHERE id=1",
+            [now],
+        )
+        .map_err(storage_error)?;
     }
     Ok(Some((generation, now.max(mark))))
 }
 
 fn session_timestamps_valid(created: i64, last: i64, expires: i64, now: i64) -> bool {
-    0 <= created && created <= last && last <= now && last.checked_add(BROWSER_IDLE_MS) == Some(expires)
+    0 <= created
+        && created <= last
+        && last <= now
+        && last.checked_add(BROWSER_IDLE_MS) == Some(expires)
 }
 
 struct SessionRow {
@@ -413,26 +473,40 @@ struct SessionRow {
     token: Generation,
     auth: Generation,
     restore: Generation,
-    created: i64,
     last: i64,
     expires: i64,
+    created: i64,
     sequence: i64,
 }
 
 fn load_session(conn: &Connection, id: &Generation) -> Result<Option<SessionRow>, String> {
-    let result = conn.query_row(
-        "SELECT origin,token_digest,auth_generation,restore_generation,created_ms,last_used_ms,expires_ms,issued_seq
-         FROM console_browser_sessions WHERE id_digest=?1",
-        [id.as_slice()],
-        |row| Ok(SessionRow {
-            origin: row.get(0)?, token: row.get(1)?, auth: row.get(2)?, restore: row.get(3)?,
-            created: row.get(4)?, last: row.get(5)?, expires: row.get(6)?, sequence: row.get(7)?,
-        }),
-    ).optional();
+    let result = conn
+        .query_row(
+            "SELECT origin,token_digest,auth_generation,restore_generation,
+                    created_ms,last_used_ms,expires_ms,issued_seq
+             FROM console_browser_sessions WHERE id_digest=?1",
+            [id.as_slice()],
+            |row| {
+                Ok(SessionRow {
+                    origin: row.get(0)?,
+                    token: row.get(1)?,
+                    auth: row.get(2)?,
+                    restore: row.get(3)?,
+                    created: row.get(4)?,
+                    last: row.get(5)?,
+                    expires: row.get(6)?,
+                    sequence: row.get(7)?,
+                })
+            },
+        )
+        .optional();
     match result {
         Ok(row) => Ok(row),
-        Err(rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::FromSqlConversionFailure(..)
-            | rusqlite::Error::IntegralValueOutOfRange(..)) => {
+        Err(
+            rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..),
+        ) => {
             delete_session(conn, id)?;
             Ok(None)
         }
@@ -441,17 +515,27 @@ fn load_session(conn: &Connection, id: &Generation) -> Result<Option<SessionRow>
 }
 
 fn delete_session(conn: &Connection, id: &Generation) -> Result<(), String> {
-    conn.execute("DELETE FROM console_browser_sessions WHERE id_digest=?1", [id.as_slice()])
-        .map_err(storage_error)?;
+    conn.execute(
+        "DELETE FROM console_browser_sessions WHERE id_digest=?1",
+        [id.as_slice()],
+    )
+    .map_err(storage_error)?;
     Ok(())
 }
 
 fn live_session(
-    conn: &Connection, id: &Generation, now: i64, expiry_clock: i64,
-    current: &BrowserProof, token: &Generation,
+    conn: &Connection,
+    id: &Generation,
+    now: i64,
+    expiry_clock: i64,
+    current: &BrowserProof,
+    token: &Generation,
 ) -> Result<Option<SessionRow>, String> {
-    let Some(row) = load_session(conn, id)? else { return Ok(None) };
-    if row.sequence <= 0 || !session_timestamps_valid(row.created, row.last, row.expires, now)
+    let Some(row) = load_session(conn, id)? else {
+        return Ok(None);
+    };
+    if row.sequence <= 0
+        || !session_timestamps_valid(row.created, row.last, row.expires, now)
         || expiry_clock >= row.expires
         || !digests_equal(&row.auth, &current.auth_generation)
         || !digests_equal(&row.restore, &current.restore_generation)
@@ -464,11 +548,16 @@ fn live_session(
 }
 
 fn session_ids(conn: &Connection) -> Result<Vec<(Generation, i64)>, String> {
-    let mut query = conn.prepare(
-        "SELECT id_digest,last_used_ms FROM console_browser_sessions LIMIT ?1",
-    ).map_err(storage_error)?;
-    let rows = query.query_map([MAX_BROWSER_SESSIONS as i64 + 1], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(storage_error)?.collect::<Result<Vec<_>, _>>().map_err(storage_error)?;
+    let mut query = conn
+        .prepare("SELECT id_digest,last_used_ms FROM console_browser_sessions LIMIT ?1")
+        .map_err(storage_error)?;
+    let rows = query
+        .query_map([MAX_BROWSER_SESSIONS as i64 + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
     if rows.len() > MAX_BROWSER_SESSIONS {
         return Err(STORAGE_ERROR.to_string());
     }
@@ -478,59 +567,113 @@ fn session_ids(conn: &Connection) -> Result<Vec<(Generation, i64)>, String> {
 pub(crate) fn start_browser_clock(context: &RuntimeContext) -> Result<(), (u16, String)> {
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let rows = session_write(context, |conn| {
         observe_browser_clock(conn, now)?;
         session_ids(conn)
-    })?.unwrap_or_default();
-    let mut anchors = context.browser_anchors.0.lock().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    *anchors = rows.into_iter().map(|(id, last)| (id, (last, monotonic))).collect();
+    })?
+    .unwrap_or_default();
+    *anchors = rows
+        .into_iter()
+        .map(|(id, last)| (id, (last, monotonic)))
+        .collect();
     Ok(())
 }
 
 pub(crate) fn admit_browser(
-    context: &RuntimeContext, origin: &str, token: Option<Generation>, ids: &[Generation], renew: bool,
+    context: &RuntimeContext,
+    origin: &str,
+    token: Option<Generation>,
+    ids: &[Generation],
+    renew: bool,
 ) -> Result<Option<BrowserAdmission>, (u16, String)> {
-    admit_browser_at(context, origin, token, ids, renew, crate::parity_clock::now_ms(), Instant::now())
+    admit_browser_at(
+        context,
+        origin,
+        token,
+        ids,
+        renew,
+        crate::parity_clock::now_ms(),
+        Instant::now(),
+    )
 }
 
 fn admit_browser_at(
-    context: &RuntimeContext, origin: &str, token: Option<Generation>, ids: &[Generation],
-    renew: bool, now: i64, monotonic: Instant,
+    context: &RuntimeContext,
+    origin: &str,
+    token: Option<Generation>,
+    ids: &[Generation],
+    renew: bool,
+    now: i64,
+    monotonic: Instant,
 ) -> Result<Option<BrowserAdmission>, (u16, String)> {
-    let mut anchors = context.browser_anchors.0.lock().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let restore = restore_generation(context);
     let (admission, rows) = session_write(context, |conn| {
         let result = (|| -> Result<Option<BrowserAdmission>, String> {
-            let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else { return Ok(None) };
-            let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten()) else {
+            let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else {
                 return Ok(None);
             };
-            let mut proof = BrowserProof { id_digest: [0; 32], origin: origin.to_owned(), auth_generation: auth, restore_generation: restore };
+            let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten())
+            else {
+                return Ok(None);
+            };
+            let mut proof = BrowserProof {
+                id_digest: [0; 32],
+                origin: origin.to_owned(),
+                auth_generation: auth,
+                restore_generation: restore,
+            };
             let mut selected: Option<SessionRow> = None;
             for id in ids {
                 if let Some(row) = live_session(conn, id, now, expiry_clock, &proof, &token)? {
-                    if selected.as_ref().is_none_or(|current| row.sequence > current.sequence) {
+                    if selected
+                        .as_ref()
+                        .is_none_or(|current| row.sequence > current.sequence)
+                    {
                         proof.id_digest = *id;
                         selected = Some(row);
                     }
                 }
             }
-            let Some(row) = selected else { return Ok(None) };
-            let renewed = if let Some((wall, instant)) = anchors.get(&proof.id_digest).filter(|_| renew) {
-                let elapsed = i64::try_from(monotonic.saturating_duration_since(*instant).as_millis()).unwrap_or(i64::MAX);
+            let Some(row) = selected else {
+                return Ok(None);
+            };
+            let renewed = if let Some((wall, instant)) =
+                anchors.get(&proof.id_digest).filter(|_| renew)
+            {
+                let elapsed =
+                    i64::try_from(monotonic.saturating_duration_since(*instant).as_millis())
+                        .unwrap_or(i64::MAX);
                 let safe = now.min(wall.saturating_add(elapsed));
-                if let Some(expires) = safe.checked_add(BROWSER_IDLE_MS).filter(|_| safe > row.last) {
+                if let Some(expires) = safe.checked_add(BROWSER_IDLE_MS).filter(|_| safe > row.last)
+                {
                     conn.execute(
                         "UPDATE console_browser_sessions SET last_used_ms=?1,expires_ms=?2
                          WHERE id_digest=?3 AND last_used_ms=?4",
                         params![safe, expires, proof.id_digest.as_slice(), row.last],
-                    ).map_err(storage_error)? == 1
-                } else { false }
-            } else { false };
+                    )
+                    .map_err(storage_error)?
+                        == 1
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             Ok(Some(BrowserAdmission { proof, renewed }))
         })()?;
         Ok((result, session_ids(conn)?))
-    })?.unwrap_or_default();
+    })?
+    .unwrap_or_default();
     anchors.retain(|id, _| rows.iter().any(|(current, _)| current == id));
     for (id, last) in rows {
         anchors.entry(id).or_insert((last, monotonic));
@@ -539,19 +682,28 @@ fn admit_browser_at(
     Ok(admission)
 }
 
-pub(crate) fn recheck_browser(
-    context: &RuntimeContext, proof: &BrowserProof, token: Option<Generation>,
+pub(super) fn recheck_browser(
+    context: &RuntimeContext,
+    proof: &BrowserProof,
+    token: Option<Generation>,
 ) -> Result<bool, (u16, String)> {
     let now = crate::parity_clock::now_ms();
     let restore = restore_generation(context);
     let valid = session_write(context, |conn| {
-        let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else { return Ok(false) };
-        let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten()) else { return Ok(false) };
-        if !digests_equal(&auth, &proof.auth_generation) || !digests_equal(&restore, &proof.restore_generation) {
+        let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else {
+            return Ok(false);
+        };
+        let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten()) else {
+            return Ok(false);
+        };
+        if !digests_equal(&auth, &proof.auth_generation)
+            || !digests_equal(&restore, &proof.restore_generation)
+        {
             return Ok(false);
         }
         Ok(live_session(conn, &proof.id_digest, now, expiry_clock, proof, &token)?.is_some())
-    })?.unwrap_or(false);
+    })?
+    .unwrap_or(false);
     restore.map_err(unavailable)?;
     Ok(valid)
 }
@@ -559,8 +711,9 @@ pub(crate) fn recheck_browser(
 fn ensure_restore_generation(context: &RuntimeContext) -> Result<Generation, (u16, String)> {
     match restore_generation(context).map_err(unavailable)? {
         Some(value) => Ok(value),
-        None => crate::console_auth::rotate_restore_generation(context)
-            .map_err(|_| unavailable(STORAGE_ERROR.to_string())),
+        None => {
+            rotate_restore_generation(context).map_err(|_| unavailable(STORAGE_ERROR.to_string()))
+        }
     }
 }
 
@@ -598,9 +751,12 @@ fn active_throttle_tx(conn: &Connection, now: i64) -> Result<(i64, i64), (u16, S
     if now < deadline {
         let clamped = if deadline.saturating_sub(now) > THROTTLE_MAX_MS {
             let next = now.saturating_add(THROTTLE_MAX_MS);
-            conn.execute("UPDATE console_auth_state SET deadline_ms=?1 WHERE id=1", [next])
-                .map_err(storage_error)
-                .map_err(unavailable)?;
+            conn.execute(
+                "UPDATE console_auth_state SET deadline_ms=?1 WHERE id=1",
+                [next],
+            )
+            .map_err(storage_error)
+            .map_err(unavailable)?;
             next
         } else {
             deadline
@@ -612,7 +768,7 @@ fn active_throttle_tx(conn: &Connection, now: i64) -> Result<(i64, i64), (u16, S
 
 pub(crate) fn auth_status(context: &RuntimeContext) -> Result<AuthStatusSnapshot, (u16, String)> {
     if !context.is_isolated() {
-        return Err((503, super::LEGACY_ERROR.to_string()));
+        return Err((503, LEGACY_ERROR.to_string()));
     }
     let (password_set, consecutive_failures, deadline) = read_store(context, |conn| {
         let Some(conn) = conn else {
@@ -631,12 +787,12 @@ pub(crate) fn auth_status(context: &RuntimeContext) -> Result<AuthStatusSnapshot
     })
 }
 
-pub(crate) fn load_login_challenge(
+pub(super) fn load_login_challenge(
     context: &RuntimeContext,
     honor_throttle: bool,
 ) -> Result<LoginChallenge, (u16, String)> {
     if !context.is_isolated() {
-        return Err((503, super::LEGACY_ERROR.to_string()));
+        return Err((503, LEGACY_ERROR.to_string()));
     }
     let (hash, throttle) = read_store(context, |conn| {
         let Some(conn) = conn else {
@@ -671,7 +827,9 @@ pub(crate) fn load_login_challenge(
     Ok(LoginChallenge::Ready { hash })
 }
 
-pub(crate) fn clamp_throttle_deadline(context: &RuntimeContext) -> Result<(i64, i64), (u16, String)> {
+pub(super) fn clamp_throttle_deadline(
+    context: &RuntimeContext,
+) -> Result<(i64, i64), (u16, String)> {
     let now = crate::parity_clock::now_ms();
     write_administrator_password(context, true, |conn| {
         if administrator_password_in(conn).map_err(unavailable)?.is_none() {
@@ -696,7 +854,9 @@ fn insert_browser_session_tx(
     let id = new_generation().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let id_digest: Generation = Sha256::digest(id).into();
     let count: i64 = conn
-        .query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get(0))
+        .query_row("SELECT count(*) FROM console_browser_sessions", [], |row| {
+            row.get(0)
+        })
         .map_err(storage_error)
         .map_err(unavailable)?;
     let excess = count.saturating_sub(MAX_BROWSER_SESSIONS as i64 - 1);
@@ -715,7 +875,8 @@ fn insert_browser_session_tx(
         .ok_or_else(|| unavailable(STORAGE_ERROR.to_string()))?;
     conn.execute(
         "INSERT INTO console_browser_sessions
-         (id_digest, origin, token_digest, auth_generation, restore_generation, created_ms, last_used_ms, expires_ms, issued_seq)
+         (id_digest, origin, token_digest, auth_generation, restore_generation,
+          created_ms, last_used_ms, expires_ms, issued_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7,
                  (SELECT coalesce(max(issued_seq), 0) + 1 FROM console_browser_sessions))",
         params![
@@ -741,6 +902,11 @@ pub(crate) fn issue_browser_session(
     let restore = ensure_restore_generation(context)?;
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let issued = write_administrator_password(context, false, |conn| {
         migrate_auth(conn).map_err(unavailable)?;
         initialize_auth_state(conn).map_err(unavailable)?;
@@ -753,16 +919,13 @@ pub(crate) fn issue_browser_session(
         insert_browser_session_tx(conn, origin, token_digest, restore, now)
     })?
     .ok_or_else(|| unavailable(STORAGE_ERROR.to_string()))?;
-    let mut anchors = context
-        .browser_anchors
-        .0
-        .lock()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     anchors.insert(issued.id_digest, (now, monotonic));
     Ok(issued)
 }
 
-pub(crate) fn record_login_failure(context: &RuntimeContext) -> Result<LoginFailureState, (u16, String)> {
+pub(super) fn record_login_failure(
+    context: &RuntimeContext,
+) -> Result<LoginFailureState, (u16, String)> {
     let now = crate::parity_clock::now_ms();
     write_administrator_password(context, true, |conn| {
         if administrator_password_in(conn).map_err(unavailable)?.is_none() {
@@ -780,7 +943,11 @@ pub(crate) fn record_login_failure(context: &RuntimeContext) -> Result<LoginFail
         }
         let next_failures = failures.saturating_add(1);
         let delay = throttle_delay_ms(next_failures);
-        let next_deadline = if delay > 0 { now.saturating_add(delay) } else { 0 };
+        let next_deadline = if delay > 0 {
+            now.saturating_add(delay)
+        } else {
+            0
+        };
         conn.execute(
             "UPDATE console_auth_state SET consecutive_failures=?1, deadline_ms=?2 WHERE id=1",
             params![next_failures, next_deadline],
@@ -796,7 +963,7 @@ pub(crate) fn record_login_failure(context: &RuntimeContext) -> Result<LoginFail
     .ok_or((409, "尚未设置管理员密码".to_string()))
 }
 
-pub(crate) fn complete_login(
+pub(super) fn complete_login(
     context: &RuntimeContext,
     expected_phc: &str,
     origin: &str,
@@ -805,6 +972,11 @@ pub(crate) fn complete_login(
     let restore = ensure_restore_generation(context)?;
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let outcome = write_administrator_password(context, true, |conn| {
         migrate_auth(conn).map_err(unavailable)?;
         initialize_auth_state(conn).map_err(unavailable)?;
@@ -832,32 +1004,33 @@ pub(crate) fn complete_login(
     })?
     .unwrap_or(LoginOutcome::NotSet);
     if let LoginOutcome::Issued(ref issued) = outcome {
-        let mut anchors = context
-            .browser_anchors
-            .0
-            .lock()
-            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
         anchors.insert(issued.id_digest, (now, monotonic));
     }
     Ok(outcome)
 }
 
-pub(crate) fn change_administrator_password(
+pub(super) fn change_administrator_password(
     context: &RuntimeContext,
     expected_phc: &str,
     new_hash: &AdministratorPasswordHash,
     actor: &str,
     rotate_browser: Option<(&str, Generation)>,
 ) -> Result<Option<IssuedSession>, (u16, String)> {
-    let restore = if rotate_browser.is_some() {
-        Some(ensure_restore_generation(context)?)
-    } else {
-        None
+    let rotate_browser = match rotate_browser {
+        Some((origin, token_digest)) => {
+            Some((origin, token_digest, ensure_restore_generation(context)?))
+        }
+        None => None,
     };
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let rotated = write_administrator_password(context, false, |conn| {
-        let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
+        let old = stored_setting_row(conn, ADMINISTRATOR_PASSWORD.key)?;
         if old.is_none() {
             return Err((409, "尚未设置管理员密码".to_string()));
         }
@@ -870,7 +1043,7 @@ pub(crate) fn change_administrator_password(
         migrate_auth(conn).map_err(unavailable)?;
         initialize_auth_state(conn).map_err(unavailable)?;
         let text = json!(new_hash.as_str()).to_string();
-        record_change(
+        record_setting_change(
             conn,
             &ADMINISTRATOR_PASSWORD,
             old,
@@ -879,25 +1052,14 @@ pub(crate) fn change_administrator_password(
             "change-password",
         )?;
         reset_auth_state(conn).map_err(unavailable)?;
-        if let Some((origin, token_digest)) = rotate_browser {
-            let issued = insert_browser_session_tx(
-                conn,
-                origin,
-                token_digest,
-                restore.expect("restore generation prepared for browser rotation"),
-                now,
-            )?;
+        if let Some((origin, token_digest, restore)) = rotate_browser {
+            let issued = insert_browser_session_tx(conn, origin, token_digest, restore, now)?;
             Ok(Some(issued))
         } else {
             Ok(None)
         }
     })?
     .flatten();
-    let mut anchors = context
-        .browser_anchors
-        .0
-        .lock()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     anchors.clear();
     if let Some(ref issued) = rotated {
         anchors.insert(issued.id_digest, (now, monotonic));
@@ -905,13 +1067,13 @@ pub(crate) fn change_administrator_password(
     Ok(rotated)
 }
 
-pub(crate) fn list_browser_sessions(
+pub(super) fn list_browser_sessions_raw(
     context: &RuntimeContext,
     token_digest: Generation,
     current_id: Option<Generation>,
 ) -> Result<Vec<BrowserSessionView>, (u16, String)> {
     if !context.is_isolated() {
-        return Err((503, super::LEGACY_ERROR.to_string()));
+        return Err((503, LEGACY_ERROR.to_string()));
     }
     let Some(restore) = restore_generation(context).map_err(unavailable)? else {
         return Ok(Vec::new());
@@ -981,7 +1143,7 @@ pub(crate) fn list_browser_sessions(
             || !digests_equal(&tok, &token_digest)
             || !context
                 .console_port()
-                .is_none_or(|port| origin == crate::console_auth::canonical_origin(port))
+                .is_none_or(|port| origin == canonical_origin(port))
         {
             continue;
         }
@@ -997,10 +1159,15 @@ pub(crate) fn list_browser_sessions(
     Ok(views)
 }
 
-pub(crate) fn revoke_browser_session_by_digest(
+pub(super) fn revoke_browser_session_by_digest(
     context: &RuntimeContext,
     id_digest: Generation,
 ) -> Result<bool, (u16, String)> {
+    let mut anchors = context
+        .browser_anchors
+        .0
+        .lock()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let deleted = session_write(context, |conn| {
         let count = conn
             .execute(
@@ -1011,19 +1178,19 @@ pub(crate) fn revoke_browser_session_by_digest(
         Ok(count > 0)
     })?
     .unwrap_or(false);
+    anchors.remove(&id_digest);
+    Ok(deleted)
+}
+
+pub(super) fn revoke_other_browser_sessions(
+    context: &RuntimeContext,
+    keep: Option<Generation>,
+) -> Result<usize, (u16, String)> {
     let mut anchors = context
         .browser_anchors
         .0
         .lock()
         .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    anchors.remove(&id_digest);
-    Ok(deleted)
-}
-
-pub(crate) fn revoke_other_browser_sessions(
-    context: &RuntimeContext,
-    keep: Option<Generation>,
-) -> Result<usize, (u16, String)> {
     let Some(keep_digest) = keep else {
         let count = session_write(context, |conn| {
             let existing: i64 = conn
@@ -1033,11 +1200,6 @@ pub(crate) fn revoke_other_browser_sessions(
             Ok(usize::try_from(existing).unwrap_or(0))
         })?
         .unwrap_or(0);
-        let mut anchors = context
-            .browser_anchors
-            .0
-            .lock()
-            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
         anchors.clear();
         return Ok(count);
     };
@@ -1049,18 +1211,17 @@ pub(crate) fn revoke_other_browser_sessions(
         .map_err(storage_error)
     })?
     .unwrap_or(0);
-    let mut anchors = context
-        .browser_anchors
-        .0
-        .lock()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     anchors.retain(|id, _| digests_equal(id, &keep_digest));
     Ok(deleted)
 }
 
 #[cfg(test)]
 pub(crate) fn seed_browser_session(
-    context: &RuntimeContext, port: u16, token: &str, id: Generation, last: i64,
+    context: &RuntimeContext,
+    port: u16,
+    token: &str,
+    id: Generation,
+    last: i64,
 ) -> Result<(), (u16, String)> {
     let restore = ensure_restore_generation(context)?;
     write_administrator_password(context, false, |conn| {
@@ -1069,10 +1230,19 @@ pub(crate) fn seed_browser_session(
         conn.execute(
             "INSERT INTO console_browser_sessions
              SELECT ?1,?2,?3,auth_generation,?4,?5,?5,?6,
-             (SELECT coalesce(max(issued_seq),0)+1 FROM console_browser_sessions) FROM console_auth_state WHERE id=1",
-            params![id.as_slice(), crate::console_auth::canonical_origin(port),
-                crate::console_auth::credential_digest(token).as_slice(), restore.as_slice(), last, last + BROWSER_IDLE_MS],
-        ).map_err(storage_error).map_err(unavailable)?;
+             (SELECT coalesce(max(issued_seq),0)+1 FROM console_browser_sessions)
+             FROM console_auth_state WHERE id=1",
+            params![
+                id.as_slice(),
+                canonical_origin(port),
+                super::credential_digest(token).as_slice(),
+                restore.as_slice(),
+                last,
+                last + BROWSER_IDLE_MS
+            ],
+        )
+        .map_err(storage_error)
+        .map_err(unavailable)?;
         Ok(())
     })?;
     Ok(())
@@ -1085,10 +1255,10 @@ pub(crate) struct ArchivedCredentials {
 }
 
 fn archive_schema(conn: &Connection) -> Result<i64, String> {
-    if !check_schema(conn)? {
+    if !check_store_schema(conn)? {
         return Err(STORAGE_ERROR.to_string());
     }
-    schema_version(conn)
+    store_schema_version(conn)
 }
 
 fn auth_rows_exist_checked(conn: &Connection, table: &str) -> Result<bool, InspectError> {
@@ -1111,13 +1281,7 @@ pub(crate) fn archive_credentials(conn: &Connection) -> Result<ArchivedCredentia
     {
         return Err("backup settings contain operational console authentication state".to_string());
     }
-    let has_endpoints = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
-            params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
-            |row| row.get(0),
-        )
-        .map_err(storage_error)?;
+    let has_endpoints = has_endpoint_credentials(conn)?;
     let has_password = administrator_password_in(conn)?.is_some();
     Ok(ArchivedCredentials {
         has_endpoints,
@@ -1157,7 +1321,7 @@ pub(crate) fn scrub_auth_snapshot(
         tx.commit().map_err(storage_error)?;
     }
     conn.close().map_err(|(_, error)| storage_error(error))?;
-    for name in SIDECARS {
+    for name in STORE_SIDECARS {
         if path
             .with_file_name(name)
             .try_exists()
@@ -1172,11 +1336,22 @@ pub(crate) fn scrub_auth_snapshot(
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::{admit_browser_at, BrowserAdmission, Generation, BROWSER_IDLE_MS};
+    use super::{
+        administrator_password, admit_browser_at, reset_administrator_password,
+        seed_browser_session, set_initial_administrator_password, BrowserAdmission, Generation,
+        BROWSER_IDLE_MS,
+    };
+    use crate::settings::{
+        apply, inspect_store, migrate_store_v2, store_schema_version, StoreInspection, StoreProbe,
+        ADMINISTRATOR_PASSWORD, FAIL_BEFORE_AUDIT,
+    };
+    use rusqlite::Connection;
+    use serde_json::json;
     use std::time::Instant;
-    use crate::settings::StoreProbe;
 
-    fn browser_clock_fixture(last: i64) -> (crate::runtime::tests::FixtureRoot, RuntimeContext, Generation) {
+    fn browser_clock_fixture(
+        last: i64,
+    ) -> (crate::runtime::tests::FixtureRoot, RuntimeContext, Generation) {
         let (root, context) = crate::console_auth::tests::runtime(true);
         let id = [72; 32];
         let token = context.effective_console_token(&context.load_config().unwrap());
@@ -1184,49 +1359,124 @@ mod tests {
         (root, context, id)
     }
 
-    fn check_at(context: &RuntimeContext, id: Generation, now: i64, monotonic: Instant) -> Option<BrowserAdmission> {
+    fn check_at(
+        context: &RuntimeContext,
+        id: Generation,
+        now: i64,
+        monotonic: Instant,
+    ) -> Option<BrowserAdmission> {
         let token = context.effective_console_token(&context.load_config().unwrap());
-        admit_browser_at(context, "http://her.localhost:3999", Some(crate::console_auth::credential_digest(&token)), &[id], true, now, monotonic).unwrap()
+        admit_browser_at(
+            context,
+            "http://her.localhost:3999",
+            Some(credential_digest(&token)),
+            &[id],
+            true,
+            now,
+            monotonic,
+        )
+        .unwrap()
     }
 
     #[test]
     fn browser_session_renews_until_the_exact_expiry_boundary() {
         let (_root, context, id) = browser_clock_fixture(100_000);
         let anchor = Instant::now();
-        context.browser_anchors.0.lock().unwrap().insert(id, (100_000, anchor));
-        assert!(check_at(&context, id, 101_000, anchor + std::time::Duration::from_secs(1)).unwrap().renewed);
-        assert!(check_at(&context, id, 101_000 + BROWSER_IDLE_MS - 1, anchor + std::time::Duration::from_secs(1)).is_some());
-        assert!(check_at(&context, id, 101_000 + BROWSER_IDLE_MS, anchor + std::time::Duration::from_secs(1)).is_none(),
-            "a session must expire at its exact seven-day boundary");
+        context
+            .browser_anchors
+            .0
+            .lock()
+            .unwrap()
+            .insert(id, (100_000, anchor));
+        assert!(
+            check_at(
+                &context,
+                id,
+                101_000,
+                anchor + std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+            .renewed
+        );
+        assert!(check_at(
+            &context,
+            id,
+            101_000 + BROWSER_IDLE_MS - 1,
+            anchor + std::time::Duration::from_secs(1)
+        )
+        .is_some());
+        assert!(
+            check_at(
+                &context,
+                id,
+                101_000 + BROWSER_IDLE_MS,
+                anchor + std::time::Duration::from_secs(1)
+            )
+            .is_none(),
+            "a session must expire at its exact seven-day boundary"
+        );
     }
 
     #[test]
     fn future_browser_timestamp_fails_closed_after_restart() {
         let (root, context, id) = browser_clock_fixture(120_000);
         let restarted = RuntimeContext::from_root(&root.0).unwrap();
-        assert!(check_at(&restarted, id, 119_999, Instant::now()).is_none(),
-            "a future persisted last-use must refuse after a tolerated backward step");
-        assert!(check_at(&context, id, 120_000, Instant::now()).is_none(),
-            "the invalid row must be removed when checked");
+        assert!(
+            check_at(&restarted, id, 119_999, Instant::now()).is_none(),
+            "a future persisted last-use must refuse after a tolerated backward step"
+        );
+        assert!(
+            check_at(&context, id, 120_000, Instant::now()).is_none(),
+            "the invalid row must be removed when checked"
+        );
     }
 
     #[test]
     fn wall_clock_jump_cannot_extend_absolute_browser_expiry() {
         let (root, context, id) = browser_clock_fixture(120_000);
         let anchor = Instant::now();
-        context.browser_anchors.0.lock().unwrap().insert(id, (120_000, anchor));
+        context
+            .browser_anchors
+            .0
+            .lock()
+            .unwrap()
+            .insert(id, (120_000, anchor));
         let result = check_at(&context, id, 120_000 + BROWSER_IDLE_MS / 2, anchor).unwrap();
-        assert!(!result.renewed, "a forward wall-only step must never renew a browser cookie");
+        assert!(
+            !result.renewed,
+            "a forward wall-only step must never renew a browser cookie"
+        );
         let conn = StoreProbe::at(&root.0).open();
-        let expiry: i64 = conn.query_row(
-            "SELECT expires_ms FROM console_browser_sessions WHERE id_digest=?",
-            [id.as_slice()], |row| row.get(0),
-        ).unwrap();
+        let expiry: i64 = conn
+            .query_row(
+                "SELECT expires_ms FROM console_browser_sessions WHERE id_digest=?",
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(expiry, 120_000 + BROWSER_IDLE_MS);
         drop(conn);
-        assert!(check_at(&context, id, 120_000 + BROWSER_IDLE_MS / 2, anchor + std::time::Duration::from_secs(1)).unwrap().renewed);
+        assert!(
+            check_at(
+                &context,
+                id,
+                120_000 + BROWSER_IDLE_MS / 2,
+                anchor + std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+            .renewed
+        );
         let restarted = RuntimeContext::from_root(&root.0).unwrap();
-        assert!(!check_at(&restarted, id, 120_000 + BROWSER_IDLE_MS / 2, Instant::now()).unwrap().renewed);
+        assert!(
+            !check_at(
+                &restarted,
+                id,
+                120_000 + BROWSER_IDLE_MS / 2,
+                Instant::now()
+            )
+            .unwrap()
+            .renewed
+        );
         assert!(check_at(&restarted, id, 121_000 + BROWSER_IDLE_MS, Instant::now()).is_none());
     }
 
@@ -1241,26 +1491,29 @@ mod tests {
         assert!(check_at(&context, id, root_time - 60_000, anchor).is_some());
         assert!(check_at(&context, [11; 32], root_time - 60_001, anchor).is_none());
         let db = StoreProbe::at(&root.0).open();
-        let remaining: i64 = db.query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get(0)).unwrap();
+        let remaining: i64 = db
+            .query_row("SELECT count(*) FROM console_browser_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(remaining, 0);
-        let mark: i64 = db.query_row("SELECT clock_high_water_ms FROM console_auth_state", [], |row| row.get(0)).unwrap();
+        let mark: i64 = db
+            .query_row(
+                "SELECT clock_high_water_ms FROM console_auth_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(mark, root_time - 60_001);
     }
 
     fn old_store(version: i64) -> (crate::runtime::tests::FixtureRoot, RuntimeContext) {
         let (root, context) = crate::console_auth::tests::runtime(false);
-        super::super::apply(
-            &context,
-            "reply.wakeQuietMs",
-            &json!(4000),
-            "fixture",
-            "console",
-        )
-        .unwrap();
+        apply(&context, "reply.wakeQuietMs", &json!(4000), "fixture", "console").unwrap();
         if version == 2 {
             let mut conn = StoreProbe::at(&root.0).open();
             let tx = conn.transaction().unwrap();
-            migrate(&tx).unwrap();
+            migrate_store_v2(&tx).unwrap();
             tx.commit().unwrap();
         }
         assert_eq!(StoreProbe::at(&root.0).user_version(), version);
@@ -1277,7 +1530,10 @@ mod tests {
                     .unwrap();
             set_initial_administrator_password(&context, &hash, "her-cli").unwrap();
             assert!(
-                matches!(inspect(&context), Ok(Inspection::Ready(conn)) if schema_version(&conn) == Ok(3)),
+                matches!(
+                    inspect_store(&context),
+                    Ok(StoreInspection::Ready(conn)) if store_schema_version(&conn) == Ok(3)
+                ),
                 "reopen must recognize the committed v3 schema"
             );
             assert_eq!(store.value("reply.wakeQuietMs").as_deref(), Some("4000"));
@@ -1375,7 +1631,7 @@ mod tests {
             .unwrap();
         drop(conn);
         assert!(
-            inspect(&context).is_err(),
+            inspect_store(&context).is_err(),
             "v3 must have exactly the supported table and index shape"
         );
     }
@@ -1390,19 +1646,33 @@ mod tests {
             AdministratorPasswordHash::parse(&crate::console_auth::tests::supported_phc()).unwrap();
         set_initial_administrator_password(&context, &hash, "her-cli").unwrap();
         let session_count = |conn: &Connection| {
-            conn.query_row("SELECT count(*) FROM console_browser_sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
+            conn.query_row(
+                "SELECT count(*) FROM console_browser_sessions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap()
         };
         let state = |conn: &Connection| {
-            conn.query_row("SELECT auth_generation, consecutive_failures, deadline_ms, clock_high_water_ms FROM console_auth_state",
-                [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
-                .unwrap()
+            conn.query_row(
+                "SELECT auth_generation, consecutive_failures, deadline_ms, clock_high_water_ms
+                 FROM console_auth_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
         };
         for password_was_set in [true, false] {
             store.edit(
-                "UPDATE console_auth_state SET consecutive_failures=5, deadline_ms=60001, clock_high_water_ms=1;
+                "UPDATE console_auth_state SET consecutive_failures=5, deadline_ms=60001,
+                        clock_high_water_ms=1;
                  INSERT INTO console_browser_sessions
                  SELECT randomblob(32), 'http://her.localhost:4567', randomblob(32),
                         auth_generation, randomblob(32), 0, 0, 1, 1 FROM console_auth_state;",
@@ -1410,7 +1680,7 @@ mod tests {
             let before = state(&store.open());
             let audit = store.audit_count();
             if password_was_set {
-                super::super::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
+                FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
                 assert!(reset_administrator_password(&context).is_err());
                 assert_eq!(state(&store.open()), before);
                 assert_eq!(session_count(&store.open()), 1);

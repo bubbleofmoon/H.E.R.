@@ -1105,7 +1105,7 @@ fn create_snapshot(
         {
             let snapshot = scratch.0.join("settings.db");
             online_snapshot(db, &snapshot, "settings", check)?;
-            crate::settings::scrub_auth_snapshot(&snapshot, check)
+            crate::console_auth::scrub_auth_snapshot(&snapshot, check)
                 .map_err(|error| format!("settings backup: {error}"))?;
             databases.push("settings.db");
         }
@@ -1222,7 +1222,7 @@ fn add(
 
 pub(crate) struct VerifiedArchive {
     pub manifest: Manifest,
-    pub credentials: crate::settings::ArchivedCredentials,
+    pub credentials: crate::console_auth::ArchivedCredentials,
     pub settings_overlay: Vec<(&'static crate::settings::Setting, serde_json::Value)>,
 }
 
@@ -1280,9 +1280,14 @@ fn verify_file_inner(
         }
         let auth_path = name.to_ascii_lowercase();
         let auth_path = auth_path.strip_prefix("state/").or_else(|| auth_path.strip_prefix("data/")).unwrap_or(&auth_path);
-        if matches!(auth_path, crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
-            | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE | crate::restore::RECOVERY_DIR)
-            || auth_path.starts_with("console-restore-recovery/")
+        if matches!(
+            auth_path,
+            crate::console_auth::RESTORE_GENERATION_FILE
+                | crate::console_auth::TOKEN_FILE
+                | crate::console_auth::ROTATION_FILE
+                | crate::console_auth::DESKTOP_GRANTS_FILE
+                | crate::restore::RECOVERY_DIR
+        ) || auth_path.starts_with("console-restore-recovery/")
         {
             return Err("backup contains destination console authentication state".into());
         }
@@ -1326,7 +1331,7 @@ fn verify_file_inner(
     if seen.len() != manifest.files.len() + 1 {
         return Err("backup files missing from ZIP".into());
     }
-    let mut credentials = crate::settings::ArchivedCredentials::default();
+    let mut credentials = crate::console_auth::ArchivedCredentials::default();
     let mut settings_overlay = Vec::new();
     for &name in ArchiveScope::for_restore(false).databases() {
         if !manifest.files.contains_key(name) {
@@ -1355,7 +1360,7 @@ fn verify_file_inner(
             return Err("backup database integrity check returned no result".into());
         }
         if inspect_settings && name == "settings.db" {
-            credentials = crate::settings::archive_credentials(&db)
+            credentials = crate::console_auth::archive_credentials(&db)
                 .map_err(|error| format!("backup settings verification: {error}"))?;
             settings_overlay = crate::settings::read_archive_values(&db)
                 .map_err(|error| format!("backup settings overlay: {error}"))?;

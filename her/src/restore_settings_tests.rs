@@ -1074,9 +1074,9 @@ fn console_auth_full_restore_reinstates_archived_credential() {
     let without_store = f.backup();
     set_auth_password(&f, ARCHIVED_PASSWORD);
     let archive = f.backup();
-    crate::settings::reset_administrator_password(&f.context()).unwrap();
+    crate::console_auth::reset_administrator_password(&f.context()).unwrap();
     let unset = f.backup();
-    crate::settings::reset_administrator_password(&f.context()).unwrap();
+    crate::console_auth::reset_administrator_password(&f.context()).unwrap();
     set_auth_password(&f, CURRENT_PASSWORD);
     auth_restore(&f, &archive, false, &mut FakeControl::default()).unwrap();
     let hash = stored_auth_password(&f).unwrap();
@@ -1100,7 +1100,7 @@ fn console_auth_full_restore_advances_destination_generation() {
     let restored = crate::console_auth::restore_generation(&context).unwrap().unwrap();
     assert_ne!(restored, initial, "full restore must publish a fresh destination generation");
     assert!(credential_file_is_private(&f.0.join("data/console-auth-generation"), true));
-    crate::settings::reset_administrator_password(&context).unwrap();
+    crate::console_auth::reset_administrator_password(&context).unwrap();
     set_auth_password(&f, CURRENT_PASSWORD);
     let mut control = FakeControl {
         unhealthy: true,

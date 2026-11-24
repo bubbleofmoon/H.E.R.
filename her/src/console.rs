@@ -6,7 +6,7 @@
 //!   · 令牌校验用定长比较，且**所有**路由都要过，包括 `/`
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
 
-use crate::console_auth::{credential_digest, credential_eq, digests_equal};
+use crate::console_auth::{credential_digest, credential_eq};
 use crate::conversation_state::{Conversation, ConversationState, SocialDocument};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
@@ -471,44 +471,6 @@ enum RequestReadError {
     Invalid,
 }
 
-fn is_role_management_post(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("POST", "/api/roles/create")
-            | ("POST", "/api/roles/rename")
-            | ("POST", "/api/roles/delete")
-            | ("POST", "/api/roles/update")
-            | ("POST", "/api/roles/limit")
-            | ("POST", "/api/role")
-            | ("POST", "/api/role-mode")
-    )
-}
-
-fn is_bounded_json_post(method: &str, path: &str) -> bool {
-    is_role_management_post(method, path)
-        || (method == "POST" && path == "/api/socialV2/send-message")
-        || (method == "POST" && path.starts_with("/api/tasks/"))
-        || (method == "POST" && (path == "/api/schedule" || path.starts_with("/api/schedule/")))
-        || (method == "POST" && path.starts_with("/api/backups/"))
-        || (method == "POST" && path.starts_with("/api/releases/"))
-        || (method == "POST" && path.starts_with("/api/dependencies/"))
-        || (matches!(method, "GET" | "POST") && path == "/api/memory/acl")
-        || (method == "POST" && path == "/api/restart")
-        || (method == "POST" && path.starts_with("/api/settings/"))
-        || (method == "POST" && path.starts_with("/api/auth/"))
-}
-
-fn bounded_post_body_too_large(req: &Request) -> bool {
-    is_bounded_json_post(&req.method, &req.path)
-        && (req.body_too_large
-            || req
-                .headers
-                .get("content-length")
-                .map(|value| decimal_exceeds_limit(value, BOUNDED_POST_MAX_BODY_BYTES))
-                .unwrap_or(false)
-            || req.body.as_bytes().len() > BOUNDED_POST_MAX_BODY_BYTES)
-}
-
 fn parse_query(q: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for pair in q.split('&').filter(|s| !s.is_empty()) {
@@ -596,7 +558,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
         None => (target.clone(), String::new()),
     };
 
-    let bounded_json_post = is_bounded_json_post(&method, &path);
+    let bounded_json_post = front::is_bounded_json_request(&method, &path);
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut duplicate_framing_header = false;
     for line in lines {
@@ -907,8 +869,8 @@ fn read_chunked_request_body(
     }
 }
 
-fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
-    let ConsoleResponse {
+fn respond(stream: &mut TcpStream, response: front::ConsoleResponse) {
+    let front::ConsoleResponse {
         status,
         content_type,
         body,
@@ -943,13 +905,13 @@ fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
         head.push_str(&format!("Content-Security-Policy: {csp}\r\n"));
     }
     match redirect {
-        Some(ConsoleRedirect::CanonicalOrigin(port, mount)) => {
+        Some(front::ConsoleRedirect::CanonicalOrigin(port, mount)) => {
             head.push_str(&format!(
                 "Location: {}{mount}\r\n",
                 crate::console_auth::canonical_origin(port)
             ));
         }
-        Some(ConsoleRedirect::Path(mount)) => {
+        Some(front::ConsoleRedirect::Path(mount)) => {
             head.push_str(&format!("Location: {mount}\r\n"));
         }
         None => {}
@@ -972,195 +934,11 @@ fn console_token(cfg: &Value) -> String {
         .to_string()
 }
 
-fn authorized(req: &Request, cfg: &Value) -> bool {
-    token_supplied(req, &console_token(cfg))
-}
-
 /// `authorized` against the credential the runtime actually accepts (a selected runtime's
 /// generated token lives in `data/console-token` while `config.json` holds "").
 #[cfg(test)]
 fn authorized_in(context: &RuntimeContext, req: &Request, cfg: &Value) -> bool {
-    token_supplied(req, &context.effective_console_token(cfg))
-}
-
-fn presented_console_token(req: &Request) -> Option<&str> {
-    req.query.get("token").or_else(|| req.headers.get("x-console-token")).map(String::as_str)
-}
-
-fn token_supplied(req: &Request, expected: &str) -> bool {
-    presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
-}
-
-#[cfg(any(windows, test))]
-fn desktop_file_proof_matches(req: &Request, expected: &str) -> bool {
-    presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
-}
-
-pub(crate) const DESKTOP_GRANTS_FILE: &str = "console-desktop-grants";
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DesktopProof {
-    bearer_digest: [u8; 32],
-    generation: [u8; 32],
-    issuer_pid: u32,
-    issuer_start: u64,
-}
-
-pub(crate) fn recheck_desktop(
-    context: &RuntimeContext, proof: &DesktopProof, token: &[u8; 32],
-) -> Result<bool, (u16, String)> {
-    let current = selected_desktop_proof(context, &proof.bearer_digest, token)?;
-    Ok(current.is_some_and(|current| {
-        current.issuer_pid == proof.issuer_pid
-            && current.issuer_start == proof.issuer_start
-            && digests_equal(&current.generation, &proof.generation)
-    }))
-}
-
-#[cfg(not(windows))]
-fn selected_desktop_proof(
-    _: &RuntimeContext, _: &[u8; 32], _: &[u8; 32],
-) -> Result<Option<DesktopProof>, (u16, String)> {
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn selected_desktop_proof(
-    context: &RuntimeContext, bearer: &[u8; 32], token: &[u8; 32],
-) -> Result<Option<DesktopProof>, (u16, String)> {
-    let Some(registry) = desktop_grants::read(context)? else { return Ok(None) };
-    let now = desktop_grants::ticks();
-    if !registry.verified(context) {
-        return Ok(None);
-    }
-    Ok(registry.grants.iter().find(|grant| {
-        grant.issued <= now && now < grant.expires
-            && digests_equal(bearer, &grant.bearer_digest) && digests_equal(token, &grant.token_digest)
-    }).map(|_| DesktopProof {
-        bearer_digest: *bearer,
-        generation: registry.generation,
-        issuer_pid: registry.issuer_pid,
-        issuer_start: registry.issuer_start,
-    }))
-}
-
-#[cfg(windows)]
-mod desktop_grants {
-    use super::*;
-
-    const LIFETIME: u64 = 12 * 60 * 60 * 1000;
-    const LIMIT: usize = 128;
-
-    #[cfg(test)]
-    thread_local! {
-        static TEST_TICKS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    }
-
-    pub(super) fn ticks() -> u64 {
-        #[cfg(test)]
-        if let Some(ticks) = TEST_TICKS.with(std::cell::Cell::get) { return ticks; }
-        // SAFETY: GetTickCount64 takes no arguments.
-        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct Registry {
-        v: u8,
-        pub(super) generation: [u8; 32],
-        pub(super) issuer_pid: u32,
-        pub(super) issuer_start: u64,
-        pub(super) grants: std::collections::VecDeque<Grant>,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct Grant {
-        pub(super) bearer_digest: [u8; 32],
-        pub(super) token_digest: [u8; 32],
-        pub(super) issued: u64,
-        pub(super) expires: u64,
-    }
-
-    fn unavailable() -> (u16, String) {
-        (503, "desktop grant registry is unavailable".into())
-    }
-
-    fn owner(context: &RuntimeContext) -> Option<crate::lifecycle::ProcessIdentity> {
-        let _path = context
-            .resolve_path(
-                RuntimeArea::Data,
-                &format!("logs/{}", crate::lifecycle::CONSOLE_LOCK),
-                PathIntent::ReadFile,
-            )
-            .ok()?;
-        match crate::lifecycle::verify_owner(
-            &mut crate::lifecycle::LiveLifecycle,
-            context.data_dir(),
-            crate::lifecycle::OwnerRole::Console,
-            &crate::lifecycle::ImagePolicy::HealthReadOnly,
-            crate::lifecycle::ProbeMode::Existing,
-        ) {
-            crate::lifecycle::OwnerObservation::Verified(owner) => Some(owner.marker.identity),
-            _ => None,
-        }
-    }
-
-    impl Registry {
-        pub(super) fn verified(&self, context: &RuntimeContext) -> bool {
-            owner(context).is_some_and(|identity| identity.pid == self.issuer_pid && identity.start == self.issuer_start)
-        }
-    }
-
-    pub(super) fn read(context: &RuntimeContext) -> Result<Option<Registry>, (u16, String)> {
-        let Some(bytes) = context
-            .read_protected_data_file(DESKTOP_GRANTS_FILE, 128 * 1024)
-            .map_err(|_| unavailable())? else { return Ok(None) };
-        let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
-        let mut ids = std::collections::HashSet::new();
-        if registry.v != 1 || registry.issuer_pid == 0 || registry.issuer_start == 0 || registry.grants.len() > LIMIT
-            || registry.grants.iter().any(|grant| grant.issued.checked_add(LIFETIME) != Some(grant.expires) || !ids.insert(grant.bearer_digest))
-        {
-            return Err(unavailable());
-        }
-        Ok(Some(registry))
-    }
-
-    fn write(context: &RuntimeContext, registry: &Registry) -> Result<(), (u16, String)> {
-        let bytes = serde_json::to_vec(registry).map_err(|_| unavailable())?;
-        context.write_atomic(RuntimeArea::Data, DESKTOP_GRANTS_FILE, &bytes).map_err(|_| unavailable())
-    }
-
-    pub(super) fn current_issuer(context: &RuntimeContext) -> Result<Registry, (u16, String)> {
-        let owner = owner(context).filter(|identity| identity.pid == std::process::id()).ok_or_else(unavailable)?;
-        if let Some(existing) = read(context)? {
-            if existing.issuer_pid == owner.pid && existing.issuer_start == owner.start {
-                return Ok(existing);
-            }
-        }
-        let registry = Registry {
-            v: 1, generation: crate::console_auth::new_generation().map_err(|_| unavailable())?,
-            issuer_pid: owner.pid, issuer_start: owner.start, grants: Default::default(),
-        };
-        write(context, &registry)?;
-        Ok(registry)
-    }
-
-    pub(super) fn issue(
-        context: &RuntimeContext, mut registry: Registry, token_digest: [u8; 32],
-    ) -> Result<String, (u16, String)> {
-        let token = generate_console_token().map_err(|_| unavailable())?;
-        let now = ticks();
-        let expires = now.checked_add(LIFETIME).ok_or_else(unavailable)?;
-        registry.grants.retain(|grant| grant.issued <= now && now < grant.expires);
-        while registry.grants.len() >= LIMIT {
-            registry.grants.pop_front();
-        }
-        registry.grants.push_back(Grant { bearer_digest: credential_digest(&token), token_digest, issued: now, expires });
-        write(context, &registry)?;
-        Ok(token)
-    }
+    front::token_supplied(req, &context.effective_console_token(cfg))
 }
 
 /// File-backed administrator status fields; `agent::finish_status` adds the agent readiness probe.
@@ -1513,10 +1291,21 @@ fn decimal_exceeds_limit(value: &str, limit: usize) -> bool {
 /// role mutation routes. This parser contract applies in selected and legacy
 /// contexts without changing which routes the isolated allowlist opens.
 fn role_management_dispatch_body(req: &Request) -> Result<Option<String>, (u16, String)> {
-    if !is_role_management_post(&req.method, &req.path) {
+    let is_role_post = req.method == "POST"
+        && matches!(
+            req.path.as_str(),
+            "/api/roles/create"
+                | "/api/roles/rename"
+                | "/api/roles/delete"
+                | "/api/roles/update"
+                | "/api/roles/limit"
+                | "/api/role"
+                | "/api/role-mode"
+        );
+    if !is_role_post {
         return Ok(None);
     }
-    if bounded_post_body_too_large(req) {
+    if front::bounded_post_body_too_large(req) {
         return Err((413, BODY_TOO_LARGE_ERROR.to_string()));
     }
     let parsed = parse_object_body(&req.body)?;
@@ -7066,26 +6855,6 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
     }
 }
 
-/// A generated console token: 24 bytes of operating-system randomness as 48 hex characters (JS
-/// `crypto.randomBytes(24).toString('hex')`).
-pub(crate) fn generate_console_token() -> Result<String, String> {
-    generate_console_token_from(&mut |bytes: &mut [u8]| {
-        getrandom::getrandom(bytes).map_err(|e| format!("系统随机数不可用：{e}"))
-    })
-}
-
-/// The token made from exactly the bytes `fill` provides (the entropy source is the only input).
-pub(crate) fn generate_console_token_from(fill: &mut dyn FnMut(&mut [u8]) -> Result<(), String>) -> Result<String, String> {
-    let mut bytes = [0u8; 24];
-    fill(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Publish the token through protected staging before placing it at its final path.
-pub(crate) fn write_console_token_file(context: &RuntimeContext, token: &str) -> Result<(), String> {
-    context.write_atomic(RuntimeArea::Data, crate::console_auth::TOKEN_FILE, token.as_bytes())
-}
-
 /// `POST /api/console/token`：改控制台访问令牌（留空则随机生成）。
 ///
 /// Selected runtime (JS `bridge.js` 4311-4341): a manual token goes to `config.json` and to
@@ -7109,7 +6878,7 @@ fn handle_console_token_post_tx(
     };
     let generated = provided.is_empty();
     let new_token = if generated {
-        generate_console_token()
+        crate::console_auth::generate_console_token()
             .map_err(|e| crate::config_tx::CommitError::plain(500, e))?
     } else {
         provided
@@ -10302,178 +10071,64 @@ fn route_test(req: &Request, cfg: &Value, context: &RuntimeContext) -> (u16, Str
     (response.status, response.content_type, response.body)
 }
 
-/// Protect the JS-owned pending approval/question view from agent credentials.
-/// Keep this check independent of social-v2 state, mode, and pause settings.
+#[cfg(test)]
 fn pending_agent_denial(req: &Request) -> Option<(u16, String)> {
-    if req.method != "GET" || req.path != "/api/pending" {
-        return None;
-    }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        Some((403, "agent token 不能为空".to_string()))
-    } else {
-        Some((403, "该接口仅控制台可用".to_string()))
-    }
-}
-/// `/api/pending` is a console-only administration view, independent of query keys.
-fn pending_admin_agent_gate_route(req: &Request) -> bool {
-    req.method == "GET" && req.path == "/api/pending"
-}
-
-/// Restore the JS agent-token policy for the two tool-log administration routes.
-///
-/// This is intentionally scoped to these exact route/method pairs. The remaining
-/// global agent-token middleware is still a separate migration task.
-fn tool_log_agent_denial(
-    req: &Request,
-    cfg: &Value,
-    context: &RuntimeContext,
-) -> Option<(u16, String)> {
+    let policy = front::route_policy(&req.method, &req.path);
     if !matches!(
-        (req.method.as_str(), req.path.as_str()),
-        ("GET", "/api/socialV2/tool-log")
-            | ("POST", "/api/socialV2/tool-log/clear")
+        policy,
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::PendingAdminOnly,
+            ..
+        })
     ) {
         return None;
     }
-
-    let token = req.headers.get("x-agent-token")?;
-    // bridge.js rejects an explicitly empty header before pause/config/mode checks.
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-
-    let doc = match ConversationState::for_runtime(context).read_document() {
-        Ok(doc) => doc,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if doc.paused() {
-        return Some((
-            403,
-            "当前已暂停，不允许执行 v2 工具".to_string(),
-        ));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => return Some((status, message)),
-    }
-
-    Some((403, "该接口仅控制台可用".to_string()))
+    front::policy_agent_denial(policy, req, &Value::Null, &RuntimeContext::legacy())
 }
 
-fn v1_sticker_admin_path(path: &str) -> bool {
-    path == "/api/stickers" || path.starts_with("/api/stickers/")
+#[cfg(test)]
+fn pending_admin_agent_gate_route(req: &Request) -> bool {
+    matches!(
+        front::route_policy(&req.method, &req.path),
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::PendingAdminOnly,
+            ..
+        })
+    )
 }
 
+#[cfg(test)]
 fn social_agent_policy_route(req: &Request) -> bool {
-    agent::is_agent_policy_route(req)
-        || v1_sticker_admin_path(&req.path)
-        || req.path == "/api/socialV2/config"
-        || req.path == "/api/socialV2/activity"
-        || matches!(
-            (req.method.as_str(), req.path.as_str()),
-            ("GET", "/api/socialV2/memory")
-                | ("POST", "/api/socialV2/memory-append")
-                | ("POST", "/api/socialV2/memory-update")
-                | ("POST", "/api/socialV2/memory-remove")
-                | ("POST", "/api/socialV2/memory-clear")
-                | ("GET", "/api/socialV2/state")
-                | ("GET", "/api/socialV2/states")
-                | ("GET", "/api/socialV2/unread")
-                | ("GET", "/api/socialV2/prompt")
-                | ("GET", "/api/socialV2/slang/query")
-                | ("POST", "/api/socialV2/slang/submit")
-                | ("GET", "/api/socialV2/recent")
-                | ("GET", "/api/socialV2/my-recent")
-                | ("GET", "/api/socialV2/active-members")
-                | ("GET", "/api/socialV2/self-image")
-                | ("GET", "/api/images/message")
-                | ("GET", "/api/socialV2/forward-message")
-                | ("POST", "/api/socialV2/forward-media")
-                | ("POST", "/api/socialV2/send-message")
-                | ("GET", "/api/socialV2/sticker-list")
-                | ("POST", "/api/socialV2/sticker-list")
-                | ("GET", "/api/socialV2/sticker-image")
-                | ("POST", "/api/socialV2/sticker-note")
-                | ("POST", "/api/socialV2/sticker-remark")
-                | ("POST", "/api/socialV2/send-sticker")
-                | ("POST", "/api/socialV2/collect-sticker")
-                | ("GET", "/api/stickers")
-                | ("POST", "/api/stickers/sync")
-                | ("POST", "/api/stickers/note")
-                | ("POST", "/api/stickers/remark")
-        )
+    matches!(
+        front::route_policy(&req.method, &req.path),
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::V1StickerAdmin
+                | front::AgentPolicy::V2AdminOnly
+                | front::AgentPolicy::V2AgentAllowed,
+            ..
+        })
+    )
 }
 
-/// Restore the JS global agent-token gates for selected social config, inline-memory,
-/// and projection handlers. Per-session token, allow-list and tool checks happen
-/// after each route's required-key validation.
+#[cfg(test)]
 fn social_agent_policy_denial(
     req: &Request,
     cfg: &Value,
     context: &RuntimeContext,
 ) -> Option<(u16, String)> {
-    if !social_agent_policy_route(req) {
+    let policy = front::route_policy(&req.method, &req.path);
+    if !matches!(
+        policy,
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::V1StickerAdmin
+                | front::AgentPolicy::V2AdminOnly
+                | front::AgentPolicy::V2AgentAllowed,
+            ..
+        })
+    ) {
         return None;
     }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-    // Frozen JS treats V1 sticker administration separately from all V2 state/mode gates.
-    if v1_sticker_admin_path(&req.path) {
-        return Some((403, "该接口仅控制台可用".to_string()));
-    }
-
-    let doc = match ConversationState::for_runtime(context).read_document() {
-        Ok(doc) => doc,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if doc.paused() {
-        return Some((
-            403,
-            "当前已暂停，不允许执行 v2 工具".to_string(),
-        ));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => return Some((status, message)),
-    }
-
-    if matches!(
-        (req.method.as_str(), req.path.as_str()),
-        ("GET", "/api/socialV2/states")
-    )
-        || req.path == "/api/socialV2/config"
-        || req.path == "/api/socialV2/activity"
-    {
-        return Some((403, "该接口仅控制台可用".to_string()));
-    }
-    None
+    front::policy_agent_denial(policy, req, cfg, context)
 }
 
 fn social_projection_agent_denial_doc(
@@ -10600,9 +10255,7 @@ fn sticker_agent_allowed(
     Ok(true)
 }
 
-/// Apply the frozen global v2 gates to agent-authenticated send-message calls.
-/// Keep this scoped to one exact method/path pair; per-session token, allowlist,
-/// and sendMessage-tool checks remain in `handle_send_message`.
+#[cfg(test)]
 fn send_message_global_agent_denial(
     req: &Request,
     cfg: &Value,
@@ -10611,33 +10264,7 @@ fn send_message_global_agent_denial(
     if req.method != "POST" || req.path != "/api/socialV2/send-message" {
         return None;
     }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-    let doc = match ConversationState::for_runtime(context).read_document() {
-        Ok(doc) => doc,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if doc.paused() {
-        return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => None,
-        Ok(_) => Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => Some((status, message)),
-    }
+    front::policy_agent_denial(front::route_policy(&req.method, &req.path), req, cfg, context)
 }
 
 
@@ -10764,7 +10391,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
             json!({ "ok": false, "error": message }).to_string(),
         );
     }
-    if bounded_post_body_too_large(req) {
+    if front::bounded_post_body_too_large(req) {
         return (
             413,
             "application/json; charset=utf-8".to_string(),
@@ -12152,774 +11779,6 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
     }
 }
 
-fn has_fetch_metadata(req: &Request) -> bool {
-    req.headers.keys().any(|name| name.starts_with("sec-fetch-"))
-}
-
-fn has_agent_marker(req: &Request) -> bool {
-    req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call")
-}
-
-fn canonical_request(req: &Request, port: u16) -> bool {
-    req.headers.get("host").is_some_and(|host| host == &crate::console_auth::canonical_host(port))
-}
-
-enum BrowserCookie {
-    Renew { port: u16, digest: [u8; 32], id: [u8; 32] },
-    Delete { port: u16, digest: [u8; 32] },
-    LegacyPage { port: u16, mac: [u8; 32] },
-    LegacyPageDelete { port: u16 },
-}
-
-impl BrowserCookie {
-    fn header(&self) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        match self {
-            Self::Renew { port, digest, id } => format!(
-                "her_browser_{port}_{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-                URL_SAFE_NO_PAD.encode(digest),
-                URL_SAFE_NO_PAD.encode(id),
-                7 * 24 * 60 * 60
-            ),
-            Self::Delete { port, digest } => format!(
-                "her_browser_{port}_{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-                URL_SAFE_NO_PAD.encode(digest)
-            ),
-            Self::LegacyPage { port, mac } => format!(
-                "her_legacy_{port}={}; HttpOnly; SameSite=Strict; Path=/",
-                URL_SAFE_NO_PAD.encode(mac)
-            ),
-            Self::LegacyPageDelete { port } => format!(
-                "her_legacy_{port}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
-            ),
-        }
-    }
-}
-
-enum ConsoleRedirect {
-    CanonicalOrigin(u16, String),
-    Path(String),
-}
-
-struct ConsoleResponse {
-    status: u16,
-    content_type: String,
-    body: String,
-    redirect: Option<ConsoleRedirect>,
-    cookies: Vec<BrowserCookie>,
-    raw_body: Option<&'static [u8]>,
-    csp: Option<&'static str>,
-}
-
-impl From<(u16, String, String)> for ConsoleResponse {
-    fn from((status, content_type, body): (u16, String, String)) -> Self {
-        Self {
-            status,
-            content_type,
-            body,
-            redirect: None,
-            cookies: Vec::new(),
-            raw_body: None,
-            csp: None,
-        }
-    }
-}
-
-fn browser_candidates(req: &Request, port: u16) -> Result<Vec<([u8; 32], [u8; 32])>, (u16, String)> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use sha2::{Digest as _, Sha256};
-
-    let invalid = || (401, "browser credential is invalid".into());
-    let prefix = format!("her_browser_{port}_");
-    let Some(line) = req.headers.get("cookie") else { return Ok(Vec::new()) };
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    for pair in line.split(';').map(str::trim) {
-        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        let Some(tag) = name.trim().strip_prefix(&prefix) else { continue };
-        let (exact_name, value) = pair.split_once('=').ok_or_else(invalid)?;
-        if name.trim() != exact_name || tag.len() != 43 || value.len() != 43
-            || candidates.len() >= crate::console_auth::MAX_BROWSER_SESSIONS
-            || !seen.insert(name)
-        {
-            return Err(invalid());
-        }
-        let id: [u8; 32] = URL_SAFE_NO_PAD.decode(value).ok()
-            .and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?;
-        let digest: [u8; 32] = Sha256::digest(id).into();
-        if URL_SAFE_NO_PAD.encode(digest) != tag || URL_SAFE_NO_PAD.encode(id) != value {
-            return Err(invalid());
-        }
-        candidates.push((digest, id));
-    }
-    Ok(candidates)
-}
-
-fn browser_denial(req: &Request, port: u16) -> Result<(), (u16, String)> {
-    let origin = crate::console_auth::canonical_origin(port);
-    let claimed_origin = req.headers.get("origin");
-    let origin_matches = claimed_origin == Some(&origin);
-    if !canonical_request(req, port)
-        || req.headers.get("sec-fetch-site").is_some_and(|site| !matches!(site.as_str(), "same-origin" | "none"))
-        || ((claimed_origin.is_some() || req.method != "GET") && !origin_matches)
-    {
-        return Err((403, "browser request requires the console origin".into()));
-    }
-    if req.method != "GET" && !req.headers.get("content-type").is_some_and(|value| {
-        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-    }) {
-        return Err((415, "browser request requires application/json".into()));
-    }
-    Ok(())
-}
-
-fn validate_browser_acl(req: &Request) -> Result<Option<crate::memory_actions::BrowserAcl>, (u16, String)> {
-    use crate::memory_actions::BrowserAcl;
-    if req.path != "/api/memory/acl" { return Ok(None); }
-    if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
-    if !req.query.is_empty() { return Err((400, "browser ACL requests do not accept query fields".into())); }
-    match req.method.as_str() {
-        "GET" if req.body.is_empty() && !req.headers.contains_key("transfer-encoding") => Ok(Some(BrowserAcl::List)),
-        "POST" => {
-            let fields: Value = serde_json::from_str(&req.body).map_err(|_| (400, "body must be a JSON object".into()))?;
-            let action = match fields.get("action").and_then(Value::as_str) {
-                Some("grant") => crate::memory_actions::AclAction::Grant,
-                Some("revoke") => crate::memory_actions::AclAction::Revoke,
-                _ => return Err((400, "ACL action must be grant or revoke".into())),
-            };
-            Ok(Some(BrowserAcl::Write(action, fields)))
-        }
-        _ => Err((405, "browser ACL changes require POST".into())),
-    }
-}
-
-fn select_browser(
-    req: &Request, context: &RuntimeContext, port: u16, expected: &str, renew: bool,
-) -> Result<(Option<crate::console_auth::ConsoleAuthority>, Option<BrowserCookie>), (u16, String)> {
-    use crate::console_auth::ConsoleAuthority;
-    let candidates = browser_candidates(req, port)?;
-    if candidates.is_empty() { return Ok((None, None)); }
-    let ids: Vec<_> = candidates.iter().map(|(digest, _)| *digest).collect();
-    let token = credential_digest(expected);
-    let Some(admission) = crate::settings::admit_browser(
-        context, &crate::console_auth::canonical_origin(port), (!expected.is_empty()).then_some(token), &ids, renew,
-    )? else { return Ok((None, None)) };
-    let digest = admission.proof.id_digest;
-    let cookie = if admission.renewed {
-        candidates.into_iter().find(|(id_digest, _)| *id_digest == digest)
-            .map(|(_, id)| BrowserCookie::Renew { port, digest, id })
-    } else { None };
-    Ok((Some(ConsoleAuthority::Browser { token_digest: token, grant: admission.proof }), cookie))
-}
-
-fn select_explicit_authority(
-    context: &RuntimeContext, presented: &str, expected: &str, allow_raw: bool,
-) -> Result<Option<crate::console_auth::ConsoleAuthority>, (u16, String)> {
-    use crate::console_auth::ConsoleAuthority;
-    if presented.is_empty() || expected.is_empty() { return Ok(None); }
-    let token_digest = credential_digest(expected);
-    let bearer_digest = credential_digest(presented);
-    if digests_equal(&token_digest, &bearer_digest) {
-        return Ok(allow_raw.then_some(ConsoleAuthority::Machine { token_digest }));
-    }
-    Ok(selected_desktop_proof(context, &bearer_digest, &token_digest)?
-        .map(|grant| ConsoleAuthority::Desktop { token_digest, grant }))
-}
-
-fn selected_memory_capability(
-    req: &Request, context: &RuntimeContext, cfg: &Value, effective: &str,
-) -> Result<crate::memory_actions::ConsoleCapability, (u16, String)> {
-    use crate::memory_actions::ConsoleCapability;
-    let Some(header) = req.headers.get("x-console-token").map(|token| token.trim()) else {
-        return Ok(ConsoleCapability::Conversation);
-    };
-    let configured = console_token(cfg);
-    if !has_fetch_metadata(req) && credential_eq(&configured, header) {
-        return Ok(ConsoleCapability::Configured(credential_digest(header)));
-    }
-    if let Some(proof) = select_explicit_authority(context, header, effective, false)? {
-        return Ok(ConsoleCapability::Desktop(proof));
-    }
-    Ok(ConsoleCapability::Conversation)
-}
-
-#[cfg(test)]
-thread_local! {
-    static FRONT_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> =
-        std::cell::RefCell::new(None);
-    static AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        std::cell::RefCell::new(None);
-}
-
-fn load_front_config(context: &RuntimeContext) -> Result<Value, &'static str> {
-    #[cfg(test)]
-    if FRONT_READ_HOOK.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook())) {
-        return Err("runtime config is unavailable");
-    }
-    context.load_config()
-}
-
-struct FrontAdmission {
-    config: Value,
-    proof: Option<crate::console_auth::ConsoleAuthority>,
-    renewal: Option<BrowserCookie>,
-    memory: crate::memory_actions::ConsoleCapability,
-    browser_acl: Option<crate::memory_actions::BrowserAcl>,
-}
-
-fn admit_selected_request(
-    req: &Request, context: &RuntimeContext, port: u16,
-) -> Result<FrontAdmission, (u16, String)> {
-    use crate::memory_actions::ConsoleCapability;
-    let config = load_front_config(context)
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    crate::console_auth::ensure_credentials_ready(context)?;
-    let agent_call = has_agent_marker(req);
-    let explicit = presented_console_token(req);
-    let candidates = browser_candidates(req, port)?;
-    let browser_auth = explicit.is_none()
-        && !agent_call
-        && !candidates.is_empty()
-        && (canonical_request(req, port)
-            || !crate::console_ui::is_ui_page_request(&req.method, &req.path));
-    let _gate = if browser_auth {
-        Some(acquire_social_state_gate(context)?)
-    } else {
-        None
-    };
-    let config = if browser_auth {
-        crate::console_auth::ensure_credentials_ready(context)?;
-        load_front_config(context)
-            .map_err(|_| (503, "runtime config is unavailable".to_string()))?
-    } else {
-        config
-    };
-    let expected = context.effective_console_token(&config);
-    let memory_route = req.path.starts_with("/api/memory/");
-    let (proof, renewal, browser_acl) = if let Some(presented) = explicit {
-        (select_explicit_authority(context, presented, &expected, !has_fetch_metadata(req))?, None, None)
-    } else if browser_auth {
-        browser_denial(req, port)?;
-        if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
-        let acl = validate_browser_acl(req)?;
-        let renew = !(req.method == "POST"
-            && matches!(
-                req.path.as_str(),
-                "/api/console/token"
-                    | "/api/auth/first-run"
-                    | "/api/auth/login"
-                    | "/api/auth/logout"
-                    | "/api/auth/change-password"
-                    | "/api/auth/sessions/revoke"
-            ))
-            && !(req.method == "GET" && req.path == "/api/auth/status");
-        let (proof, renewal) = select_browser(req, context, port, &expected, renew)?;
-        let acl = proof.as_ref().and(acl);
-        (proof, renewal, acl)
-    } else {
-        (None, None, None)
-    };
-    if (proof.is_some() || (memory_route && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty())))
-        && !matches!(proof, Some(crate::console_auth::ConsoleAuthority::Browser { .. }))
-    {
-        if let Some((status, value)) = front::cross_site_denial(req, port) {
-            return Err((status, value["error"].as_str().unwrap_or("request refused").to_string()));
-        }
-    }
-    let memory = if memory_route {
-        selected_memory_capability(req, context, &config, &expected)?
-    } else { ConsoleCapability::Conversation };
-    Ok(FrontAdmission { config, proof, renewal, memory, browser_acl })
-}
-
-fn parse_auth_json_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, String)> {
-    let Value::Object(map) = serde_json::from_str::<Value>(body)
-        .map_err(|_| (400, "请求体必须是合法 JSON 对象".to_string()))?
-    else {
-        return Err((400, "请求体必须是 JSON 对象".to_string()));
-    };
-    Ok(map)
-}
-
-fn parse_auth_digest(raw: &str) -> Option<[u8; 32]> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    if raw.len() != 43 {
-        return None;
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(raw).ok()?;
-    let digest: [u8; 32] = bytes.try_into().ok()?;
-    if URL_SAFE_NO_PAD.encode(digest) != raw {
-        return None;
-    }
-    Some(digest)
-}
-
-fn auth_retry_seconds(retry_after_ms: i64) -> i64 {
-    if retry_after_ms <= 0 {
-        0
-    } else {
-        retry_after_ms.saturating_add(999) / 1000
-    }
-}
-
-fn issue_session_cookie_response(
-    port: u16,
-    issued: crate::settings::IssuedSession,
-) -> ConsoleResponse {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let mut response = ConsoleResponse::from((
-        200,
-        "application/json; charset=utf-8".to_string(),
-        json!({
-            "ok": true,
-            "authenticated": true,
-            "sessionId": URL_SAFE_NO_PAD.encode(issued.id_digest),
-        })
-        .to_string(),
-    ));
-    response.cookies.push(BrowserCookie::Renew {
-        port,
-        digest: issued.id_digest,
-        id: issued.id,
-    });
-    response
-}
-
-fn auth_status_route(
-    context: &RuntimeContext,
-    port: u16,
-    admission: &FrontAdmission,
-) -> ConsoleResponse {
-    use crate::console_auth::ConsoleAuthority;
-    let json_reply = |status: u16, value: Value| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            value.to_string(),
-        ))
-    };
-    let snapshot = match crate::settings::auth_status(context) {
-        Ok(snapshot) => snapshot,
-        Err((code, msg)) => return json_reply(code, json!({ "ok": false, "error": msg })),
-    };
-    let auth_kind = match &admission.proof {
-        Some(ConsoleAuthority::Browser { .. }) => json!("browser"),
-        Some(ConsoleAuthority::Desktop { .. }) => json!("desktop"),
-        Some(ConsoleAuthority::Machine { .. }) => json!("machine"),
-        None => Value::Null,
-    };
-    let configured_token = admission
-        .config
-        .get("consoleToken")
-        .and_then(Value::as_str)
-        .is_some_and(|token| !token.trim().is_empty());
-    let token_file = if configured_token || !context.is_isolated() {
-        "config/config.json"
-    } else {
-        "data/console-token"
-    };
-    json_reply(
-        200,
-        json!({
-            "ok": true,
-            "passwordSet": snapshot.password_set,
-            "authenticated": admission.proof.is_some(),
-            "authKind": auth_kind,
-            "canonicalOrigin": crate::console_auth::canonical_origin(port),
-            "tokenFile": token_file,
-            "consecutiveFailures": snapshot.consecutive_failures,
-            "retryAfterMs": snapshot.retry_after_ms,
-            "retryAfterSeconds": auth_retry_seconds(snapshot.retry_after_ms),
-            "requirePasswordLocally": crate::console_auth::require_password_locally(&admission.config),
-            "localAutoSignInAvailable": cfg!(windows),
-        }),
-    )
-}
-
-fn auth_first_run_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
-    use crate::console_auth::PasswordError;
-    let err = |status: u16, message: &str| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        ))
-    };
-    if let Err((code, msg)) = browser_denial(req, port) {
-        return err(code, &msg);
-    }
-    let fields = match parse_auth_json_object(&req.body) {
-        Ok(fields) => fields,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    let Some(token) = fields
-        .get("consoleToken")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return err(400, "缺少 consoleToken");
-    };
-    let Some(password) = fields.get("password").and_then(Value::as_str) else {
-        return err(400, "缺少 password");
-    };
-    match crate::console_auth::auth_first_run_browser(context, port, token, password) {
-        Ok(issued) => issue_session_cookie_response(port, issued),
-        Err(PasswordError::Input) => err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符"),
-        Err(PasswordError::Proof) => err(401, "控制台令牌校验失败"),
-        Err(PasswordError::AlreadySet) => err(409, "管理员密码已设置"),
-        Err(PasswordError::Busy | PasswordError::Unavailable) => {
-            err(503, "administrator password storage is unavailable")
-        }
-    }
-}
-
-fn auth_login_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
-    use crate::console_auth::LoginError;
-    let err = |status: u16, value: Value| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            value.to_string(),
-        ))
-    };
-    if let Err((code, msg)) = browser_denial(req, port) {
-        return err(code, json!({ "ok": false, "error": msg }));
-    }
-    let fields = match parse_auth_json_object(&req.body) {
-        Ok(fields) => fields,
-        Err((code, msg)) => return err(code, json!({ "ok": false, "error": msg })),
-    };
-    let Some(password) = fields.get("password").and_then(Value::as_str) else {
-        return err(400, json!({ "ok": false, "error": "缺少 password" }));
-    };
-    match crate::console_auth::auth_login(context, port, password) {
-        Ok(issued) => issue_session_cookie_response(port, issued),
-        Err(LoginError::Input) => err(400, json!({ "ok": false, "error": "密码长度超出限制" })),
-        Err(LoginError::NotSet) => err(
-            409,
-            json!({ "ok": false, "passwordSet": false, "error": "尚未设置管理员密码" }),
-        ),
-        Err(LoginError::WrongPassword { retry_after_ms, consecutive_failures }) => err(
-            401,
-            json!({
-                "ok": false,
-                "error": "管理员密码错误",
-                "consecutiveFailures": consecutive_failures,
-                "retryAfterMs": retry_after_ms,
-                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
-            }),
-        ),
-        Err(LoginError::Throttled { retry_after_ms, consecutive_failures }) => err(
-            429,
-            json!({
-                "ok": false,
-                "error": "尝试次数过多，请稍后再试",
-                "consecutiveFailures": consecutive_failures,
-                "retryAfterMs": retry_after_ms,
-                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
-            }),
-        ),
-        Err(LoginError::Busy | LoginError::Unavailable) => {
-            err(503, json!({ "ok": false, "error": "administrator authentication is unavailable" }))
-        }
-    }
-}
-
-fn auth_logout_route(
-    req: &Request,
-    context: &RuntimeContext,
-    port: u16,
-    admission: &FrontAdmission,
-) -> ConsoleResponse {
-    use crate::console_auth::ConsoleAuthority;
-    let err = |status: u16, message: &str| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        ))
-    };
-    if let Err((code, msg)) = browser_denial(req, port) {
-        return err(code, &msg);
-    }
-    let _gate = match acquire_social_state_gate(context) {
-        Ok(gate) => gate,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    let mut digests = Vec::new();
-    if let Some(ConsoleAuthority::Browser { grant, .. }) = &admission.proof {
-        if let Err((code, msg)) = crate::settings::revoke_browser_session_by_digest(context, grant.id_digest) {
-            return err(code, &msg);
-        }
-        digests.push(grant.id_digest);
-    }
-    if let Ok(candidates) = browser_candidates(req, port) {
-        for (digest, _) in candidates {
-            if !digests.iter().any(|existing| crate::console_auth::digests_equal(existing, &digest)) {
-                digests.push(digest);
-            }
-        }
-    }
-    let mut response = ConsoleResponse::from((
-        200,
-        "application/json; charset=utf-8".to_string(),
-        json!({ "ok": true }).to_string(),
-    ));
-    for digest in digests {
-        response.cookies.push(BrowserCookie::Delete { port, digest });
-    }
-    response
-}
-
-fn auth_change_password_route(
-    req: &Request,
-    context: &RuntimeContext,
-    port: u16,
-    admission: &FrontAdmission,
-) -> ConsoleResponse {
-    use crate::console_auth::{ChangePasswordError, ConsoleAuthority};
-    let err = |status: u16, message: &str| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        ))
-    };
-    let Some(authority) = &admission.proof else {
-        return err(401, "console credential is required");
-    };
-    let fields = match parse_auth_json_object(&req.body) {
-        Ok(fields) => fields,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    let Some(current_password) = fields.get("currentPassword").and_then(Value::as_str) else {
-        return err(400, "缺少 currentPassword");
-    };
-    let Some(new_password) = fields.get("newPassword").and_then(Value::as_str) else {
-        return err(400, "缺少 newPassword");
-    };
-    match crate::console_auth::auth_change_password(
-        context,
-        port,
-        authority,
-        current_password,
-        new_password,
-    ) {
-        Ok(rotated) => {
-            let mut response = ConsoleResponse::from((
-                200,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": true, "sessionRotated": rotated.is_some() }).to_string(),
-            ));
-            if let (ConsoleAuthority::Browser { grant, .. }, Some(issued)) = (authority, rotated) {
-                response.cookies.push(BrowserCookie::Delete {
-                    port,
-                    digest: grant.id_digest,
-                });
-                response.cookies.push(BrowserCookie::Renew {
-                    port,
-                    digest: issued.id_digest,
-                    id: issued.id,
-                });
-            }
-            response
-        }
-        Err(ChangePasswordError::Input) => err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符"),
-        Err(ChangePasswordError::WrongCurrent) => err(401, "当前密码错误"),
-        Err(ChangePasswordError::Revoked) => err(401, "console credential was revoked"),
-        Err(ChangePasswordError::NotSet) => err(409, "尚未设置管理员密码"),
-        Err(ChangePasswordError::Busy | ChangePasswordError::Unavailable) => {
-            err(503, "administrator password storage is unavailable")
-        }
-    }
-}
-
-fn auth_sessions_list_route(
-    context: &RuntimeContext,
-    admission: &FrontAdmission,
-) -> ConsoleResponse {
-    use crate::console_auth::ConsoleAuthority;
-    let json_reply = |status: u16, value: Value| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            value.to_string(),
-        ))
-    };
-    let Some(authority) = &admission.proof else {
-        return json_reply(401, json!({ "ok": false, "error": "console credential is required" }));
-    };
-    let (token_digest, current_id) = match authority {
-        ConsoleAuthority::Browser { token_digest, grant } => (*token_digest, Some(grant.id_digest)),
-        ConsoleAuthority::Machine { token_digest } | ConsoleAuthority::Desktop { token_digest, .. } => {
-            (*token_digest, None)
-        }
-    };
-    match crate::settings::list_browser_sessions(context, token_digest, current_id) {
-        Ok(sessions) => json_reply(200, json!({ "ok": true, "sessions": sessions })),
-        Err((code, msg)) => json_reply(code, json!({ "ok": false, "error": msg })),
-    }
-}
-
-fn auth_sessions_revoke_route(
-    req: &Request,
-    context: &RuntimeContext,
-    port: u16,
-    admission: &FrontAdmission,
-) -> ConsoleResponse {
-    use crate::console_auth::ConsoleAuthority;
-    enum RevokeTarget {
-        One([u8; 32]),
-        Others([u8; 32]),
-        All,
-    }
-    let err = |status: u16, message: &str| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        ))
-    };
-    let Some(authority) = &admission.proof else {
-        return err(401, "console credential is required");
-    };
-    let fields = match parse_auth_json_object(&req.body) {
-        Ok(fields) => fields,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    let id_field = fields.get("id").filter(|v| !v.is_null());
-    let others_field = match fields.get("others") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return err(400, "others 必须是布尔值"),
-    };
-    let all_field = match fields.get("all") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return err(400, "all 必须是布尔值"),
-    };
-    let target = match (id_field, others_field, all_field) {
-        (Some(Value::String(raw)), false, false) => {
-            let Some(digest) = parse_auth_digest(raw) else {
-                return err(400, "无效的会话 id");
-            };
-            RevokeTarget::One(digest)
-        }
-        (None, true, false) => {
-            let ConsoleAuthority::Browser { grant, .. } = authority else {
-                return err(400, "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true");
-            };
-            RevokeTarget::Others(grant.id_digest)
-        }
-        (None, false, true) => RevokeTarget::All,
-        _ => return err(400, "请明确指定 id、others: true 或 all: true"),
-    };
-
-    let _gate = match acquire_social_state_gate(context) {
-        Ok(gate) => gate,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    let cfg = match selected_config_for_handler(context) {
-        Ok(cfg) => cfg,
-        Err((code, msg)) => return err(code, &msg),
-    };
-    if let Err((code, msg)) = authority.recheck(context, &cfg) {
-        return err(code, &msg);
-    }
-    let (revoked_count, delete_own) = match target {
-        RevokeTarget::One(digest) => {
-            match crate::settings::revoke_browser_session_by_digest(context, digest) {
-                Ok(removed) => {
-                    let own = matches!(
-                        authority,
-                        ConsoleAuthority::Browser { grant, .. }
-                            if crate::console_auth::digests_equal(&grant.id_digest, &digest)
-                    )
-                    .then_some(digest);
-                    (usize::from(removed), own)
-                }
-                Err((code, msg)) => return err(code, &msg),
-            }
-        }
-        RevokeTarget::Others(keep) => {
-            match crate::settings::revoke_other_browser_sessions(context, Some(keep)) {
-                Ok(count) => (count, None),
-                Err((code, msg)) => return err(code, &msg),
-            }
-        }
-        RevokeTarget::All => {
-            match crate::settings::revoke_other_browser_sessions(context, None) {
-                Ok(count) => {
-                    let own = match authority {
-                        ConsoleAuthority::Browser { grant, .. } => Some(grant.id_digest),
-                        _ => None,
-                    };
-                    (count, own)
-                }
-                Err((code, msg)) => return err(code, &msg),
-            }
-        }
-    };
-    let mut response = ConsoleResponse::from((
-        200,
-        "application/json; charset=utf-8".to_string(),
-        json!({ "ok": true, "revoked": revoked_count }).to_string(),
-    ));
-    if let Some(digest) = delete_own {
-        response.cookies.push(BrowserCookie::Delete { port, digest });
-    }
-    response
-}
-
-fn handle_auth_route(
-    req: &Request,
-    context: &RuntimeContext,
-    port: u16,
-    admission: &FrontAdmission,
-) -> Option<ConsoleResponse> {
-    if !context.is_isolated() || !req.path.starts_with("/api/auth/") {
-        return None;
-    }
-    let err = |status: u16, message: &str| {
-        ConsoleResponse::from((
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        ))
-    };
-    if has_agent_marker(req) {
-        return Some(err(403, "agent credential cannot access console authentication"));
-    }
-    if bounded_post_body_too_large(req) {
-        return Some(err(413, BODY_TOO_LARGE_ERROR));
-    }
-    let response = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/auth/status") => auth_status_route(context, port, admission),
-        ("POST", "/api/auth/first-run") => auth_first_run_route(req, context, port),
-        ("POST", "/api/auth/login") => auth_login_route(req, context, port),
-        ("POST", "/api/auth/logout") => auth_logout_route(req, context, port, admission),
-        ("POST", "/api/auth/change-password") => {
-            auth_change_password_route(req, context, port, admission)
-        }
-        ("GET", "/api/auth/sessions") => auth_sessions_list_route(context, admission),
-        ("POST", "/api/auth/sessions/revoke") => {
-            auth_sessions_revoke_route(req, context, port, admission)
-        }
-        (
-            _,
-            "/api/auth/status"
-            | "/api/auth/first-run"
-            | "/api/auth/login"
-            | "/api/auth/logout"
-            | "/api/auth/change-password"
-            | "/api/auth/sessions"
-            | "/api/auth/sessions/revoke",
-        ) => err(405, "method not allowed"),
-        _ => err(404, "not found"),
-    };
-    Some(response)
-}
-
 fn handle_conn(
     mut stream: TcpStream, cfg: Value, context: RuntimeContext, startup: std::sync::Arc<std::sync::Mutex<bool>>,
 ) {
@@ -12942,82 +11801,13 @@ fn handle_conn(
     respond(&mut stream, response);
 }
 
-#[cfg(windows)]
-pub(super) fn same_installing_user(stream: &TcpStream) -> bool {
-    crate::process_identity::tcp_peer_user(stream)
-        .and_then(|peer| {
-            crate::process_identity::current_user().map(|own| {
-                #[cfg(debug_assertions)]
-                let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
-                    .map(|sid| {
-                        sid.eq_ignore_ascii_case(
-                            &peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                        )
-                    })
-                    .unwrap_or(true);
-                #[cfg(not(debug_assertions))]
-                let fixture_matches = true;
-                peer == own && fixture_matches
-            })
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-pub(super) fn same_installing_user(_stream: &TcpStream) -> bool {
-    false
-}
-
-#[cfg(windows)]
-pub(super) fn desktop_sign_in_selected(
-    stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16,
-) -> Result<String, (u16, String)> {
-    use crate::console_auth::{checked_console_token, ConsoleAuthority};
-
-    let browser = has_fetch_metadata(req) || ["origin", "referer", "cookie"].iter().any(|key| req.headers.contains_key(*key));
-    let native_proof = || -> Result<(), (u16, String)> {
-        let expected = crate::desktop::console_token(context)
-            .map_err(|_| (403, "protected console token file is unavailable".into()))?;
-        if !desktop_file_proof_matches(req, &expected) {
-            return Err((401, "console credential is required".into()));
-        }
-        Ok(())
-    };
-    let revoked = || (401, "console credential was revoked".into());
-    let (token_digest, generation, proof) = {
-        let _gate = acquire_social_state_gate(context)?;
-        let cfg = selected_config_for_handler(context)?;
-        let expected = checked_console_token(context, &cfg)?;
-        if expected.is_empty() { return Err(revoked()); }
-        let proof = if browser {
-            browser_denial(req, port)?;
-            let (proof, _) = select_browser(req, context, port, &expected, false)?;
-            let Some(proof @ ConsoleAuthority::Browser { .. }) = proof else { return Err(revoked()) };
-            Some(proof)
-        } else {
-            native_proof()?;
-            None
-        };
-        (credential_digest(&expected), desktop_grants::current_issuer(context)?.generation, proof)
-    };
-    if !same_installing_user(stream) {
-        return Err((403, "desktop sign-in requires the installing user".into()));
-    }
-    let _gate = acquire_social_state_gate(context)?;
-    let cfg = selected_config_for_handler(context)?;
-    let effective = checked_console_token(context, &cfg)?;
-    let registry = desktop_grants::read(context)?.filter(|registry| {
-        registry.verified(context) && digests_equal(&generation, &registry.generation)
-    }).ok_or_else(revoked)?;
-    if effective.is_empty() || !digests_equal(&token_digest, &credential_digest(&effective)) {
-        return Err(revoked());
-    }
-    if let Some(proof) = proof { proof.recheck(context, &cfg)?; } else { native_proof()?; }
-    desktop_grants::issue(context, registry, token_digest)
-}
-
 #[cfg(test)]
-fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+fn serve_request(
+    req: &Request,
+    cfg: &Value,
+    context: &RuntimeContext,
+    port: u16,
+) -> front::ConsoleResponse {
     front::handle_http_request(None, req, cfg, context, port)
 }
 
@@ -13741,7 +12531,7 @@ fn selected_startup_config(context: &RuntimeContext) -> Result<Option<Value>, St
     if crate::restore::recovery_pending(context) { return Ok(None); }
     let cfg = context.load_config().map_err(str::to_owned)?;
     if crate::console_auth::ensure_credentials_ready(context).is_ok() {
-        if crate::settings::start_browser_clock(context).is_err() {
+        if crate::console_auth::start_browser_clock(context).is_err() {
             crate::safe_eprintln!("[console] browser session state is unavailable");
         }
         Ok(Some(cfg))
@@ -13794,6 +12584,10 @@ pub fn load_config() -> Value {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use front::{
+        authorized, bounded_post_body_too_large, BrowserCookie, ConsoleResponse, AFTER_ADMISSION,
+        FRONT_READ_HOOK,
+    };
     use crate::conversation_state::{SOCIAL_STATE_GATE, SOCIAL_STATE_GATE_WAIT};
 
     #[test]
@@ -13868,7 +12662,14 @@ pub(super) mod tests {
         let id = [83; 32];
         let digest: [u8; 32] = Sha256::digest(id).into();
         let prior = crate::parity_clock::now_ms() - 1_000;
-        crate::settings::seed_browser_session(&context, BROWSER_FIXTURE_PORT, BROWSER_FIXTURE_TOKEN, digest, prior).unwrap();
+        crate::console_auth::seed_browser_session(
+            &context,
+            BROWSER_FIXTURE_PORT,
+            BROWSER_FIXTURE_TOKEN,
+            digest,
+            prior,
+        )
+        .unwrap();
         context.browser_anchors.0.lock().unwrap().insert(digest, (prior, std::time::Instant::now() - std::time::Duration::from_secs(1)));
         let cookie = format!("her_browser_{}_{}={}", BROWSER_FIXTURE_PORT, URL_SAFE_NO_PAD.encode(digest), URL_SAFE_NO_PAD.encode(id));
         (root, context, cookie, digest, prior)
@@ -13983,7 +12784,7 @@ pub(super) mod tests {
             let context_for_cut = context.clone();
             AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
                 let _gate = config_gate(&context_for_cut).unwrap();
-                crate::settings::revoke_browser_sessions(&context_for_cut).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context_for_cut).unwrap();
             })));
             let writer = if body["rehardenStateDir"] == true { "hardening" } else { "settings or mutation" };
             let request = browser_request("POST", path, &cookie, Some(body));
@@ -14031,7 +12832,7 @@ pub(super) mod tests {
             before_start.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             {
                 let _gate = config_gate(&context).unwrap();
-                crate::settings::revoke_browser_sessions(&context).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context).unwrap();
             }
             release.send(()).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -14198,13 +12999,16 @@ pub(super) mod tests {
         let pw = "正确登录密码-42";
         crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
 
-        assert_eq!(crate::settings::throttle_delay_ms(4), 0);
-        assert_eq!(crate::settings::throttle_delay_ms(5), 60_000);
-        assert_eq!(crate::settings::throttle_delay_ms(6), 120_000);
-        assert_eq!(crate::settings::throttle_delay_ms(7), 240_000);
-        assert_eq!(crate::settings::throttle_delay_ms(8), 480_000);
-        assert_eq!(crate::settings::throttle_delay_ms(9), crate::settings::THROTTLE_MAX_MS);
-        assert_eq!(crate::settings::throttle_delay_ms(12), crate::settings::THROTTLE_MAX_MS);
+        assert_eq!(crate::console_auth::throttle_delay_ms(4), 0);
+        assert_eq!(crate::console_auth::throttle_delay_ms(5), 60_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(6), 120_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(7), 240_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(8), 480_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(9), crate::console_auth::THROTTLE_MAX_MS);
+        assert_eq!(
+            crate::console_auth::throttle_delay_ms(12),
+            crate::console_auth::THROTTLE_MAX_MS
+        );
 
         for attempt in 1..=4 {
             let resp = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
@@ -14233,7 +13037,10 @@ pub(super) mod tests {
             &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
         )
         .unwrap();
-        assert!(status_clamped["retryAfterMs"].as_i64().unwrap() <= crate::settings::THROTTLE_MAX_MS);
+        assert!(
+            status_clamped["retryAfterMs"].as_i64().unwrap()
+                <= crate::console_auth::THROTTLE_MAX_MS
+        );
 
         probe.edit("UPDATE console_auth_state SET deadline_ms=1 WHERE id=1;");
         let sixth = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
@@ -14257,7 +13064,7 @@ pub(super) mod tests {
         probe.edit(&format!("UPDATE console_auth_state SET consecutive_failures=5, deadline_ms={far_future_reset} WHERE id=1;"));
         {
             let _gate = config_gate(&context).unwrap();
-            crate::settings::reset_administrator_password(&context).unwrap();
+            crate::console_auth::reset_administrator_password(&context).unwrap();
         }
         assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie, None)).status, 401);
         let after_reset: Value = serde_json::from_str(
@@ -14281,7 +13088,7 @@ pub(super) mod tests {
         let stale_cookie = cookie_pair(&initial_login);
         {
             let _gate = config_gate(&context).unwrap();
-            crate::settings::revoke_browser_sessions(&context).unwrap();
+            crate::console_auth::revoke_browser_sessions(&context).unwrap();
         }
         let relogin = browser_reply(
             &context,
@@ -14298,18 +13105,22 @@ pub(super) mod tests {
         let throttled = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
         assert_eq!(throttled.status, 429, "{}", throttled.body);
         let throttled_json: Value = serde_json::from_str(&throttled.body).unwrap();
-        assert!(throttled_json["retryAfterMs"].as_i64().unwrap() <= crate::settings::THROTTLE_MAX_MS);
+        assert!(
+            throttled_json["retryAfterMs"].as_i64().unwrap()
+                <= crate::console_auth::THROTTLE_MAX_MS
+        );
 
         let clamped_deadline: i64 = probe
             .open()
             .query_row("SELECT deadline_ms FROM console_auth_state WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert!(
-            clamped_deadline <= crate::parity_clock::now_ms() + crate::settings::THROTTLE_MAX_MS,
+            clamped_deadline
+                <= crate::parity_clock::now_ms() + crate::console_auth::THROTTLE_MAX_MS,
             "stored rollback deadline {clamped_deadline} must be clamped within 15 minutes"
         );
 
-        let past_fifteen_min = clamped_deadline - crate::settings::THROTTLE_MAX_MS - 1;
+        let past_fifteen_min = clamped_deadline - crate::console_auth::THROTTLE_MAX_MS - 1;
         probe.edit(&format!("UPDATE console_auth_state SET deadline_ms={past_fifteen_min} WHERE id=1;"));
         let recovered = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
         assert_eq!(recovered.status, 200, "login must succeed once 15-minute clamped window elapses: {}", recovered.body);
@@ -14328,7 +13139,7 @@ pub(super) mod tests {
         AFTER_ADMISSION.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 let _gate = config_gate(&context_for_cut).unwrap();
-                crate::settings::revoke_browser_sessions(&context_for_cut).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context_for_cut).unwrap();
             }));
         });
         let revoked = browser_reply(
@@ -14440,7 +13251,7 @@ pub(super) mod tests {
             let origin = crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT);
             let digest = crate::console_auth::credential_digest(BROWSER_FIXTURE_TOKEN);
             for _ in 0..crate::console_auth::MAX_BROWSER_SESSIONS {
-                crate::settings::issue_browser_session(&context, &origin, digest).unwrap();
+                crate::console_auth::issue_browser_session(&context, &origin, digest).unwrap();
             }
         }
         let newest = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
@@ -22965,7 +21776,7 @@ pub(super) mod tests {
         let missing = req("GET", "/", Some(""));
         assert!(authorized(&presented, &configured));
         assert!(memory_console_authority(&presented.headers, &configured, &context));
-        assert!(desktop_file_proof_matches(&presented, "fixture-raw-machine-proof"));
+        assert!(front::token_supplied(&presented, "fixture-raw-machine-proof"));
 
         let file = root.0.join("data/console-token");
         for contents in [Some(""), None] {
@@ -22977,7 +21788,10 @@ pub(super) mod tests {
             assert!(expected.is_empty());
             assert!(!authorized_in(&context, &missing, &empty), "selected raw auth must refuse missing proof");
             assert!(!memory_console_authority(&missing.headers, &empty, &context), "empty memory header grants no authority");
-            assert!(!desktop_file_proof_matches(&missing, &expected), "desktop file proof requires two nonempty values");
+            assert!(
+                !front::token_supplied(&missing, &expected),
+                "desktop file proof requires two nonempty values"
+            );
         }
         assert!(!authorized(&missing, &empty), "legacy raw auth must refuse two empty credentials");
     }

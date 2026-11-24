@@ -915,7 +915,7 @@ fn stop_and_replace(
         control.publish_generation(context).map_err(|error| match error {
             GenerationWriteError::Unpublished(error) | GenerationWriteError::Published(error) => Step::Failed(error),
         })?;
-        context.remove_protected_data_file(crate::console::DESKTOP_GRANTS_FILE)?;
+        context.remove_protected_data_file(console_auth::DESKTOP_GRANTS_FILE)?;
         apply(context, prepared, false, control, Some(&authority))?;
         control.replace(context, RuntimeArea::Data, console_auth::TOKEN_FILE, &mut pair.token.as_bytes(), Some(&authority))?;
         control.replace(context, RuntimeArea::Config, "config.json", &mut pair.config.as_slice(), Some(&authority))?;

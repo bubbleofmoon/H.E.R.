@@ -1,5 +1,18 @@
 //! Console credential comparison and the selected runtime's offline password commands.
 
+mod storage;
+
+pub(crate) use storage::{
+    administrator_password_is_set, admit_browser, archive_credentials, auth_status,
+    scrub_auth_snapshot, start_browser_clock, ArchivedCredentials, AuthStatusSnapshot,
+    BrowserAdmission, BrowserSessionView, IssuedSession, SCHEMA_V3_ADDED, SCHEMA_V3_IMPLICIT,
+};
+#[cfg(test)]
+pub(crate) use storage::{
+    issue_browser_session, reset_administrator_password, revoke_browser_sessions,
+    seed_browser_session, throttle_delay_ms, THROTTLE_MAX_MS,
+};
+
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use argon2::password_hash::{
     Error as PhcError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -8,8 +21,25 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Read};
+use std::net::TcpStream;
 use std::path::Path;
 use subtle::ConstantTimeEq;
+
+/// A generated console token: 24 bytes of OS randomness as 48 hex characters.
+pub(crate) fn generate_console_token() -> Result<String, String> {
+    generate_console_token_from(&mut |bytes: &mut [u8]| {
+        getrandom::getrandom(bytes).map_err(|e| format!("系统随机数不可用：{e}"))
+    })
+}
+
+/// The token made from exactly the bytes `fill` provides (the entropy source is the only input).
+pub(crate) fn generate_console_token_from(
+    fill: &mut dyn FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<String, String> {
+    let mut bytes = [0u8; 24];
+    fill(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 pub(crate) fn credential_digest(credential: &str) -> [u8; 32] {
     Sha256::digest(credential.as_bytes()).into()
@@ -57,7 +87,8 @@ pub(crate) fn new_generation() -> Result<Generation, PasswordError> {
     Ok(generation)
 }
 
-/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate (Argon2id never runs inside any gate).
+/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate
+/// (Argon2id hashing/verification always runs outside all gates).
 pub(crate) fn credential_mutation_gate(context: &RuntimeContext) -> Result<fs::File, String> {
     context
         .open_locked_file(RuntimeArea::Data, "locks/console-credential.lock")
@@ -75,9 +106,17 @@ pub(crate) fn restore_generation(context: &RuntimeContext) -> Result<Option<Gene
     if !context.is_isolated() {
         return Err(GENERATION_UNAVAILABLE.to_string());
     }
-    let resolve = || context.resolve_path(RuntimeArea::Data, RESTORE_GENERATION_FILE, PathIntent::ReadOptionalFile);
+    let resolve = || {
+        context.resolve_path(
+            RuntimeArea::Data,
+            RESTORE_GENERATION_FILE,
+            PathIntent::ReadOptionalFile,
+        )
+    };
     let path = resolve()?;
-    let Some(mut file) = crate::guarded_fs::open_protected_file(&path).map_err(|_| GENERATION_UNAVAILABLE)? else {
+    let Some(mut file) =
+        crate::guarded_fs::open_protected_file(&path).map_err(|_| GENERATION_UNAVAILABLE)?
+    else {
         return Ok(None);
     };
     if resolve()? != path {
@@ -98,7 +137,9 @@ pub(crate) enum GenerationWriteError {
 }
 
 /// The caller holds the configuration gate. The destination marker is outside the replacement set.
-pub(crate) fn rotate_restore_generation(context: &RuntimeContext) -> Result<Generation, GenerationWriteError> {
+pub(crate) fn rotate_restore_generation(
+    context: &RuntimeContext,
+) -> Result<Generation, GenerationWriteError> {
     use GenerationWriteError::{Published, Unpublished};
     if !context.is_isolated() {
         return Err(Unpublished(GENERATION_UNAVAILABLE.to_string()));
@@ -110,7 +151,8 @@ pub(crate) fn rotate_restore_generation(context: &RuntimeContext) -> Result<Gene
         .map_err(|failure| Unpublished(failure.to_string()))?;
     staged.commit(&mut || {
         context.revalidate_atomic_target(area, name, &target)?;
-        crate::guarded_fs::open_protected_file(&target).map_err(|_| GENERATION_UNAVAILABLE.to_string())?;
+        crate::guarded_fs::open_protected_file(&target)
+            .map_err(|_| GENERATION_UNAVAILABLE.to_string())?;
         Ok(())
     }).map_err(|failure| {
         // Directory sync happens after replacement. Preserve the new marker and use rollback.
@@ -149,42 +191,402 @@ pub(crate) struct BrowserProof {
     pub(crate) restore_generation: Generation,
 }
 
-/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate (Argon2id never runs inside any gate).
+/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate
+/// (Argon2id hashing/verification always runs outside all gates).
 #[derive(Debug, Default)]
 pub(crate) struct BrowserAnchors(
     pub(crate) std::sync::Mutex<std::collections::HashMap<[u8; 32], (i64, std::time::Instant)>>,
 );
 
+pub(crate) const DESKTOP_GRANTS_FILE: &str = "console-desktop-grants";
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopProof {
+    bearer_digest: [u8; 32],
+    generation: [u8; 32],
+    issuer_pid: u32,
+    issuer_start: u64,
+}
+
+pub(crate) fn recheck_desktop(
+    context: &RuntimeContext,
+    proof: &DesktopProof,
+    token: &[u8; 32],
+) -> Result<bool, (u16, String)> {
+    let current = selected_desktop_proof(context, &proof.bearer_digest, token)?;
+    Ok(current.is_some_and(|current| {
+        current.issuer_pid == proof.issuer_pid
+            && current.issuer_start == proof.issuer_start
+            && digests_equal(&current.generation, &proof.generation)
+    }))
+}
+
+#[cfg(not(windows))]
+fn selected_desktop_proof(
+    _: &RuntimeContext,
+    _: &[u8; 32],
+    _: &[u8; 32],
+) -> Result<Option<DesktopProof>, (u16, String)> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn selected_desktop_proof(
+    context: &RuntimeContext,
+    bearer: &[u8; 32],
+    token: &[u8; 32],
+) -> Result<Option<DesktopProof>, (u16, String)> {
+    let Some(registry) = desktop_grants::read(context)? else {
+        return Ok(None);
+    };
+    let now = desktop_grants::ticks();
+    if !registry.verified(context) {
+        return Ok(None);
+    }
+    Ok(registry
+        .grants
+        .iter()
+        .find(|grant| {
+            grant.issued <= now
+                && now < grant.expires
+                && digests_equal(bearer, &grant.bearer_digest)
+                && digests_equal(token, &grant.token_digest)
+        })
+        .map(|_| DesktopProof {
+            bearer_digest: *bearer,
+            generation: registry.generation,
+            issuer_pid: registry.issuer_pid,
+            issuer_start: registry.issuer_start,
+        }))
+}
+
+#[cfg(windows)]
+mod desktop_grants {
+    use super::*;
+
+    pub(super) const LIFETIME: u64 = 12 * 60 * 60 * 1000;
+    pub(super) const LIMIT: usize = 128;
+
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static TEST_TICKS: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn ticks() -> u64 {
+        #[cfg(test)]
+        if let Some(ticks) = TEST_TICKS.with(std::cell::Cell::get) {
+            return ticks;
+        }
+        // SAFETY: GetTickCount64 takes no arguments.
+        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Registry {
+        v: u8,
+        pub(super) generation: [u8; 32],
+        pub(super) issuer_pid: u32,
+        pub(super) issuer_start: u64,
+        pub(super) grants: std::collections::VecDeque<Grant>,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Grant {
+        pub(super) bearer_digest: [u8; 32],
+        pub(super) token_digest: [u8; 32],
+        pub(super) issued: u64,
+        pub(super) expires: u64,
+    }
+
+    fn unavailable() -> (u16, String) {
+        (503, "desktop grant registry is unavailable".into())
+    }
+
+    fn owner(context: &RuntimeContext) -> Option<crate::lifecycle::ProcessIdentity> {
+        let _path = context
+            .resolve_path(
+                RuntimeArea::Data,
+                &format!("logs/{}", crate::lifecycle::CONSOLE_LOCK),
+                PathIntent::ReadFile,
+            )
+            .ok()?;
+        match crate::lifecycle::verify_owner(
+            &mut crate::lifecycle::LiveLifecycle,
+            context.data_dir(),
+            crate::lifecycle::OwnerRole::Console,
+            &crate::lifecycle::ImagePolicy::HealthReadOnly,
+            crate::lifecycle::ProbeMode::Existing,
+        ) {
+            crate::lifecycle::OwnerObservation::Verified(owner) => Some(owner.marker.identity),
+            _ => None,
+        }
+    }
+
+    impl Registry {
+        pub(super) fn verified(&self, context: &RuntimeContext) -> bool {
+            owner(context).is_some_and(|identity| {
+                identity.pid == self.issuer_pid && identity.start == self.issuer_start
+            })
+        }
+    }
+
+    pub(super) fn read(context: &RuntimeContext) -> Result<Option<Registry>, (u16, String)> {
+        let Some(bytes) = context
+            .read_protected_data_file(DESKTOP_GRANTS_FILE, 128 * 1024)
+            .map_err(|_| unavailable())?
+        else {
+            return Ok(None);
+        };
+        let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+        let mut ids = std::collections::HashSet::new();
+        if registry.v != 1
+            || registry.issuer_pid == 0
+            || registry.issuer_start == 0
+            || registry.grants.len() > LIMIT
+            || registry.grants.iter().any(|grant| {
+                grant.issued.checked_add(LIFETIME) != Some(grant.expires)
+                    || !ids.insert(grant.bearer_digest)
+            })
+        {
+            return Err(unavailable());
+        }
+        Ok(Some(registry))
+    }
+
+    fn write(context: &RuntimeContext, registry: &Registry) -> Result<(), (u16, String)> {
+        let bytes = serde_json::to_vec(registry).map_err(|_| unavailable())?;
+        context
+            .write_atomic(RuntimeArea::Data, DESKTOP_GRANTS_FILE, &bytes)
+            .map_err(|_| unavailable())
+    }
+
+    pub(super) fn current_issuer(context: &RuntimeContext) -> Result<Registry, (u16, String)> {
+        let owner = owner(context)
+            .filter(|identity| identity.pid == std::process::id())
+            .ok_or_else(unavailable)?;
+        if let Some(existing) = read(context)? {
+            if existing.issuer_pid == owner.pid && existing.issuer_start == owner.start {
+                return Ok(existing);
+            }
+        }
+        let registry = Registry {
+            v: 1,
+            generation: new_generation().map_err(|_| unavailable())?,
+            issuer_pid: owner.pid,
+            issuer_start: owner.start,
+            grants: Default::default(),
+        };
+        write(context, &registry)?;
+        Ok(registry)
+    }
+
+    pub(super) fn issue(
+        context: &RuntimeContext,
+        mut registry: Registry,
+        token_digest: [u8; 32],
+    ) -> Result<String, (u16, String)> {
+        let token = generate_console_token().map_err(|_| unavailable())?;
+        let now = ticks();
+        let expires = now.checked_add(LIFETIME).ok_or_else(unavailable)?;
+        registry
+            .grants
+            .retain(|grant| grant.issued <= now && now < grant.expires);
+        while registry.grants.len() >= LIMIT {
+            registry.grants.pop_front();
+        }
+        registry.grants.push_back(Grant {
+            bearer_digest: credential_digest(&token),
+            token_digest,
+            issued: now,
+            expires,
+        });
+        write(context, &registry)?;
+        Ok(token)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn same_installing_user(stream: &TcpStream) -> bool {
+    crate::process_identity::tcp_peer_user(stream)
+        .and_then(|peer| {
+            crate::process_identity::current_user().map(|own| {
+                #[cfg(debug_assertions)]
+                let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
+                    .map(|sid| {
+                        sid.eq_ignore_ascii_case(
+                            &peer
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>(),
+                        )
+                    })
+                    .unwrap_or(true);
+                #[cfg(not(debug_assertions))]
+                let fixture_matches = true;
+                peer == own && fixture_matches
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn same_installing_user(_stream: &TcpStream) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub(crate) enum DesktopSignInProof<'a> {
+    Browser { id_digests: Vec<[u8; 32]> },
+    Native { presented_token: Option<&'a str> },
+}
+
+#[cfg(windows)]
+pub(crate) fn desktop_sign_in(
+    stream: &TcpStream,
+    context: &RuntimeContext,
+    port: u16,
+    proof_input: DesktopSignInProof<'_>,
+) -> Result<String, (u16, String)> {
+    let native_proof = |presented: Option<&str>| -> Result<(), (u16, String)> {
+        let expected = crate::desktop::console_token(context)
+            .map_err(|_| (403, "protected console token file is unavailable".into()))?;
+        if !presented.is_some_and(|presented| credential_eq(&expected, presented)) {
+            return Err((401, "console credential is required".into()));
+        }
+        Ok(())
+    };
+    let revoked = || (401, "console credential was revoked".into());
+    let load_cfg = || {
+        context
+            .load_config()
+            .map_err(|_| (503, "runtime config is unavailable".to_string()))
+    };
+    let (token_digest, generation, authority_proof) = {
+        let _gate = crate::social_state::acquire_config_gate(context)
+            .map_err(crate::social_state::SocialError::into_http)?;
+        let cfg = load_cfg()?;
+        let expected = checked_console_token(context, &cfg)?;
+        if expected.is_empty() {
+            return Err(revoked());
+        }
+        let digest = credential_digest(&expected);
+        let authority_proof = match &proof_input {
+            DesktopSignInProof::Browser { id_digests } => {
+                let Some(admission) = admit_browser(
+                    context,
+                    &canonical_origin(port),
+                    Some(digest),
+                    id_digests,
+                    false,
+                )?
+                else {
+                    return Err(revoked());
+                };
+                Some(ConsoleAuthority::Browser {
+                    token_digest: digest,
+                    grant: admission.proof,
+                })
+            }
+            DesktopSignInProof::Native { presented_token } => {
+                native_proof(*presented_token)?;
+                None
+            }
+        };
+        (digest, desktop_grants::current_issuer(context)?.generation, authority_proof)
+    };
+    if !same_installing_user(stream) {
+        return Err((403, "desktop sign-in requires the installing user".into()));
+    }
+    let _gate = crate::social_state::acquire_config_gate(context)
+        .map_err(crate::social_state::SocialError::into_http)?;
+    let cfg = load_cfg()?;
+    let effective = checked_console_token(context, &cfg)?;
+    let registry = desktop_grants::read(context)?
+        .filter(|registry| {
+            registry.verified(context) && digests_equal(&generation, &registry.generation)
+        })
+        .ok_or_else(revoked)?;
+    if effective.is_empty() || !digests_equal(&token_digest, &credential_digest(&effective)) {
+        return Err(revoked());
+    }
+    match (&authority_proof, &proof_input) {
+        (Some(authority), _) => authority.recheck(context, &cfg)?,
+        (None, DesktopSignInProof::Native { presented_token }) => native_proof(*presented_token)?,
+        (None, DesktopSignInProof::Browser { .. }) => return Err(revoked()),
+    }
+    desktop_grants::issue(context, registry, token_digest)
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum ConsoleAuthority {
     Machine { token_digest: [u8; 32] },
-    Desktop { token_digest: [u8; 32], grant: crate::console::DesktopProof },
+    Desktop { token_digest: [u8; 32], grant: DesktopProof },
     Browser { token_digest: [u8; 32], grant: BrowserProof },
 }
 
 impl ConsoleAuthority {
     /// Configuration is fresh and the caller holds the configuration gate.
     pub(crate) fn recheck(
-        &self, context: &RuntimeContext, cfg: &serde_json::Value,
+        &self,
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
     ) -> Result<(), (u16, String)> {
         let revoked = || (401, "console credential was revoked".into());
         let live = checked_console_token(context, cfg)?;
         let token_digest = match self {
-            Self::Machine { token_digest } | Self::Desktop { token_digest, .. }
+            Self::Machine { token_digest }
+            | Self::Desktop { token_digest, .. }
             | Self::Browser { token_digest, .. } => token_digest,
         };
-        let matches_token = !live.is_empty() && digests_equal(token_digest, &credential_digest(&live));
+        let matches_token =
+            !live.is_empty() && digests_equal(token_digest, &credential_digest(&live));
         let valid = match self {
             Self::Machine { .. } => matches_token,
-            Self::Desktop { grant, .. } => matches_token && crate::console::recheck_desktop(context, grant, token_digest)?,
+            Self::Desktop { grant, .. } => {
+                matches_token && recheck_desktop(context, grant, token_digest)?
+            }
             Self::Browser { grant, .. } => {
-                let valid = crate::settings::recheck_browser(context, grant, matches_token.then_some(*token_digest))?;
-                valid && matches_token && context.console_port().is_none_or(|port| grant.origin == canonical_origin(port))
+                let valid = storage::recheck_browser(
+                    context,
+                    grant,
+                    matches_token.then_some(*token_digest),
+                )?;
+                valid
+                    && matches_token
+                    && context
+                        .console_port()
+                        .is_none_or(|port| grant.origin == canonical_origin(port))
             }
         };
-        if valid { Ok(()) } else { Err(revoked()) }
+        if valid {
+            Ok(())
+        } else {
+            Err(revoked())
+        }
     }
+}
+
+pub(crate) fn admit_explicit_authority(
+    context: &RuntimeContext,
+    presented: &str,
+    expected: &str,
+    allow_raw: bool,
+) -> Result<Option<ConsoleAuthority>, (u16, String)> {
+    if presented.is_empty() || expected.is_empty() {
+        return Ok(None);
+    }
+    let token_digest = credential_digest(expected);
+    let bearer_digest = credential_digest(presented);
+    if digests_equal(&token_digest, &bearer_digest) {
+        return Ok(allow_raw.then_some(ConsoleAuthority::Machine { token_digest }));
+    }
+    Ok(selected_desktop_proof(context, &bearer_digest, &token_digest)?
+        .map(|grant| ConsoleAuthority::Desktop { token_digest, grant }))
 }
 
 pub(crate) fn checked_console_token(
@@ -254,7 +656,9 @@ pub(crate) fn ensure_credentials_ready(context: &RuntimeContext) -> Result<(), (
 }
 
 pub(crate) fn raw_token_config(context: &RuntimeContext) -> Result<serde_json::Value, String> {
-    let text = context.read_optional_text(RuntimeArea::Config, "config.json")?.ok_or(ROTATION_UNAVAILABLE)?;
+    let text = context
+        .read_optional_text(RuntimeArea::Config, "config.json")?
+        .ok_or(ROTATION_UNAVAILABLE)?;
     parse_token_config(&text)
 }
 
@@ -334,8 +738,8 @@ pub(crate) fn rotate_console_token(
     let (config_target, staged_config) = context
         .stage_atomic_from(RuntimeArea::Config, "config.json", &mut after.as_bytes())
         .map_err(|_| (500, "console token configuration is unavailable".to_string()))?;
-    crate::settings::revoke_browser_sessions(context)?;
-    remove_rotation_file(context, crate::console::DESKTOP_GRANTS_FILE).map_err(unavailable)?;
+    storage::revoke_browser_sessions(context)?;
+    remove_rotation_file(context, DESKTOP_GRANTS_FILE).map_err(unavailable)?;
     context
         .write_atomic(RuntimeArea::Data, ROTATION_FILE, &journal)
         .map_err(unavailable)?;
@@ -514,7 +918,7 @@ fn first_run_with_password_work(
     let _config = crate::social_state::acquire_config_gate(&unauth)
         .map_err(|_| PasswordError::Unavailable)?;
     check_first_run_proof(&unauth, proof)?;
-    crate::settings::set_initial_administrator_password(&unauth, &hash, actor).map_err(
+    storage::set_initial_administrator_password(&unauth, &hash, actor).map_err(
         |(code, _)| {
             if code == 409 {
                 PasswordError::AlreadySet
@@ -559,7 +963,7 @@ pub(crate) fn auth_first_run_browser(
     port: u16,
     proof: &str,
     password: &str,
-) -> Result<crate::settings::IssuedSession, PasswordError> {
+) -> Result<IssuedSession, PasswordError> {
     if !context.is_isolated() {
         return Err(PasswordError::Unavailable);
     }
@@ -572,7 +976,7 @@ pub(crate) fn auth_first_run_browser(
         .map_err(|_| PasswordError::Unavailable)?;
     check_first_run_proof(&unauth, proof)?;
     let digest = current_token_digest(&unauth).map_err(|_| PasswordError::Unavailable)?;
-    crate::settings::set_initial_administrator_password_with_session(
+    storage::set_initial_administrator_password_with_session(
         &unauth,
         &hash,
         "administrator",
@@ -592,8 +996,8 @@ pub(crate) fn auth_login(
     context: &RuntimeContext,
     port: u16,
     password: &str,
-) -> Result<crate::settings::IssuedSession, LoginError> {
-    use crate::settings::{LoginChallenge, LoginOutcome};
+) -> Result<IssuedSession, LoginError> {
+    use storage::{LoginChallenge, LoginOutcome};
 
     if !context.is_isolated() {
         return Err(LoginError::Unavailable);
@@ -601,7 +1005,7 @@ pub(crate) fn auth_login(
     validate_password_maximum(password).map_err(|_| LoginError::Input)?;
     let mut attempted_clamp = false;
     let hash = loop {
-        match crate::settings::load_login_challenge(context, true).map_err(|_| LoginError::Unavailable)? {
+        match storage::load_login_challenge(context, true).map_err(|_| LoginError::Unavailable)? {
             LoginChallenge::NotSet => return Err(LoginError::NotSet),
             LoginChallenge::Throttled {
                 retry_after_ms,
@@ -619,7 +1023,7 @@ pub(crate) fn auth_login(
                 let unauth = unauthenticated_context(context);
                 let _config = crate::social_state::acquire_config_gate(&unauth)
                     .map_err(|_| LoginError::Unavailable)?;
-                let (failures, wait_ms) = crate::settings::clamp_throttle_deadline(&unauth)
+                let (failures, wait_ms) = storage::clamp_throttle_deadline(&unauth)
                     .map_err(|(code, _)| {
                         if code == 409 {
                             LoginError::NotSet
@@ -637,9 +1041,13 @@ pub(crate) fn auth_login(
             LoginChallenge::Ready { hash } => break hash,
         }
     };
-    let matched = hash
-        .verify(password)
-        .map_err(|err| if err == PasswordError::Input { LoginError::Input } else { LoginError::Unavailable })?;
+    let matched = hash.verify(password).map_err(|err| {
+        if err == PasswordError::Input {
+            LoginError::Input
+        } else {
+            LoginError::Unavailable
+        }
+    })?;
 
     let _credential = credential_mutation_gate(context).map_err(|_| LoginError::Busy)?;
     let unauth = unauthenticated_context(context);
@@ -648,7 +1056,7 @@ pub(crate) fn auth_login(
     let digest = current_token_digest(&unauth).map_err(|_| LoginError::Unavailable)?;
 
     if !matched {
-        let failure = crate::settings::record_login_failure(&unauth).map_err(|(code, _)| {
+        let failure = storage::record_login_failure(&unauth).map_err(|(code, _)| {
             if code == 409 { LoginError::NotSet } else { LoginError::Unavailable }
         })?;
         return Err(if failure.throttled_before {
@@ -664,7 +1072,7 @@ pub(crate) fn auth_login(
         });
     }
 
-    match crate::settings::complete_login(&unauth, hash.as_str(), &canonical_origin(port), digest) {
+    match storage::complete_login(&unauth, hash.as_str(), &canonical_origin(port), digest) {
         Ok(LoginOutcome::Issued(issued)) => Ok(issued),
         Ok(LoginOutcome::NotSet) => Err(LoginError::NotSet),
         Ok(LoginOutcome::PasswordChanged) => Err(LoginError::WrongPassword {
@@ -685,7 +1093,7 @@ pub(crate) fn require_password_locally(cfg: &serde_json::Value) -> bool {
 pub(crate) fn auth_local_browser_auto_sign_in(
     context: &RuntimeContext,
     port: u16,
-) -> Result<Option<(crate::settings::IssuedSession, ConsoleAuthority)>, (u16, String)> {
+) -> Result<Option<(IssuedSession, ConsoleAuthority)>, (u16, String)> {
     if !context.is_isolated() {
         return Ok(None);
     }
@@ -706,9 +1114,9 @@ pub(crate) fn auth_local_browser_auto_sign_in(
     }
     let digest = credential_digest(&expected);
     let origin = canonical_origin(port);
-    let issued = crate::settings::issue_browser_session(&unauth, &origin, digest)?;
+    let issued = storage::issue_browser_session(&unauth, &origin, digest)?;
     let Some(admitted) =
-        crate::settings::admit_browser(&unauth, &origin, Some(digest), &[issued.id_digest], false)?
+        storage::admit_browser(&unauth, &origin, Some(digest), &[issued.id_digest], false)?
     else {
         return Ok(None);
     };
@@ -727,14 +1135,14 @@ pub(crate) fn auth_change_password(
     authority: &ConsoleAuthority,
     current_password: &str,
     new_password: &str,
-) -> Result<Option<crate::settings::IssuedSession>, ChangePasswordError> {
+) -> Result<Option<IssuedSession>, ChangePasswordError> {
     if !context.is_isolated() {
         return Err(ChangePasswordError::Unavailable);
     }
     validate_password_maximum(current_password).map_err(|_| ChangePasswordError::Input)?;
     validate_new_password(new_password).map_err(|_| ChangePasswordError::Input)?;
-    let crate::settings::LoginChallenge::Ready { hash } =
-        crate::settings::load_login_challenge(context, false)
+    let storage::LoginChallenge::Ready { hash } =
+        storage::load_login_challenge(context, false)
             .map_err(|_| ChangePasswordError::Unavailable)?
     else {
         return Err(ChangePasswordError::NotSet);
@@ -745,8 +1153,8 @@ pub(crate) fn auth_change_password(
     {
         return Err(ChangePasswordError::WrongCurrent);
     }
-    let new_hash =
-        AdministratorPasswordHash::derive(new_password).map_err(|_| ChangePasswordError::Unavailable)?;
+    let new_hash = AdministratorPasswordHash::derive(new_password)
+        .map_err(|_| ChangePasswordError::Unavailable)?;
 
     let _credential = credential_mutation_gate(context).map_err(|_| ChangePasswordError::Busy)?;
     let _config = crate::social_state::acquire_config_gate(context).map_err(|err| {
@@ -767,7 +1175,7 @@ pub(crate) fn auth_change_password(
     } else {
         None
     };
-    crate::settings::change_administrator_password(
+    storage::change_administrator_password(
         context,
         hash.as_str(),
         &new_hash,
@@ -778,6 +1186,97 @@ pub(crate) fn auth_change_password(
         409 => ChangePasswordError::NotSet,
         401 => ChangePasswordError::WrongCurrent,
         _ => ChangePasswordError::Unavailable,
+    })
+}
+
+pub(crate) fn auth_logout(
+    context: &RuntimeContext,
+    authority: Option<&ConsoleAuthority>,
+) -> Result<Option<[u8; 32]>, (u16, String)> {
+    let _config = crate::social_state::acquire_config_gate(context)
+        .map_err(crate::social_state::SocialError::into_http)?;
+    let Some(ConsoleAuthority::Browser { grant, .. }) = authority else {
+        return Ok(None);
+    };
+    storage::revoke_browser_session_by_digest(context, grant.id_digest)?;
+    Ok(Some(grant.id_digest))
+}
+
+pub(crate) fn list_browser_sessions(
+    context: &RuntimeContext,
+    authority: &ConsoleAuthority,
+) -> Result<Vec<BrowserSessionView>, (u16, String)> {
+    let (token_digest, current_id) = match authority {
+        ConsoleAuthority::Browser { token_digest, grant } => (*token_digest, Some(grant.id_digest)),
+        ConsoleAuthority::Machine { token_digest }
+        | ConsoleAuthority::Desktop { token_digest, .. } => (*token_digest, None),
+    };
+    storage::list_browser_sessions_raw(context, token_digest, current_id)
+}
+
+pub(crate) enum RevokeTarget {
+    One([u8; 32]),
+    Others,
+    All,
+}
+
+pub(crate) struct RevokeOutcome {
+    pub(crate) revoked_count: usize,
+    pub(crate) delete_own: Option<[u8; 32]>,
+}
+
+pub(crate) fn revoke_browser_sessions_authorized(
+    context: &RuntimeContext,
+    authority: &ConsoleAuthority,
+    target: RevokeTarget,
+) -> Result<RevokeOutcome, (u16, String)> {
+    if matches!(target, RevokeTarget::Others)
+        && !matches!(authority, ConsoleAuthority::Browser { .. })
+    {
+        return Err((
+            400,
+            "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true".to_string(),
+        ));
+    }
+    let _config = crate::social_state::acquire_config_gate(context)
+        .map_err(crate::social_state::SocialError::into_http)?;
+    let cfg = context
+        .load_config()
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    authority.recheck(context, &cfg)?;
+    let (revoked_count, delete_own) = match (target, authority) {
+        (RevokeTarget::One(digest), _) => {
+            let removed = storage::revoke_browser_session_by_digest(context, digest)?;
+            let own = matches!(
+                authority,
+                ConsoleAuthority::Browser { grant, .. }
+                    if digests_equal(&grant.id_digest, &digest)
+            )
+            .then_some(digest);
+            (usize::from(removed), own)
+        }
+        (RevokeTarget::Others, ConsoleAuthority::Browser { grant, .. }) => (
+            storage::revoke_other_browser_sessions(context, Some(grant.id_digest))?,
+            None,
+        ),
+        (RevokeTarget::Others, _) => {
+            return Err((
+                400,
+                "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true".to_string(),
+            ));
+        }
+        (RevokeTarget::All, _) => {
+            let count = storage::revoke_other_browser_sessions(context, None)?;
+            let own = match authority {
+                ConsoleAuthority::Browser { grant, .. } => Some(grant.id_digest),
+                _ => None,
+            };
+            (count, own)
+        }
+    };
+    Ok(RevokeOutcome {
+        revoked_count,
+        delete_own,
     })
 }
 
@@ -820,7 +1319,7 @@ fn reset_password_cli(context: &RuntimeContext) -> Result<(), PasswordError> {
     let _config = crate::social_state::acquire_config_gate(context)
         .map_err(|_| PasswordError::Unavailable)?;
     ensure_credentials_ready(context).map_err(|_| PasswordError::Unavailable)?;
-    crate::settings::reset_administrator_password(context).map_err(|_| PasswordError::Unavailable)
+    storage::reset_administrator_password(context).map_err(|_| PasswordError::Unavailable)
 }
 
 pub(crate) fn run_cli(args: &[String]) -> i32 {
@@ -894,13 +1393,15 @@ pub(crate) mod tests {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
             "her-console-auth-{}-{}",
             std::process::id(),
-            crate::console::generate_console_token().unwrap(),
+            generate_console_token().unwrap(),
         )));
         let root = runtime_fixture(
             root,
             &json!({"consoleToken": TOKEN}),
             &json!({
-                "dsh":"http://127.0.0.1:1", "model":"http://127.0.0.1:1", "onebot":"http://127.0.0.1:1"
+                "dsh": "http://127.0.0.1:1",
+                "model": "http://127.0.0.1:1",
+                "onebot": "http://127.0.0.1:1",
             }),
         );
         if generated {
@@ -927,7 +1428,10 @@ pub(crate) mod tests {
         fs::write(&target, [7; 32]).unwrap();
         fs::hard_link(&target, &marker).unwrap();
         assert!(restore_generation(&context).is_err());
-        assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+        assert!(matches!(
+            rotate_restore_generation(&context),
+            Err(GenerationWriteError::Unpublished(_))
+        ));
         assert_eq!(fs::read(&target).unwrap(), [7; 32]);
         fs::remove_file(&marker).unwrap();
 
@@ -935,13 +1439,19 @@ pub(crate) mod tests {
         {
             std::os::unix::fs::symlink(&target, &marker).unwrap();
             assert!(restore_generation(&context).is_err());
-            assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+            assert!(matches!(
+                rotate_restore_generation(&context),
+                Err(GenerationWriteError::Unpublished(_))
+            ));
             assert_eq!(fs::read(&target).unwrap(), [7; 32]);
             fs::remove_file(&marker).unwrap();
         }
         fs::create_dir(&marker).unwrap();
         assert!(restore_generation(&context).is_err());
-        assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+        assert!(matches!(
+            rotate_restore_generation(&context),
+            Err(GenerationWriteError::Unpublished(_))
+        ));
         fs::remove_dir(&marker).unwrap();
 
         let generation = rotate_restore_generation(&context).unwrap();
@@ -1067,7 +1577,7 @@ pub(crate) mod tests {
         crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
         {
             let _config = crate::social_state::acquire_config_gate(&context).unwrap();
-            assert!(crate::settings::reset_administrator_password(&context).is_err());
+            assert!(reset_administrator_password(&context).is_err());
         }
         assert!(
             probe.value(KEY) == before,
@@ -1146,5 +1656,175 @@ pub(crate) mod tests {
                 Err(PasswordError::AlreadySet)
             );
         }
+    }
+
+    #[test]
+    fn console_auth_session_management_and_backup_scrub_preserve_contract() {
+        let (root, context) = runtime(false);
+        let port = 3999;
+        let issued = auth_first_run_browser(&context, port, TOKEN, PASSWORD).unwrap();
+        let origin = canonical_origin(port);
+        let token_digest = credential_digest(TOKEN);
+        let admitted =
+            admit_browser(&context, &origin, Some(token_digest), &[issued.id_digest], false)
+                .unwrap()
+                .expect("first-run browser session must admit");
+        let authority = ConsoleAuthority::Browser {
+            token_digest,
+            grant: admitted.proof,
+        };
+        let status = auth_status(&context).unwrap();
+        assert!(status.password_set);
+        assert_eq!(status.consecutive_failures, 0);
+
+        let second = auth_login(&context, port, PASSWORD).unwrap();
+        let listed = list_browser_sessions(&context, &authority).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.iter().filter(|item| item.current).count(), 1);
+
+        let revoke_other = revoke_browser_sessions_authorized(
+            &context,
+            &authority,
+            RevokeTarget::One(second.id_digest),
+        )
+        .unwrap();
+        assert_eq!(revoke_other.revoked_count, 1);
+        assert!(revoke_other.delete_own.is_none());
+
+        let third = auth_login(&context, port, PASSWORD).unwrap();
+        let revoke_others =
+            revoke_browser_sessions_authorized(&context, &authority, RevokeTarget::Others).unwrap();
+        assert_eq!(revoke_others.revoked_count, 1);
+        assert!(admit_browser(&context, &origin, Some(token_digest), &[third.id_digest], false)
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            auth_logout(&context, Some(&authority)).unwrap(),
+            Some(issued.id_digest)
+        );
+        assert!(admit_browser(&context, &origin, Some(token_digest), &[issued.id_digest], false)
+            .unwrap()
+            .is_none());
+        let err = revoke_browser_sessions_authorized(&context, &authority, RevokeTarget::All)
+            .err()
+            .expect("revoked authority must fail recheck");
+        assert_eq!(err.0, 401);
+
+        let machine = admit_explicit_authority(&context, TOKEN, TOKEN, true)
+            .unwrap()
+            .expect("raw machine token admitted");
+        assert!(matches!(machine, ConsoleAuthority::Machine { .. }));
+        assert!(admit_explicit_authority(&context, TOKEN, TOKEN, false).unwrap().is_none());
+
+        // Snapshot scrubbing must drop browser sessions and auth state while keeping the password.
+        let snapshot = root.0.join("snapshot-settings.db");
+        {
+            let src = crate::settings::backup_source(&context).unwrap().unwrap();
+            let mut dst = rusqlite::Connection::open(&snapshot).unwrap();
+            let backup = rusqlite::backup::Backup::new(&src, &mut dst).unwrap();
+            backup.run_to_completion(100, std::time::Duration::ZERO, None).unwrap();
+        }
+        let check = || Ok(());
+        scrub_auth_snapshot(&snapshot, &check).unwrap();
+        let scrubbed = rusqlite::Connection::open(&snapshot).unwrap();
+        let archived = archive_credentials(&scrubbed).unwrap();
+        assert!(archived.has_password);
+        assert!(!archived.has_endpoints);
+        let session_rows: i64 = scrubbed
+            .query_row("SELECT count(*) FROM console_browser_sessions", [], |r| r.get(0))
+            .unwrap();
+        let state_rows: i64 = scrubbed
+            .query_row("SELECT count(*) FROM console_auth_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((session_rows, state_rows), (0, 0));
+    }
+
+    #[test]
+    fn console_auth_rotation_clears_desktop_grants_and_browser_sessions() {
+        let (root, context) = runtime(false);
+        let port = 3999;
+        let issued = auth_first_run_browser(&context, port, TOKEN, PASSWORD).unwrap();
+        let grants_path = root.0.join("data").join(DESKTOP_GRANTS_FILE);
+        fs::write(&grants_path, b"{\"v\":1}").unwrap();
+        let rotated_token = generate_console_token().unwrap();
+        {
+            let _cred = credential_mutation_gate(&context).unwrap();
+            let _cfg = crate::social_state::acquire_config_gate(&context).unwrap();
+            rotate_console_token(&context, &rotated_token, true).unwrap();
+        }
+        assert!(!grants_path.exists(), "rotation must remove desktop grants");
+        assert!(admit_browser(
+            &context,
+            &canonical_origin(port),
+            Some(credential_digest(&rotated_token)),
+            &[issued.id_digest],
+            false,
+        )
+        .unwrap()
+        .is_none());
+
+        let stale_proof = DesktopProof {
+            bearer_digest: [1; 32],
+            generation: [2; 32],
+            issuer_pid: 1,
+            issuer_start: 1,
+        };
+        assert!(
+            !recheck_desktop(&context, &stale_proof, &credential_digest(&rotated_token)).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_grants_registry_rejects_malformed_and_expired_entries() {
+        struct TickGuard;
+        impl Drop for TickGuard {
+            fn drop(&mut self) {
+                desktop_grants::TEST_TICKS.with(|cell| cell.set(None));
+            }
+        }
+        let _guard = TickGuard;
+        let (root, context) = runtime(false);
+        assert!(desktop_grants::read(&context).unwrap().is_none());
+
+        let token_digest = credential_digest(TOKEN);
+        let bearer = generate_console_token().unwrap();
+        let bearer_digest = credential_digest(&bearer);
+        let registry = desktop_grants::Registry {
+            v: 1,
+            generation: [9; 32],
+            issuer_pid: std::process::id(),
+            issuer_start: 42,
+            grants: std::collections::VecDeque::from([desktop_grants::Grant {
+                bearer_digest,
+                token_digest,
+                issued: 1000,
+                expires: 1000 + desktop_grants::LIFETIME,
+            }]),
+        };
+        context
+            .write_atomic(
+                RuntimeArea::Data,
+                DESKTOP_GRANTS_FILE,
+                &serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+        let parsed = desktop_grants::read(&context).unwrap().unwrap();
+        assert_eq!(parsed.grants.len(), 1);
+        desktop_grants::TEST_TICKS.with(|c| c.set(Some(1000 + desktop_grants::LIFETIME)));
+        assert_eq!(desktop_grants::ticks(), 1000 + desktop_grants::LIFETIME);
+
+        let mut bad = registry;
+        bad.grants[0].expires += 1;
+        context
+            .write_atomic(
+                RuntimeArea::Data,
+                DESKTOP_GRANTS_FILE,
+                &serde_json::to_vec(&bad).unwrap(),
+            )
+            .unwrap();
+        assert!(desktop_grants::read(&context).is_err());
+        let _ = root;
     }
 }

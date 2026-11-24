@@ -83,30 +83,24 @@ pub(crate) use registry::{
     GATEWAY_SILENCE_WARN,
 };
 #[cfg(test)]
-pub(crate) use store::seed_browser_session;
-#[cfg(test)]
 pub(crate) use store::{
     create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
-    complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
-    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
-    holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay,
-    overlay_checked, overlay_values, place_changes, preview,
-    admit_browser, archive_credentials, auth_status, change_administrator_password,
-    clamp_throttle_deadline, complete_login, harness_credential, issue_browser_session,
-    list_browser_sessions, load_login_challenge, read_archive_values, recheck_browser,
-    record_login_failure,
-    revoke_browser_session_by_digest, revoke_browser_sessions, revoke_other_browser_sessions,
-    scrub_auth_snapshot, set_initial_administrator_password_with_session, start_browser_clock,
-    throttle_delay_ms, ArchivedCredentials, AuthStatusSnapshot, BrowserSessionView, IssuedSession,
-    LoginChallenge, LoginFailureState, LoginOutcome, THROTTLE_MAX_MS, registry_free, reset,
-    reset_conversation, resolve_config,
-    resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
-    reset_administrator_password, set_initial_administrator_password, store_mark, store_path, stored_secrets, undo,
-    view, write_back, Applied, Change, CONVERSATION_ERROR,
+    check_store_schema, complete_timing, console_changes, conversation_admitted, conversation_value,
+    conversation_view, direct_change_error, engine_choice, harness_credential,
+    has_endpoint_credentials, has_legacy_engine_choices, has_stored_setting, has_stored_values,
+    history, holds_any, import_engine_choices, inspect_store, keep_file_members,
+    keep_registry_values, last_good_text, migrate_store_v2, mirror_into, open_store_for_write,
+    overlay, overlay_checked, overlay_values, place_changes, preview, read_archive_values,
+    read_store, record_setting_change, registry_free, reset, reset_conversation, resolve_config,
+    resolve_live_batch, restore_gate, restore_switch_choice, schema_version_checked,
+    secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
+    stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
+    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, LEGACY_ERROR,
+    STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

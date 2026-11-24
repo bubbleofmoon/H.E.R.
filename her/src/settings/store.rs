@@ -4,22 +4,7 @@
 //! conversation (#218, schema version 2) are in `store/conversation.rs`. The module root (`settings.rs`) re-exports what
 //! callers use; the contract is described there.
 
-mod console_auth;
 mod conversation;
-
-pub(crate) use console_auth::{
-    admit_browser, archive_credentials, auth_status, change_administrator_password,
-    clamp_throttle_deadline, complete_login, issue_browser_session, list_browser_sessions,
-    load_login_challenge, recheck_browser, record_login_failure, reset_administrator_password,
-    revoke_browser_session_by_digest, revoke_browser_sessions, revoke_other_browser_sessions,
-    scrub_auth_snapshot, set_initial_administrator_password,
-    set_initial_administrator_password_with_session, start_browser_clock, throttle_delay_ms,
-    ArchivedCredentials, AuthStatusSnapshot, BrowserSessionView, IssuedSession, LoginChallenge,
-    LoginFailureState, LoginOutcome, THROTTLE_MAX_MS,
-};
-
-#[cfg(test)]
-pub(crate) use console_auth::seed_browser_session;
 
 pub(crate) use conversation::{
     apply_conversation, apply_switch_choice, canonical_conversation, conversation_admitted, conversation_value,
@@ -32,7 +17,6 @@ use super::{
     WEB_SEARCH_API_KEY,
 };
 use super::registry::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
-use crate::console_auth::AdministratorPasswordHash;
 use crate::guarded_fs::file_link_count;
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -43,15 +27,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DB: &str = "settings.db";
 const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-journal"];
+pub(crate) const STORE_SIDECARS: [&str; 3] = SIDECARS;
 /// Global settings start at v1, conversation settings need v2, and durable console authentication needs v3.
 const SCHEMA_VERSION: i64 = 3;
 const SECRET_MARKER: &str = "(hidden)";
 const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
-const PASSWORD_UNAVAILABLE: &str = "administrator password is unavailable";
-const STORAGE_ERROR: &str = "settings storage is unavailable";
+pub(crate) const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
-const LEGACY_ERROR: &str = "settings require a selected runtime";
+pub(crate) const LEGACY_ERROR: &str = "settings require a selected runtime";
 /// The configuration file the store seeds from and writes back into (`RuntimeArea::Config`).
 const CONFIG: &str = "config.json";
 /// The copy of `config.json` from before settings first wrote anything, beside it.
@@ -317,19 +301,19 @@ pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connectio
     Ok(Some(conn))
 }
 
-pub(super) enum InspectError {
+pub(crate) enum InspectError {
     Retry(String),
     Fatal(String),
 }
 
 impl InspectError {
-    pub(super) fn into_message(self) -> String {
+    pub(crate) fn into_message(self) -> String {
         match self {
             Self::Retry(error) | Self::Fatal(error) => error,
         }
     }
 
-    pub(super) fn from_sqlite(error: rusqlite::Error) -> Self {
+    pub(crate) fn from_sqlite(error: rusqlite::Error) -> Self {
         if let rusqlite::Error::SqliteFailure(ffi, _) = &error {
             if ffi.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK {
                 return Self::Fatal(LEFTOVER_JOURNAL_ERROR.to_string());
@@ -426,9 +410,13 @@ fn retry_sidecars(
     retry_until(deadline, || check_sidecars(context).map(|_| ()))
 }
 
-pub(super) fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
+pub(crate) fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(InspectError::from_sqlite)
+}
+
+pub(crate) fn store_schema_version(conn: &Connection) -> Result<i64, String> {
+    schema_version(conn)
 }
 
 fn schema_version(conn: &Connection) -> Result<i64, String> {
@@ -442,14 +430,16 @@ fn refuse_version(version: i64) -> String {
 
 /// What a read-only look at the store found. Nothing here opens the store for writing, so a store this release
 /// refuses is never checkpointed, rolled back or switched to WAL.
-enum Inspection {
+pub(crate) enum StoreInspection {
     /// No `settings.db` yet.
     Missing,
     /// No schema yet: an empty file, or version 0 without any schema object.
     Fresh,
-    /// Version 1 with exactly this release's schema, open read-only and with no checkpoint on close.
+    /// Version 1..=3 with this release's schema, open read-only and with no checkpoint on close.
     Ready(Connection),
 }
+
+type Inspection = StoreInspection;
 
 /// The store gate, a file under `data/`: every write holds it from its inspection until its connection closes
 /// (`write_store`).
@@ -550,6 +540,10 @@ fn normalized_sql(sql: &str) -> String {
     normalized
 }
 
+pub(crate) fn check_store_schema(conn: &Connection) -> Result<bool, String> {
+    check_schema(conn)
+}
+
 /// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for versions 1 through 3
 /// with exactly this release's schema of that version (`has_settings_schema`); anything else is refused.
 fn check_schema_checked(conn: &Connection) -> Result<bool, InspectError> {
@@ -573,6 +567,10 @@ fn check_schema_checked(conn: &Connection) -> Result<bool, InspectError> {
         }
         version => Err(InspectError::Fatal(refuse_version(version))),
     }
+}
+
+pub(crate) fn inspect_store(context: &RuntimeContext) -> Result<StoreInspection, String> {
+    inspect(context)
 }
 
 fn check_schema(conn: &Connection) -> Result<bool, String> {
@@ -657,7 +655,7 @@ fn inspect_attempt(
     }
 }
 
-pub(super) fn read_store<T>(
+pub(crate) fn read_store<T>(
     context: &RuntimeContext,
     mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
 ) -> Result<T, String> {
@@ -811,34 +809,22 @@ pub(crate) fn secret_value(
     })
 }
 
-fn administrator_password(
-    context: &RuntimeContext,
-) -> Result<Option<AdministratorPasswordHash>, String> {
-    read_store(context, |conn| match conn {
-        None => Ok(None),
-        Some(conn) => administrator_password_checked(conn),
-    })
+pub(crate) fn has_endpoint_credentials(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
+        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
+        |row| row.get(0),
+    )
+    .map_err(|_| STORAGE_ERROR.to_string())
 }
 
-pub(super) fn administrator_password_checked(
-    conn: &Connection,
-) -> Result<Option<AdministratorPasswordHash>, InspectError> {
-    let Some((text, _)) = stored_row_sqlite(conn, ADMINISTRATOR_PASSWORD.key)
-        .map_err(InspectError::from_sqlite)?
-    else {
-        return Ok(None);
-    };
-    let phc: String = serde_json::from_str(&text)
-        .map_err(|_| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))?;
-    AdministratorPasswordHash::parse(&phc)
-        .map(Some)
-        .ok_or_else(|| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))
-}
-
-fn administrator_password_in(
-    conn: &Connection,
-) -> Result<Option<AdministratorPasswordHash>, String> {
-    administrator_password_checked(conn).map_err(InspectError::into_message)
+pub(crate) fn has_stored_setting(conn: &Connection, key: &str) -> Result<bool, (u16, String)> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
+        [key],
+        |row| row.get(0),
+    )
+    .map_err(|_| (503, STORAGE_ERROR.to_string()))
 }
 
 /// The settings row revision partitions the per-process search cache after a credential change.
@@ -1049,8 +1035,8 @@ fn has_settings_schema(conn: &Connection, version: i64) -> Result<bool, InspectE
         .map_err(InspectError::from_sqlite)?;
     let v2 = SCHEMA_V2_ADDED.iter().filter(|_| version >= 2);
     let v2_indexes = SCHEMA_V2_IMPLICIT.iter().filter(|_| version >= 2);
-    let v3 = console_auth::SCHEMA_V3_ADDED.iter().filter(|_| version >= 3);
-    let v3_indexes = console_auth::SCHEMA_V3_IMPLICIT.iter().filter(|_| version >= 3);
+    let v3 = crate::console_auth::SCHEMA_V3_ADDED.iter().filter(|_| version >= 3);
+    let v3_indexes = crate::console_auth::SCHEMA_V3_IMPLICIT.iter().filter(|_| version >= 3);
     let mut expected: Vec<Object> = SCHEMA_V1
         .iter()
         .chain(v2)
@@ -1080,6 +1066,10 @@ fn has_settings_schema(conn: &Connection, version: i64) -> Result<bool, InspectE
         objects.sort();
     }
     Ok(found == expected)
+}
+
+pub(crate) fn open_store_for_write(context: &RuntimeContext) -> Result<Connection, String> {
+    open_for_write(context)
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
@@ -1445,6 +1435,10 @@ fn write_store_with<T>(
     Ok((result, mirror_after_commit(context, stored)))
 }
 
+pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
+    migrate(conn)
+}
+
 /// Migrates a version-1 store to schema version 2 inside the caller's immediate transaction: `conversation_settings`
 /// is created and `user_version` set to 2 together, so a crash or a refusal before the commit leaves version 1 as it
 /// was (`PRAGMA user_version` is part of the transaction). A version-2 store is left as it is. Only a write that keeps a
@@ -1474,6 +1468,20 @@ fn access_rows(conn: &Connection) -> Result<Vec<(String, String)>, (u16, String)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
     Ok(rows.into_iter().filter(|(key, _)| find(key).is_some_and(Setting::access)).collect())
+}
+
+pub(crate) fn stored_setting_row(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<(String, i64)>, (u16, String)> {
+    stored_row(conn, key)
+}
+
+pub(crate) fn stored_setting_row_checked(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<(String, i64)>, InspectError> {
+    stored_row_sqlite(conn, key).map_err(InspectError::from_sqlite)
 }
 
 fn stored_row_sqlite(
@@ -1566,6 +1574,17 @@ fn validate_rollout_change<'a>(
         }
     }
     Ok(())
+}
+
+pub(crate) fn record_setting_change(
+    conn: &Connection,
+    setting: &Setting,
+    old: Option<(String, i64)>,
+    new: Option<&str>,
+    actor: &str,
+    source: &str,
+) -> Result<i64, (u16, String)> {
+    record_change(conn, setting, old, new, actor, source)
 }
 
 /// Writes one change of a global setting and its audit row in the caller's transaction: `new` is the text to store,
@@ -2138,10 +2157,11 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         Ok(secrets) => (secrets, store_error),
         Err(error) => (Vec::new(), store_error.or(Some(error))),
     };
-    let (password_is_set, store_error) = match administrator_password(context) {
-        Ok(hash) => (hash.is_some(), store_error),
-        Err(error) => (false, store_error.or(Some(error))),
-    };
+    let (password_is_set, store_error) =
+        match crate::console_auth::administrator_password_is_set(context) {
+            Ok(is_set) => (is_set, store_error),
+            Err(error) => (false, store_error.or(Some(error))),
+        };
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let settings: Vec<Value> = registry()
         .map(|setting| {
