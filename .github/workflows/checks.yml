@@ -89,30 +89,52 @@ jobs:
           HER_GITLEAKS="$RUNNER_TEMP/her-gitleaks/gitleaks"
           if [ "$RUNNER_OS" = Windows ]; then HER_GITLEAKS="$HER_GITLEAKS.exe"; fi
           export HER_GITLEAKS
-          python -I scripts/check-repo.py
-          python -I scripts/tests/test_scan_public.py
-          python -I scripts/tests/test_pre_push_hook.py
-          python -I scripts/tests/test_gh_public.py
-          python -I scripts/tests/test_handoff.py
-          python -I scripts/tests/test_check_repo.py
-          python -I scripts/tests/test_ci_suite.py
-          python -I scripts/tests/test_agent_guard.py
-          python -I scripts/tests/test_issue_watch.py
-          python -I scripts/tests/test_watch_stream.py
-          python -I scripts/tests/test_ci_wait.py
-          python -I scripts/tests/test_strip_history.py
-          python -I scripts/tests/test_snowluma_export.py
-          python -I scripts/tests/test_codex_task.py
-          python -I scripts/tests/test_quick_workflow.py
-          python -I scripts/tests/test_checks_workflow.py
-          python -I scripts/tests/test_merge_check.py
-          python -I scripts/tests/test_plan_export.py
+          python -I scripts/ci/run-scans.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
+  ui-build:
+    name: ui-build (ubuntu-24.04)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: /tmp
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: /tmp/her
+    steps:
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
+      - name: Build console UI (her-ui)
+        run: |
+          cd "$PUBLIC_TREE/her-ui"
+          npm ci
+          npm run typecheck
+          npm run build
+      - name: Upload console UI (her-ui)
+        uses: actions/upload-artifact@v4
+        with:
+          name: her-ui-dist
+          path: ${{ env.PUBLIC_TREE }}/her-ui/dist
+          retention-days: 1
+          if-no-files-found: error
   # Formatting and clippy on both OSes; report-only for now (the job stays green, the output is in the log).
   lint:
     name: lint (${{ matrix.os }})
-    needs: changes
+    needs: [changes, ui-build]
     if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
@@ -139,6 +161,7 @@ jobs:
       PYTHONUTF8: '1'
       PUBLIC_TREE: ${{ matrix.tree }}
       CARGO_TARGET_DIR: ${{ matrix.target }}
+      HER_REQUIRE_UI_DIST: '1'
     steps:
       - name: Use long-form Windows temporary directory
         if: runner.os == 'Windows'
@@ -154,18 +177,13 @@ jobs:
           git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
       - name: Toolchains
         run: |
-          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
-          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
-          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
-      - name: Build console UI (her-ui)
-        run: |
-          cd "$PUBLIC_TREE/her-ui"
-          npm ci
-          npm run typecheck
-          npm run build
-          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
+      - name: Download console UI (her-ui)
+        uses: actions/download-artifact@v4
+        with:
+          name: her-ui-dist
+          path: ${{ env.PUBLIC_TREE }}/her-ui/dist
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -198,7 +216,7 @@ jobs:
   # Linux test shards run on every pull request and every push to main.
   tests:
     name: tests (ubuntu-24.04, shard ${{ matrix.shard }}/5)
-    needs: changes
+    needs: [changes, ui-build]
     if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
@@ -216,6 +234,7 @@ jobs:
       PUBLIC_TREE: /tmp/her
       CARGO_TARGET_DIR: /tmp/her-target
       CI_EVIDENCE: /tmp/her-evidence
+      HER_REQUIRE_UI_DIST: '1'
     steps:
       - name: Fetch source
         run: |
@@ -233,12 +252,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           python --version
-      - name: Build console UI (her-ui)
-        run: |
-          cd "$PUBLIC_TREE/her-ui"
-          npm ci
-          npm run build
-          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
+      - name: Download console UI (her-ui)
+        uses: actions/download-artifact@v4
+        with:
+          name: her-ui-dist
+          path: ${{ env.PUBLIC_TREE }}/her-ui/dist
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -261,7 +279,7 @@ jobs:
   # Windows test shards run on every push to main only; a pull request runs scans on Windows and the Linux shards.
   tests-windows:
     name: tests (windows-2022, shard ${{ matrix.shard }}/5)
-    needs: changes
+    needs: [changes, ui-build]
     if: github.event_name == 'push' && needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
@@ -279,6 +297,7 @@ jobs:
       PUBLIC_TREE: C:/her-ci
       CARGO_TARGET_DIR: C:/her-ci-target
       CI_EVIDENCE: C:/her-ci-evidence
+      HER_REQUIRE_UI_DIST: '1'
     steps:
       # Long-form path on the checkout's drive: RUNNER_TEMP is a short name on D:,
       # and fixtures rename between the temporary folder and the tree.
@@ -303,12 +322,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           python --version
-      - name: Build console UI (her-ui)
-        run: |
-          cd "$PUBLIC_TREE/her-ui"
-          npm ci
-          npm run build
-          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
+      - name: Download console UI (her-ui)
+        uses: actions/download-artifact@v4
+        with:
+          name: her-ui-dist
+          path: ${{ env.PUBLIC_TREE }}/her-ui/dist
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -339,7 +357,7 @@ jobs:
   # Always-run merge-gate aggregator so branch rulesets can require one stable check across code and docs-only PRs.
   gate:
     name: checks-gate
-    needs: [changes, scans, lint, tests]
+    needs: [changes, scans, ui-build, lint, tests]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -347,13 +365,14 @@ jobs:
       CHANGES_RESULT: ${{ needs.changes.result }}
       CODE_CHANGED: ${{ needs.changes.outputs.code }}
       SCANS_RESULT: ${{ needs.scans.result }}
+      UI_BUILD_RESULT: ${{ needs.ui-build.result }}
       LINT_RESULT: ${{ needs.lint.result }}
       TESTS_RESULT: ${{ needs.tests.result }}
     steps:
       - name: Verify required checks
         shell: bash
         run: |
-          echo "changes=$CHANGES_RESULT code=$CODE_CHANGED scans=$SCANS_RESULT lint=$LINT_RESULT tests=$TESTS_RESULT"
+          echo "changes=$CHANGES_RESULT code=$CODE_CHANGED scans=$SCANS_RESULT ui-build=$UI_BUILD_RESULT lint=$LINT_RESULT tests=$TESTS_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "FAIL: changes job did not succeed ($CHANGES_RESULT)" >&2
             exit 1
@@ -363,6 +382,10 @@ jobs:
             exit 1
           fi
           if [ "$CODE_CHANGED" = "false" ]; then
+            if [ "$UI_BUILD_RESULT" != "skipped" ] && [ "$UI_BUILD_RESULT" != "success" ]; then
+              echo "FAIL: ui-build job unexpected result on docs-only change ($UI_BUILD_RESULT)" >&2
+              exit 1
+            fi
             if [ "$LINT_RESULT" != "skipped" ] && [ "$LINT_RESULT" != "success" ]; then
               echo "FAIL: lint job unexpected result on docs-only change ($LINT_RESULT)" >&2
               exit 1
@@ -373,6 +396,10 @@ jobs:
             fi
             echo "PASS: docs-only checks green"
             exit 0
+          fi
+          if [ "$UI_BUILD_RESULT" != "success" ]; then
+            echo "FAIL: ui-build job did not succeed ($UI_BUILD_RESULT)" >&2
+            exit 1
           fi
           if [ "$LINT_RESULT" != "success" ]; then
             echo "FAIL: lint job did not succeed ($LINT_RESULT)" >&2
