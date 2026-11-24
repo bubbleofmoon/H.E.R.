@@ -1901,7 +1901,7 @@ pub(crate) fn history(
                  ORDER BY id DESC LIMIT ?3",
             )
             .map_err(InspectError::from_sqlite)?;
-        statement
+        let entries = statement
             .query_map(
                 params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
                 |row| {
@@ -1926,7 +1926,8 @@ pub(crate) fn history(
             )
             .map_err(InspectError::from_sqlite)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(InspectError::from_sqlite)
+            .map_err(InspectError::from_sqlite)?;
+        Ok(entries)
     })
     .map_err(|error| (503, error))?;
     let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
