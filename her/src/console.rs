@@ -63,8 +63,11 @@ fn acquire_social_state_gate(
     social_state::acquire_gate(context).map_err(SocialError::into_http)
 }
 
+use crate::config_tx::redact_setting;
 #[cfg(test)]
-use crate::config_tx::{SETTINGS_MIRROR_UNFINISHED, SETTINGS_READ_REFUSED, SETTINGS_WRITABLE};
+use crate::config_tx::{
+    setting_is_secret, SETTINGS_MIRROR_UNFINISHED, SETTINGS_READ_REFUSED, SETTINGS_WRITABLE,
+};
 #[cfg(test)]
 use crate::conversation_state::{
     new_conversation, read_console_document as load_social_state_for,

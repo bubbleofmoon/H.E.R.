@@ -1392,7 +1392,7 @@ pub(crate) fn setting_is_secret(path: &str) -> bool {
     })
 }
 
-fn redact_setting(path: &str, value: Value) -> Value {
+pub(crate) fn redact_setting(path: &str, value: Value) -> Value {
     if setting_is_secret(path) {
         return json!(SETTINGS_SECRET_MARKER);
     }
