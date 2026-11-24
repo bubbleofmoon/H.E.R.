@@ -230,11 +230,21 @@ fn ticket24_generated_console_token_is_the_hex_of_os_entropy() {
         }
         Ok(())
     };
-    let token = generate_console_token_from(&mut fill).unwrap();
-    let expected: String = (0..24u8).map(|i| format!("{:02x}", i.wrapping_mul(7).wrapping_add(1))).collect();
+    let token = crate::console_auth::generate_console_token_from(&mut fill).unwrap();
+    let expected: String =
+        (0..24u8).map(|i| format!("{:02x}", i.wrapping_mul(7).wrapping_add(1))).collect();
     assert_eq!(token, expected, "the token must be exactly the entropy bytes (not time or pid)");
-    assert!(generate_console_token_from(&mut |_: &mut [u8]| Err("no entropy".to_string())).is_err(), "no entropy, no token");
-    let (a, b) = (generate_console_token().unwrap(), generate_console_token().unwrap());
+    assert!(
+        crate::console_auth::generate_console_token_from(&mut |_: &mut [u8]| {
+            Err("no entropy".to_string())
+        })
+        .is_err(),
+        "no entropy, no token"
+    );
+    let (a, b) = (
+        crate::console_auth::generate_console_token().unwrap(),
+        crate::console_auth::generate_console_token().unwrap(),
+    );
     assert_ne!(a, b);
     for token in [&a, &b] {
         assert_eq!(token.len(), 48);

@@ -1347,9 +1347,6 @@ fn validate_browser_acl(
     if req.path != "/api/memory/acl" {
         return Ok(None);
     }
-    if bounded_post_body_too_large(req) {
-        return Err((413, BODY_TOO_LARGE_ERROR.into()));
-    }
     if !req.query.is_empty() {
         return Err((400, "browser ACL requests do not accept query fields".into()));
     }
@@ -2353,18 +2350,15 @@ pub(crate) fn handle_http_request(
     };
     let mut admitted_context = context.clone().with_console_port(port);
     let public = is_public_probe(&req.method, &req.path);
-    let mut admission = if context.is_isolated() && !public {
+    if !public
+        && (context.is_isolated() || (req.method == "GET" && req.path.starts_with("/assets/")))
+    {
         if let Some((status, value)) = host_denial(req, port) {
             return json_reply(status, value);
         }
-        None
-    } else {
-        None
-    };
+    }
+    let mut admission = None;
     if !public && req.method == "GET" && req.path.starts_with("/assets/") {
-        if let Some((status, value)) = host_denial(req, port) {
-            return json_reply(status, value);
-        }
         if has_agent_marker(req) {
             return json_reply(
                 403,
@@ -2388,11 +2382,14 @@ pub(crate) fn handle_http_request(
             isolated_admission.proof,
             Some(crate::console_auth::ConsoleAuthority::Desktop { .. })
         );
-        if req.method == "GET" && crate::console_ui::is_ui_page_request(&req.method, &req.path) {
+        if crate::console_ui::is_ui_page_request(&req.method, &req.path) {
             if has_agent_marker(req) {
                 return json_reply(
                     403,
-                    json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                    json!({
+                        "ok": false,
+                        "error": "console UI routes are restricted to administrators",
+                    }),
                 );
             }
             if !canonical_request(req, port) && !desktop {
@@ -2432,12 +2429,6 @@ pub(crate) fn handle_http_request(
     let agent_marker = has_agent_marker(req);
     if let Some(admission_state) = admission.as_mut() {
         if crate::console_ui::is_ui_page_request(&req.method, &req.path) {
-            if agent_marker {
-                return json_reply(
-                    403,
-                    json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
-                );
-            }
             if presented_console_token(req).is_some()
                 && admitted_context.console_authority.is_none()
             {

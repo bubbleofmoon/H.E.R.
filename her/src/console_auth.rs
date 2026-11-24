@@ -1230,24 +1230,22 @@ pub(crate) fn revoke_browser_sessions_authorized(
     authority: &ConsoleAuthority,
     target: RevokeTarget,
 ) -> Result<RevokeOutcome, (u16, String)> {
-    let keep_other = match (&target, authority) {
-        (RevokeTarget::Others, ConsoleAuthority::Browser { grant, .. }) => Some(grant.id_digest),
-        (RevokeTarget::Others, _) => {
-            return Err((
-                400,
-                "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true".to_string(),
-            ));
-        }
-        _ => None,
-    };
+    if matches!(target, RevokeTarget::Others)
+        && !matches!(authority, ConsoleAuthority::Browser { .. })
+    {
+        return Err((
+            400,
+            "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true".to_string(),
+        ));
+    }
     let _config = crate::social_state::acquire_config_gate(context)
         .map_err(crate::social_state::SocialError::into_http)?;
     let cfg = context
         .load_config()
         .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
     authority.recheck(context, &cfg)?;
-    let (revoked_count, delete_own) = match target {
-        RevokeTarget::One(digest) => {
+    let (revoked_count, delete_own) = match (target, authority) {
+        (RevokeTarget::One(digest), _) => {
             let removed = storage::revoke_browser_session_by_digest(context, digest)?;
             let own = matches!(
                 authority,
@@ -1257,11 +1255,17 @@ pub(crate) fn revoke_browser_sessions_authorized(
             .then_some(digest);
             (usize::from(removed), own)
         }
-        RevokeTarget::Others => {
-            let keep = keep_other.expect("browser grant checked above");
-            (storage::revoke_other_browser_sessions(context, Some(keep))?, None)
+        (RevokeTarget::Others, ConsoleAuthority::Browser { grant, .. }) => (
+            storage::revoke_other_browser_sessions(context, Some(grant.id_digest))?,
+            None,
+        ),
+        (RevokeTarget::Others, _) => {
+            return Err((
+                400,
+                "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true".to_string(),
+            ));
         }
-        RevokeTarget::All => {
+        (RevokeTarget::All, _) => {
             let count = storage::revoke_other_browser_sessions(context, None)?;
             let own = match authority {
                 ConsoleAuthority::Browser { grant, .. } => Some(grant.id_digest),

@@ -21776,7 +21776,7 @@ pub(super) mod tests {
         let missing = req("GET", "/", Some(""));
         assert!(authorized(&presented, &configured));
         assert!(memory_console_authority(&presented.headers, &configured, &context));
-        assert!(desktop_file_proof_matches(&presented, "fixture-raw-machine-proof"));
+        assert!(front::token_supplied(&presented, "fixture-raw-machine-proof"));
 
         let file = root.0.join("data/console-token");
         for contents in [Some(""), None] {
@@ -21788,7 +21788,10 @@ pub(super) mod tests {
             assert!(expected.is_empty());
             assert!(!authorized_in(&context, &missing, &empty), "selected raw auth must refuse missing proof");
             assert!(!memory_console_authority(&missing.headers, &empty, &context), "empty memory header grants no authority");
-            assert!(!desktop_file_proof_matches(&missing, &expected), "desktop file proof requires two nonempty values");
+            assert!(
+                !front::token_supplied(&missing, &expected),
+                "desktop file proof requires two nonempty values"
+            );
         }
         assert!(!authorized(&missing, &empty), "legacy raw auth must refuse two empty credentials");
     }

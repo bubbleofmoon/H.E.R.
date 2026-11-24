@@ -1,9 +1,8 @@
 //! Durable browser authentication state and the settings archive boundary.
 
 use super::{
-    canonical_origin, credential_digest, digests_equal, new_generation, restore_generation,
-    rotate_restore_generation, AdministratorPasswordHash, BrowserProof, Generation,
-    BROWSER_IDLE_MS, MAX_BROWSER_SESSIONS,
+    canonical_origin, digests_equal, new_generation, restore_generation, rotate_restore_generation,
+    AdministratorPasswordHash, BrowserProof, Generation, BROWSER_IDLE_MS, MAX_BROWSER_SESSIONS,
 };
 use crate::runtime::RuntimeContext;
 use crate::settings::{
@@ -993,10 +992,11 @@ pub(super) fn change_administrator_password(
     actor: &str,
     rotate_browser: Option<(&str, Generation)>,
 ) -> Result<Option<IssuedSession>, (u16, String)> {
-    let restore = if rotate_browser.is_some() {
-        Some(ensure_restore_generation(context)?)
-    } else {
-        None
+    let rotate_browser = match rotate_browser {
+        Some((origin, token_digest)) => {
+            Some((origin, token_digest, ensure_restore_generation(context)?))
+        }
+        None => None,
     };
     let now = crate::parity_clock::now_ms();
     let monotonic = Instant::now();
@@ -1028,14 +1028,8 @@ pub(super) fn change_administrator_password(
             "change-password",
         )?;
         reset_auth_state(conn).map_err(unavailable)?;
-        if let Some((origin, token_digest)) = rotate_browser {
-            let issued = insert_browser_session_tx(
-                conn,
-                origin,
-                token_digest,
-                restore.expect("restore generation prepared for browser rotation"),
-                now,
-            )?;
+        if let Some((origin, token_digest, restore)) = rotate_browser {
+            let issued = insert_browser_session_tx(conn, origin, token_digest, restore, now)?;
             Ok(Some(issued))
         } else {
             Ok(None)
@@ -1213,7 +1207,7 @@ pub(crate) fn seed_browser_session(
             params![
                 id.as_slice(),
                 canonical_origin(port),
-                credential_digest(token).as_slice(),
+                super::credential_digest(token).as_slice(),
                 restore.as_slice(),
                 last,
                 last + BROWSER_IDLE_MS
