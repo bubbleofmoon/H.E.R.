@@ -286,7 +286,7 @@ mod desktop_grants {
     #[derive(serde::Deserialize, serde::Serialize)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Registry {
-        v: u8,
+        pub(super) v: u8,
         pub(super) generation: [u8; 32],
         pub(super) issuer_pid: u32,
         pub(super) issuer_start: u64,
