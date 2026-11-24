@@ -573,12 +573,29 @@ mod tests {
         apply(&mut state, &chain, 0, failed("quota"), 100);
         assert_eq!(state.all_failed, None, "one of two routes failed");
         apply(&mut state, &chain, 1, failed("timeout"), 200);
-        assert_eq!(state.all_failed, Some(Episode { n: 200, since: 200, class: "timeout".into(), alerted: false, claim: None }));
+        assert_eq!(
+            state.all_failed,
+            Some(Episode {
+                n: 200,
+                since: 200,
+                class: "timeout".into(),
+                alerted: false,
+                claim: None,
+                last_key: None,
+            })
+        );
         state.all_failed.as_mut().unwrap().alerted = true;
         apply(&mut state, &chain, 0, failed("backend"), 300);
         assert_eq!(
             state.all_failed,
-            Some(Episode { n: 200, since: 200, class: "backend".into(), alerted: true, claim: None }),
+            Some(Episode {
+                n: 200,
+                since: 200,
+                class: "backend".into(),
+                alerted: true,
+                claim: None,
+                last_key: None,
+            }),
             "a later failure keeps the episode and its alert"
         );
         apply(&mut state, &chain, 1, Seen::Answered, 400);
@@ -586,7 +603,14 @@ mod tests {
         apply(&mut state, &chain, 1, failed("quota"), 500);
         assert_eq!(
             state.all_failed,
-            Some(Episode { n: 500, since: 500, class: "quota".into(), alerted: false, claim: None }),
+            Some(Episode {
+                n: 500,
+                since: 500,
+                class: "quota".into(),
+                alerted: false,
+                claim: None,
+                last_key: None,
+            }),
             "a new episode is owed again"
         );
         let single = chain_of(&["only-route"]);

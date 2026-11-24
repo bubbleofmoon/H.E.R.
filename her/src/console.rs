@@ -3112,8 +3112,14 @@ fn handle_usage_attribution(context: &RuntimeContext, cfg: &Value, days: i64) ->
 
     let ledger = ledger_for_runtime(context)?;
     let attr = ledger.dsh_attribution(&table, &start_day, now);
-    let (dsh_turns, dsh_tokens, dsh_cost) = dsh_usage_total(context, &start_day)?;
-    Ok(attr.to_response(days, &today, &start_day, &table, dsh_turns, dsh_tokens, dsh_cost))
+    let (turns, tokens, cost) = dsh_usage_total(context, &start_day)?;
+    Ok(attr.to_response(
+        days,
+        &today,
+        &start_day,
+        &table,
+        crate::ledger::DshTotals { turns, tokens, cost },
+    ))
 }
 /// `/api/tokens/recent?limit=`：最近 N 条按轮计费的采样（带金额与峰谷标记）。
 ///

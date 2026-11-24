@@ -25,8 +25,7 @@
 mod storage;
 
 pub use storage::{
-    LedgerStorage, DEFAULT_KEEP_SAMPLES, DEFAULT_MAX_LINES, LEDGER_FILE, LEDGER_FILES,
-    RUST_LEDGER_FILE, SESSIONS_FILE,
+    LedgerStorage, DEFAULT_MAX_LINES, LEDGER_FILE, LEDGER_FILES, RUST_LEDGER_FILE,
 };
 
 use serde_json::{json, Value};
@@ -2092,6 +2091,14 @@ pub struct DshAttribution {
     pub by_provider: BTreeMap<String, AttributionAgg>,
 }
 
+/// DSH total summary passed into `DshAttribution::to_response`.
+#[derive(Debug, Clone, Copy)]
+pub struct DshTotals {
+    pub turns: i64,
+    pub tokens: f64,
+    pub cost: f64,
+}
+
 impl DshAttribution {
     /// Combine bridge attribution with `.dshw-usage.json` totals for `/api/usage/attribution`.
     pub fn to_response(
@@ -2100,9 +2107,7 @@ impl DshAttribution {
         today: &str,
         start_day: &str,
         table: &PriceTable,
-        dsh_turns: i64,
-        dsh_tokens: f64,
-        dsh_cost: f64,
+        dsh: DshTotals,
     ) -> Value {
         let token_sort_key = |v: &Value| v.get("tokens").and_then(|t| t.as_f64()).unwrap_or(0.0);
         let mut by_key_rows: Vec<Value> = self
@@ -2133,9 +2138,9 @@ impl DshAttribution {
                 .partial_cmp(&token_sort_key(a))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let unattributed_turns = dsh_turns - self.samples;
-        let unattributed_tokens = dsh_tokens - self.our.tokens;
-        let unattributed_cost = dsh_cost - self.our.cost;
+        let unattributed_turns = dsh.turns - self.samples;
+        let unattributed_tokens = dsh.tokens - self.our.tokens;
+        let unattributed_cost = dsh.cost - self.our.cost;
         let note = "DSH 总账（.dshw-usage.json）减去桥接账本（token-usage.jsonl 里带 key 的记录）。\
 差额没有被吞掉：可能是 Web GUI / CLI 探针等没有 QQ 会话归属的调用，也可能是回合刚跑完、\
 总账尚未落盘（此时为负）。dshTotal.turns 与 unattributed.turns 都按 LLM 请求计（总账事件\
@@ -2152,10 +2157,10 @@ impl DshAttribution {
                 "samples": self.samples,
             },
             "dshTotal": {
-                "turns": dsh_turns,
-                "tokens": dsh_tokens,
-                "cost": dsh_cost,
-                "events": dsh_turns,
+                "turns": dsh.turns,
+                "tokens": dsh.tokens,
+                "cost": dsh.cost,
+                "events": dsh.turns,
             },
             "unattributed": {
                 "turns": unattributed_turns,
@@ -2172,6 +2177,7 @@ impl DshAttribution {
 /// Pure output of token ledger compaction (`Ledger::compact_plan` / `compact_jsonl`).
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
+    #[cfg(test)]
     pub records: Vec<Value>,
     pub jsonl: String,
     pub evicted_attempt_ids: Vec<String>,
@@ -2436,6 +2442,7 @@ impl Ledger {
         let jsonl: String = records.iter().map(|r| format!("{r}\n")).collect();
         let compacted = evict_count > 0 || self.journal_lines > records.len();
         CompactionPlan {
+            #[cfg(test)]
             records,
             jsonl,
             evicted_attempt_ids,

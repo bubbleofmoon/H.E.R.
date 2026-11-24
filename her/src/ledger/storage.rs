@@ -23,15 +23,18 @@ pub const RUST_LEDGER_FILE: &str = crate::legacy_path!("state/token-usage-rust.j
 /// All ledger files merged by read views.
 pub const LEDGER_FILES: [&str; 2] = [LEDGER_FILE, RUST_LEDGER_FILE];
 /// Active DSH sessions map for legacy key resolution.
-pub const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
+const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
 
 pub const DEFAULT_MAX_LINES: usize = 20_000;
-pub const DEFAULT_KEEP_SAMPLES: usize = 10_000;
+const DEFAULT_KEEP_SAMPLES: usize = 10_000;
 
 const RUST_LEDGER_NAME: &str = "token-usage-rust.jsonl";
 const JS_LEDGER_NAME: &str = "token-usage.jsonl";
 const COMPACT_SIDECAR: &str = "token-usage-rust.jsonl.compact";
 const RECONCILE_FILE: &str = "harness-usage-reconcile.json";
+/// Leaf lock protecting `RECONCILE_FILE` read-modify-write only. Lock order: `RECONCILE_LOCK` and
+/// ledger file locks (`JS_LEDGER_NAME`, `RUST_LEDGER_NAME`) are strictly disjoint leaf gates;
+/// neither is ever acquired while holding the other or while opening `conversations.db`.
 const RECONCILE_LOCK: &str = "locks/harness-reconcile.lock";
 
 /// I/O adapter for token ledger JSONL persistence, locking, compaction, and reset.
@@ -174,59 +177,63 @@ impl LedgerStorage {
         let sidecar_len = context
             .optional_file_len(RuntimeArea::Data, COMPACT_SIDECAR)
             .map_err(|e| e.to_string())?;
-        if rust_len.unwrap_or(0) == 0 && sidecar_len.unwrap_or(0) == 0 {
+        if rust_len == 0 && sidecar_len == 0 {
             return Ok(false);
         }
         let sessions_json = context
             .read_optional_text(RuntimeArea::Data, "sessions.json")
             .map_err(|e| e.to_string())?;
-        let mut file = open_locked_file_retry(
-            context,
-            RuntimeArea::Data,
-            RUST_LEDGER_NAME,
-            Instant::now() + APPEND_CONFLICT_WAIT,
-        )?;
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)
-            .map_err(|e| format!("读取账本失败：{}", runtime_io_error("compact/read", &e)))?;
-        if raw.is_empty() {
-            if let Some(sidecar) = context
-                .read_optional_text(RuntimeArea::Data, COMPACT_SIDECAR)
-                .map_err(|e| e.to_string())?
-                .filter(|s| !s.is_empty())
-            {
-                write_locked_handle(&mut file, sidecar.as_bytes())?;
-                raw = sidecar;
+        let evicted_attempt_ids = {
+            let mut file = open_locked_file_retry(
+                context,
+                RuntimeArea::Data,
+                RUST_LEDGER_NAME,
+                Instant::now() + APPEND_CONFLICT_WAIT,
+            )?;
+            let mut raw = String::new();
+            file.read_to_string(&mut raw)
+                .map_err(|e| format!("读取账本失败：{}", runtime_io_error("compact/read", &e)))?;
+            if raw.is_empty() {
+                if let Some(sidecar) = context
+                    .read_optional_text(RuntimeArea::Data, COMPACT_SIDECAR)
+                    .map_err(|e| e.to_string())?
+                    .filter(|s| !s.is_empty())
+                {
+                    write_locked_handle(&mut file, sidecar.as_bytes())?;
+                    raw = sidecar;
+                }
             }
-        }
-        let line_count = raw.split('\n').filter(|l| !l.is_empty()).count();
-        if line_count < max_lines {
+            let line_count = raw.split('\n').filter(|l| !l.is_empty()).count();
+            if line_count < max_lines {
+                remove_sidecar(context);
+                return Ok(false);
+            }
+            let plan = compact_jsonl(
+                &raw,
+                sessions_json.as_deref(),
+                table,
+                keep_samples,
+                now_ms(),
+            );
+            if !plan.compacted {
+                remove_sidecar(context);
+                return Ok(false);
+            }
+            context.write_atomic(RuntimeArea::Data, COMPACT_SIDECAR, plan.jsonl.as_bytes())?;
+            write_locked_handle(&mut file, plan.jsonl.as_bytes())?;
             remove_sidecar(context);
-            return Ok(false);
-        }
-        let plan = compact_jsonl(
-            &raw,
-            sessions_json.as_deref(),
-            table,
-            keep_samples,
-            now_ms(),
-        );
-        if !plan.compacted {
-            remove_sidecar(context);
-            return Ok(false);
-        }
-        if !plan.evicted_attempt_ids.is_empty() {
+            plan.evicted_attempt_ids
+        };
+        // Ledger lock is released before querying `conversations.db` or taking `RECONCILE_LOCK`.
+        if !evicted_attempt_ids.is_empty() {
             let max_seq = crate::harness::store::max_attempt_event_seq(
                 context,
-                Some(&plan.evicted_attempt_ids),
+                Some(&evicted_attempt_ids),
             )?;
             if max_seq > 0 {
                 Self::advance_reconcile_seq(context, max_seq)?;
             }
         }
-        context.write_atomic(RuntimeArea::Data, COMPACT_SIDECAR, plan.jsonl.as_bytes())?;
-        write_locked_handle(&mut file, plan.jsonl.as_bytes())?;
-        remove_sidecar(context);
         Ok(true)
     }
 
@@ -278,32 +285,35 @@ impl LedgerStorage {
             };
             let js_exists = exists(&js_path)?;
             let rust_exists = exists(&rust_path)?;
-            let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
-                let rust = context
-                    .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
+            {
+                let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
+                    let rust = context
+                        .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
+                        .map_err(|_| err())?;
+                    let js = context
+                        .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
+                        .map_err(|_| err())?;
+                    (js, rust)
+                } else {
+                    let js = context
+                        .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
+                        .map_err(|_| err())?;
+                    let rust = context
+                        .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
+                        .map_err(|_| err())?;
+                    (js, rust)
+                };
+                js_ledger
+                    .set_len(0)
+                    .and_then(|_| js_ledger.sync_all())
                     .map_err(|_| err())?;
-                let js = context
-                    .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
+                rust_ledger
+                    .set_len(0)
+                    .and_then(|_| rust_ledger.sync_all())
                     .map_err(|_| err())?;
-                (js, rust)
-            } else {
-                let js = context
-                    .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
-                    .map_err(|_| err())?;
-                let rust = context
-                    .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
-                    .map_err(|_| err())?;
-                (js, rust)
-            };
-            js_ledger
-                .set_len(0)
-                .and_then(|_| js_ledger.sync_all())
-                .map_err(|_| err())?;
-            rust_ledger
-                .set_len(0)
-                .and_then(|_| rust_ledger.sync_all())
-                .map_err(|_| err())?;
-            remove_sidecar(context);
+                remove_sidecar(context);
+            }
+            // Release ledger locks before querying `conversations.db` or taking `RECONCILE_LOCK`.
             if let Ok(max_seq) = crate::harness::store::max_attempt_event_seq(context, None) {
                 if max_seq > 0 {
                     let _ = Self::advance_reconcile_seq(context, max_seq);
