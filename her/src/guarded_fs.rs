@@ -20,6 +20,15 @@ pub(crate) enum AclPolicy {
     OwnerSystemAdmins,
 }
 
+/// Outcome of verifying and conditionally hardening an entry's permissions / DACL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestrictOutcome {
+    /// Entry already matched `policy` without needing a permission / DACL write.
+    AlreadyPrivate,
+    /// Entry permissions / DACL were updated to match `policy`.
+    Hardened,
+}
+
 /// Failure from applying or verifying private permissions / DACLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AclError {
@@ -213,6 +222,23 @@ pub(crate) fn restrict_entry(
             )));
         }
         windows::restrict_path(path, Some(meta.is_dir()), policy)
+    }
+}
+
+/// Verify on one no-follow handle/FD whether `path` already matches `policy`, hardening it on
+/// that same handle only when needed.
+pub(crate) fn ensure_entry_private(
+    path: &Path,
+    expected_dir: Option<bool>,
+    policy: AclPolicy,
+) -> Result<RestrictOutcome, AclError> {
+    #[cfg(unix)]
+    {
+        unix::ensure_entry_private(path, expected_dir, policy)
+    }
+    #[cfg(windows)]
+    {
+        windows::ensure_entry_private(path, expected_dir, policy)
     }
 }
 
@@ -576,7 +602,7 @@ pub(crate) fn remove_protected_file_with(
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     pub(super) fn check_ownership(path: &Path, meta: &fs::Metadata) -> Result<(), AclError> {
         // SAFETY: geteuid has no preconditions.
@@ -603,6 +629,84 @@ mod unix {
             }
         })
     }
+
+    pub(super) fn ensure_entry_private(
+        path: &Path,
+        expected_dir: Option<bool>,
+        policy: AclPolicy,
+    ) -> Result<RestrictOutcome, AclError> {
+        let _ = policy;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        if expected_dir == Some(true) {
+            flags |= libc::O_DIRECTORY;
+        }
+        options.custom_flags(flags);
+        let file = options.open(path).map_err(|error| {
+            let reason = format!(
+                "private path {}: open failed ({})",
+                sanitized_path(path),
+                native_error_code(&error)
+            );
+            if vanished(&error) {
+                AclError::Missing(reason)
+            } else {
+                AclError::Refused(reason)
+            }
+        })?;
+        let meta = file.metadata().map_err(|error| {
+            let reason = format!(
+                "private path {}: metadata failed ({})",
+                sanitized_path(path),
+                native_error_code(&error)
+            );
+            if vanished(&error) {
+                AclError::Missing(reason)
+            } else {
+                AclError::Refused(reason)
+            }
+        })?;
+        if is_link(&meta)
+            || !(meta.is_file() || meta.is_dir())
+            || expected_dir.is_some_and(|dir| dir != meta.is_dir())
+        {
+            return Err(AclError::Refused(format!(
+                "private path {}: unexpected entry type",
+                sanitized_path(path)
+            )));
+        }
+        if meta.nlink() == 0 {
+            return Err(AclError::Missing(format!(
+                "private path {}: entry was unlinked",
+                sanitized_path(path)
+            )));
+        }
+        check_ownership(path, &meta)?;
+        let current_mode = meta.permissions().mode() & 0o7777;
+        let target_mode = if meta.is_dir() {
+            0o700
+        } else {
+            (current_mode & 0o700) | 0o600
+        };
+        if current_mode == target_mode {
+            return Ok(RestrictOutcome::AlreadyPrivate);
+        }
+        file.set_permissions(fs::Permissions::from_mode(target_mode))
+            .map_err(|error| {
+                let reason = format!(
+                    "private permissions could not be applied: {}: set_permissions failed ({})",
+                    sanitized_path(path),
+                    native_error_code(&error)
+                );
+                if vanished(&error) {
+                    AclError::Missing(reason)
+                } else {
+                    AclError::Refused(reason)
+                }
+            })?;
+        Ok(RestrictOutcome::Hardened)
+    }
 }
 
 #[cfg(windows)]
@@ -610,7 +714,9 @@ mod windows {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, LocalFree, ERROR_DELETE_PENDING, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
         NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
@@ -652,7 +758,7 @@ mod windows {
 
     fn windows_acl_err(path: &Path, step: &str, code: u32) -> AclError {
         let reason = windows_acl_error(path, step, code);
-        if win32_vanished(code) {
+        if win32_vanished(code) || code == ERROR_DELETE_PENDING {
             AclError::Missing(reason)
         } else {
             AclError::Refused(reason)
@@ -786,6 +892,12 @@ mod windows {
                 sanitized_path(path)
             )));
         }
+        if info.nNumberOfLinks == 0 {
+            return Err(AclError::Missing(format!(
+                "private ACL {}: entry was unlinked",
+                sanitized_path(path)
+            )));
+        }
         let is_dir = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         Ok((file, is_dir))
     }
@@ -827,6 +939,29 @@ mod windows {
             Ok(unsafe { File::from_raw_handle(handle) })
         })
         .map_err(io::Error::from)?
+    }
+
+    pub(super) fn ensure_entry_private(
+        path: &Path,
+        expected_dir: Option<bool>,
+        policy: AclPolicy,
+    ) -> Result<RestrictOutcome, AclError> {
+        let (file, is_dir) = open_handle_no_follow(path, READ_CONTROL | WRITE_DAC)?;
+        if expected_dir.is_some_and(|dir| dir != is_dir) {
+            return Err(AclError::Refused(format!(
+                "private ACL {}: unexpected entry type",
+                sanitized_path(path)
+            )));
+        }
+        let sids = policy_sids(path, policy)?;
+        let expected: Vec<&[u8]> = sids.iter().map(Vec::as_slice).collect();
+        match check_handle_exact_grants(&file, path, is_dir, &expected)? {
+            VerifyGrants::Match => Ok(RestrictOutcome::AlreadyPrivate),
+            VerifyGrants::Mismatch(_) => {
+                restrict_handle(&file, path, is_dir, policy)?;
+                Ok(RestrictOutcome::Hardened)
+            }
+        }
     }
 
     pub(super) fn restrict_path(
@@ -889,12 +1024,17 @@ mod windows {
         verify_handle_exact_grants(&file, path, directory, &expected)
     }
 
-    fn verify_handle_exact_grants(
+    enum VerifyGrants {
+        Match,
+        Mismatch(String),
+    }
+
+    fn check_handle_exact_grants(
         file: &File,
         path: &Path,
         directory: bool,
         sids: &[&[u8]],
-    ) -> Result<(), AclError> {
+    ) -> Result<VerifyGrants, AclError> {
         let mut descriptor = LocalDescriptor(std::ptr::null_mut());
         let mut acl = std::ptr::null_mut();
         // SAFETY: open handle and initialized output pointers; `descriptor` owns `acl`.
@@ -913,11 +1053,11 @@ mod windows {
         if result != 0 {
             return Err(windows_acl_err(path, "GetSecurityInfo (verify)", result));
         }
-        let invalid = |reason: &str| {
-            AclError::Refused(format!(
+        let mismatch = |reason: &str| {
+            Ok(VerifyGrants::Mismatch(format!(
                 "private ACL {}: verify failed: {reason}",
                 sanitized_path(path)
-            ))
+            )))
         };
         let mut control = 0;
         let mut revision = 0;
@@ -925,22 +1065,22 @@ mod windows {
         if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
             // SAFETY: immediate Win32 error lookup.
             let code = unsafe { GetLastError() };
-            return Err(AclError::Refused(windows_acl_error(
+            return Err(windows_acl_err(
                 path,
                 "GetSecurityDescriptorControl (verify)",
                 code,
-            )));
+            ));
         }
         if control & SE_DACL_PROTECTED == 0 {
-            return Err(invalid("DACL is not protected; parent inheritance is enabled"));
+            return mismatch("DACL is not protected; parent inheritance is enabled");
         }
         // SAFETY: non-null `acl` belongs to retained `descriptor.0`.
         if acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
-            return Err(invalid("DACL is missing or invalid"));
+            return mismatch("DACL is missing or invalid");
         }
         // SAFETY: IsValidAcl validated header and ACE count.
         if usize::from(unsafe { (*acl).AceCount }) != sids.len() {
-            return Err(invalid("DACL contains an unexpected number of grants"));
+            return mismatch("DACL contains an unexpected number of grants");
         }
         let expected_flags = if directory {
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
@@ -955,11 +1095,7 @@ mod windows {
             if unsafe { GetAce(acl, index as u32, &mut ace) } == 0 {
                 // SAFETY: immediate Win32 error lookup.
                 let code = unsafe { GetLastError() };
-                return Err(AclError::Refused(windows_acl_error(
-                    path,
-                    "GetAce (verify)",
-                    code,
-                )));
+                return Err(windows_acl_err(path, "GetAce (verify)", code));
             }
             // SAFETY: GetAce returned a validated ACE header inside `acl`.
             let header = unsafe { &*ace.cast::<ACE_HEADER>() };
@@ -967,7 +1103,7 @@ mod windows {
                 || header.AceType != 0
                 || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
             {
-                return Err(invalid("DACL contains an unexpected ACE type or flags"));
+                return mismatch("DACL contains an unexpected ACE type or flags");
             }
             let sid_bytes = usize::from(header.AceSize) - sid_offset;
             // SAFETY: ACCESS_ALLOWED_ACE fixed fields and SID bytes fit inside `header.AceSize`.
@@ -976,14 +1112,26 @@ mod windows {
                 std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), sid_bytes)
             };
             let Some(found) = remaining.iter().position(|expected| *expected == sid) else {
-                return Err(invalid("DACL contains a repeated or unexpected SID"));
+                return mismatch("DACL contains a repeated or unexpected SID");
             };
             remaining.swap_remove(found);
             if allowed.Mask != FILE_ALL_ACCESS || u32::from(header.AceFlags) != expected_flags {
-                return Err(invalid("ACE has incorrect access or inheritance flags"));
+                return mismatch("ACE has incorrect access or inheritance flags");
             }
         }
-        Ok(())
+        Ok(VerifyGrants::Match)
+    }
+
+    fn verify_handle_exact_grants(
+        file: &File,
+        path: &Path,
+        directory: bool,
+        sids: &[&[u8]],
+    ) -> Result<(), AclError> {
+        match check_handle_exact_grants(file, path, directory, sids)? {
+            VerifyGrants::Match => Ok(()),
+            VerifyGrants::Mismatch(reason) => Err(AclError::Refused(reason)),
+        }
     }
 
     fn check_owner_and_acl_trustees(
@@ -1252,6 +1400,94 @@ mod tests {
         let hard = dir.0.join("hard");
         fs::hard_link(&real, &hard).unwrap();
         assert!(open_protected_file(&real).is_err());
+        assert!(matches!(
+            ensure_entry_private(&real, Some(false), AclPolicy::OwnerOnly),
+            Err(AclError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn ensure_entry_private_skips_verified_entries_and_hardens_exposed_ones() {
+        let dir = TempDir::new("ensure-private");
+        let sub = dir.0.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let file = sub.join("secret.txt");
+        fs::write(&file, b"synthetic").unwrap();
+
+        assert_eq!(
+            ensure_entry_private(&sub, Some(true), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_eq!(
+            ensure_entry_private(&sub, Some(true), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::AlreadyPrivate)
+        );
+        assert_eq!(
+            ensure_entry_private(&file, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_eq!(
+            ensure_entry_private(&file, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::AlreadyPrivate)
+        );
+        assert!(verify_file_private(&file, AclPolicy::OwnerOnly));
+
+        assert!(matches!(
+            ensure_entry_private(&sub.join("missing"), Some(false), AclPolicy::OwnerOnly),
+            Err(AclError::Missing(_))
+        ));
+        assert!(matches!(
+            ensure_entry_private(&sub, Some(false), AclPolicy::OwnerOnly),
+            Err(AclError::Refused(_))
+        ));
+        assert!(matches!(
+            ensure_entry_private(&file, Some(true), AclPolicy::OwnerOnly),
+            Err(AclError::Refused(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_entry_private_unix_preserves_exec_and_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("ensure-unix");
+        let exec = dir.0.join("relay-bin");
+        fs::write(&exec, b"bin").unwrap();
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            ensure_entry_private(&exec, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_eq!(
+            fs::symlink_metadata(&exec).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            ensure_entry_private(&exec, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::AlreadyPrivate)
+        );
+
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ensure_entry_private(&exec, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+
+        let outside = TempDir::new("ensure-unix-out");
+        let target = outside.0.join("target");
+        fs::write(&target, b"outside").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            ensure_entry_private(&link, Some(false), AclPolicy::OwnerOnly),
+            Err(AclError::Refused(_))
+        ));
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }
 
@@ -1484,7 +1720,53 @@ mod native_tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(restrict_path(&junction, AclPolicy::OwnerOnly).is_err());
+        assert!(ensure_entry_private(&junction, Some(true), AclPolicy::OwnerOnly).is_err());
         assert!(!is_directory_hardened(&junction, AclPolicy::OwnerSystemAdmins));
         assert!(harden_directory_tree(&junction, AclPolicy::OwnerSystemAdmins).is_err());
+    }
+
+    #[test]
+    fn ensure_entry_private_skips_exact_dacl_and_handles_open_writer() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let fixture = Fixture::new("ensure-win");
+        assert_eq!(
+            ensure_entry_private(&fixture.0, Some(true), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_eq!(
+            ensure_entry_private(&fixture.0, Some(true), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::AlreadyPrivate)
+        );
+
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&part)
+            .unwrap();
+        // Inherited ACE only (`!SE_DACL_PROTECTED`), so handle-based check must harden it once,
+        // even while an active writer holds the file open without FILE_SHARE_WRITE/DELETE.
+        assert_dacl_owner_only(&part, false, 16);
+        assert_eq!(
+            ensure_entry_private(&part, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_dacl_owner_only(&part, true, 0);
+        assert_eq!(
+            ensure_entry_private(&part, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::AlreadyPrivate)
+        );
+        drop(writer);
+
+        // Foreign SID triggers mismatch and re-hardening on the handle.
+        apply_sddl(&part, "D:P(A;;FA;;;WD)", true);
+        assert_eq!(
+            ensure_entry_private(&part, Some(false), AclPolicy::OwnerOnly),
+            Ok(RestrictOutcome::Hardened)
+        );
+        assert_dacl_owner_only(&part, true, 0);
     }
 }
