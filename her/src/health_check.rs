@@ -208,7 +208,7 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
     });
     let (mut snowluma, (mut dsh, dsh_login)) = (snowluma, dsh);
     for (name, part) in [("snowluma", &mut snowluma), ("dsh", &mut dsh)] {
-        match crate::supervisor_dependencies::pinned_version(&cfg, name) {
+        match crate::supervisor_dependencies::runnable_pin(&cfg, name) {
             Ok(version) => part.pinned_version = version,
             Err(reason) => *part = Part::new(false, reason),
         }

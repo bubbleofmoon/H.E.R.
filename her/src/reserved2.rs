@@ -60,8 +60,8 @@ impl Active {
     }
 }
 
-/// Wakes waiting for DSH, per conversation: at most `dsh_health::QUEUE_MAX` each (JS `QUEUE_MAX` per key), the oldest of that
-/// conversation dropped beyond it. There is no process-wide cap: one busy conversation never costs another its wake.
+/// Wakes waiting for DSH, per conversation: at most `dsh_health::QUEUE_MAX` each (the oldest of that
+/// conversation dropped beyond it). There is no process-wide cap: one busy conversation never costs another its wake.
 #[derive(Default)]
 struct DshWait {
     per_key: HashMap<String, std::collections::VecDeque<(i64, String)>>,
@@ -2700,8 +2700,8 @@ mod tests {
 
     #[tokio::test]
     async fn refreshed_default_wake_config_reaches_a_running_driver_without_a_new_confirmation() {
-        // JS `refreshDefaultWakeConfigV2` replaces the in-memory wake config but keeps
-        // `confirmedAt`, so a change of `confirmedAt` alone cannot be the signal to adopt it.
+        // Default wake-config refreshes preserve `confirmedAt`, so `WakeSync` diffs the whole config
+        // rather than relying on `confirmedAt` alone (pinned by this test).
         let (root, mut hub) = queued_hub("refreshed-default").await;
         let key = "group:420042";
         hub.ready.clear();
@@ -2975,7 +2975,7 @@ mod tests {
     mod ticket24_base { include!("reserved2_ticket24_base_tests.rs"); }
     mod ticket24 { include!("reserved2_ticket24_tests.rs"); }
 
-    /// Ticket 25 review 2: wakes waiting for DSH are bounded per conversation (JS `QUEUE_MAX` per key, the oldest of that
+    /// Ticket 25 review 2: wakes waiting for DSH are bounded per conversation (`dsh_health::QUEUE_MAX` per key, the oldest of that
     /// conversation dropped); no process-wide cap ever throws one conversation's work away for another's.
     #[test]
     fn waiting_wakes_are_bounded_per_conversation_not_per_process() {
@@ -3141,8 +3141,8 @@ impl Hub {
         }
     }
 
-    /// `segmentsToText` over one inbound message, with the gateway lookups JS `handleIncoming` uses. A failed
-    /// lookup falls back to the QQ number / `[引用消息]`, as in JS.
+    /// Render an inbound message via `inbound_text::render_inbound` using gateway lookups; a failed
+    /// lookup falls back to `@<qq>` / `[引用消息]` (pinned by `inbound_text` tests).
     fn render(&mut self, cfg: &Value, key: &str, message: &Value, self_id: i64) -> inbound_text::Rendered {
         if self.lookups.is_none() {
             match chat::onebot_of(&self.context, cfg) {
@@ -3312,8 +3312,8 @@ impl Hub {
         Ok((doc.into_value(), in_turn))
     }
 
-    /// Queue a wake that cannot be dispatched while DSH is down. A full conversation drops its oldest wake (JS shifts its
-    /// queue); the messages themselves stay in the conversation state and are served by the wakes that remain.
+    /// Queue a wake that cannot be dispatched while DSH is down. A full conversation drops its oldest wake
+    /// (`dsh_health::QUEUE_MAX` cap); the messages themselves stay in the conversation state and are served by the wakes that remain.
     fn park_for_dsh(&mut self, key: &str, now: i64, reason: String) {
         if let Some((_, dropped)) = self.dsh_wait.push(key, now, reason) {
             println!("[reserved2] {key} 等待 DSH 的唤醒已满（{}），丢弃最早的一条（{dropped}）", crate::dsh_health::QUEUE_MAX);
@@ -3587,8 +3587,8 @@ impl Hub {
         {
             return Ok(());
         }
-        // JS `handleIncoming` returns before the store for a message with no words of its own that does not
-        // quote the bot (a lone quote of someone else, whitespace).
+        // Messages with no words of their own that do not quote the bot (e.g. quoting someone else or whitespace)
+        // are settled without storage.
         if !is_poke && plain.is_empty() && !quote_self {
             self.journal.mark_handled(vec![inbound_key], now).await?;
             return Ok(());
@@ -3644,8 +3644,8 @@ impl Hub {
         // for `qq_get_message_detail` (model views never carry it).
         let full = if is_poke { None } else { inbound_text::stored_full_text(&text, inbound_text::full_text_cap(&cfg)) };
         let (media, forward_ids) = crate::forward_fmt::collect_segment_meta(ev.message.as_array().map(Vec::as_slice).unwrap_or(&[]));
-        // JS `handleIncoming` stores a private message's sender as `'私聊'` (the name is only for groups);
-        // `appendSocialV2Message` adds `ownerLabel` for the owner (`String(cfg.ownerQQ ?? '')`).
+        // Private messages store sender as `'私聊'` (display names apply only to groups);
+        // `record_reserved2_incoming` adds `ownerLabel` for the owner (`String(cfg.ownerQQ ?? '')`).
         let stored_sender = if !is_poke && key.starts_with("private:") { "私聊".to_string() } else { sender.clone() };
         let owner_qq = cfg.get("ownerQQ").filter(|v| !v.is_null()).map(crate::aux_text::js_string).unwrap_or_default();
         let is_owner = ev.user_id.map(|id| id.to_string()).is_some_and(|id| id == owner_qq);
@@ -4209,7 +4209,7 @@ impl Hub {
                         .await?;
                 }
             } else if result.is_ok() || (model_error.is_some() && !held) {
-                // JS runs the wake-reminder check at every turn end, a model error included.
+                // Run the wake-reminder check at every turn end, a model error included.
                 if result.is_ok() {
                     self.failures.remove(&key);
                 }
@@ -4296,9 +4296,9 @@ impl Hub {
             self.ready
                 .push((key.clone(), self.retries.remove(&key).unwrap().1));
         }
-        // Manual wakes from the console (`POST /api/socialV2/wake`), JS `sendWakePromptV2`: the
-        // pending batch wake is replaced, a busy conversation buffers the reason, a free one wakes
-        // now (rate limits still apply). One request per conversation per tick.
+        // Manual wakes from the console (`POST /api/socialV2/wake`): the pending batch wake is
+        // replaced, a busy conversation buffers the reason, and a free one wakes now (rate limits still apply).
+        // One request per conversation per tick.
         let requested: Vec<String> = state["conversations"]
             .as_object()
             .map(|c| c.iter().filter(|(_, v)| v["adminWakes"].as_array().is_some_and(|a| !a.is_empty())).map(|(k, _)| k.clone()).collect())

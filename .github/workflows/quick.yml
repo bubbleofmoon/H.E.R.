@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'run-tests.py target name(s), comma-separated (unit, herupdate, memory_library, an her/tests stem, scripts), or alone: lint, check, console_ui'
+        description: 'run-tests.py target name(s), comma-separated (unit, herupdate, memory_library, an her/tests stem, scripts, dsh_contract), or alone: lint, check, console_ui'
         required: true
       filter:
         description: 'optional libtest name filter'
@@ -36,7 +36,8 @@ concurrency:
 jobs:
   quick:
     name: quick (${{ inputs.os }}, ${{ inputs.target }})
-    runs-on: ${{ inputs.os == 'windows' && 'windows-2022' || 'ubuntu-24.04' }}
+    # The DSH contract needs unprivileged user and network namespaces.
+    runs-on: ${{ inputs.os == 'windows' && 'windows-2022' || (contains(format(',{0},', inputs.target), ',dsh_contract,') && 'ubuntu-22.04') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     defaults:
       run:
@@ -91,7 +92,7 @@ jobs:
         with:
           # rust-cache joins workspace and target; relative so it resolves to CARGO_TARGET_DIR on both OSes.
           workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ inputs.os == 'windows' && '../../her-ci-target' || '../../her-target' }}
-          key: quick-${{ inputs.os }}
+          key: quick-${{ inputs.os }}${{ contains(format(',{0},', inputs.target), ',dsh_contract,') && '-dsh-contract' || '' }}
           cache-on-failure: true
       - name: Build and run the named target
         if: inputs.target != 'lint' && inputs.target != 'check' && inputs.target != 'console_ui'

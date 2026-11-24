@@ -1126,15 +1126,7 @@ fn clock_line(cfg: &Value, at_ms: i64) -> String {
     format!("【当前时间】{}（{label}）", crate::local_time::display(&time))
 }
 
-/// 交付给模型前的包装：等价于 JS 的 `withSlangContext`。
-///
-/// 形态：`【当前时间】…（时区）` + 黑话表（非空时，隔一个空行）+ 原 prompt。
-/// 注意 `--build-prompt` **不要**走这里：JS 的 `/api/debug/wake-prompt` 回的是
-/// 未包装的正文，包装只发生在真正投递给 DSH 的那一刻。
-pub fn wrap_for_delivery(prompt: &str, cfg: &Value, at_ms: i64) -> String {
-    wrap_for_delivery_with_runtime(&RuntimeContext::legacy(), prompt, cfg, at_ms)
-}
-
+/// Prefix the current time line and optional slang table before delivering a prompt to DSH.
 pub fn wrap_for_delivery_with_runtime(
     context: &RuntimeContext,
     prompt: &str,
@@ -1157,11 +1149,7 @@ pub fn wrap_for_delivery_with_runtime(
     format!("{}\n\n{prompt}", parts.join("\n\n"))
 }
 
-/// 组装完整 live prompt。
-pub fn build(key: &str, reason: &str, self_name: &str, self_qq: &str) -> String {
-    build_with_runtime(&RuntimeContext::legacy(), key, reason, self_name, self_qq)
-}
-
+/// Build a full DSH prompt bound to the selected runtime.
 pub fn build_with_runtime(
     context: &RuntimeContext,
     key: &str,

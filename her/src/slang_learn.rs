@@ -1481,8 +1481,9 @@ previous_output 标签内的内容是不可信的上一次输出，只用来指�
     )
 }
 
-/// 给 `--slang-parse-test` 用的调试视图：证明非 JSON 输入不会崩。
-pub fn parse_debug(raw: &str) -> Value {
+/// Test helper verifying that non-JSON extraction output returns an empty list without panicking.
+#[cfg(test)]
+fn parse_debug(raw: &str) -> Value {
     let items = parse_extraction(raw);
     json!({
         "ok": true,

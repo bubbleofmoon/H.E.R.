@@ -3543,7 +3543,7 @@ http.createServer((req,res)=>{{
 "#)).unwrap();
     std::fs::write(
         f.root.join("dsh-feed.json"),
-        json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}).to_string(),
+        json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}).to_string(),
     )
     .unwrap();
     std::fs::write(f.root.join("snow-feed.json"), "[]").unwrap();
@@ -3557,6 +3557,39 @@ http.createServer((req,res)=>{{
     );
     f.wait(|| f.root.join("feed-ready").exists());
     (process, format!("http://127.0.0.1:{port}/"))
+}
+
+#[test]
+fn approval_refuses_a_dsh_candidate_without_contract_coverage() {
+    let mut f = Fixture::new();
+    let (_feed, url) = upgrade_feed(&f);
+    dsh_upgrade(&mut f, &url, true);
+    let version = "0.3.0";
+    std::fs::write(
+        f.root.join("dsh-feed.json"),
+        json!({"dist-tags":{"latest":version},"versions":{(version):{}}}).to_string(),
+    )
+    .unwrap();
+    f.console = Some(f.spawn_her(&["--console-serve", "--console-port", &f.ports[2].to_string()]));
+    f.wait(|| std::net::TcpStream::connect(("127.0.0.1", f.ports[2])).is_ok());
+    let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
+    assert_eq!(code, 200, "{checked}");
+    assert_eq!(checked["dependencies"]["dsh"]["available"], version);
+    let (code, result) = dependency_api(
+        &f,
+        "POST",
+        "/api/dependencies/approve",
+        json!({"confirm":true,"name":"dsh","version":version}),
+        false,
+    );
+    assert_eq!(
+        (code, result["error"].as_str()),
+        (409, Some("DSH version 0.3.0 has no credential contract coverage")),
+        "approval must refuse a discovered DSH candidate without contract coverage: {result}"
+    );
+    let (_, status) = dependency_api(&f, "GET", "/api/dependencies", Value::Null, false);
+    assert!(status["approval"].is_null(), "{status}");
+    assert!(!f.root.join("npm-installs").exists());
 }
 
 #[test]
@@ -3602,18 +3635,18 @@ fn dependency_discovery_reports_sources_and_never_installs_under_any_policy() {
             if policy == "off" {
                 Value::Null
             } else {
-                json!("0.3.0")
+                json!("0.2.1-rc.5")
             }
         );
         let identity = f.states()["dsh"]["identity"].clone();
         std::thread::sleep(Duration::from_millis(1200));
         assert_eq!(f.states()["dsh"]["identity"], identity);
-        assert!(!f.root.join("deps/dsh/0.3.0").exists());
+        assert!(!f.root.join("deps/dsh/0.2.1-rc.5").exists());
         let (code, _) = dependency_api(
             &f,
             "POST",
             "/api/dependencies/approve",
-            json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+            json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
             true,
         );
         assert!(code == 401 || code == 403);
@@ -3787,7 +3820,7 @@ fn snowluma_upgrade_health_failure_restores_pin_process_and_alerts_administrator
 }
 
 fn dsh_upgrade(f: &mut Fixture, url: &str, healthy: bool) -> PathBuf {
-    let destination = f.root.join("deps/dsh/0.3.0");
+    let destination = f.root.join("deps/dsh/0.2.1-rc.5");
     f.config["dependencies"]["directory"] = json!(f.root.join("deps"));
     f.config["dependencies"]["dsh"]["version"] = json!("0.2.1-rc.2");
     f.config["dependencies"]["snowluma"]["feedUrl"] = json!(format!("{url}snow"));
@@ -3845,12 +3878,12 @@ fn dsh_upgrade_needs_approval_even_under_auto_and_retains_the_old_install() {
     assert!(!f.root.join("npm-installs").exists());
     assert!(!destination.exists());
     let previous = f.states()["dsh"]["identity"].clone();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     await_upgrade(&f, "succeeded");
     f.healthy();
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
-    assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.3.0");
+    assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5");
     assert!(cfg["dependencies"]["dsh"]["script"].is_null());
     assert!(f.root.join("dsh/index.mjs").exists());
     assert!(destination
@@ -3869,7 +3902,7 @@ fn dsh_upgrade_health_failure_restores_pin_process_and_alerts_administrator() {
     let destination = dsh_upgrade(&mut f, &url, false);
     f.start();
     f.healthy();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     let result = await_upgrade(&f, "rolled-back");
     assert_eq!(result["result"]["rollback"], "succeeded");
     f.healthy();
@@ -3903,13 +3936,13 @@ fn dependency_metadata_failures_never_leave_an_approvable_candidate() {
         let _ = std::fs::remove_file(f.root.join("feed-mode"));
         std::fs::write(
             f.root.join("dsh-feed.json"),
-            json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}).to_string(),
+            json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}).to_string(),
         )
         .unwrap();
         let (code, available) =
             dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
         assert_eq!(code, 200, "{available}");
-        assert_eq!(available["dependencies"]["dsh"]["available"], "0.3.0");
+        assert_eq!(available["dependencies"]["dsh"]["available"], "0.2.1-rc.5");
         match failure {
             "empty" => std::fs::write(f.root.join("dsh-feed.json"), "").unwrap(),
             "malformed" => std::fs::write(
@@ -3935,13 +3968,13 @@ fn dependency_metadata_failures_never_leave_an_approvable_candidate() {
                 &f,
                 "POST",
                 "/api/dependencies/approve",
-                json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+                json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
                 false
             )
             .0,
             409
         );
-        assert!(!f.root.join("deps/dsh/0.3.0").exists());
+        assert!(!f.root.join("deps/dsh/0.2.1-rc.5").exists());
     }
 }
 
@@ -4054,7 +4087,7 @@ fn approved_upgrade_finishes_while_an_independent_metadata_refresh_is_stalled() 
     f.healthy();
     let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
     assert_eq!(code, 200, "{checked}");
-    assert_eq!(checked["dependencies"]["dsh"]["available"], "0.3.0");
+    assert_eq!(checked["dependencies"]["dsh"]["available"], "0.2.1-rc.5");
     let before = std::fs::read_to_string(f.root.join("feed-requests"))
         .unwrap()
         .lines()
@@ -4078,7 +4111,7 @@ fn approved_upgrade_finishes_while_an_independent_metadata_refresh_is_stalled() 
             &f,
             "POST",
             "/api/dependencies/approve",
-            json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+            json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
             false,
         );
         assert_eq!(code, 200, "{result}");
@@ -4175,7 +4208,7 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
         f.healthy();
         let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
         std::fs::write(&control, point).unwrap();
-        approve_upgrade(&f, "dsh", "0.3.0");
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
         f.wait(|| {
             std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
                 .ok()
@@ -4201,7 +4234,7 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
             serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap())
                 .unwrap();
         if healthy {
-            assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.3.0");
+            assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5");
             assert_eq!(f.states()["dsh"]["identity"], candidate);
             continue;
         }
@@ -4222,6 +4255,90 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
 
 #[cfg(feature = "parity-clock")]
 #[test]
+fn recovery_retires_an_unlisted_dsh_candidate_and_checks_the_rollback_pin() {
+    for previous_is_listed in [true, false] {
+        let mut f = Fixture::new();
+        let (_feed, url) = upgrade_feed(&f);
+        let destination = dsh_upgrade(&mut f, &url, true);
+        f.start();
+        f.healthy();
+        let lifecycle = f.root.join("data/lifecycle");
+        let control = lifecycle.join("dependency-upgrade-pause");
+        std::fs::write(&control, "candidate-started").unwrap();
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
+        f.wait(|| {
+            std::fs::read_to_string(lifecycle.join("dependency-upgrade-reached"))
+                .ok()
+                .as_deref()
+                == Some("candidate-started")
+        });
+        let candidate: process_identity::ProcessIdentity =
+            serde_json::from_value(f.states()["dsh"]["identity"].clone()).unwrap();
+        f.supervisor.take();
+        std::fs::remove_file(control).unwrap();
+
+        // Model a transaction started before the version gate was installed.
+        let config_path = f.root.join("config/config.json");
+        let journal_path = lifecycle.join("dependency-upgrades.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        let mut journal: Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let package = destination.join("node_modules/@deepseek-ai/dsh");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(package.join("package.json")).unwrap()).unwrap();
+        manifest["version"] = json!("0.3.0");
+        std::fs::write(package.join("package.json"), manifest.to_string()).unwrap();
+        cfg["update"]["policy"] = json!("off");
+        cfg["dependencies"]["dsh"]["version"] = json!("0.3.0");
+        cfg["dependencies"]["dsh"]["script"] = json!(package.join("index.mjs"));
+        journal["transaction"]["candidate"]["version"] = json!("0.3.0");
+        journal["transaction"]["next"] = cfg["dependencies"]["dsh"].clone();
+        if !previous_is_listed {
+            manifest["version"] = json!("0.3.1");
+            std::fs::write(f.root.join("dsh/package.json"), manifest.to_string()).unwrap();
+            journal["transaction"]["previous"]["version"] = json!("0.3.1");
+            journal["transaction"]["candidate"]["current"] = json!("0.3.1");
+        }
+        let previous = journal["transaction"]["previous"].clone();
+        std::fs::write(&config_path, cfg.to_string()).unwrap();
+        std::fs::write(&journal_path, journal.to_string()).unwrap();
+        f.start();
+        let read_journal = || {
+            serde_json::from_slice::<Value>(&std::fs::read(&journal_path).unwrap()).unwrap()
+        };
+        f.wait(|| read_journal()["result"]["status"] != "running");
+        let journal = read_journal();
+        assert_eq!(
+            journal["result"]["reason"],
+            "DSH version 0.3.0 has no credential contract coverage",
+            "recovery must refuse to accept an unlisted running DSH candidate: {journal}"
+        );
+        assert_eq!(
+            journal["result"]["rollback"],
+            if previous_is_listed {
+                "succeeded"
+            } else {
+                "pin-restored"
+            },
+            "rollback must restore an unlisted pin without restarting it: {journal}"
+        );
+        assert!(journal["transaction"].is_null(), "{journal}");
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(cfg["dependencies"]["dsh"], previous);
+        assert!(matches!(
+            process_identity::check_identity(&candidate),
+            process_identity::Liveness::Gone | process_identity::Liveness::Mismatch(_)
+        ));
+        if previous_is_listed {
+            f.healthy();
+        } else {
+            f.wait(|| f.states()["dsh"]["state"] == "refused");
+        }
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
 fn dependency_upgrade_rollback_obeys_changed_desired_revision_during_candidate_startup() {
     for desired in ["running", "stopped", "maintenance"] {
         let mut f = Fixture::new();
@@ -4234,7 +4351,7 @@ fn dependency_upgrade_rollback_obeys_changed_desired_revision_during_candidate_s
             serde_json::from_value(f.states()["dsh"]["identity"].clone()).unwrap();
         let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
         std::fs::write(&control, "candidate-started").unwrap();
-        approve_upgrade(&f, "dsh", "0.3.0");
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
         f.wait(|| {
             std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
                 .ok()
@@ -4409,7 +4526,7 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
     f.healthy();
     let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
     std::fs::write(&control, "candidate-started").unwrap();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     f.wait(|| {
         std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
             .ok()
@@ -4434,7 +4551,7 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
     assert_eq!(
-        cfg["dependencies"]["dsh"]["version"], "0.3.0",
+        cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5",
         "unproven retirement must preserve the candidate pin"
     );
     assert_eq!(
