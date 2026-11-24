@@ -793,53 +793,12 @@ mod native_tests {
 
     #[test]
     fn relay_acl_verification_refuses_a_protected_foreign_sid_grant() {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-        };
-        use windows_sys::Win32::Security::{
-            GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-        };
-
         let fixture = Fixture::new();
         restrict(&fixture.0).unwrap();
         let file = fixture.0.join("synthetic.key");
         std::fs::write(&file, b"synthetic fixture").unwrap();
         // A protected DACL alone is insufficient: this grants Everyone access to fake data.
-        let sddl: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
-        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut descriptor = Descriptor(std::ptr::null_mut());
-        // SAFETY: terminated SDDL/path, valid output pointers, retained descriptor owns ACL.
-        unsafe {
-            assert_ne!(
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    1,
-                    &mut descriptor.0,
-                    std::ptr::null_mut(),
-                ),
-                0
-            );
-            let mut acl = std::ptr::null_mut();
-            let mut present = 0;
-            let mut defaulted = 0;
-            assert_ne!(
-                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted),
-                0
-            );
-            assert_ne!(present, 0);
-            assert_eq!(
-                SetNamedSecurityInfoW(
-                    wide.as_ptr(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    acl,
-                    std::ptr::null(),
-                ),
-                0
-            );
-        }
+        apply_everyone_dacl(&file);
         let Err(AclError::Refused(error)) =
             crate::guarded_fs::verify_path_exact_acl(&file, false, AclPolicy::OwnerOnly)
         else {

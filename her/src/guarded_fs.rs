@@ -152,23 +152,8 @@ fn restrict_path_inner(
 ) -> Result<(), AclError> {
     #[cfg(unix)]
     {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(error) if vanished(&error) => {
-                return Err(AclError::Missing(format!(
-                    "private path {}: symlink_metadata failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                )));
-            }
-            Err(error) => {
-                return Err(AclError::Refused(format!(
-                    "private path {}: symlink_metadata failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                )));
-            }
-        };
+        let meta = fs::symlink_metadata(path)
+            .map_err(|error| unix::acl_err(path, "private path", "symlink_metadata", &error))?;
         if is_link(&meta)
             || !(meta.is_file() || meta.is_dir())
             || expected_dir.is_some_and(|dir| dir != meta.is_dir())
@@ -206,11 +191,7 @@ pub(crate) fn restrict_entry(
             )));
         }
         unix::check_ownership(path, meta)?;
-        let mode = if meta.is_dir() {
-            0o700
-        } else {
-            (meta.permissions().mode() & 0o700) | 0o600
-        };
+        let mode = unix::private_mode(meta.is_dir(), meta.permissions().mode());
         unix::apply_mode(path, mode)
     }
     #[cfg(windows)]
@@ -254,14 +235,9 @@ pub(crate) fn restrict_handle(
     #[cfg(unix)]
     {
         let _ = policy;
-        use std::os::unix::fs::PermissionsExt;
-        let meta = file.metadata().map_err(|error| {
-            AclError::Refused(format!(
-                "private path {}: metadata failed ({})",
-                sanitized_path(path),
-                native_error_code(&error)
-            ))
-        })?;
+        let meta = file
+            .metadata()
+            .map_err(|error| unix::acl_err(path, "private path", "metadata", &error))?;
         if is_link(&meta) || meta.is_dir() != directory {
             return Err(AclError::Refused(format!(
                 "private path {}: unexpected entry type",
@@ -270,19 +246,7 @@ pub(crate) fn restrict_handle(
         }
         unix::check_ownership(path, &meta)?;
         let mode = if directory { 0o700 } else { 0o600 };
-        file.set_permissions(fs::Permissions::from_mode(mode))
-            .map_err(|error| {
-                let reason = format!(
-                    "private permissions could not be applied: {}: set_permissions failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                );
-                if vanished(&error) {
-                    AclError::Missing(reason)
-                } else {
-                    AclError::Refused(reason)
-                }
-            })
+        unix::apply_handle_mode(file, path, mode)
     }
     #[cfg(windows)]
     {
@@ -301,23 +265,8 @@ pub(crate) fn verify_path_exact_acl(
     {
         let _ = policy;
         use std::os::unix::fs::PermissionsExt;
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(error) if vanished(&error) => {
-                return Err(AclError::Missing(format!(
-                    "private path {}: symlink_metadata failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                )));
-            }
-            Err(error) => {
-                return Err(AclError::Refused(format!(
-                    "private path {}: symlink_metadata failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                )));
-            }
-        };
+        let meta = fs::symlink_metadata(path)
+            .map_err(|error| unix::acl_err(path, "private path", "symlink_metadata", &error))?;
         if is_link(&meta) || meta.is_dir() != directory || (!directory && !meta.is_file()) {
             return Err(AclError::Refused(format!(
                 "private path {}: verify failed: unexpected type or link",
@@ -604,6 +553,27 @@ mod unix {
     use super::*;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
+    pub(super) fn acl_err(path: &Path, prefix: &str, step: &str, error: &io::Error) -> AclError {
+        let reason = format!(
+            "{prefix} {}: {step} failed ({})",
+            sanitized_path(path),
+            native_error_code(error)
+        );
+        if vanished(error) {
+            AclError::Missing(reason)
+        } else {
+            AclError::Refused(reason)
+        }
+    }
+
+    pub(super) fn private_mode(is_dir: bool, current: u32) -> u32 {
+        if is_dir {
+            0o700
+        } else {
+            (current & 0o700) | 0o600
+        }
+    }
+
     pub(super) fn check_ownership(path: &Path, meta: &fs::Metadata) -> Result<(), AclError> {
         // SAFETY: geteuid has no preconditions.
         if meta.uid() != unsafe { libc::geteuid() } || (meta.is_file() && meta.nlink() != 1) {
@@ -617,17 +587,25 @@ mod unix {
 
     pub(super) fn apply_mode(path: &Path, mode: u32) -> Result<(), AclError> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
-            let reason = format!(
-                "private permissions could not be applied: {}: set_permissions failed ({})",
-                sanitized_path(path),
-                native_error_code(&error)
-            );
-            if vanished(&error) {
-                AclError::Missing(reason)
-            } else {
-                AclError::Refused(reason)
-            }
+            acl_err(
+                path,
+                "private permissions could not be applied:",
+                "set_permissions",
+                &error,
+            )
         })
+    }
+
+    pub(super) fn apply_handle_mode(file: &File, path: &Path, mode: u32) -> Result<(), AclError> {
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|error| {
+                acl_err(
+                    path,
+                    "private permissions could not be applied:",
+                    "set_permissions",
+                    &error,
+                )
+            })
     }
 
     pub(super) fn ensure_entry_private(
@@ -643,30 +621,12 @@ mod unix {
             flags |= libc::O_DIRECTORY;
         }
         options.custom_flags(flags);
-        let file = options.open(path).map_err(|error| {
-            let reason = format!(
-                "private path {}: open failed ({})",
-                sanitized_path(path),
-                native_error_code(&error)
-            );
-            if vanished(&error) {
-                AclError::Missing(reason)
-            } else {
-                AclError::Refused(reason)
-            }
-        })?;
-        let meta = file.metadata().map_err(|error| {
-            let reason = format!(
-                "private path {}: metadata failed ({})",
-                sanitized_path(path),
-                native_error_code(&error)
-            );
-            if vanished(&error) {
-                AclError::Missing(reason)
-            } else {
-                AclError::Refused(reason)
-            }
-        })?;
+        let file = options
+            .open(path)
+            .map_err(|error| acl_err(path, "private path", "open", &error))?;
+        let meta = file
+            .metadata()
+            .map_err(|error| acl_err(path, "private path", "metadata", &error))?;
         if is_link(&meta)
             || !(meta.is_file() || meta.is_dir())
             || expected_dir.is_some_and(|dir| dir != meta.is_dir())
@@ -684,27 +644,11 @@ mod unix {
         }
         check_ownership(path, &meta)?;
         let current_mode = meta.permissions().mode() & 0o7777;
-        let target_mode = if meta.is_dir() {
-            0o700
-        } else {
-            (current_mode & 0o700) | 0o600
-        };
+        let target_mode = private_mode(meta.is_dir(), current_mode);
         if current_mode == target_mode {
             return Ok(RestrictOutcome::AlreadyPrivate);
         }
-        file.set_permissions(fs::Permissions::from_mode(target_mode))
-            .map_err(|error| {
-                let reason = format!(
-                    "private permissions could not be applied: {}: set_permissions failed ({})",
-                    sanitized_path(path),
-                    native_error_code(&error)
-                );
-                if vanished(&error) {
-                    AclError::Missing(reason)
-                } else {
-                    AclError::Refused(reason)
-                }
-            })?;
+        apply_handle_mode(&file, path, target_mode)?;
         Ok(RestrictOutcome::Hardened)
     }
 }
@@ -807,13 +751,12 @@ mod windows {
         Ok(sids)
     }
 
-    fn with_policy_acl<T>(
+    fn with_sids_acl<T>(
         path: &Path,
         directory: bool,
-        policy: AclPolicy,
+        sids: &mut [Vec<u8>],
         use_acl: impl FnOnce(*mut ACL, &[Vec<u8>]) -> T,
     ) -> Result<T, AclError> {
-        let mut sids = policy_sids(path, policy)?;
         let inheritance = if directory {
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
         } else {
@@ -851,10 +794,20 @@ mod windows {
                 result,
             )));
         }
-        let value = use_acl(acl, &sids);
+        let value = use_acl(acl, sids);
         // SAFETY: SetEntriesInAclW allocated `acl` with LocalAlloc.
         unsafe { LocalFree(acl.cast()) };
         Ok(value)
+    }
+
+    fn with_policy_acl<T>(
+        path: &Path,
+        directory: bool,
+        policy: AclPolicy,
+        use_acl: impl FnOnce(*mut ACL, &[Vec<u8>]) -> T,
+    ) -> Result<T, AclError> {
+        let mut sids = policy_sids(path, policy)?;
+        with_sids_acl(path, directory, &mut sids, use_acl)
     }
 
     fn open_handle_no_follow(path: &Path, access: u32) -> Result<(File, bool), AclError> {
@@ -941,11 +894,10 @@ mod windows {
         .map_err(io::Error::from)?
     }
 
-    pub(super) fn ensure_entry_private(
+    fn open_handle_with_type(
         path: &Path,
         expected_dir: Option<bool>,
-        policy: AclPolicy,
-    ) -> Result<RestrictOutcome, AclError> {
+    ) -> Result<(File, bool), AclError> {
         let (file, is_dir) = open_handle_no_follow(path, READ_CONTROL | WRITE_DAC)?;
         if expected_dir.is_some_and(|dir| dir != is_dir) {
             return Err(AclError::Refused(format!(
@@ -953,14 +905,28 @@ mod windows {
                 sanitized_path(path)
             )));
         }
-        let sids = policy_sids(path, policy)?;
-        let expected: Vec<&[u8]> = sids.iter().map(Vec::as_slice).collect();
-        match check_handle_exact_grants(&file, path, is_dir, &expected)? {
-            VerifyGrants::Match => Ok(RestrictOutcome::AlreadyPrivate),
-            VerifyGrants::Mismatch(_) => {
-                restrict_handle(&file, path, is_dir, policy)?;
-                Ok(RestrictOutcome::Hardened)
-            }
+        Ok((file, is_dir))
+    }
+
+    pub(super) fn ensure_entry_private(
+        path: &Path,
+        expected_dir: Option<bool>,
+        policy: AclPolicy,
+    ) -> Result<RestrictOutcome, AclError> {
+        let (file, is_dir) = open_handle_with_type(path, expected_dir)?;
+        let mut sids = policy_sids(path, policy)?;
+        let mismatch = {
+            let expected: Vec<&[u8]> = sids.iter().map(Vec::as_slice).collect();
+            matches!(
+                check_handle_exact_grants(&file, path, is_dir, &expected)?,
+                VerifyGrants::Mismatch(_)
+            )
+        };
+        if mismatch {
+            restrict_handle_with_sids(&file, path, is_dir, &mut sids)?;
+            Ok(RestrictOutcome::Hardened)
+        } else {
+            Ok(RestrictOutcome::AlreadyPrivate)
         }
     }
 
@@ -969,23 +935,17 @@ mod windows {
         expected_dir: Option<bool>,
         policy: AclPolicy,
     ) -> Result<(), AclError> {
-        let (file, is_dir) = open_handle_no_follow(path, WRITE_DAC | READ_CONTROL)?;
-        if expected_dir.is_some_and(|dir| dir != is_dir) {
-            return Err(AclError::Refused(format!(
-                "private ACL {}: unexpected entry type",
-                sanitized_path(path)
-            )));
-        }
+        let (file, is_dir) = open_handle_with_type(path, expected_dir)?;
         restrict_handle(&file, path, is_dir, policy)
     }
 
-    pub(super) fn restrict_handle(
+    fn restrict_handle_with_sids(
         file: &File,
         path: &Path,
         directory: bool,
-        policy: AclPolicy,
+        sids: &mut [Vec<u8>],
     ) -> Result<(), AclError> {
-        with_policy_acl(path, directory, policy, |acl, sids| {
+        with_sids_acl(path, directory, sids, |acl, sids| {
             // SAFETY: open file handle and valid ACL; PROTECTED disables parent inheritance.
             let result = unsafe {
                 SetSecurityInfo(
@@ -1004,6 +964,16 @@ mod windows {
             let expected: Vec<&[u8]> = sids.iter().map(Vec::as_slice).collect();
             verify_handle_exact_grants(file, path, directory, &expected)
         })?
+    }
+
+    pub(super) fn restrict_handle(
+        file: &File,
+        path: &Path,
+        directory: bool,
+        policy: AclPolicy,
+    ) -> Result<(), AclError> {
+        let mut sids = policy_sids(path, policy)?;
+        restrict_handle_with_sids(file, path, directory, &mut sids)
     }
 
     #[cfg(test)]
