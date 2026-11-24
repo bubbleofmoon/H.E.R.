@@ -2503,22 +2503,64 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn chain_executor_records_ready_usage_when_cancel_races_step_completion() {
+        use tokio::sync::oneshot;
+
+        struct CancelRaceStep {
+            entered: Option<oneshot::Sender<()>>,
+            ready: Option<oneshot::Receiver<()>>,
+        }
+
+        impl RouteStep for CancelRaceStep {
+            type Output = String;
+
+            fn step<'a>(
+                &'a mut self,
+                _ctx: StepContext<'a>,
+            ) -> Pin<Box<dyn Future<Output = StepResult<String>> + Send + 'a>> {
+                let entered = self.entered.take();
+                let ready = self.ready.take();
+                Box::pin(async move {
+                    if let Some(tx) = entered {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = ready {
+                        let _ = rx.await;
+                    }
+                    StepResult::Answered {
+                        value: "late-answer".into(),
+                        response_usage: Some(Some(sample_usage())),
+                        tokens_charged: 15,
+                    }
+                })
+            }
+        }
+
         let cfg_routes = json!({"routes": [route("a")]});
         let fixture = TestFixture::new("cancel-race", cfg_routes, "secret-259-cancel-race");
         let model = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
         let mut exec = ChainExecutor::new(turn_chain_cfg(&fixture.context, model, "group:9"));
-        let mut step = ScriptedStep::new(vec![ScriptAction::Answer {
-            text: "late-answer".into(),
-            response_usage: Some(Some(sample_usage())),
-            tokens_charged: 15,
-        }]);
-        let (cancel_tx, cancel_rx) = watch::channel(true);
-        let _keep = cancel_tx;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let mut step = CancelRaceStep {
+            entered: Some(entered_tx),
+            ready: Some(ready_rx),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut cancel = Cancellation::from_watch(cancel_rx);
+        let racer = tokio::spawn(async move {
+            let _ = entered_rx.await;
+            let _ = cancel_tx.send(true);
+            let _ = ready_tx.send(());
+        });
         let err = exec.next_answer(&mut step, &mut cancel).await.unwrap_err();
+        racer.await.unwrap();
         assert_eq!(err, ChainError::Cancelled);
         let rows = fixture.usage_rows();
-        assert_eq!(rows.len(), 1, "ready usage must still be recorded before returning Cancelled");
+        assert_eq!(
+            rows.len(),
+            1,
+            "ready usage must still be recorded before returning Cancelled"
+        );
         assert_eq!(rows[0]["b"]["cacheMiss"], 10);
         assert_eq!(rows[0]["b"]["output"], 5);
     }
