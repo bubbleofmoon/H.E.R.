@@ -760,7 +760,7 @@ pub(crate) fn append_runtime_json_line(
     if context.is_isolated() {
         context
             .append_bytes(runtime::RuntimeArea::Logs, relative, &line)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            .map_err(std::io::Error::other)?;
     } else {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -868,11 +868,13 @@ fn prepare_live_pipeline(
     }
 }
 
+type LiveStartup = (Vec<String>, bool, Option<pipeline::Pipeline>);
+
 fn prepare_live_startup(
     context: &runtime::RuntimeContext,
     cfg_raw: &Value,
     args: &[String],
-) -> Result<(Vec<String>, bool, Option<pipeline::Pipeline>), Box<dyn std::error::Error>> {
+) -> Result<LiveStartup, Box<dyn std::error::Error>> {
     let live_groups = args
         .iter()
         .position(|arg| arg == "--live-groups")
@@ -1028,10 +1030,10 @@ pub(crate) fn parse_target(
 /// legacy/observation wake drivers and per-connection turn scheduling.
 enum SimulationBridge {
     Isolated {
-        hub: reserved2::Hub,
+        hub: Box<reserved2::Hub>,
         events: u64,
     },
-    Fallback(FallbackWakeDrivers),
+    Fallback(Box<FallbackWakeDrivers>),
 }
 
 struct FallbackWakeDrivers {
@@ -1556,11 +1558,11 @@ impl SimulationBridge {
     ) -> Self {
         if context.is_isolated() {
             Self::Isolated {
-                hub: reserved2::Hub::new(context, journal, live_groups, live_all),
+                hub: Box::new(reserved2::Hub::new(context, journal, live_groups, live_all)),
                 events: 0,
             }
         } else {
-            Self::Fallback(FallbackWakeDrivers::new(journal, live_groups))
+            Self::Fallback(Box::new(FallbackWakeDrivers::new(journal, live_groups)))
         }
     }
 
@@ -3113,7 +3115,7 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(crate::dsh::dump_snapshot(
-                    &context.dependency_url("dsh").unwrap(),
+                    context.dependency_url("dsh").unwrap(),
                     "synthetic-cookie",
                     "snapshot-fix2",
                 ))
@@ -3754,13 +3756,15 @@ mod tests {
         assert!(wake, "群里拍一拍应该唤醒");
         assert_eq!(why, "poke");
 
-        let mut me = Event::default();
-        me.post_type = "notice".into();
-        me.sub_type = "poke".into();
-        me.group_id = Some(7003);
-        me.sender_id = Some(7004);
-        me.target_id = Some(7001);
-        me.self_id = Some(7004);
+        let me = Event {
+            post_type: "notice".into(),
+            sub_type: "poke".into(),
+            group_id: Some(7003),
+            sender_id: Some(7004),
+            target_id: Some(7001),
+            self_id: Some(7004),
+            ..Default::default()
+        };
         let (wake2, why2) = decide(&me, "", false, "Fixture Bot", &HashMap::new(), &t, false);
         assert!(!wake2);
         assert_eq!(why2, "poke:selfskip");

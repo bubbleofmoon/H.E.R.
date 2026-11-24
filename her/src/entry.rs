@@ -45,9 +45,11 @@ mod session;
 mod live_bridge;
 pub(crate) use live_bridge::{
     append_runtime_json_line, decide, event_message_id, feed_slang, names_self, now_ms,
-    parse_target, plain_text, protocol_integer, reserved2, sync_wake_configs, text_seed,
-    wake_cfg_of, Event, Triggers,
+    parse_target, plain_text, protocol_integer, sync_wake_configs, text_seed, wake_cfg_of, Event,
+    Triggers,
 };
+#[cfg(test)]
+pub(crate) use live_bridge::reserved2;
 mod reserved;
 mod sticker;
 mod failover;
@@ -244,50 +246,33 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("supervise") {
         std::process::exit(supervisor::run_cli(&args[2..]));
     }
-    if args.get(1).is_some_and(|arg| !arg.starts_with("--")) {
-        eprintln!("[her] unknown command");
-        std::process::exit(2);
-    }
-    // Retired startup options must not fall through to implicit runtime paths.
-    if args.iter().skip(1).any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--ab-full"
-                | "--ab-probe"
-                | "--shadow-turn"
-                | "--shadow-state-root"
-                | "--replay"
-                | "--wake-replay"
-                | "--replay-jsonl"
-                | "--replay-triggers"
-                | "--memory-probe"
-                | "--memory-write-probe"
-                | "--hot-render"
-                | "--index-hint"
-                | "--send-probe"
-                | "--ask"
-                | "--price-probe"
-                | "--role-probe"
-                | "--prompt-wrapped"
-                | "--rpc-probe"
-                | "--slang-parse-test"
-                | "--selftest-401"
-                | "--failover-probe"
-                | "--sticker-sync"
-                | "--build-prompt"
-                | "--dsh-dump"
-                | "--dsh-watch"
-                | "--dsh-probe"
-                | "--dsh-demo"
-                | "--question-probe"
-                | "--split-probe"
-                | "--sensitive-probe"
-                | "--backend-ask"
-                | "--backends"
-        )
-    }) {
-        eprintln!("[her] unknown option");
-        std::process::exit(2);
+    // Fail closed on any command or flag outside the supported entry allowlist before runtime
+    // selection or log initialization so retired/unknown flags can never touch implicit paths.
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--runtime-root" | "--console-port" | "--live-groups" => {
+                if args.get(index + 1).is_some_and(|value| !value.starts_with("--")) {
+                    index += 1;
+                }
+            }
+            "--mcp-serve"
+            | "--mcp-web-search-serve"
+            | "--mcp-host-serve"
+            | "--console-serve"
+            | "--live"
+            | "--live-all"
+            | "--no-reconnect" => {}
+            arg if arg.starts_with('-') => {
+                eprintln!("[her] unknown option");
+                std::process::exit(2);
+            }
+            _ => {
+                eprintln!("[her] unknown command");
+                std::process::exit(2);
+            }
+        }
+        index += 1;
     }
     let runtime_context = match runtime::RuntimeContext::from_process_args(&args) {
         Ok(context) => context,

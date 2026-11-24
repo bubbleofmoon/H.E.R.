@@ -1236,6 +1236,8 @@ impl FollowStream {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn baseline_seq(&self) -> i64 {
         self.baseline_seq
     }

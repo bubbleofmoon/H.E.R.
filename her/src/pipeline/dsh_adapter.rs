@@ -698,6 +698,7 @@ impl Pipeline {
     ///
     /// **只在还没发出任何字节时重投**：这里发送发生在回合成功之后，
     /// 所以重投不会重复发言；一旦将来改成流式边说边发，这个前提就得重新审。
+    #[cfg(test)]
     pub async fn ask_with_failover(
         &mut self,
         key: &str,
