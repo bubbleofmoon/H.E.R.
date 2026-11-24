@@ -248,21 +248,23 @@ fn notice_worker_child() {
                 .is_send());
         }
     } else if phase == "queue" {
-        assert!(send_private(
+        assert!(send_private_job(
             &context,
             &cfg,
             70001,
             "filler".into(),
-            "fill".into()
+            "fill".into(),
+            AlertTarget::Plain,
         ));
         wait(|| root.join("request-observed").is_file());
         for _ in 0..32 {
-            assert!(send_private(
+            assert!(send_private_job(
                 &context,
                 &cfg,
                 70001,
                 "filler".into(),
-                "fill".into()
+                "fill".into(),
+                AlertTarget::Plain,
             ));
         }
     }
@@ -283,6 +285,7 @@ fn notice_worker_child() {
                 .any(|line| line.contains("owner-alert-release-available") && line.contains(reason))
         });
         // Observe the completed poll, after any definite-refusal claim release.
+        wait(|| state()["notified"] == json!([]));
         let mut gate = None;
         wait(|| {
             gate = context

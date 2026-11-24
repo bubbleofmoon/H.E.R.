@@ -433,7 +433,7 @@ fn plain_text_of_message(message: &Value) -> String {
                 Some("text") => s["data"]["text"].as_str().map(str::to_owned),
                 Some("face") => Some(format!(
                     "[表情{}]",
-                    crate::console::social_policy_js_string(&s["data"]["id"])
+                    crate::social_state::js_string(&s["data"]["id"])
                 )),
                 _ => None,
             })

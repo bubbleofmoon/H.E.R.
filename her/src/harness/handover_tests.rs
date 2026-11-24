@@ -79,18 +79,21 @@ fn serve(listener: Arc<TcpListener>, responses: Vec<String>) -> tokio::task::Joi
     })
 }
 
-type Answer = Box<dyn Fn(usize) -> Result<String, crate::digest::ModelError> + Send + Sync>;
+use crate::harness::one_shot::{install_test_model, Job, ModelError, OneShot};
 
-/// The digest's model port, scripted: each request is recorded as (system, input) and `answer` replies from the
-/// request's number (1 for the first). While `hold` is set a request waits, up to 10 s.
+type Answer = Box<dyn Fn(usize) -> Result<String, ModelError> + Send + Sync>;
+
+/// The digest's model port, scripted: each request is recorded as (system, input) and `answer`
+/// replies from the request's number (1 for the first). While `hold` is set a request waits, up to
+/// 10 s.
 struct Summariser {
     seen: std::sync::Mutex<Vec<(String, String)>>,
     answer: Answer,
     hold: AtomicBool,
 }
 
-impl crate::digest::DigestModel for Summariser {
-    fn complete(&self, system: &str, input: &str) -> Result<String, crate::digest::ModelError> {
+impl OneShot for Summariser {
+    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
         let count = {
             let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
             seen.push((system.to_string(), input.to_string()));
@@ -125,7 +128,7 @@ impl Drop for Rig {
 async fn rig(
     tag: &str,
     harness: Value,
-    answer: impl Fn(usize) -> Result<String, crate::digest::ModelError> + Send + Sync + 'static,
+    answer: impl Fn(usize) -> Result<String, ModelError> + Send + Sync + 'static,
 ) -> Rig {
     let root = crate::install_root::development_root(
         std::env::temp_dir().join(format!("her-6-{tag}-{}", crate::turn_ledger::mint_id(""))),
@@ -151,8 +154,8 @@ async fn rig(
         answer: Box::new(answer),
         hold: AtomicBool::new(false),
     });
-    crate::digest::install_test_model(context.runtime_root().unwrap(), summariser.clone());
-    let token = crate::conversation_authority::ensure_or_rotate(&context, OWNER, false).unwrap();
+    install_test_model(&context, Job::Digest, summariser.clone());
+    let token = crate::social_state::ensure_or_rotate(&context, OWNER, false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     Rig {
         root,
@@ -169,7 +172,7 @@ impl Rig {
     /// Re-reads the conversation's generation after a stopped turn: a stop revokes the admitted token
     /// (`harness.rs`, the cancel path calls `Tools::revoke`), and the generation is that token's epoch.
     fn renew_generation(&mut self) {
-        let token = crate::conversation_authority::token(&self.context, OWNER).unwrap().unwrap();
+        let token = crate::social_state::token(&self.context, OWNER).unwrap().unwrap();
         self.generation = crate::send_outbox::token_epoch(&token);
     }
 
@@ -442,13 +445,17 @@ async fn harness_summary_a_summary_still_running_at_the_turn_deadline_fails_as_a
     let mut rig = rig("summary-deadline", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
     rig.seed(1..=19, long_prompt, json!({}));
     let users = rig.events("user").len();
-    let token = crate::conversation_authority::token(&rig.context, OWNER).unwrap();
+    let token = crate::social_state::token(&rig.context, OWNER).unwrap();
     // The summariser holds past the turn's 8 s deadline; `SUMMARY_RESERVE` (5 s) bounds the summary to 3 s of it.
     rig.deadline = Duration::from_secs(8);
     rig.summariser.hold.store(true, Ordering::SeqCst);
     let body = rig.turn("summary-deadline-20", "现在回复", answer("好", 12)).await;
     rig.summariser.hold.store(false, Ordering::SeqCst);
-    assert_eq!(crate::conversation_authority::token(&rig.context, OWNER).unwrap(), token, "no revoke: the token stands");
+    assert_eq!(
+        crate::social_state::token(&rig.context, OWNER).unwrap(),
+        token,
+        "no revoke: the token stands"
+    );
     assert_eq!(rig.summaries().len(), 1, "the summary was asked for");
     let failed = rig.events("checkpoint_failed");
     assert_eq!(failed.len(), 1);
@@ -593,7 +600,7 @@ async fn harness_idle_rotation_a_long_conversation_stays_inside_its_budget_and_r
 
 #[tokio::test(flavor = "current_thread")]
 async fn harness_idle_rotation_a_failed_summary_leaves_the_session_unrotated_and_is_recorded() {
-    let rig = rig("rotation-failed", rotating(json!({})), |_| Err(crate::digest::ModelError("timeout"))).await;
+    let rig = rig("rotation-failed", rotating(json!({})), |_| Err(ModelError("timeout"))).await;
     rig.seed(1..=5, long_prompt, json!({"captured_usage":{"prompt_tokens":30_000}}));
     rig.sleep(10);
     let body = rig.turn("rotation-failed-6", "现在回复", answer("好的", 30_000)).await;

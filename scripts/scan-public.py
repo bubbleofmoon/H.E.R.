@@ -57,7 +57,15 @@ import sys
 import tempfile
 
 SKIP_PARTS = {'.git', 'target', 'node_modules', '__pycache__', 'ci-evidence', '.test-fixtures', 'graphify-out'}
+SKIP_PREFIXES = {('her-ui', 'dist')}
 CHAT_TREE_SUFFIXES = {'.md', '.txt'}
+
+
+def is_skipped_path(rel, scan_skipped):
+    if scan_skipped:
+        return False
+    parts = Path(rel).parts
+    return any(part in SKIP_PARTS for part in parts) or parts[:2] in SKIP_PREFIXES
 
 # An account home names the person who owns the machine, so it never belongs in public.
 # The macOS spelling is written with a bracketed first letter on purpose: the pattern
@@ -134,7 +142,7 @@ def secret_findings(source, config, scan_skipped=False):
             rel = str(item.get('File', '')).replace('\\', '/')
             if rel.startswith(root):
                 rel = rel[len(root):]
-            if not scan_skipped and any(part in SKIP_PARTS for part in Path(rel).parts):
+            if is_skipped_path(rel, scan_skipped):
                 continue
             findings.append((rel, int(item.get('StartLine') or 1)))
         return findings, None
@@ -174,7 +182,7 @@ def scan_tree(root, config, allowed, path_allowed, counters, findings, scan_skip
         rel = path.relative_to(root)
         if not path.is_file():
             continue
-        if not scan_skipped and any(part in SKIP_PARTS for part in rel.parts):
+        if is_skipped_path(rel, scan_skipped):
             continue
         files += 1
         try:

@@ -13,7 +13,7 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
     }).unwrap();
     let args = json!({"key":"group:101","token":"group-token","query":"deepseek-v4.1-flash"});
     let valid = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap();
-    assert_eq!(valid, "1. [#1 fact] deepseek-v4.1-flash v0.2.1");
+    assert_eq!(valid, "1. [#1 推断·fact] deepseek-v4.1-flash v0.2.1");
     let block = crate::prompt::recall_block_with_runtime(&context, &context.load_config().unwrap(),
         &json!({"unread":[{"text":"deepseek-v4.1-flash v0.2.1"}]}), "group:101");
     assert!(block.contains("deepseek-v4.1-flash v0.2.1"), "dotted recall must inject: {block}");
@@ -566,7 +566,7 @@ fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when
     let st = &state["conversations"][key];
     let preview = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
     assert!(preview.contains("评测记录"), "{preview}");
-    assert_eq!(preview.matches("\n- [fact").count(), 1, "relatedTopK is honoured: {preview}");
+    assert_eq!(preview.matches("\n- [推断·fact").count(), 1, "relatedTopK is honoured: {preview}");
     // Rendering (the preview and the compatibility render that precedes a delivery) counts nothing.
     let _ = crate::prompt::build_with_runtime(&context, key, "atMention", "bot", "9001");
     assert_eq!(recall_hits(&conn), 0, "reading recall for preview or for a later delivery is not a use");
@@ -576,8 +576,9 @@ fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         let (stream, _) = listener.accept().unwrap();
-        handle_conn(stream, served_cfg, served);
+        handle_conn(stream, served_cfg, served, startup);
     });
     let (delivered, recalled) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-148", "").unwrap();
     server.join().unwrap();
@@ -597,9 +598,10 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     // One message packet is fetched per wake.
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..4 {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     // DSH accepting a wake installs its briefing record (what `session_context::observe` does).
@@ -636,8 +638,9 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         let (stream, _) = listener.accept().unwrap();
-        handle_conn(stream, served_cfg, served);
+        handle_conn(stream, served_cfg, served, startup);
     });
     let (_, fresh) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-5", "").unwrap();
     server.join().unwrap();
@@ -650,9 +653,10 @@ fn serve_wake_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, st
     let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..n {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     (context, server)
@@ -709,7 +713,7 @@ fn a_message_that_matches_no_memory_renders_no_recalled_memory() {
     let mut st = state["conversations"][key].clone();
     st["unread"][0]["text"] = json!("今天中午吃什么好呢，想不出来");
     let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &st, key);
-    assert!(!block.contains("\n- [fact"), "no pinned or recent padding: {block}");
+    assert!(!block.contains("\n- [推断·fact"), "no pinned or recent padding: {block}");
     assert!(!block.contains("【记忆】你可能需要回顾"), "{block}");
 }
 
@@ -792,10 +796,10 @@ fn ticket55_forget_visibility_check_failure_answers_search_failed() {
 }
 
 #[test]
-fn conversation_authority_owner_config_is_store_owner() {
+fn social_state_owner_config_is_store_owner() {
     let (_root, context) = fixture_runtime("ticket55 owner config", "fixture-console-token-17");
     let cfg = json!({"ownerQQ": 2});
-    let store = crate::memory::MemoryStore::open(&context, &cfg).unwrap();
+    let store = crate::memory::open_store(&context, &cfg).unwrap();
     assert!(!store.for_reader("private:1").is_owner(), "ownerQQ 2 must not make private:1 the owner");
     assert!(store.for_reader("private:2").is_owner(), "the configured integer owner is the owner");
 }

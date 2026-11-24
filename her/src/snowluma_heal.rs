@@ -220,7 +220,7 @@ pub fn heal(context: &RuntimeContext, cfg: &Value, base_url: &str, current_ws: &
     let follow = cfg.pointer("/snowluma/followDiscoveredEndpoint") != Some(&Value::Bool(false));
     let plan = plan_endpoints(&found, follow, current_ws);
     let ws_token = found.ws_token.clone().unwrap_or_else(|| found.http_token.clone());
-    let persisted = crate::console::persist_snowluma_endpoint(
+    let persisted = crate::config_tx::persist_snowluma_endpoint(
         context,
         &found.http_token,
         plan.persist_ws.as_deref(),

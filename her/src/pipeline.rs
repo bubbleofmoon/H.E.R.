@@ -421,7 +421,7 @@ pub(crate) fn revoke_reserved2_epoch(
 ) -> Result<(), String> {
     // Same order as the hub's epoch observation and DSH's own epoch publication.
     let mut minted = publication.map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
-    let replacement = crate::conversation_authority::revoke_if_current(context, key, token)?;
+    let replacement = crate::social_state::revoke_if_current(context, key, token)?;
     if let (Some(slot), Some(token)) = (minted.as_mut(), replacement) {
         **slot = Some(token);
     }
@@ -438,7 +438,13 @@ pub(crate) struct Reserved2Budget {
 
 impl Reserved2Budget {
     pub(crate) fn deadline_for(&self, conv: &serde_json::Value) -> i64 {
-        crate::console::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv)
+        crate::social_state::reserved2_deadline(
+            self.deadline,
+            self.cap_ms,
+            self.ceiling,
+            self.began,
+            conv,
+        )
     }
 
     pub(crate) fn expired(&self, conv: &serde_json::Value) -> bool {
@@ -844,7 +850,8 @@ impl Pipeline {
         }
         self.turn_final = true;
         if let Some(turn) = &self.cur_turn {
-            let budget_sleep = outcome == "completed" && crate::console::turn_budget_ended(&self.context, &turn.key, &turn.id);
+            let budget_sleep = outcome == "completed"
+                && crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id);
             let reason = if budget_sleep { "observationSleep" } else { reason };
             let writer = if retry { turn.clone() } else { turn.clone().without_retry() };
             let result = match rpc_id {
@@ -867,7 +874,7 @@ impl Pipeline {
         let mut minted = shared.as_ref().map(|slot| slot.lock().unwrap_or_else(|p|p.into_inner()));
         #[cfg(test)]
         if let Some(hook) = self.rotation_locked_hook.take() { hook(); }
-        let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
         #[cfg(test)]
         if let Some(hook) = self.after_abandon_rotation.take() { hook(); }
         if let Some(slot) = minted.as_mut() { **slot = Some(token.clone()); }
@@ -910,13 +917,17 @@ impl Pipeline {
         }
         if let Some(chat) = self.chat.as_ref().filter(|c| c.reserved.is_none()) {
             let cfg = self.context.load_config().map_err(|e| e.to_string())?;
-            if crate::console::runtime_mode(&self.context) != chat.mode || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key) {
+            if crate::social_state::mode(&self.context) != chat.mode
+                || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
         if self.chat.is_none() {
-            let cfg = self.context.load_config().map_err(|e|e.to_string())?;
-            if crate::console::runtime_mode(&self.context) != "reserved2" || !crate::console::inbound_admitted(&cfg,key) {
+            let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+            if crate::social_state::mode(&self.context) != "reserved2"
+                || !crate::social_state::inbound_admitted(&cfg, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
@@ -928,10 +939,10 @@ impl Pipeline {
                 Err(error) => return Err(error),
             }
         }
-        match crate::console::conversation_token(&self.context, key) {
+        match crate::social_state::token(&self.context, key) {
             Ok(Some(token)) if crate::send_outbox::token_epoch(&token) == self.turn_epoch => Ok(()),
             Ok(_) => Err("会话令牌已变化（重置、取消或被替代）".to_string()),
-            Err(error) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -958,20 +969,11 @@ impl Pipeline {
 /// 用途：判断"这一轮里模型有没有自己调发送工具"。发送路径（MCP → console →
 /// OneBot）成功后会更新这个字段，所以它比任何内存状态都可靠。
 fn last_ai_reply_at(context: &RuntimeContext, key: &str) -> i64 {
-    let state = if context.is_isolated() {
-        context.read_social_state().ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    };
-    state
-        .and_then(|v| {
-            v.get("conversations")
-                .and_then(|c| c.get(key))
-                .and_then(|c| c.get("lastAiReplyAt"))
-                .and_then(|t| t.as_i64())
-        })
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .read_optional_document()
+        .ok()
+        .and_then(|doc| doc.conversation(key))
+        .and_then(|conv| conv.field("lastAiReplyAt").and_then(|t| t.as_i64()))
         .unwrap_or(0)
 }
 
@@ -1004,15 +1006,29 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn report_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, code: &str, message: &str) {
         let failure = crate::model_failure::Failure::classify(code, message);
         note_model_error(&self.context, key, &failure.summary());
-        self.alert_backend_failure(cfg, key, backend, provider, model, &failure);
+        self.alert_backend_failure(cfg, key, backend, provider, model, &failure, &[], None);
     }
 
     /// The owner's alert and refusal record of one failed backend request, without a model error note: a request that
     /// only failed over is no turn failure (`report_backend_failure` adds the note for the failure that ended the turn).
-    fn alert_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, failure: &crate::model_failure::Failure) {
+    #[allow(clippy::too_many_arguments)]
+    fn alert_backend_failure(
+        &mut self,
+        cfg: &serde_json::Value,
+        key: &str,
+        backend: &str,
+        provider: &str,
+        model: &str,
+        failure: &crate::model_failure::Failure,
+        tool_refs: &[serde_json::Value],
+        call: Option<crate::model_failure::RefusalCall<'_>>,
+    ) {
         self.failure_reported = true;
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
-            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, &self.carried_messages);
+            let mut messages = self.carried_messages.clone();
+            crate::model_failure::merge_refs(&mut messages, tool_refs.to_vec());
+            let input = crate::model_failure::RefusalInput { messages: &messages, call };
+            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, input);
         }
         crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure);
     }
@@ -1066,10 +1082,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             .or_else(|| crate::model_failure::snapshot_refs(cli_prompt));
         let refs = WakePromptRefs { dsh: dsh_refs, cli: cli_refs };
         if !self.context.is_isolated() {
-            crate::console::begin_legacy_wait_turn(&self.context, &key)?;
+            crate::social_state::begin_legacy_wait_turn(&self.context, &key)?;
             let deadline = self.dispatch_deadline.take().unwrap_or_else(||crate::turn_ledger::now_ms()
                 .saturating_add(crate::wake::turn_budget(cfg).hard_cap_ms));
-            crate::console::set_legacy_wait_deadline(&self.context, &key, deadline)?;
+            crate::social_state::set_legacy_wait_deadline(&self.context, &key, deadline)?;
             self.carried_messages.clear();
             return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
@@ -1131,7 +1147,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if let Some((at, previous)) = self.dispatch_wake.take() {
                 let claim = serde_json::json!({"at":at,"previous":previous});
                 self.cur_turn.as_ref().unwrap().wake_claim(&claim)?;
-                crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous)?;
+                crate::social_state::consume_reserved2_deadline(
+                    &self.context,
+                    &key,
+                    &token,
+                    at,
+                    &previous,
+                )?;
             }
             Ok(())
         })();
@@ -1181,7 +1203,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             let message = format!("{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）", blocking.id);
             return Err(LedgerAdmissionError::Held { message, record });
         }
-        let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, false)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, false)
+            .map_err(String::from)?;
         if self.dispatch_token.take().is_some_and(|expected| expected != token) {
             return Err("queued wake token invalidated".to_string().into());
         }
@@ -1220,15 +1243,19 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let cfg = self.context.load_config().map_err(|e| e.to_string())?;
         if let Some(authority) = self.chat.as_ref().and_then(|c| c.reserved.as_ref()) {
             authority.check_generation(&self.context, key)?;
-            if crate::console::chat_role_state(&self.context)?["mode"] == "silent"
+            if crate::social_state::role_state(&self.context)?["mode"] == "silent"
                 && !crate::chat::is_owner_key(&cfg, key)
             {
                 return Err("静默模式已启用".into());
             }
-        } else if self.chat.as_ref().is_none_or(|chat| crate::console::runtime_mode(&self.context) != chat.mode) {
+        } else if self
+            .chat
+            .as_ref()
+            .is_none_or(|chat| crate::social_state::mode(&self.context) != chat.mode)
+        {
             return Err("模式已变化".to_string());
         }
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         if !crate::chat::allowed_in_mode(&cfg, &mode, key) {
             return Err("会话或白名单已变化".to_string());
         }
@@ -1628,17 +1655,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return self.chat_guard(key, "").map(|()| serde_json::Value::Null);
         }
         let cfg = self.context.load_config().map_err(str::to_string)?;
-        let state = self.context.read_social_state()?;
-        let conv = &state["conversations"][key];
+        let doc = crate::conversation_state::ConversationState::for_runtime(&self.context)
+            .read_document()
+            .map_err(|(_, e)| e)?;
+        let conv_token = doc
+            .conversation(key)
+            .and_then(|c| c.token().map(str::to_string));
         if crate::harness::Tools::current_mode(&self.context) != "reserved2"
-            || !crate::console::inbound_admitted(&cfg, key)
+            || !crate::social_state::inbound_admitted(&cfg, key)
             || cfg.pointer("/socialV2/enabled") == Some(&serde_json::json!(false))
-            || state["paused"] == true
-            || conv["agentToken"].as_str() != Some(self.turn_token.as_str())
+            || doc.paused()
+            || conv_token.as_deref() != Some(self.turn_token.as_str())
         {
             return Err("mode, permission or turn generation changed".into());
         }
-        Ok(state)
+        Ok(doc.into_value())
     }
 
     fn check_harness_turn(&self, key: &str) -> Result<bool, String> {
@@ -1806,7 +1837,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     match self.check_harness_turn(key) {
                         Ok(false) => continue,
                         Ok(true) => {
-                            if crate::console::observation_wait_turn(&self.context, key)
+                            if crate::social_state::observation_wait_turn(&self.context, key)
                                 .ok().flatten().as_deref() == Some(recorder.id.as_str())
                             {
                                 // Publish the sleep before revocation can release the handler.
@@ -1833,11 +1864,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             capped = true;
         }
         let turn_ms = started.elapsed().as_millis() as i64;
-        for reference in turn.message_refs() {
-            if !self.carried_messages.contains(&reference) {
-                self.carried_messages.push(reference);
-            }
-        }
         // The runner may have committed completion while the cap poll was checking authority.
         let settled_cap = match &status {
             Status::ObservationSleep => Some("observationSleep"),
@@ -1881,12 +1907,17 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let count = failures.len();
         for (index, failure) in failures.iter().enumerate() {
             println!("[failover] {key} harness route {} failed ({})", failure.route, failure.summary);
+            let classified = crate::model_failure::Failure::classify("", &failure.summary);
             if model_end && index + 1 == count {
-                self.report_backend_failure(cfg, key, "harness", "openai", &failure.model, "", &failure.summary);
-            } else {
-                let classified = crate::model_failure::Failure::classify("", &failure.summary);
-                self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified);
+                note_model_error(&self.context, key, &classified.summary());
             }
+            let call = crate::model_failure::RefusalCall {
+                turn_id: &recorder.id,
+                index: Some(failure.model_call),
+                rpc_id: None,
+            };
+            self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified,
+                &failure.message_refs, Some(call));
         }
         // When every route of the chain has failed, the owner is told once per outage, after the route reports above
         // (`harness::route_health`).
@@ -1925,7 +1956,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let audit = outbound_guard_enabled(&reply_cfg)
             && (!self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") || !crate::chat::is_owner_key(cfg, key));
         let mut secrets = self.secrets.clone();
-        if let Ok(Some(token)) = crate::console::conversation_token(&self.context, key) {
+        if let Ok(Some(token)) = crate::social_state::token(&self.context, key) {
             secrets.push(token);
         }
         if let Some(command) = report.command {
@@ -1967,7 +1998,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 self.send_chat_text(key, &sid, "reply", "⏹️ 已停止");
             }
             crate::chat::Reply::Send(plain) => {
-                let silent_for_members = crate::console::chat_role_state(&self.context)
+                let silent_for_members = crate::social_state::role_state(&self.context)
                     .ok()
                     .is_some_and(|state| state.get("mode").and_then(|m| m.as_str()) == Some("silent"))
                     && !crate::chat::is_owner_key(cfg, key);
@@ -1991,7 +2022,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     where F: FnMut(&str) -> Result<(String, String), String> + Send {
         let key = target.key();
         let token = if self.cur_turn.is_some() { self.turn_token.clone() }
-            else { crate::console::ensure_or_rotate_agent_token(&self.context, &key, false)? };
+            else { crate::social_state::ensure_or_rotate(&self.context, &key, false)? };
         let mut draft_prompt = cli_prompt.to_owned();
         // Match the shared hold's three revisions. The fourth draft uses its fixed deadline.
         for revision in 0..=3 {
@@ -2145,7 +2176,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let n = trimmed.chars().count();
         // 记录模型到底输出了什么（截断）：既用于判断它有没有说话，也是排障的唯一线索。
         let preview = internal_output_preview(&self.context, trimmed);
-        if crate::console::runtime_mode(&self.context) == "reserved2" {
+        if crate::social_state::mode(&self.context) == "reserved2" {
             self.log_internal_output(key, trimmed);
         }
         println!(
@@ -2628,7 +2659,7 @@ mod tests {
         let (context, mut pipe) = pipeline_for_fake_dsh(&root, listener.local_addr().unwrap().port());
         let key = "group:42";
         crate::session_map::bind(&context, key, "sid-136", None).unwrap();
-        let before = crate::console::ensure_or_rotate_agent_token(&context, key, false).unwrap();
+        let before = crate::social_state::ensure_or_rotate(&context, key, false).unwrap();
         let epoch = crate::send_outbox::token_epoch(&before);
         let turn = crate::turn_ledger::Recorder::begin(&context, key, "dsh", "test", &epoch, &[], None).unwrap();
         turn.session("sid-136").unwrap();
@@ -2651,7 +2682,7 @@ mod tests {
         })));
         let result = pipe.cancel_with_reason(key, "turnTimeout");
         crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
-        let after = crate::console::conversation_token(&context, key).unwrap().unwrap();
+        let after = crate::social_state::token(&context, key).unwrap().unwrap();
         let methods = server.join().unwrap();
         let records = crate::turn_ledger::read_records(&context).unwrap();
         std::fs::remove_dir_all(root).unwrap();
@@ -2669,11 +2700,11 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
         let (context, mut pipe) = pipeline_for_fake_dsh(&root, listener.local_addr().unwrap().port());
         let key = "group:42";
-        let before = crate::console::ensure_or_rotate_agent_token(&context,key,false).unwrap();
+        let before = crate::social_state::ensure_or_rotate(&context,key,false).unwrap();
         let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         pipe.share_minted_epoch(minted.clone());
         let result = pipe.pause_unknown(key,"turn-unverified","synthetic unknown collector outcome");
-        let after = crate::console::conversation_token(&context,key).unwrap().unwrap();
+        let after = crate::social_state::token(&context,key).unwrap().unwrap();
         let published = minted.lock().unwrap().clone();
         std::fs::remove_dir_all(root).unwrap();
         assert!(result.is_err());

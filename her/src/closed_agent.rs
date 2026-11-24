@@ -117,7 +117,7 @@ impl Pending {
 }
 
 fn valid_session(context: &RuntimeContext, key: &str, session: &str, epoch: &str) -> bool {
-    if crate::console::runtime_mode(context) != "closed-agent" {
+    if crate::social_state::mode(context) != "closed-agent" {
         return false;
     }
     let Ok(cfg) = context.load_config() else {
@@ -134,7 +134,7 @@ fn valid_session(context: &RuntimeContext, key: &str, session: &str, epoch: &str
     {
         return false;
     }
-    let token = crate::console::conversation_token(context, key)
+    let token = crate::social_state::token(context, key)
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -322,7 +322,7 @@ impl Hub {
         let Some(mode) = crate::config::normalize_mode(mode) else {
             return;
         };
-        match crate::console::apply_dsh_mode(&self.context, mode, observed) {
+        match crate::social_state::apply_dsh_mode(&self.context, mode, observed) {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
@@ -345,7 +345,7 @@ impl Hub {
             return;
         };
         if let Err(error) =
-            crate::console::apply_closed_agent_owner(&self.context, &normalized["ownerQQ"])
+            crate::social_state::apply_closed_agent_owner(&self.context, &normalized["ownerQQ"])
         {
             eprintln!("[closed-agent] DSH owner policy update failed: {error}");
         }

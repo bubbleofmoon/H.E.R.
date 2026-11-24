@@ -67,7 +67,10 @@ fn ticket24_whitelist_revocation_is_immediate_and_undo_grants_only_a_new_epoch()
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let config = context.load_config().unwrap();
-    assert!(crate::console::inbound_admitted(&config, GROUP), "undo must restore the allow list");
+    assert!(
+        crate::social_state::inbound_admitted(&config, GROUP),
+        "undo must restore the allow list"
+    );
     assert_eq!(group_token(&context).as_deref(), Some(rotated.as_str()), "undo must not bring back the old token");
     assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "undo must not bring back the old session");
     let (status, _) = admin_request(&context, "POST", "/api/authorize/read", Some(&json!({"key": GROUP, "token": old})));
@@ -146,7 +149,7 @@ fn ticket24_audit_records_admin_actions_and_refusals_without_request_secrets() {
         ]
     );
     assert_eq!(entries[1]["key"], GROUP);
-    assert_eq!(entries[2]["error"], crate::console::agent::KEY_FORMAT_ERROR);
+    assert_eq!(entries[2]["error"], crate::social_state::KEY_FORMAT_ERROR);
     let log = std::fs::read_to_string(root.0.join("data/audit/audit.jsonl")).unwrap();
     assert!(!log.contains(replacement), "the audit log must not carry the new console token");
     assert!(audit_blob_texts(&root).iter().all(|b| !b.contains(replacement)), "an audit blob carries the new console token");
@@ -214,8 +217,8 @@ fn request_with_token(context: &RuntimeContext, token: &str, method: &str, path:
         body_too_large: false,
     };
     let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let (status, _, text) = serve_request(&req, &cfg, context, port);
-    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    let response = serve_request(&req, &cfg, context, port);
+    (response.status, serde_json::from_str(&response.body).unwrap_or(Value::Null))
 }
 
 /// S1: the generated console token is the hex of 24 bytes from the entropy source, nothing else.
@@ -227,11 +230,21 @@ fn ticket24_generated_console_token_is_the_hex_of_os_entropy() {
         }
         Ok(())
     };
-    let token = generate_console_token_from(&mut fill).unwrap();
-    let expected: String = (0..24u8).map(|i| format!("{:02x}", i.wrapping_mul(7).wrapping_add(1))).collect();
+    let token = crate::console_auth::generate_console_token_from(&mut fill).unwrap();
+    let expected: String =
+        (0..24u8).map(|i| format!("{:02x}", i.wrapping_mul(7).wrapping_add(1))).collect();
     assert_eq!(token, expected, "the token must be exactly the entropy bytes (not time or pid)");
-    assert!(generate_console_token_from(&mut |_: &mut [u8]| Err("no entropy".to_string())).is_err(), "no entropy, no token");
-    let (a, b) = (generate_console_token().unwrap(), generate_console_token().unwrap());
+    assert!(
+        crate::console_auth::generate_console_token_from(&mut |_: &mut [u8]| {
+            Err("no entropy".to_string())
+        })
+        .is_err(),
+        "no entropy, no token"
+    );
+    let (a, b) = (
+        crate::console_auth::generate_console_token().unwrap(),
+        crate::console_auth::generate_console_token().unwrap(),
+    );
     assert_ne!(a, b);
     for token in [&a, &b] {
         assert_eq!(token.len(), 48);
@@ -256,7 +269,7 @@ fn ticket24_revoking_a_conversation_without_records_ends_its_epoch() {
     let revoke = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/whitelist").unwrap();
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), fresh));
+    assert!(crate::social_state::inbound_admitted(&context.load_config().unwrap(), fresh));
     assert_eq!(crate::turn_ledger::reset_count(&context, fresh).unwrap(), after, "the undo grants a new epoch only");
     // Allow-all: a conversation never listed and without records anywhere is still reached when
     // the policy narrows (Codex 6).
@@ -268,12 +281,20 @@ fn ticket24_revoking_a_conversation_without_records_ends_its_epoch() {
     let mut config = raw_config(&root);
     config["allowAllWhenEmpty"] = json!(true);
     std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    assert!(crate::console::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
+    assert!(crate::social_state::access_allowed(
+        &context.load_config().unwrap(),
+        "reserved2",
+        unknown
+    ));
     let before = crate::turn_ledger::reset_count(&context, unknown).unwrap();
     let kept_before = crate::turn_ledger::reset_count(&context, GROUP).unwrap();
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(!crate::console::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
+    assert!(!crate::social_state::access_allowed(
+        &context.load_config().unwrap(),
+        "reserved2",
+        unknown
+    ));
     assert!(crate::turn_ledger::reset_count(&context, unknown).unwrap() > before, "a queued job of {unknown} (allow-all, no records) would survive the narrowing");
     assert_eq!(crate::turn_ledger::reset_count(&context, GROUP).unwrap(), kept_before, "a conversation that stays allowed keeps its queued work");
     drop(root);
@@ -381,8 +402,7 @@ fn ticket24_token_change_is_not_half_written_when_the_token_file_fails() {
         assert_eq!(context.load_config().unwrap()["consoleToken"], old);
     }
     std::fs::remove_dir_all(root.0.join("data/console-token")).unwrap();
-    // Post-write failure: the token file is written, then config.json cannot be replaced (its
-    // directory is immutable). The token file must be rolled back so the old token still works.
+    // A configuration directory that cannot stage the new document refuses before either publication.
     #[cfg(target_os = "linux")]
     {
         let previous = "previous-file-console-token-abcdefghij";
@@ -681,17 +701,20 @@ fn ticket24_fix2_every_config_writer_waits_for_the_gate_and_rereads_inside_it() 
 #[test]
 fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
     let (root, context) = seeded("票据24 fix2 attribution", "fixture-ticket24-fix2-attr-token-abcdefghij");
-    let held = acquire_social_state_gate(&context).unwrap();
-    let worker_context = context.clone();
-    let worker = std::thread::spawn(move || admin_request(&worker_context, "POST", "/api/security", Some(&json!({"interceptNotify": false, "confirm": true}))));
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    // Another administrator replaces the console token meanwhile (as the token handler writes it).
     let rotated = "fixture-ticket24-fix2-attr-rotated-abcdefghij";
-    let mut cfg = raw_config(&root);
-    cfg["consoleToken"] = json!(rotated);
-    write_raw_config(&root, &cfg);
-    drop(held);
-    let (status, reply) = worker.join().unwrap();
+    let worker_context = context.clone();
+    AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+        let _config = acquire_social_state_gate(&worker_context).unwrap();
+        let mut cfg = crate::social_state::raw_config_object(&worker_context).unwrap();
+        cfg["consoleToken"] = json!(rotated);
+        worker_context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+    })));
+    let edit = json!({"interceptNotify": false, "confirm": true});
+    let (status, reply) = admin_request(&context, "POST", "/api/security", Some(&edit));
+    assert_eq!(status, 401, "{reply}");
+    let refused = audit_entries(&context).into_iter().next().unwrap();
+    assert_eq!(refused["files"], json!([]), "revocation refuses the write and records no mutation");
+    let (status, reply) = admin_request(&context, "POST", "/api/security", Some(&edit));
     assert_eq!(status, 200, "{reply}");
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/security").unwrap();
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
@@ -786,10 +809,13 @@ fn ticket24_fix2_an_owner_only_change_revokes_an_aliased_group_immediately() {
     let mut cfg = raw_config(&root);
     cfg["allow"] = json!({"group": [420042], "private": ["7001"]});
     write_raw_config(&root, &cfg);
-    assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP), "the alias grants access");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "the alias grants access"
+    );
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(!crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP));
+    assert!(!crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP));
     assert_ne!(group_token(&context).as_deref(), Some("old-group-token-abcdefghij"), "the lost access must be reconciled at once");
     drop(root);
 }
@@ -804,7 +830,10 @@ fn ticket24_fix2_an_owner_only_change_keeps_an_aliased_allow_list() {
     write_raw_config(&root, &cfg);
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP), "an owner-only change revoked the aliased group");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "an owner-only change revoked the aliased group"
+    );
     assert_eq!(raw_config(&root)["allow"], json!({"group": [420042], "private": ["7001"]}), "the configured allow list must stay byte-for-byte as configured");
     drop(root);
 }
@@ -1017,4 +1046,39 @@ fn turns_view_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound
     assert!(!error.contains(&root.0.display().to_string()), "the error must not disclose the runtime root: {reply}");
     assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
     assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "the read must wait out the whole bound, waited {waited:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn reset_count_waits_out_an_append_lock_on_the_turn_ledger() {
+    let (root, context, _) = seeded_ledgers("reset count ledger lock");
+    crate::turn_ledger::record_reset(&context, GROUP).unwrap();
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", Some(conflicts.0.clone()));
+    let resets = crate::turn_ledger::reset_count(&context, GROUP);
+    holder.release();
+    let hits = conflicts.0.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(hits >= 1, "reset_count never met the lock: {resets:?}");
+    assert_eq!(resets, Ok(1), "a released lock must not drop reset_count");
+}
+
+#[cfg(windows)]
+#[test]
+fn reset_count_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound() {
+    let (root, context, _) = seeded_ledgers("reset count lock bound");
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", None);
+    let started = std::time::Instant::now();
+    let resets = crate::turn_ledger::reset_count(&context, GROUP);
+    let waited = started.elapsed();
+    holder.release();
+    let error = resets.unwrap_err();
+    assert!(error.contains("class=read/file"), "missing read class: {error}");
+    assert!(error.contains("os=Some(33)"), "missing OS lock code: {error}");
+    let root_str = root.0.display().to_string();
+    assert!(!error.contains(&root_str), "runtime root leaked: {error}");
+    let hits = conflicts.0.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(hits >= 1, "reset_count never met the lock: {error}");
+    let min_wait = crate::runtime::APPEND_CONFLICT_WAIT;
+    assert!(waited >= min_wait, "waited {waited:?} < {min_wait:?}");
 }
