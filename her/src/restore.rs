@@ -50,36 +50,8 @@ struct Prepared {
     files: BTreeMap<String, (RuntimeArea, String)>,
     state_included: bool,
     config: Option<Vec<u8>>,
+    configured_token: Option<String>,
     view: Value,
-}
-
-fn location(name: &str) -> Result<(RuntimeArea, String), String> {
-    let simple = |s: &str| !s.is_empty() && !s.contains(['/', '\\', ':']) && s != "." && s != "..";
-    match name {
-        "memory.db" | "conversations.db" | "settings.db" => Ok((RuntimeArea::Data, name.into())),
-        "config.json" => Ok((RuntimeArea::Config, "config.json".into())),
-        console_auth::RESTORE_GENERATION_FILE => Err("cannot restore a destination console generation".into()),
-        "说明.md" => Ok((RuntimeArea::Resources, name.into())),
-        _ if name.starts_with("state/") => {
-            let relative = &name[6..];
-            if !simple(relative) || !relative.ends_with(".json") {
-                return Err("unsupported restore state path".into());
-            }
-            Ok((RuntimeArea::Data, relative.into()))
-        }
-        _ if name.starts_with("roles/")
-            || name.starts_with("patches/")
-            || name.starts_with("docs/") =>
-        {
-            if !name.split('/').all(simple)
-                || (name.starts_with("roles/") && name.split('/').count() != 2)
-            {
-                return Err("unsupported restore resource path".into());
-            }
-            Ok((RuntimeArea::Resources, name.into()))
-        }
-        _ => Err(format!("unsupported restore payload: {name}")),
-    }
 }
 
 fn label(area: RuntimeArea, relative: &str) -> String {
@@ -138,84 +110,6 @@ fn remove_runtime_file(
     }
 }
 
-fn current_files(
-    context: &RuntimeContext,
-    memory_only: bool,
-) -> Result<BTreeMap<String, (RuntimeArea, String)>, String> {
-    let mut files = BTreeMap::from([("memory.db".into(), location("memory.db")?)]);
-    if memory_only {
-        return Ok(files);
-    }
-    let conversations = crate::backup::conversation_db_path(context)?;
-    if conversations.try_exists().map_err(|e| e.to_string())? {
-        files.insert("conversations.db".into(), location("conversations.db")?);
-    }
-    if crate::settings::store_path(context)?
-        .try_exists()
-        .map_err(|e| e.to_string())?
-    {
-        files.insert("settings.db".into(), location("settings.db")?);
-    }
-    files.insert("config.json".into(), location("config.json")?);
-    let data = context.resolve_path(RuntimeArea::Data, "", PathIntent::ReadDirectory)?;
-    for entry in fs::read_dir(data).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "state filename is not UTF-8")?;
-        if name.ends_with(".json") {
-            context.resolve_path(RuntimeArea::Data, &name, PathIntent::ReadFile)?;
-            files.insert(format!("state/{name}"), (RuntimeArea::Data, name));
-        }
-    }
-    fn tree(
-        context: &RuntimeContext,
-        relative: &str,
-        recursive: bool,
-        out: &mut BTreeMap<String, (RuntimeArea, String)>,
-    ) -> Result<(), String> {
-        let base = context.resolve_path(RuntimeArea::Resources, "", PathIntent::ReadDirectory)?;
-        match fs::symlink_metadata(base.join(relative)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.to_string()),
-            Ok(_) => {}
-        }
-        let path =
-            context.resolve_path(RuntimeArea::Resources, relative, PathIntent::ReadDirectory)?;
-        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "resource filename is not UTF-8")?;
-            let child = format!("{relative}/{name}");
-            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-                context.resolve_path(RuntimeArea::Resources, &child, PathIntent::ReadDirectory)?;
-                if recursive {
-                    tree(context, &child, true, out)?;
-                }
-            } else {
-                context.resolve_path(RuntimeArea::Resources, &child, PathIntent::ReadFile)?;
-                out.insert(child.clone(), (RuntimeArea::Resources, child));
-            }
-        }
-        Ok(())
-    }
-    for (name, recursive) in [("roles", false), ("patches", true), ("docs", true)] {
-        tree(context, name, recursive, &mut files)?;
-    }
-    let readme = context.resolve_path(
-        RuntimeArea::Resources,
-        "说明.md",
-        PathIntent::ReadOptionalFile,
-    )?;
-    if readme.exists() {
-        files.insert("说明.md".into(), location("说明.md")?);
-    }
-    Ok(files)
-}
-
 impl Prepared {
     fn open(context: &RuntimeContext, path: &Path, memory_only: bool) -> Result<Self, String> {
         Self::open_internal(context, path, memory_only, true)
@@ -268,7 +162,9 @@ impl Prepared {
         }
         target.sync_all().map_err(|e| e.to_string())?;
         drop(target);
-        let (manifest, credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
+        let verified = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
+        let manifest = verified.manifest;
+        let credentials = verified.credentials;
         let mut warnings = Vec::new();
         if !memory_only {
             if !credentials.has_endpoints {
@@ -283,40 +179,48 @@ impl Prepared {
         }
         let mut state_included = true;
         let mut config_bytes = None;
+        let mut configured_token = None;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-            let mut text = String::new();
+            let mut bytes = Vec::new();
             archive
                 .by_name("config.json")
                 .map_err(|e| e.to_string())?
-                .read_to_string(&mut text)
+                .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-                .map_err(|e| format!("restore config invalid: {e}"))?;
-            let (config, _) = crate::config::canonical_config(&raw)?;
+            let raw = crate::backup::parse_archive_config(&bytes)?;
+            let (config, _) = crate::backup::validate_archive_config(
+                context.runtime_root().ok_or("runtime root missing")?,
+                raw,
+                &verified.settings_overlay,
+            )?;
             state_included = config["backup"]["includeState"] != false
                 || manifest.files.keys().any(|name| name.starts_with("state/"));
-            crate::backup::Settings::from_config_resolved(
-                context.runtime_root().ok_or("runtime root missing")?,
-                &config,
-            )?;
+            let archive_token = token_from_canonical_config(&config);
             context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
-            if check_destination && configured_token(text.as_bytes())?.is_none() {
+            if check_destination && archive_token.is_none() {
                 let live = console_auth::raw_token_config(context)?;
-                if context.effective_console_token(&live).is_empty() { return Err(recovery_error()); }
+                if context.effective_console_token(&live).is_empty() {
+                    return Err(recovery_error());
+                }
             }
-            config_bytes = Some(text.into_bytes());
+            configured_token = archive_token;
+            config_bytes = Some(bytes);
         }
         let mut files = BTreeMap::new();
         for name in manifest.files.keys() {
-            let entry = location(name)?;
+            let entry = crate::backup::archive_location(name)?;
             if !memory_only || name == "memory.db" {
                 context.resolve_path(entry.0, &entry.1, PathIntent::ReadOptionalFile)?;
                 files.insert(name.clone(), entry);
             }
         }
-        let mut replacements = current_files(context, memory_only)?;
+        let mut replacements = crate::backup::runtime_inventory(
+            context,
+            crate::backup::ArchiveScope::for_restore(memory_only),
+            &|| Ok(()),
+        )?;
         if !state_included {
             replacements.retain(|name, _| !name.starts_with("state/"));
         }
@@ -354,6 +258,7 @@ impl Prepared {
             files,
             state_included,
             config: config_bytes,
+            configured_token,
             view,
         })
     }
@@ -378,12 +283,78 @@ pub fn operation_gate(context: &RuntimeContext) -> Result<File, String> {
         .map_err(|_| "an update or another restore is running".into())
 }
 
+/// Persistent OS gate protecting `memory.db` and chat-tool `settings.db`/`config.json`
+/// writers that a restore does not stop (`her-cli --mcp-serve`, direct `memory` opens).
+///
+/// Lock order:
+/// 1. `locks/update-restore.lock` (`operation_gate`)
+/// 2. `locks/restore.lock`
+/// 3. `locks/console-credential.lock` (full restore & offline password CLI)
+/// 4. `quiesce` (`tasks/locks/*.lock` -> `lifecycle/lifecycle.lock` -> `rbridge-live.lock`, `rbridge-console.lock`)
+/// 5. `locks/restore-writers.lock` (this gate: exclusive during restore pre-snapshot/replacement; shared for unstopped `memory.db` and chat-tool writers)
+/// 6. `locks/social-v2.lock` (`console::config_gate` / `conversation_state::acquire`)
+/// 7. `locks/authority.lock`
+/// 8. `locks/settings-store.lock` (`settings::restore_gate` / `store_gate`)
+///
+/// Unstopped writers (`memory_actions::handle_inner`, `memory::open_store`,
+/// `memory::open_ready_guarded_for_runtime`) acquire this gate shared before `locks/social-v2.lock`
+/// or opening `memory.db`, and never take outer restore/lifecycle locks while holding it.
+/// Restore acquires it exclusively only after `quiesce` stops live, console, and ordinary task
+/// owners, and releases it with `Stopped` before `resume`/health.
+const WRITER_RESTORE_GATE: &str = "locks/restore-writers.lock";
+const WRITER_RESTORE_WAIT: Duration = Duration::from_secs(5);
+
+pub(crate) fn writer_gate_shared(context: &RuntimeContext) -> Result<Option<File>, String> {
+    if !context.is_isolated() {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + WRITER_RESTORE_WAIT;
+    loop {
+        match context.open_shared_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE) {
+            Ok(file) => return Ok(Some(file)),
+            Err(error)
+                if error == "runtime file is already locked" && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error == "runtime file is already locked" => {
+                return Err("a backup restore is in progress".into());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn writer_gate_exclusive(context: &RuntimeContext) -> Result<File, String> {
+    let deadline = Instant::now() + WRITER_RESTORE_WAIT;
+    loop {
+        match context.open_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE) {
+            Ok(file) => return Ok(file),
+            Err(error)
+                if error == "runtime file is already locked" && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error == "runtime file is already locked" => {
+                return Err(
+                    "unstopped memory or settings writers did not finish before restore".into(),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// External process/health/notice boundary. File transactions always use the real runtime API.
 trait Control {
     fn preflight(&mut self, context: &RuntimeContext) -> Result<(), String>;
     fn stop(&mut self, context: &RuntimeContext, revision: u64) -> Result<(), String>;
     #[cfg(feature = "parity-clock")]
     fn snapshot_ready(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    #[cfg(test)]
+    fn after_snapshot(&mut self, _context: &RuntimeContext) -> Result<(), String> {
         Ok(())
     }
     fn restart(&mut self, _context: &RuntimeContext) -> Result<(), String> {
@@ -572,34 +543,29 @@ impl Control for RealControl {
 
 struct Stopped {
     _hold: crate::lifecycle::QuiescentHold,
+    _writers: File,
 }
 fn quiesce(
     context: &RuntimeContext,
     by: &str,
-    memory_only: bool,
     control: &mut dyn Control,
 ) -> Result<Stopped, Step> {
     use crate::lifecycle::{
         self, DesiredState, DesiredStore, LiveLifecycle, OwnerRole, QuiesceError,
     };
     let data = context.data_dir();
-    lifecycle::validate_owner_gate_paths(data)?;
+    lifecycle::validate_owner_gate_paths(data).map_err(Step::Refused)?;
     let store = DesiredStore::new(data.join("lifecycle"));
-    let record = store.write(
-        DesiredState::Stopped,
-        by,
-        "backup restore",
-        None,
-        crate::parity_clock::now_ms(),
-    )?;
-    control.stop(context, record.revision)?;
-    let gate_error = |error| {
-        if memory_only {
-            Step::Failed(error)
-        } else {
-            Step::Refused(error)
-        }
-    };
+    let record = store
+        .write(
+            DesiredState::Stopped,
+            by,
+            "backup restore",
+            None,
+            crate::parity_clock::now_ms(),
+        )
+        .map_err(Step::Refused)?;
+    control.stop(context, record.revision).map_err(Step::Refused)?;
     let hold = lifecycle::quiesce_stopped_gates(
         &mut LiveLifecycle,
         data,
@@ -608,10 +574,13 @@ fn quiesce(
         "restore",
     )
     .map_err(|error| match error {
-        QuiesceError::Superseded(message) => Step::Failed(message),
-        QuiesceError::Gate(message) => gate_error(message),
+        QuiesceError::Superseded(message) | QuiesceError::Gate(message) => Step::Refused(message),
     })?;
-    Ok(Stopped { _hold: hold })
+    let writers = writer_gate_exclusive(context).map_err(Step::Refused)?;
+    Ok(Stopped {
+        _hold: hold,
+        _writers: writers,
+    })
 }
 fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     crate::lifecycle::DesiredStore::new(context.data_dir().join("lifecycle")).write(
@@ -731,12 +700,13 @@ fn protected_stash_dir(context: &RuntimeContext) -> Result<(), String> {
     crate::guarded_file::sync_directory(context.data_dir()).map_err(|_| recovery_error())
 }
 
-fn configured_token(raw: &[u8]) -> Result<Option<String>, String> {
-    let text = std::str::from_utf8(raw).map_err(|_| recovery_error())?;
-    let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| recovery_error())?;
-    let (cfg, _) = crate::config::canonical_config(&raw).map_err(|_| recovery_error())?;
-    Ok(cfg.get("consoleToken").and_then(Value::as_str).map(str::trim)
-        .filter(|value| !value.is_empty()).map(str::to_owned))
+fn token_from_canonical_config(config: &Value) -> Option<String> {
+    config
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn checked_recovery_bytes(context: &RuntimeContext, name: &str, digest: [u8; 32]) -> Result<Vec<u8>, String> {
@@ -805,8 +775,10 @@ fn stage_full_restore(
     let rollback_config = rollback.config.as_deref().ok_or_else(recovery_error)?;
     let live = console_auth::raw_token_config(context)?;
     let effective = context.effective_console_token(&live);
-    let mode = configured_token(live.to_string().as_bytes())?;
-    if effective.is_empty() || configured_token(rollback_config)? != mode {
+    let overlaid = context.overlay_config(live.clone());
+    let (live_cfg, _) = crate::config::canonical_config(&overlaid).map_err(|_| recovery_error())?;
+    let mode = token_from_canonical_config(&live_cfg);
+    if effective.is_empty() || rollback.configured_token != mode {
         return Err(recovery_error());
     }
     let original_file = context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
@@ -827,7 +799,10 @@ fn stage_full_restore(
         destination_token: Sha256::digest(&serialized).into(),
     };
     let config = checked_recovery_bytes(context, FORWARD_CONFIG, intent.forward_config)?;
-    let token = configured_token(&config)?.unwrap_or(captured.effective);
+    let token = forward
+        .configured_token
+        .clone()
+        .unwrap_or(captured.effective);
     publish_recovery_intent(context, &intent)?;
     Ok(RestorePair { token, config })
 }
@@ -838,13 +813,6 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
     let config = checked_recovery_bytes(context, ROLLBACK_CONFIG, intent.rollback_config)?;
     let token_bytes = checked_recovery_bytes(context, DESTINATION_TOKEN, intent.destination_token)?;
     let token: DestinationToken = serde_json::from_slice(&token_bytes).map_err(|_| recovery_error())?;
-    let mode = configured_token(&config)?;
-    let saved_file = token.original_file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim);
-    if token.effective.is_empty() || token.configured != mode.is_some()
-        || mode.as_deref().or(saved_file) != Some(token.effective.as_str())
-    {
-        return Err(recovery_error());
-    }
     let archive = context.resolve_path(RuntimeArea::Data, ROLLBACK_ARCHIVE, PathIntent::ReadFile)?;
     let file = crate::guarded_fs::open_protected_file(&archive)
         .map_err(|_| recovery_error())?
@@ -856,27 +824,78 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
     if prepared.config.as_ref() != Some(&config) {
         return Err(recovery_error());
     }
+    let mode = prepared.configured_token.clone();
+    let saved_file = token.original_file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim);
+    if token.effective.is_empty() || token.configured != mode.is_some()
+        || mode.as_deref().or(saved_file) != Some(token.effective.as_str())
+    {
+        return Err(recovery_error());
+    }
     Ok((prepared, RestorePair { config, token: token.effective }))
 }
 
-#[derive(Clone, Copy)]
 enum FullPublication<'a> {
     Forward(&'a Prepared),
     Rollback(&'a RestorePair),
 }
 
-/// Quiesce first, then acquire config/social-state, transport authority and the settings store in that order.
-/// Release the publication gates before reconciliation or restart.
+enum ReplaceMode<'a> {
+    Forward {
+        memory_only: bool,
+        pre_restore_archive: &'a mut Option<String>,
+        previous_path: &'a mut Option<PathBuf>,
+        rollback: &'a mut Option<Prepared>,
+    },
+    Rollback {
+        pair: Option<&'a RestorePair>,
+    },
+}
+
+/// Quiesce owners/tasks and take the writer restore gate first, then take the scoped pre-restore
+/// snapshot (forward restore only), then acquire config/social-state, transport authority and the
+/// settings store in that order. Release the publication gates before reconciliation or restart.
 fn stop_and_replace(
     context: &RuntimeContext,
     by: &str,
     prepared: &Prepared,
-    full: Option<FullPublication<'_>>,
+    mode: ReplaceMode<'_>,
     control: &mut dyn Control,
 ) -> Result<(), Step> {
-    let memory_only = full.is_none();
-    let stopped = quiesce(context, by, memory_only, control)?;
-    if let Some(publication) = full {
+    let memory_only = match &mode {
+        ReplaceMode::Forward { memory_only, .. } => *memory_only,
+        ReplaceMode::Rollback { pair } => pair.is_none(),
+    };
+    let stopped = quiesce(context, by, control)?;
+    let rollback_pair = match mode {
+        ReplaceMode::Forward {
+            memory_only,
+            pre_restore_archive,
+            previous_path,
+            rollback,
+        } => {
+            let prev = crate::backup::create_pre_restore_scoped(context, memory_only, &|| Ok(()))
+                .map_err(Step::Refused)?;
+            *pre_restore_archive = prev
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let rb = Prepared::open(context, &prev, memory_only).map_err(Step::Refused)?;
+            *previous_path = Some(prev);
+            *rollback = Some(rb);
+            #[cfg(feature = "parity-clock")]
+            control.snapshot_ready().map_err(Step::Refused)?;
+            #[cfg(test)]
+            control.after_snapshot(context).map_err(Step::Refused)?;
+            if !memory_only {
+                Some(FullPublication::Forward(
+                    rollback.as_ref().expect("staged rollback"),
+                ))
+            } else {
+                None
+            }
+        }
+        ReplaceMode::Rollback { pair } => pair.map(FullPublication::Rollback),
+    };
+    if let Some(publication) = rollback_pair {
         let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
         let authority = context.authority_gate().map_err(Step::Refused)?;
         let _store = crate::settings::restore_gate(context).map_err(Step::Refused)?;
@@ -920,19 +939,17 @@ fn apply(
     // A stopped writer must not leave an old WAL to replay against the replacement database. A reader in a process
     // the restore does not stop may hold a file open for a moment; removals retry that (`remove_runtime_file`).
     crate::memory::db_path_for_runtime(context)?;
-    let databases: &[&str] = if memory_only {
-        &["memory.db"]
-    } else {
+    let scope = crate::backup::ArchiveScope::for_restore(memory_only);
+    if !memory_only {
         crate::backup::conversation_db_path(context)?;
         crate::settings::store_path(context)?;
-        &["memory.db", "conversations.db", "settings.db"]
-    };
-    for database in databases {
+    }
+    for database in scope.databases() {
         for suffix in ["-wal", "-shm", "-journal"] {
             remove_runtime_file(context, RuntimeArea::Data, &format!("{database}{suffix}"))?;
         }
     }
-    let current = current_files(context, memory_only)?;
+    let current = crate::backup::runtime_inventory(context, scope, &|| Ok(()))?;
     let mut archive = zip::ZipArchive::new(File::open(&prepared.zip).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     for (name, (area, relative)) in &prepared.files {
@@ -1129,16 +1146,7 @@ fn execute_with(
         }
         control.preflight(context)?;
         let config = context.load_config().map_err(str::to_owned)?;
-        audit(
-            context,
-            by,
-            archive,
-            memory_only,
-            "started",
-            "verified archive; taking pre-restore backup",
-            &recovery,
-        )?;
-        let previous = crate::backup::create_pre_restore(context, &|| Ok(())).map_err(|error| {
+        crate::backup::check_pre_restore_destination(context).map_err(|error| {
             control.alert(
                 context,
                 &config,
@@ -1146,14 +1154,33 @@ fn execute_with(
             );
             error
         })?;
-        recovery.pre_restore_archive = previous
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        let rollback = Prepared::open(context, &previous, memory_only)?;
-        #[cfg(feature = "parity-clock")]
-        control.snapshot_ready()?;
-        let attempt = (|| -> Result<(), Step> {
-            stop_and_replace(context, by, &prepared, (!memory_only).then_some(FullPublication::Forward(&rollback)), control)?;
+        audit(
+            context,
+            by,
+            archive,
+            memory_only,
+            "started",
+            "verified archive; stopping writers and taking pre-restore backup",
+            &recovery,
+        )?;
+        let mut previous: Option<PathBuf> = None;
+        let mut rollback: Option<Prepared> = None;
+        let attempt = (|| -> Result<PathBuf, Step> {
+            stop_and_replace(
+                context,
+                by,
+                &prepared,
+                ReplaceMode::Forward {
+                    memory_only,
+                    pre_restore_archive: &mut recovery.pre_restore_archive,
+                    previous_path: &mut previous,
+                    rollback: &mut rollback,
+                },
+                control,
+            )?;
+            let previous_path = previous
+                .clone()
+                .ok_or_else(|| Step::Refused("pre-restore backup unavailable".into()))?;
             if !memory_only {
                 let _config = crate::console::config_gate(context).map_err(|(_, e)| Step::Failed(e))?;
                 set_restore_phase(context, RestorePhase::Verifying)?;
@@ -1161,13 +1188,13 @@ fn execute_with(
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
-            crate::backup::protect_pre_restore(&previous, &|| Ok(()))?;
+            crate::backup::protect_pre_restore(&previous_path, &|| Ok(()))?;
             if !memory_only { finish_recovery(context, RestorePhase::Committed)?; }
-            Ok(())
+            Ok(previous_path)
         })();
         match attempt {
-            Ok(()) => {
-                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)});
+            Ok(previous_path) => {
+                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous_path)});
                 if !memory_only {
                     if let Ok(effective) = context.load_config() {
                         let notices = crate::watchdog::rollout_scope_gaps(&effective).lines();
@@ -1193,21 +1220,40 @@ fn execute_with(
             Err(Step::Failed(reason)) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
+                    let previous = previous
+                        .as_ref()
+                        .ok_or_else(|| "pre-restore backup unavailable".to_string())?;
                     if memory_only {
-                        stop_and_replace(context, by, &rollback, None, control).map_err(Step::message)?;
+                        let rollback = rollback
+                            .as_ref()
+                            .ok_or_else(|| "pre-restore rollback plan unavailable".to_string())?;
+                        stop_and_replace(
+                            context,
+                            by,
+                            rollback,
+                            ReplaceMode::Rollback { pair: None },
+                            control,
+                        )
+                        .map_err(Step::message)?;
                     } else {
                         let terminal = read_recovery_intent(context, RECOVERY_INTENT)?
                             .or(read_recovery_intent(context, RECOVERY_OUTCOME)?)
                             .is_some_and(|intent| intent.phase.terminal());
                         if terminal || !recovery_pending(context) { return Err(recovery_error()); }
                         let (rollback, pair) = rollback_artifacts(context)?;
-                        stop_and_replace(context, by, &rollback, Some(FullPublication::Rollback(&pair)), control)
-                            .map_err(Step::message)?;
+                        stop_and_replace(
+                            context,
+                            by,
+                            &rollback,
+                            ReplaceMode::Rollback { pair: Some(&pair) },
+                            control,
+                        )
+                        .map_err(Step::message)?;
                         finish_recovery(context, RestorePhase::RolledBack)?;
                     }
                     resume(context, by)?;
                     control.restart(context)?;
-                    crate::backup::protect_pre_restore(&previous, &|| Ok(()))
+                    crate::backup::protect_pre_restore(previous, &|| Ok(()))
                 })();
                 let detail = match undo {
                     Ok(()) => {
@@ -1218,7 +1264,10 @@ fn execute_with(
                         recovery.rollback_status = "failed";
                         format!(
                             "{reason}; rollback failed: {e}; pre-restore backup: {}",
-                            ordinary_path(&previous)
+                            previous
+                                .as_ref()
+                                .map(|path| ordinary_path(path))
+                                .unwrap_or_else(|| "unavailable".into())
                         )
                     }
                 };
@@ -1341,7 +1390,14 @@ fn recover_with(context: &RuntimeContext, control: &mut dyn Control) -> Result<V
     }
     let (rollback, pair) = rollback_artifacts(context)?;
     control.preflight(context)?;
-    stop_and_replace(context, by, &rollback, Some(FullPublication::Rollback(&pair)), control).map_err(Step::message)?;
+    stop_and_replace(
+        context,
+        by,
+        &rollback,
+        ReplaceMode::Rollback { pair: Some(&pair) },
+        control,
+    )
+    .map_err(Step::message)?;
     finish_recovery(context, RestorePhase::RolledBack)?;
     resume(context, by)?;
     control.restart(context)?;
@@ -1567,6 +1623,7 @@ fn queue_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backup::archive_location as location;
     use std::{fs, path::PathBuf};
     struct Fixture(PathBuf);
     impl Fixture {
@@ -1717,6 +1774,8 @@ mod tests {
         observe_generation: bool,
         generation_at_health: Option<console_auth::Generation>,
         generation_fault: Option<&'static str>,
+        on_stop: Option<Box<dyn FnMut(&RuntimeContext, usize) -> Result<(), String> + Send>>,
+        on_after_snapshot: Option<Box<dyn FnMut(&RuntimeContext) -> Result<(), String> + Send>>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1724,6 +1783,9 @@ mod tests {
         }
         fn stop(&mut self, context: &RuntimeContext, _: u64) -> Result<(), String> {
             self.stops += 1;
+            if let Some(hook) = self.on_stop.as_mut() {
+                hook(context, self.stops)?;
+            }
             // The store gate is free while the restore waits for the owners and the task gates (a stop is the first
             // of those waits); a writer that takes it now holds it until the restore gives up.
             match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
@@ -1734,30 +1796,6 @@ mod tests {
                     }
                 }
                 Err(_) => self.store_free_at_stop.push(false),
-            }
-            if self.leave_conversation_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .unwrap()
-                            .join(format!("data/conversations.db{suffix}")),
-                        b"stale conversation sidecar",
-                    )
-                    .unwrap();
-                }
-            }
-            if self.leave_settings_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .unwrap()
-                            .join(format!("data/settings.db{suffix}")),
-                        b"stale settings sidecar",
-                    )
-                    .unwrap();
-                }
             }
             if self.fail_rollback_stop && self.stops == 2 {
                 return Err("fixture rollback stop failed".into());
@@ -1802,6 +1840,36 @@ mod tests {
         }
         fn alert(&mut self, _: &RuntimeContext, _: &Value, reason: &str) {
             self.alerts.push(reason.into());
+        }
+        fn after_snapshot(&mut self, context: &RuntimeContext) -> Result<(), String> {
+            if self.leave_conversation_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/conversations.db{suffix}")),
+                        b"stale conversation sidecar",
+                    )
+                    .unwrap();
+                }
+            }
+            if self.leave_settings_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/settings.db{suffix}")),
+                        b"stale settings sidecar",
+                    )
+                    .unwrap();
+                }
+            }
+            if let Some(hook) = self.on_after_snapshot.as_mut() {
+                hook(context)?;
+            }
+            Ok(())
         }
         fn publish_generation(&mut self, context: &RuntimeContext) -> Result<console_auth::Generation, GenerationWriteError> {
             let Some(fault) = self.generation_fault.take() else {
@@ -1974,10 +2042,13 @@ mod tests {
                 serde_json::from_slice(&fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
             assert_eq!(config.get("currentOnly").is_some(), memory_only);
             let pre = Path::new(result["preRestoreBackup"].as_str().unwrap());
-            assert!(crate::backup::verify_archive(pre, &|| Ok(()))
-                .unwrap()
-                .files
-                .contains_key("conversations.db"));
+            let pre_manifest = crate::backup::verify_archive(pre, &|| Ok(())).unwrap();
+            assert!(pre_manifest.files.contains_key("memory.db"));
+            assert_eq!(
+                pre_manifest.files.contains_key("conversations.db"),
+                !memory_only
+            );
+            assert_eq!(pre_manifest.files.contains_key("config.json"), !memory_only);
             let until: i64 = fs::read_to_string(pre.with_extension("zip.restore-until"))
                 .unwrap()
                 .parse()
@@ -1986,10 +2057,10 @@ mod tests {
                 until >= control.health_finished.unwrap() + 7 * 86_400_000,
                 "protection starts after restored health"
             );
-            assert!(crate::backup::verify_archive(pre, &|| Ok(()))
-                .unwrap()
-                .files
-                .contains_key("state/probe.json"));
+            assert_eq!(
+                pre_manifest.files.contains_key("state/probe.json"),
+                !memory_only
+            );
             let audit = fs::read_to_string(f.0.join("data/audit/audit.jsonl")).unwrap();
             assert!(
                 audit.contains("fixture-admin")
@@ -2987,6 +3058,412 @@ mod tests {
         assert_eq!(ordinary_path(Path::new(r"\\?\C:\x\backups\a.zip")), r"C:\x\backups\a.zip");
         assert_eq!(ordinary_path(Path::new(r"\\?\UNC\srv\share\a.zip")), r"\\srv\share\a.zip");
         assert_eq!(ordinary_path(Path::new(r"\\?\GLOBALROOT\x")), r"\\?\GLOBALROOT\x");
+    }
+
+    fn setup_owner_chat_fixture(f: &Fixture) {
+        let mut cfg: Value =
+            serde_json::from_slice(&fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+        cfg["ownerQQ"] = json!(7001);
+        fs::write(f.0.join("config/config.json"), cfg.to_string()).unwrap();
+        fs::write(
+            f.0.join("data/social-v2.json"),
+            json!({"conversations": {"private:7001": {"agentToken": "tok-216"}}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pre_restore_backup_runs_after_quiesce_and_captures_late_writes_for_rollback() {
+        for memory_only in [true, false] {
+            let f = Fixture::new();
+            setup_owner_chat_fixture(&f);
+            set_quiet(&f, 4000);
+            let archive = f.backup();
+            mutate(&f);
+            set_quiet(&f, 5000);
+            let plan = preview(&f.context(), &archive, memory_only).unwrap();
+            let mut control = FakeControl {
+                unhealthy: true,
+                on_stop: Some(Box::new(move |context, stops| {
+                    if stops == 1 {
+                        // Before quiescence finishes, the exclusive writer restore gate is not held yet.
+                        let _shared = context
+                            .open_shared_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE)
+                            .expect("writer restore gate must be free during stop");
+                        drop(_shared);
+                        let conn = crate::memory::open_ready_for_runtime(context)?;
+                        conn.execute(
+                            "UPDATE probe SET value='late memory before quiesce'",
+                            [],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if !memory_only {
+                            crate::memory_actions::tool_action(
+                                context,
+                                "settings-set",
+                                &json!({
+                                    "key": "private:7001",
+                                    "token": "tok-216",
+                                    "settingKey": "socialV2.reply.wakeQuietMs",
+                                    "value": 6123
+                                }),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })),
+                on_after_snapshot: Some(Box::new(|context| {
+                    // When the pre-restore snapshot runs, the exclusive writer restore gate is held.
+                    assert_eq!(
+                        context
+                            .open_shared_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE)
+                            .unwrap_err(),
+                        "runtime file is already locked"
+                    );
+                    Ok(())
+                })),
+                ..Default::default()
+            };
+            let error = execute_with(
+                &f.context(),
+                &archive,
+                memory_only,
+                plan["confirmation"].as_str().unwrap(),
+                "late-write-admin",
+                &mut control,
+            )
+            .unwrap_err();
+            assert!(error.contains("pre-restore backup restored"), "{error}");
+            assert_eq!(
+                memory(&f),
+                "late memory before quiesce",
+                "rollback must preserve late memory writes made before quiesce completed"
+            );
+            assert_eq!(
+                quiet(&f),
+                Some(if memory_only { 5000 } else { 6123 }),
+                "full rollback must preserve late chat settings writes before quiesce completed"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_only_restore_succeeds_with_corrupt_or_missing_conversations_and_settings() {
+        for case in ["corrupt", "missing"] {
+            let f = Fixture::new();
+            set_quiet(&f, 4200);
+            let archive = f.backup();
+            mutate(&f);
+            let conv_path = f.0.join("data/conversations.db");
+            let settings_path = f.0.join("data/settings.db");
+            let journal_path = f.0.join("data/settings.db-journal");
+            if case == "corrupt" {
+                fs::write(&conv_path, b"corrupt conversations bytes").unwrap();
+                fs::write(&settings_path, b"corrupt settings bytes").unwrap();
+                fs::write(&journal_path, b"leftover journal").unwrap();
+            } else {
+                fs::remove_file(&conv_path).unwrap();
+                fs::remove_file(&settings_path).unwrap();
+            }
+
+            let plan = preview(&f.context(), &archive, true).unwrap();
+            let result = execute_with(
+                &f.context(),
+                &archive,
+                true,
+                plan["confirmation"].as_str().unwrap(),
+                "fixture-admin",
+                &mut FakeControl::default(),
+            )
+            .unwrap();
+            assert_eq!(memory(&f), "old memory");
+
+            let pre = Path::new(result["preRestoreBackup"].as_str().unwrap());
+            let manifest = crate::backup::verify_archive(pre, &|| Ok(())).unwrap();
+            assert_eq!(
+                manifest.files.keys().cloned().collect::<Vec<_>>(),
+                vec!["memory.db"],
+                "memory-only pre-restore snapshot must contain memory.db only"
+            );
+            assert!(
+                preview(&f.context(), pre, false).is_err(),
+                "full restore must reject a memory.db-only archive"
+            );
+            assert!(preview(&f.context(), pre, true).is_ok());
+
+            if case == "corrupt" {
+                assert_eq!(fs::read(&conv_path).unwrap(), b"corrupt conversations bytes");
+                assert_eq!(fs::read(&settings_path).unwrap(), b"corrupt settings bytes");
+                assert_eq!(fs::read(&journal_path).unwrap(), b"leftover journal");
+
+                // Full-scope restore must still refuse damaged databases.
+                rusqlite::Connection::open(f.0.join("data/memory.db"))
+                    .unwrap()
+                    .execute("UPDATE probe SET value='current memory'", [])
+                    .unwrap();
+                let full_plan = preview(&f.context(), &archive, false).unwrap();
+                let mut full_control = FakeControl::default();
+                let error = execute_with(
+                    &f.context(),
+                    &archive,
+                    false,
+                    full_plan["confirmation"].as_str().unwrap(),
+                    "fixture-admin",
+                    &mut full_control,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("conversation") || error.contains("settings"),
+                    "{error}"
+                );
+                assert_eq!(full_control.writes, 0);
+                assert_eq!(memory(&f), "current memory");
+            } else {
+                assert!(!conv_path.exists());
+                assert!(!settings_path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn archive_backup_settings_validation_uses_archive_settings_db_overlay() {
+        let f = Fixture::new();
+        let context = f.context();
+        crate::settings::apply(&context, "backup.time", &json!("04:30"), "admin", "console")
+            .unwrap();
+        let archive = f.backup();
+
+        // Archive config.json alone has an invalid backup.time ("99:99"), but its own settings.db
+        // overlay supplies "04:30". Meanwhile the live runtime holds a different value ("06:00").
+        let mut invalid_cfg: Value =
+            serde_json::from_slice(&fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+        invalid_cfg["backup"] = json!({"time": "99:99"});
+        let overlaid = rewrite_archive(
+            &archive,
+            "overlaid-backup.zip",
+            "config.json",
+            &serde_json::to_vec(&invalid_cfg).unwrap(),
+        );
+        crate::settings::apply(&context, "backup.time", &json!("06:00"), "admin", "console")
+            .unwrap();
+
+        let plan = preview(&context, &overlaid, false).unwrap();
+        execute_with(
+            &context,
+            &overlaid,
+            false,
+            plan["confirmation"].as_str().unwrap(),
+            "fixture-admin",
+            &mut FakeControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            context.load_config().unwrap()["backup"]["time"],
+            json!("04:30"),
+            "full restore must validate and apply the archive's own settings.db overlay"
+        );
+
+        // Removing settings.db from that archive must fail validation even though the live
+        // runtime's settings.db currently holds a valid backup.time ("04:30").
+        let mut source = zip::ZipArchive::new(fs::File::open(&overlaid).unwrap()).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..source.len() {
+            let mut entry = source.by_index(index).unwrap();
+            let name = entry.name().to_string();
+            if name == "settings.db" {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            entries.push((name, bytes));
+        }
+        drop(source);
+        if let Some((_, manifest)) = entries.iter_mut().find(|(name, _)| name == "manifest.json") {
+            let mut value: Value = serde_json::from_slice(manifest).unwrap();
+            value["files"].as_object_mut().unwrap().remove("settings.db");
+            *manifest = serde_json::to_vec(&value).unwrap();
+        }
+        let without_store = overlaid.with_file_name("no-settings-invalid-backup.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&without_store).unwrap());
+        for (name, bytes) in entries {
+            writer
+                .start_file(name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = preview(&context, &without_store, false).unwrap_err();
+        assert!(
+            error.contains("backup.time"),
+            "live settings.db must never mask invalid archive config.json: {error}"
+        );
+    }
+
+    #[test]
+    fn restore_gate_blocks_and_defers_unstopped_memory_and_chat_settings_writers() {
+        use std::sync::mpsc;
+
+        // 1. Active restore defers concurrent unstopped memory.db and chat-tool settings.db writers
+        //    until replacement/quiesce finishes, then lets them proceed on the restored state.
+        let f = Fixture::new();
+        setup_owner_chat_fixture(&f);
+        let context = f.context();
+        let cfg = context.load_config().unwrap();
+        set_quiet(&f, 4000);
+        let archive = f.backup();
+        set_quiet(&f, 5000);
+        let plan = preview(&context, &archive, false).unwrap();
+        let confirmation = plan["confirmation"].as_str().unwrap().to_string();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut control = FakeControl {
+            on_after_snapshot: Some(Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        std::thread::scope(|scope| {
+            let restore_ctx = context.clone();
+            let restore_archive = archive.clone();
+            let restore_handle = scope.spawn(move || {
+                execute_with(
+                    &restore_ctx,
+                    &restore_archive,
+                    false,
+                    &confirmation,
+                    "gate-admin",
+                    &mut control,
+                )
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mem_ctx = context.clone();
+            let mem_writer = scope.spawn(move || {
+                crate::memory_actions::tool_action(
+                    &mem_ctx,
+                    "write",
+                    &json!({
+                        "key": "private:7001",
+                        "token": "tok-216",
+                        "content": "deferred memory write"
+                    }),
+                )
+            });
+            let settings_ctx = context.clone();
+            let settings_writer = scope.spawn(move || {
+                crate::memory_actions::tool_action(
+                    &settings_ctx,
+                    "settings-set",
+                    &json!({
+                        "key": "private:7001",
+                        "token": "tok-216",
+                        "settingKey": "socialV2.reply.wakeQuietMs",
+                        "value": 6543
+                    }),
+                )
+            });
+            let store_ctx = context.clone();
+            let store_cfg = cfg.clone();
+            let direct_opener =
+                scope.spawn(move || crate::memory::open_store(&store_ctx, &store_cfg).map(|_| ()));
+
+            std::thread::sleep(Duration::from_millis(250));
+            assert!(
+                !mem_writer.is_finished(),
+                "memory tool writer must block while restore holds the writer gate"
+            );
+            assert!(
+                !settings_writer.is_finished(),
+                "chat settings writer must block while restore holds the writer gate"
+            );
+            assert!(
+                !direct_opener.is_finished(),
+                "direct memory store opener must block while restore holds the writer gate"
+            );
+
+            release_tx.send(()).unwrap();
+            restore_handle.join().unwrap().unwrap();
+            assert!(mem_writer.join().unwrap().is_ok());
+            assert!(settings_writer.join().unwrap().is_ok());
+            assert!(direct_opener.join().unwrap().is_ok());
+        });
+
+        assert_eq!(quiet(&f), Some(6543));
+        let search = crate::memory_actions::tool_action(
+            &context,
+            "search",
+            &json!({"key": "private:7001", "token": "tok-216", "query": "deferred"}),
+        )
+        .unwrap();
+        assert_eq!(search["count"], 1, "{search}");
+
+        // 2. When restore holds the writer gate past the bounded wait, writers refuse cleanly
+        //    without mutating memory.db or settings.db.
+        let exclusive = context
+            .open_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE)
+            .unwrap();
+        std::thread::scope(|scope| {
+            let mem_err = scope.spawn(|| {
+                crate::memory_actions::tool_action(
+                    &context,
+                    "write",
+                    &json!({
+                        "key": "private:7001",
+                        "token": "tok-216",
+                        "content": "refused memory write"
+                    }),
+                )
+                .unwrap_err()
+            });
+            let settings_err = scope.spawn(|| {
+                crate::memory_actions::tool_action(
+                    &context,
+                    "settings-set",
+                    &json!({
+                        "key": "private:7001",
+                        "token": "tok-216",
+                        "settingKey": "socialV2.reply.wakeQuietMs",
+                        "value": 7777
+                    }),
+                )
+                .unwrap_err()
+            });
+            let open_err = scope.spawn(|| {
+                crate::memory::open_store(&context, &cfg)
+                    .err()
+                    .expect("open_store must refuse while restore gate is held")
+            });
+            assert!(mem_err.join().unwrap().contains("restore is in progress"));
+            assert!(settings_err.join().unwrap().contains("restore is in progress"));
+            assert!(open_err.join().unwrap().contains("restore is in progress"));
+        });
+        drop(exclusive);
+        assert_eq!(quiet(&f), Some(6543));
+
+        // 3. An unstopped shared writer holding the gate past the restore wait refuses the
+        //    restore cleanly after stopping without modifying any runtime database.
+        let shared = writer_gate_shared(&context).unwrap().unwrap();
+        let plan = preview(&context, &archive, true).unwrap();
+        let mut refused_control = FakeControl::default();
+        let err = execute_with(
+            &context,
+            &archive,
+            true,
+            plan["confirmation"].as_str().unwrap(),
+            "gate-admin",
+            &mut refused_control,
+        )
+        .unwrap_err();
+        drop(shared);
+        assert!(err.contains("Restore refused after stopping"), "{err}");
+        assert_eq!(refused_control.stops, 1);
+        assert_eq!(refused_control.writes, 0);
+        assert_eq!(refused_control.restarts, 1);
     }
 
     include!("restore_settings_tests.rs");

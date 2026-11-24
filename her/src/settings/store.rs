@@ -109,12 +109,20 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Applies a pre-read set of registry values over `document`, leaving non-object parents untouched.
+pub(crate) fn overlay_values(document: &mut Value, values: &[(&'static Setting, Value)]) {
+    if document.is_object() {
+        for (setting, value) in values {
+            set_at(document, setting.pointer, value.clone());
+        }
+    }
+}
+
 /// Applies the overlay only after a successful read, so durable repairs can refuse to use file-only values.
 pub(crate) fn overlay_checked(context: &RuntimeContext, document: &mut Value) -> Result<(), String> {
     if context.is_isolated() && document.is_object() {
-        for (setting, value) in stored_values(context)? {
-            set_at(document, setting.pointer, value);
-        }
+        let values = stored_values(context)?;
+        overlay_values(document, &values);
     }
     Ok(())
 }
@@ -533,6 +541,13 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
         Inspection::Ready(conn) => conn,
     };
     read_stored_values(&conn)
+}
+
+/// Reads storable non-secret global settings from an already-verified archive `settings.db`.
+pub(crate) fn read_archive_values(
+    conn: &Connection,
+) -> Result<Vec<(&'static Setting, Value)>, String> {
+    read_stored_values(conn)
 }
 
 /// The stored values of registry settings on an open connection of the store; rows with a key the registry does not
