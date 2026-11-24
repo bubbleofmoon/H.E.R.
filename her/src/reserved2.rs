@@ -1120,6 +1120,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_read_requires_explicit_offered_cursor() {
+        let (_root, hub, _console, token, turn) = snapshot_grant_fixture("mark-read-explicit").await;
+        let key = HARNESS_CAP_KEY;
+        let context = &hub.context;
+        let (status, snapshot) = console::admin_request(context, "POST", "/api/socialV2/wake-snapshot",
+            Some(&json!({"key":key,"token":token,"turnId":turn})));
+        assert_eq!(status, 200);
+        assert_eq!(snapshot["readThroughSeq"], 2);
+
+        let route = "/api/socialV2/mark-read";
+        let mark = |body| console::agent_request(context, "POST", route, Some(&body), &token);
+        let (status, reply) = mark(json!({"key":key}));
+        assert_eq!(status, 400, "agent mark-read requires an explicit cursor even with receipts: {reply}");
+        assert_eq!(mark(json!({"key":key,"clearAll":true})).0, 400);
+
+        conversation_state::update_raw(context, |state| {
+            let conv = &mut state["conversations"][key];
+            conv["unread"].as_array_mut().unwrap().push(json!({"seq":3}));
+            conv["lastUnreadSeq"] = json!(3);
+            Ok(())
+        }).unwrap();
+        let (status, reply) = console::agent_request(context, "POST", "/api/socialV2/wake-config",
+            Some(&json!({"key":key,"config":{"mode":"active"}})), &token);
+        assert_eq!(status, 200);
+        assert_eq!(reply["markedCount"], 0);
+        assert_eq!(mark(json!({"key":key,"throughSeq":3})).0, 400);
+        let (status, reply) = mark(json!({"key":key,"throughSeq":snapshot["readThroughSeq"]}));
+        assert_eq!(status, 200);
+        assert_eq!(reply["unreadCount"], 1);
+
+        assert_eq!(console::admin_request(context, "POST", route, Some(&json!({"key":key}))).0, 400);
+        let (status, reply) = console::admin_request(context, "POST", route, Some(&json!({"key":key,"clearAll":true})));
+        assert_eq!(status, 200);
+        assert_eq!(reply["unreadCount"], 0);
+    }
+
+    #[tokio::test]
     async fn ticket159_snapshot_expiry_survives_revocation_lock_timeout() {
         let (_root, hub, _console, token, turn) = snapshot_grant_fixture("locked-snapshot").await;
         let key = HARNESS_CAP_KEY;
@@ -1353,6 +1390,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_wait_closes_after_final_response() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let model = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let (_root, mut hub, console) = harness_cap_fixture("wait-limit-closeout", Some(model.local_addr().unwrap())).await;
+            let key = HARNESS_CAP_KEY;
+            let _task = start_harness_cap_wake(&mut hub, |_| {}).await;
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            harness_cap_response(snapshot, "application/json", "null").await;
+            let (request, _) = harness_cap_request(&model, "/v1/chat/completions").await;
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let begun = records.iter().find(|r| r["k"] == "begun" && r["key"] == key).unwrap();
+            let turn = begun["turn"].as_str().unwrap();
+            let token = hub.active[key].admitted_token();
+            let epoch = crate::send_outbox::token_epoch(&token);
+            let scope = format!("{epoch}:{turn}");
+            let cfg = hub.context.load_config().unwrap();
+            let max = social_state::wait_policy(&cfg).max_per_turn;
+            let refunds = social_state::turn_send_cap(&cfg);
+            let wake = conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["waitBudget"] = json!({"scope":scope,"used":max-1,"refunds":refunds});
+                conv["lastUnreadSeq"] = json!(1);
+                conv["wakeConfig"]["triggers"]["atMention"] = json!(true);
+                conv["wakeConfig"]["infinite"] = json!(true);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(conv["wakeConfig"].clone())
+            }).unwrap();
+            let seq = social_state::record_reserved2_incoming(&hub.context, &cfg, key, "final-wait-question",
+                json!({"text":"fixture question","time":crate::turn_ledger::now_ms(),"atSelf":true,"isSelf":false})).unwrap();
+            let (status, wait) = console::agent_request(&hub.context, "POST", "/api/socialV2/wait",
+                Some(&json!({"key":key,"purpose":"messages","timeoutMs":1000})), &token);
+            assert_eq!(status, 200, "{wait}");
+            assert_eq!(wait["newMessages"].as_array().unwrap().last().unwrap()["seq"], seq);
+            assert_eq!(wait["waitLimitReached"], true);
+            assert!(wait["nextAction"].is_null(), "the question gets a response step: {wait}");
+
+            let chunk = json!({"id":"wait-limit","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":"finished after answering"},"finish_reason":null}]});
+            let end = json!({"id":"wait-limit","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+            harness_cap_response(request, "text/event-stream", &body).await;
+            wait_for_harness_cap_wake(&hub).await;
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let end = records.iter().find(|r| r["k"] == "ended" && r["turn"] == turn).unwrap();
+            assert_eq!(end["reason"], "observationSleep", "an exhausted turn closes after its response");
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(remove_fixture_wake(&mut hub).await.is_none(), "no closeout reminder is dispatched");
+            assert_eq!(hub.state().unwrap()["conversations"][key]["wakeConfig"], wake);
+        }).await.expect("the wait-limit fixture must settle");
+    }
+
+    #[tokio::test]
     async fn ticket159_reserved2_harness_observation_cap_completes_both_stores() {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let model = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1404,6 +1495,80 @@ mod tests {
             let receipt = harness.wake_briefing(HARNESS_CAP_KEY, &generation).unwrap();
             assert!(receipt["installed"].is_object(), "the completed observation must be eligible as a briefing receipt");
         }).await.expect("the observation cap fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn hard_cap_observation_sleep_rearms_consumed_finite_deadline() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let model = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let (_root, mut hub, console) = harness_cap_fixture("harness-cap-rearm-sleep", Some(model.local_addr().unwrap())).await;
+            let mut cfg = hub.context.load_config().unwrap();
+            cfg["socialV2"]["wake"]["recommendedSleepMinMs"] = json!(75_000);
+            cfg["socialV2"]["wake"]["recommendedSleepMaxMs"] = json!(90_000);
+            hub.context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+            conversation_state::update_raw(&hub.context, |state| {
+                let wake = &mut state["conversations"][HARNESS_CAP_KEY]["wakeConfig"];
+                wake["infinite"] = json!(false);
+                wake["sleepUntil"] = Value::Null;
+                Ok(())
+            }).unwrap();
+
+            let (before_check, cap_poll) = tokio::sync::oneshot::channel();
+            let _task = start_harness_cap_wake(&mut hub, |pipe| {
+                pipe.harness_cap_poll_hook = Some(before_check);
+            }).await;
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            harness_cap_response(snapshot, "application/json", "null").await;
+            let (request, _) = harness_cap_request(&model, "/v1/chat/completions").await;
+            let release_check = cap_poll.await.unwrap();
+            let call = json!({"index":0,"id":"observe","type":"function","function":{
+                "name":"qq_wait_for_messages","arguments":r#"{"key":"","token":"","purpose":"messages","timeoutMs":60000}"#
+            }});
+            let chunk = json!({"id":"rearm-sleep-fixture","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]},"finish_reason":null}]});
+            let end = json!({"id":"rearm-sleep-fixture","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+            let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+            harness_cap_response(request, "text/event-stream", &body).await;
+            let (wait, input) = harness_cap_request(&console, "/api/socialV2/wait").await;
+            assert_eq!(input["purpose"], "messages");
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let begun = records.iter().find(|r| r["k"] == "begun" && r["key"] == HARNESS_CAP_KEY).unwrap();
+            let turn_id = begun["turn"].as_str().unwrap();
+            let token = hub.active[HARNESS_CAP_KEY].admitted_token();
+            let _lease = social_state::hold_test_observation_wait(&hub.context, HARNESS_CAP_KEY, &token, turn_id);
+            set_harness_cap_engagement(&hub.context, Value::Null);
+            release_check.send(()).unwrap();
+            while social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().as_deref() == Some(token.as_str()) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            harness_cap_http_response(wait, "403 Forbidden", "application/json", "{}").await;
+            wait_for_harness_cap_wake(&hub).await;
+            let before_tick = crate::now_ms() as i64;
+            hub.tick("bot", 9001).await.unwrap();
+            let after_tick = crate::now_ms() as i64;
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let end = records.iter().find(|r| r["k"] == "ended" && r["turn"] == turn_id).unwrap();
+            assert_eq!(end["outcome"], "completed");
+            assert_eq!(end["reason"], "observationSleep");
+            assert_ne!(social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().as_deref(), Some(token.as_str()));
+
+            let state = hub.state().unwrap();
+            let wake = &state["conversations"][HARNESS_CAP_KEY]["wakeConfig"];
+            assert_eq!(wake["infinite"], false);
+            assert_eq!(wake["sleepRangeMs"], json!([75_000, 90_000]));
+            let until = wake["sleepUntil"].as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .expect("hard-cap observationSleep must rearm consumed finite deadline even after cap token rotation");
+            assert!(
+                until >= before_tick + 75_000 && until <= after_tick + 90_000,
+                "rearmed sleepUntil {until} outside [{}, {}]: {wake}",
+                before_tick + 75_000,
+                after_tick + 90_000
+            );
+        }).await.expect("the hard-cap observation rearm fixture must settle");
     }
 
     #[tokio::test]
@@ -3976,6 +4141,9 @@ impl Hub {
                     && t.epochs.contains(&epoch) && t.state == crate::turn_ledger::State::Completed && t.outcome_reason == "observationSleep")
             });
             if clean_sleep {
+                if completed_in_scope {
+                    social_state::rearm_observation_sleep(&self.context, &cfg, &key, &current_token, now)?;
+                }
                 println!("[reserved2] observation budget ended; keeping wake config");
             }
             if completed_in_scope && !uses_cli {

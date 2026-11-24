@@ -862,10 +862,10 @@ mod tests {
         let mut d = Driver::new(scheduler_from_state(crate::wake_cfg_of(&cfg), &conv), 1);
         d.sched.cfg.proactive_enabled = false;
         d.apply(Input::TurnStart { at_ms: T0 });
-        assert_eq!(crate::wake::pre_sleep_remaining(&conv, &cfg, T0), Some(300_000));
+        assert_eq!(crate::wake::pre_sleep_remaining(&conv, &cfg, "group:1", T0), Some(300_000));
         assert!(d.apply(Input::Tick { at_ms: T0 + 300_000 }).is_empty(),
             "default observation must finish before the turn cap");
-        assert!(crate::wake::pre_sleep_remaining(&conv, &cfg, T0 + 300_000).is_none());
+        assert!(crate::wake::pre_sleep_remaining(&conv, &cfg, "group:1", T0 + 300_000).is_none());
         assert!(d.apply(Input::TurnEnd { at_ms: T0 + 301_000 }).is_empty());
         assert_eq!(d.sched.cfg.turn_hard_cap_ms, 515_000);
         assert!(d.apply(Input::Tick { at_ms: T0 + 515_001 }).is_empty(), "closed turn must not be cancelled later");

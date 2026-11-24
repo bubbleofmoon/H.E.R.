@@ -847,7 +847,14 @@ impl Pipeline {
         self.turn_final = true;
         if let Some(turn) = &self.cur_turn {
             let budget_sleep = outcome == "completed"
-                && crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id);
+                && (crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id)
+                    || (self.reserved2_budget.is_some()
+                        && crate::social_state::turn_wait_limit_reached(
+                            &self.context,
+                            &turn.key,
+                            &turn.id,
+                            &self.turn_token,
+                        )));
             let reason = if budget_sleep { "observationSleep" } else { reason };
             let writer = if retry { turn.clone() } else { turn.clone().without_retry() };
             let result = match rpc_id {
@@ -1168,8 +1175,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else {
             result
         };
-        self.reserved2_budget = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
+        self.reserved2_budget = None;
         result
     }
 

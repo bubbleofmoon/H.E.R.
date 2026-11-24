@@ -2789,10 +2789,8 @@ pub(crate) mod tests {
         for (social, expected) in [
             (json!({"wake":{"turnHardCapMs":455000}}),455000),
             (json!({"wake":{"preSleepWaitMs":450000}}),665000),
-            // The prompt reads 0 as the 300000 default, so the budget does too.
-            (json!({"wake":{"preSleepWaitMs":0}}),515000),
-            // The prompt still asks for the observation when the gate is disabled.
-            (json!({"wake":{"preSleepWaitEnabled":false}}),515000),
+            (json!({"wake":{"preSleepWaitMs":0}}),215000),
+            (json!({"wake":{"preSleepWaitEnabled":false}}),215000),
             (json!({"wait":{"maxMs":60000}}),455000),
             (json!({"wait":{"minQuietAfterNewMs":150000}}),545000),
         ] {

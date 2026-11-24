@@ -3991,10 +3991,10 @@ pub(super) fn handle_wait_post(
             // Refunds for messages for her are counted per turn (scope) like the slots themselves.
             let refunds = Some(current["waitBudget"]["refunds"].clone())
                 .filter(|r| !r.is_null() && current["waitBudget"]["scope"].as_str() == Some(scope.as_str()));
-            current["waitBudget"] = json!({"scope":scope,"used":used});
+            current["waitBudget"] = json!({"scope":scope,"used":used,"max":batch.max_per_turn});
             if let Some(refunds) = refunds { current["waitBudget"]["refunds"] = refunds; }
             current_conv.set_field("waitBudget", current["waitBudget"].clone());
-            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(&current, cfg, now_ms()).is_some();
+            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(&current, cfg, &key, now_ms()).is_some();
             doc.set_conversation(&key, current_conv);
             Ok(Some((used, observe, scope)))
         })?
@@ -4023,7 +4023,7 @@ pub(super) fn handle_wait_post(
         reply_wait = false;
         min_new = 1;
         // The reserved slot must fit the complete observation, including when maxMs is shorter.
-        timeout_ms = timeout_ms.max(crate::wake::pre_sleep_wait_ms(cfg)).max(crate::wake::prompt_pre_sleep_wait_ms(cfg));
+        timeout_ms = timeout_ms.max(crate::wake::required_pre_sleep_ms(cfg, &key));
     }
     // The dispatch deadline is captured once, so hot reload and restarted observations
     // cannot extend the turn. Batching below must obey the same absolute boundary.
@@ -4298,7 +4298,7 @@ pub(super) fn handle_wait_post(
     let mut entry_val = entry_conv.to_value();
     let entry = &mut entry_val;
     let pre_sleep_ms = crate::wake::pre_sleep_wait_ms(cfg);
-    let blocked = crate::wake::pre_sleep_remaining(entry, &cfg, now_ms());
+    let blocked = crate::wake::pre_sleep_remaining(entry, cfg, &key, now_ms());
     let pre_sleep_remaining_ms = blocked.unwrap_or(0);
     let now = now_ms();
     // The wait keeps its entry-time stop, but a successful send may have moved the turn cap.
@@ -4332,8 +4332,8 @@ pub(super) fn handle_wait_post(
         && engaged_end.is_some_and(|end| now >= end)
         && crate::wake::engagement_end(entry, cfg).is_none_or(|end| now >= end);
     let quiet = (reply_wait || (arrived && quiet_ms > 0)) && (now - last_new_at >= quiet_ms);
-    let pre_sleep_attempt = !reply_wait && (timeout_ms >= pre_sleep_ms || window_observation);
-    let pre_sleep_satisfied_now = window_ended || !budget_ended && !reply_wait
+    let pre_sleep_attempt = pre_sleep_ms > 0 && !reply_wait && (timeout_ms >= pre_sleep_ms || window_observation);
+    let pre_sleep_satisfied_now = window_ended || pre_sleep_ms > 0 && !budget_ended && !reply_wait
         && (if !arrived {
             waited_ms >= pre_sleep_ms
         } else {
@@ -4400,7 +4400,7 @@ pub(super) fn handle_wait_post(
         "timeout": if reply_wait { !quiet } else { !arrived || (quiet_ms > 0 && !quiet && now - start >= timeout_ms) },
         "waitedMs": waited_ms,
         "preSleepWaitSatisfied": pre_sleep_satisfied_now,
-        "preSleepWaitObserved": !reply_wait && observed_flag,
+        "preSleepWaitObserved": pre_sleep_ms > 0 && !reply_wait && observed_flag,
         "newMessages": new_messages,
         "readThroughSeq": read_through,
         "unreadCount": unread_total,
@@ -9916,7 +9916,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "recommendedNameMention": true,
             "recommendedQuestion": true,
             "recommendedPoke": true,
-            "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
+            "recommendedHint": "潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
         },
         "send": {
             "recommendedHint": "普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。"
@@ -13574,7 +13574,7 @@ pub(super) mod tests {
         let after = load_social_state_for(&context).unwrap()["conversations"][HF94_KEY].clone();
         assert_eq!(after["wakeConfig"], before["wakeConfig"], "window end keeps the wake config");
         assert_eq!(after["unread"].as_array().unwrap().len(), chatter.len(), "offered chatter is not acknowledged");
-        assert!(crate::wake::pre_sleep_remaining(&after, &config, now_ms()).is_none(), "closing tools are not refused after the window");
+        assert!(crate::wake::pre_sleep_remaining(&after, &config, HF94_KEY, now_ms()).is_none(), "closing tools are not refused after the window");
     }
 
     /// Review fix 1(b): an engaged wait that uses the last slot ends the turn as a clean sleep.
@@ -14440,9 +14440,9 @@ pub(super) mod tests {
         record_reserved2_incoming(&context, &config, HF94_KEY, "late-after-cap",
             json!({"text":"new question","time":now_ms(),"isSelf":false})).unwrap();
         let (status, blocked) = agent::wake_config(&context, &config, &headers, &closing);
-        assert_eq!(status, 200, "exhausted closure must have a bounded re-wake escape: {blocked}");
-        assert_eq!(blocked["wakeConfig"]["infinite"], false);
-        assert_eq!(blocked["wakeConfig"]["sleepUntil"], crate::sticker::iso_at(now_ms()+30_000));
+        assert_eq!(status, 200, "exhausted turns may configure closure without another observation: {blocked}");
+        assert_eq!(blocked["wakeConfig"]["infinite"], true);
+        assert!(blocked["wakeConfig"]["sleepUntil"].is_null());
         assert_eq!(blocked["nextAction"], "end_turn");
         assert!(!blocked.to_string().contains("qq_wait_for_messages(timeoutMs="), "exhausted turns must not be instructed to wait again: {blocked}");
         turn.end("completed", "hf94").unwrap();
@@ -14467,7 +14467,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn hf123_exhausted_wait_names_exact_exit_and_allows_short_rewake_closure() {
+    fn hf123_exhausted_wait_names_exact_exit_and_preserves_wake_policy() {
         const HF94_KEY: &str = "group:94104";
         for tool in ["mark_read", "wake_config"] {
             let (_root, context, config, headers) = hf94_wait_fixture_for_key(HF94_KEY, json!({"minMs":100,"maxPerTurn":1}));
@@ -14488,9 +14488,8 @@ pub(super) mod tests {
                 else { agent::wake_config(&context, &config, &headers, &closing) };
             assert_eq!(status, 200, "{tool}: {result}");
             assert_eq!(result["nextAction"], "end_turn");
-            assert_eq!(result["wakeConfig"]["infinite"], false);
-            let until = result["wakeConfig"]["sleepUntil"].as_str().unwrap();
-            assert_eq!(until, crate::sticker::iso_at(now_ms()+30_000));
+            assert_eq!(result["wakeConfig"]["infinite"], true);
+            assert!(result["wakeConfig"]["sleepUntil"].is_null());
             let state = load_social_state_for(&context).unwrap();
             assert_eq!(state["conversations"][HF94_KEY]["unread"].as_array().unwrap().len(), 1, "unoffered messages are not acknowledged");
         }

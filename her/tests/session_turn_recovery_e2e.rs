@@ -2408,12 +2408,66 @@ fn engage_window_end_is_a_clean_sleep_with_one_terminal_record() {
 }
 
 #[test]
+fn dsh_exhausted_wait_completes_as_observation_sleep_and_rearms_deadline() {
+    let mut rig = Rig::new("dsh-wait-limit-closeout", Opts { seed_session: None });
+    rig.patch_config(|cfg| {
+        let wake = &mut cfg["socialV2"]["wake"];
+        wake["preSleepWaitEnabled"] = json!(false);
+        wake["recommendedSleepMinMs"] = json!(75_000);
+        wake["recommendedSleepMaxMs"] = json!(90_000);
+        cfg["socialV2"]["wait"] = json!({"minMs":100,"maxMs":1000,"maxPerTurn":2});
+    });
+    let path = rig.root.join("data/social-v2.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let wake = &mut state["conversations"][GROUP_KEY]["wakeConfig"];
+    let consumed_deadline = json!("2020-01-01T00:00:00.000Z");
+    wake["infinite"] = json!(false);
+    wake["sleepUntil"] = consumed_deadline.clone();
+    let previous = wake.clone();
+    fs::write(&path, state.to_string()).unwrap();
+    {
+        let mut inner = lock(&rig.dsh.inner);
+        inner.observation_waits = true;
+        inner.close_turns = false;
+        inner.plan = Plan { send: None, hold: false };
+    }
+
+    rig.start_candidate(vec![]);
+    assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "{:?}", rig.turns());
+    let waits = lock(&rig.dsh.inner).wait_results.clone();
+    assert_eq!(waits.len(), 2, "{waits:?}");
+    assert!(waits.iter().all(|(status, _)| *status == 200), "{waits:?}");
+    assert_ne!(waits[0].1["waitLimitReached"], true);
+    assert_eq!(waits[1].1["waitLimitReached"], true);
+    assert_eq!(waits[1].1["nextAction"], "end_turn");
+
+    let ledger = read_locked(&rig.root.join("data/turn-ledger.jsonl"));
+    let ends: Vec<Value> = ledger.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["k"] == "ended").collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0]["reason"], "observationSleep", "DSH completion must honor the exhausted wait");
+
+    assert!(wait_for(Duration::from_secs(5), || {
+        fs::read_to_string(rig.root.join("candidate-out.log")).unwrap()
+            .contains("observation budget ended; keeping wake config")
+    }), "hub did not collect the sleeping turn");
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let wake = &state["conversations"][GROUP_KEY]["wakeConfig"];
+    let deadline = wake["sleepUntil"].as_str().expect("consumed finite deadline was not rearmed");
+    assert!(deadline > consumed_deadline.as_str().unwrap(), "{wake}");
+    assert_eq!(wake["sleepRangeMs"], json!([75_000, 90_000]));
+    for field in ["mode", "infinite", "triggers"] {
+        assert_eq!(wake[field], previous[field], "{wake}");
+    }
+    assert_eq!(rig.dsh.count("session/cancel"), 0);
+}
+
+#[test]
 fn a_capped_turn_is_cancelled_and_its_late_send_is_refused() {
     let mut rig = Rig::new("timeout", Opts { seed_session: None });
     rig.patch_config(|c| {
         c["socialV2"]["wake"]["preSleepWaitEnabled"] = json!(false);
-        // The smallest valid cap: observation 1 + quiet extension (100 + 5000) + 30000 = 35101 ms.
-        c["socialV2"]["wake"]["preSleepWaitMs"] = json!(1);
+        // With observation disabled, the minimum is quiet extension (100 + 5000) plus 30000 ms.
         c["socialV2"]["wait"] = json!({"minMs": 100, "maxMs": 100, "minQuietAfterNewMs": 0,
             "batchWindowMs":100,"batchMaxMs":100});
         c["socialV2"]["wake"]["turnHardCapMs"] = json!(36000);

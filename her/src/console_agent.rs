@@ -1280,26 +1280,21 @@ pub(super) fn through_of_conv(context: &RuntimeContext, key: &str, conv: &Conver
     through_of(context, key, &conv.to_value())
 }
 
-fn force_short_rewake(wake: &mut Value, now: i64) {
-    wake["infinite"] = json!(false);
-    wake["sleepUntil"] = json!(crate::sticker::iso_at(now.saturating_add(30_000)));
-}
-
 fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Conversation, conv_val: &Value, now: i64, what: &str) -> Option<(u16, String)> {
-    let remaining = crate::wake::pre_sleep_remaining(conv_val, cfg, now)?;
+    let remaining = crate::wake::pre_sleep_remaining(conv_val, cfg, key, now)?;
     // The observation the prompt asks for; the reserved2 turn budget covers it.
-    let pre_sleep_ms = crate::wake::prompt_pre_sleep_wait_ms(cfg);
+    let pre_sleep_ms = crate::wake::required_pre_sleep_ms(cfg, key);
     let used = match wait_usage(context, key, conv) {
         Ok((_, used)) => used,
         Err(error) => return Some(error),
     };
-    // Exhausted turns may close; the handlers install a short finite re-wake below.
+    // The turn can finish without another observation once its wait allowance is spent.
     if used >= wait_policy(cfg).max_per_turn { return None; }
     let remain_min = (remaining as f64 / 60_000.0).ceil() as i64;
     let error = if what == "mark_read" {
-        format!("还不能通过 qq_mark_read 直接回到潜水：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡，若你参与了则需下次再等观察窗口。")
+        format!("还不能通过 qq_mark_read 直接回到潜水：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡。成功发言后按【互动窗口】重新计时。")
     } else {
-        format!("还不能立刻设置潜水/下一次唤醒：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡，若你参与了则需下次再等观察窗口。")
+        format!("还不能立刻设置潜水/下一次唤醒：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡。成功发言后按【互动窗口】重新计时。")
     };
     Some((
         400,
@@ -1343,8 +1338,7 @@ fn note_acknowledged_urgent(context: &RuntimeContext, before: Option<&SocialDocu
     let Some(conv) = doc.conversation(key) else { return };
     let conv_val = conv.to_value();
     let input: Value = serde_json::from_str(body).unwrap_or_default();
-    let through = js_safe_integer(&input["throughSeq"])
-        .unwrap_or_else(|| conv.field("lastUnreadSeq").and_then(Value::as_i64).unwrap_or(-1));
+    let Some(through) = js_safe_integer(&input["throughSeq"]) else { return };
     let acknowledged: Vec<_> = conv.unread_values().into_iter()
         .filter(|m| js_safe_integer(&m["seq"]).is_some_and(|seq| seq <= through)).collect();
     note_urgent_delivery(context, key, &conv_val, &acknowledged);
@@ -1385,18 +1379,19 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
         let conv_val = conv.to_value();
-        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(&conv_val, cfg, now).is_some();
-        // Back to diving right after talking is refused until the pre-sleep observation was done
-        // (private chats are exempt, as in JS).
         let wake = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-        if !storage_key.starts_with("private:") && crate::wake::is_sleeping_config(&wake) {
+        if crate::wake::is_sleeping_config(&wake) {
             if let Some(error) = pre_sleep_error(context, &storage_key, cfg, &conv, &conv_val, now, "mark_read") {
                 return Err(error);
             }
         }
-        // An agent omitting the cursor requests the whole unread prefix. Check its grant too.
-        let last_unread = json!(conv.field("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0));
-        let requested = b.get("throughSeq").or(is_agent.then_some(&last_unread));
+        let requested = b.get("throughSeq");
+        if b.get("clearAll").is_some() && (is_agent || requested.is_some() || b["clearAll"] != true) {
+            return Err((400, "clearAll=true 仅限管理端单独使用".to_string()));
+        }
+        if requested.is_none() && (is_agent || b["clearAll"] != true) {
+            return Err((400, "请使用已查看结果中的 readThroughSeq 作为 throughSeq".to_string()));
+        }
         let through = requested_through(requested, &conv, through_of_conv(context, &storage_key, &conv), is_agent)
             .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
         let marked = acknowledge(context, &storage_key, &mut conv, through);
@@ -1409,7 +1404,6 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         crate::wake::ensure_wakeable(&mut wc, cfg, now, rand01());
         wc["confirmedAt"] = json!(now);
         wc["confirmedBy"] = json!("mark_read");
-        if short_rewake { force_short_rewake(&mut wc, now); }
         conv.set_field("wakeConfig", wc.clone());
         let unread_count = conv.unread_count();
         let read_through = through_of_conv(context, &storage_key, &conv);
@@ -1420,7 +1414,6 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
             "wakeGuaranteed": safety["guaranteed"].clone(), "wakeSafety": safety, "wakeConfig": wc,
         });
         if exhausted { note_wait_budget(&mut out, wait_used, wait_max); }
-        if short_rewake { out["forcedRewakeMs"] = json!(30_000); }
         Ok(out)
     })
 }
@@ -1458,12 +1451,11 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
         let conv_val = conv.to_value();
-        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(&conv_val, cfg, now).is_some();
 
         let current = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
         let input = b.get("config").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
         let next = crate::wake::normalize_wake_config(&current, &input, cfg, &storage_key, now, rand01())?;
-        if !storage_key.starts_with("private:") && crate::wake::is_sleeping_config(&next) {
+        if crate::wake::is_sleeping_config(&next) {
             if let Some(error) = pre_sleep_error(context, &storage_key, cfg, &conv, &conv_val, now, "wake_config") {
                 return Err(error);
             }
@@ -1481,7 +1473,6 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
             obj.insert("confirmedAt".into(), json!(now));
             obj.insert("confirmedBy".into(), json!("set_wake_config"));
         }
-        if short_rewake { force_short_rewake(&mut wc, now); }
         // Her (agent) and console changes of keywords or dropNames are logged and undoable (`wake_words.rs`).
         let mut recorded_val = conv.to_value();
         if crate::wake_words::record(&mut recorded_val, &current, &wc, if is_agent { "her" } else { "console" }, now).is_some() {
@@ -1502,7 +1493,6 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
             "wakeConfig": wc.clone(), "wakeSafety": wake_safety(&wc, now),
         });
         if exhausted { note_wait_budget(&mut out, wait_used, wait_max); }
-        if short_rewake { out["forcedRewakeMs"] = json!(30_000); }
         Ok(out)
     })
 }
