@@ -3593,6 +3593,27 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn isolated_simulation_bridge_drop_joins_slang_catch_up_before_cleanup() {
+        for iteration in 0..25 {
+            let root = isolated_runtime_fixture(&format!("sim-bridge-drop-{iteration}"));
+            let isolated = runtime::RuntimeContext::from_root(&root).unwrap();
+            let journal = inbound::SharedJournal::new(inbound::Journal::open(&isolated).unwrap());
+            let bridge =
+                SimulationBridge::new(&isolated, journal, vec!["group:42".into()], false);
+            assert!(bridge.is_isolated());
+            drop(bridge);
+            let lock_present = root.join("data/slang-windows.lock").exists();
+            std::fs::remove_dir_all(&root).unwrap_or_else(|error| {
+                panic!("iteration {iteration}: remove_dir_all failed after Hub::drop: {error}")
+            });
+            assert!(
+                lock_present,
+                "iteration {iteration}: slang-catch-up had not finished when Hub::drop returned"
+            );
+        }
+    }
+
     fn ev(group: bool, text: &str) -> Event {
         Event {
             post_type: "message".into(),
