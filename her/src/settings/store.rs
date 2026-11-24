@@ -387,18 +387,16 @@ fn resolve_optional_store_file(
 fn check_optional_store_file(
     context: &RuntimeContext,
     name: &str,
-) -> Result<(std::path::PathBuf, Option<u64>), InspectError> {
+) -> Result<Option<u64>, InspectError> {
     let sidecar = resolve_optional_store_file(context, name)?;
     let len = file_len_checked(&sidecar)?;
     refuse_hard_links_checked(&sidecar)?;
-    Ok((sidecar, len))
+    Ok(len)
 }
 
 /// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or
 /// missing.
-fn check_sidecars(
-    context: &RuntimeContext,
-) -> Result<[(std::path::PathBuf, Option<u64>); 3], InspectError> {
+fn check_sidecars(context: &RuntimeContext) -> Result<[Option<u64>; 3], InspectError> {
     Ok([
         check_optional_store_file(context, SIDECARS[0])?,
         check_optional_store_file(context, SIDECARS[1])?,
@@ -461,10 +459,6 @@ const STORE_GATE: &str = "locks/settings-store.lock";
 /// schema is being created, so the owner removes both files.
 const LEFTOVER_JOURNAL_ERROR: &str =
     "settings storage has a leftover journal; remove settings.db and settings.db-journal";
-
-/// How long a store whose WAL is present waits for its wal-index (`-shm`): SQLite removes the index just before the
-/// WAL when its last connection closes.
-const SIDECAR_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 fn file_len_checked(path: &std::path::Path) -> Result<Option<u64>, InspectError> {
     match std::fs::symlink_metadata(path) {
@@ -602,16 +596,15 @@ fn inspect_at(
     deadline: std::time::Instant,
 ) -> Result<Inspection, String> {
     let path = resolve_store_db_checked(context)?;
-    retry_until(deadline, || inspect_attempt(context, &path, deadline))
+    retry_until(deadline, || inspect_attempt(context, &path))
 }
 
 fn inspect_attempt(
     context: &RuntimeContext,
     path: &std::path::Path,
-    deadline: std::time::Instant,
 ) -> Result<Inspection, InspectError> {
     // SQLite opens, truncates or removes the sidecars even when it creates the database.
-    let [(wal_path, wal_len), (shm_path, shm_len), (_, journal_len)] = check_sidecars(context)?;
+    let [wal_len, shm_len, journal_len] = check_sidecars(context)?;
     let journal_len = journal_len.unwrap_or(0);
     let wal_len = wal_len.unwrap_or(0);
     let shm_present = shm_len.is_some();
@@ -641,21 +634,9 @@ fn inspect_attempt(
             return Err(InspectError::Fatal(refuse_version(header)));
         }
     } else if !shm_present {
-        // A read-only connection would create a missing index; wait for a closing connection to finish instead.
-        let settled = deadline.min(std::time::Instant::now() + SIDECAR_SETTLE);
-        loop {
-            if file_len_checked(&wal_path)?.unwrap_or(0) == 0 {
-                return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
-            }
-            if file_len_checked(&shm_path)?.is_some() {
-                check_optional_store_file(context, SIDECARS[1])?;
-                break;
-            }
-            if std::time::Instant::now() >= settled {
-                return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // A read-only connection would create a missing index; retry via `retry_until` so a closing
+        // or starting writer can finish updating the WAL sidecars before we open read-only.
+        return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
     }
     let conn = Connection::open_with_flags(
         path,
@@ -683,7 +664,7 @@ pub(super) fn read_store<T>(
     let path = resolve_store_db_checked(context)?;
     let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
     retry_until(deadline, || {
-        let conn = match inspect_attempt(context, &path, deadline)? {
+        let conn = match inspect_attempt(context, &path)? {
             Inspection::Missing | Inspection::Fresh => None,
             Inspection::Ready(conn) => Some(conn),
         };
@@ -958,9 +939,11 @@ fn report_refused_text(key: &'static str) {
     }
 }
 
-/// How long a writer waits for the store gate and for other connections to let go while it switches a new store to
-/// WAL (the same as `busy_timeout`).
+/// How long a reader retries transient WAL/sidecar transitions and a writer waits for other
+/// connections to let go while switching a new store to WAL (the same as `busy_timeout`).
 const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a store writer waits for `locks/settings-store.lock` (matching `authority_gate`).
+const WRITE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
 /// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. The
@@ -1394,8 +1377,9 @@ fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(),
 
 /// Runs one write under the store gate. The caller holds the configuration gate (`social_state::acquire_config_gate`: the console's
 /// settings routes take it through their authority, the chat settings tools through `memory_actions::handle`), so the
-/// order is always the configuration gate, then the store gate, never the reverse. The store gate is taken (waiting up
-/// to `WAL_SWITCH_WAIT`, else 503) before the inspection and held until the connection closes, so no other writer of
+/// order is always the configuration gate, then the store gate, never the reverse. The store gate
+/// is taken (waiting up to `WRITE_GATE_WAIT`, else 503) before the inspection and held until the
+/// connection closes, so no other writer of
 /// this store can stop between this writer's inspection and its read-write open and leave a journal that open would
 /// play back. With `existing_only`, a store that is missing or fresh is 404 under the gate and none is created. Then
 /// `config.json` is read (not a JSON object: 503 before any store is created), the store is opened,
@@ -1430,7 +1414,8 @@ fn write_store_with<T>(
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
     let (result, stored) = {
-        let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+        let _gate = store_gate(context, std::time::Instant::now() + WRITE_GATE_WAIT)
+            .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
             return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
         }
