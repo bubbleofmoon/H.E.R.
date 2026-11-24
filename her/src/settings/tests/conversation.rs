@@ -297,7 +297,7 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
         ("POST", "/api/settings/conversation/set", owner_set),
         ("POST", "/api/settings/conversation/reset", owner_reset),
     ] {
-        let (status, _, reply) = crate::console_settings::route(
+        let (status, _, reply, _) = crate::console_settings::route(
             crate::console_front::AdminCaller::new(&legacy),
             method,
             path,
@@ -311,7 +311,7 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
     admit_groups(&root, json!([101]));
     let revoked = crate::console_front::revoked_admin_context(&context);
     for (path, body) in [("/api/settings/conversation/set", owner_set), ("/api/settings/conversation/reset", owner_reset)] {
-        let (status, _, reply) = crate::console_settings::route(
+        let (status, _, reply, _) = crate::console_settings::route(
             crate::console_front::AdminCaller::new(&revoked),
             "POST",
             path,
@@ -858,7 +858,7 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
         assert_eq!(status, 403, "{path}: {reply}");
     }
     let legacy_ctx = RuntimeContext::legacy();
-    let (status, _, reply) = crate::console_settings::route(
+    let (status, _, reply, _) = crate::console_settings::route(
         crate::console_front::AdminCaller::new(&legacy_ctx),
         "GET",
         "/api/settings/models",

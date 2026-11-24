@@ -4,8 +4,7 @@
 //! 1. `locks/restore-writers.lock` (shared, taken by `memory_actions` before entering `config_tx`
 //!    for chat settings writes; exclusive during `restore`)
 //! 2. `console_auth::credential_mutation_gate` (for `/api/console/token` rotation)
-//! 3. `closed_agent::lock` (`locks/closed-agent-interaction.lock`, for access changes and audit
-//!    undo)
+//! 3. `closed_agent::lock` (`locks/closed-agent.lock`, for access changes and audit undo)
 //! 4. `config_gate` (`locks/social-v2.lock`, via `conversation_state::acquire_config_gate` or
 //!    `social_state::acquire_gate`)
 //! 5. `store_gate` (`locks/settings-store.lock`, acquired inside `settings::*` writes and released
