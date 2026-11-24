@@ -1311,6 +1311,7 @@ mod tests {
         apply, inspect_store, migrate_store_v2, store_schema_version, StoreInspection, StoreProbe,
         ADMINISTRATOR_PASSWORD, FAIL_BEFORE_AUDIT,
     };
+    use rusqlite::Connection;
     use serde_json::json;
     use std::time::Instant;
 

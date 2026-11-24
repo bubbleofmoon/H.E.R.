@@ -3,7 +3,7 @@
 
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentPolicy {
     AgentAllowed,
     AdminOnly(&'static str),
@@ -13,7 +13,7 @@ pub(crate) enum AgentPolicy {
     V2AgentAllowed,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyPreflight {
     None,
     SessionKey,
@@ -24,20 +24,20 @@ pub(crate) enum KeyPreflight {
     SessionKeyOrClosedOwnerReset,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyLimit {
     None,
     Max1Mb,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionCookiePolicy {
     Renew,
     NoRenew,
     DeleteOnSuccess,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RoutePolicy {
     pub(crate) isolated_supported: bool,
     pub(crate) public_probe: bool,
@@ -2157,8 +2157,13 @@ pub(super) fn policy_agent_denial(
                 Some((403, "该接口仅控制台可用".to_string()))
             }
         }
-        AgentPolicy::V2AdminOnly => v2_agent_global_gates(req, cfg, context)
-            .or_else(|| Some((403, "该接口仅控制台可用".to_string()))),
+        AgentPolicy::V2AdminOnly => {
+            if !req.headers.contains_key("x-agent-token") {
+                return None;
+            }
+            v2_agent_global_gates(req, cfg, context)
+                .or_else(|| Some((403, "该接口仅控制台可用".to_string())))
+        }
         AgentPolicy::V2AgentAllowed => v2_agent_global_gates(req, cfg, context),
     }
 }
@@ -3769,5 +3774,48 @@ mod tests {
         assert_eq!(generated_res.status, 200, "{}", generated_res.body);
         let generated_body: Value = serde_json::from_str(&generated_res.body).unwrap();
         assert_eq!(generated_body["tokenFile"], "data/console-token");
+    }
+
+    #[test]
+    fn v2_admin_only_allows_console_without_agent_header_and_denies_agent_header() {
+        let (_root, context) = super::super::tests::fixture_runtime(
+            "v2-admin-only-policy",
+            "fixture-front-token",
+        );
+        let cfg = context.load_config().unwrap();
+        for (method, path) in [
+            ("GET", "/api/socialV2/config"),
+            ("POST", "/api/socialV2/config"),
+            ("GET", "/api/socialV2/activity"),
+            ("POST", "/api/socialV2/activity"),
+            ("GET", "/api/socialV2/tool-log"),
+            ("POST", "/api/socialV2/tool-log/clear"),
+            ("GET", "/api/socialV2/states"),
+        ] {
+            let policy = route_policy(method, path);
+            let console_req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                query: HashMap::new(),
+                headers: HashMap::new(),
+                body: String::new(),
+                body_too_large: false,
+            };
+            assert_eq!(
+                policy_agent_denial(policy, &console_req, &cfg, &context),
+                None,
+                "console request without x-agent-token must pass {method} {path}"
+            );
+
+            let mut agent_req = console_req;
+            agent_req
+                .headers
+                .insert("x-agent-token".to_string(), "any-agent-token".to_string());
+            let denial = policy_agent_denial(policy, &agent_req, &cfg, &context);
+            assert!(
+                matches!(denial, Some((403, _))),
+                "agent request must be denied with 403 on {method} {path}: {denial:?}"
+            );
+        }
     }
 }
