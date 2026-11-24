@@ -481,7 +481,7 @@ pub fn run_conversation(args: &[String]) -> i32 {
             return 2;
         }
     };
-    match crate::social_state::change_conversation_scope(&context, &conversation, &action) {
+    match crate::config_tx::change_conversation_scope(&context, &conversation, &action) {
         Ok(reply) => {
             println!("{reply}");
             0

@@ -1784,7 +1784,7 @@ pub(crate) fn direct_change_error(key: &str) -> String {
     format!("{key} changes only through the settings store")
 }
 
-/// For a console write of `config.json` (`social_state::write_selected_config_text_with`, #177): every ordinary registry member of `next`
+/// For a console write of `config.json` (`config_tx::write_selected_config_text`, #177): every ordinary registry member of `next`
 /// must be the one `current`, the stored file, holds. A member `next` lacks or holds as `null` is put back from
 /// `current` (removed when `current` has none), because a console writer never removes a registry setting; any other
 /// value that differs is refused with the setting's key, because a console writer changes a registry setting through

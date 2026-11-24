@@ -220,7 +220,10 @@ fn t186_cli_entry_uses_the_same_write_and_revocation() {
     assert_eq!(reply["changed"], json!(["allow.groups", "rollout.rustGroups"]), "{reply}");
     assert_eq!(reply["revoked"], json!([GROUP]));
     assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "the DSH mapping is retired");
-    assert!(take_config_writes().is_none(), "no request write record is left behind");
+    assert!(
+        !root.0.join("data/audit/audit.jsonl").exists(),
+        "CLI scope change does not write an HTTP audit record"
+    );
     assert_eq!(file(&root)["allow"]["groups"], json!([]));
     assert_eq!(conversation_scope_change(&context, "group:abc", "admit").unwrap_err().0, 400);
 }
@@ -239,7 +242,7 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
         drop(stop);
     });
     let started = std::time::Instant::now();
-    let reply = crate::social_state::change_conversation_scope_waiting_with(
+    let reply = crate::config_tx::change_conversation_scope_waiting_with(
         &context,
         "group:420043",
         "admit",
@@ -253,7 +256,7 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
     release.join().unwrap();
     // A stop that outlives the wait is reported, never waited for without end.
     let stuck = tracker.start_for_test();
-    let reply = crate::social_state::change_conversation_scope_waiting_with(
+    let reply = crate::config_tx::change_conversation_scope_waiting_with(
         &context,
         "group:420043",
         "admit",

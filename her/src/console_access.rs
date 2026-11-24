@@ -2,9 +2,10 @@
 //! Domain authority, token rotation, mode transitions, and immediate revocation live in `social_state`.
 
 use super::*;
+use crate::config_tx::{CommitError, CommitOutcome, PageConfigWrite};
 use crate::social_state::{
-    self, js_string, js_string_or, js_trim, js_truthy, owner_of, policy_list, raw_config_for_write,
-    raw_config_object, SocialError,
+    self, js_string, js_string_or, js_trim, js_truthy, owner_of, policy_list, raw_config_object,
+    SocialError,
 };
 
 type StartStamp = (Option<crate::runtime::ConfigStamp>, Option<i64>);
@@ -71,33 +72,32 @@ pub(super) fn whitelist_get(context: &RuntimeContext, cfg: &Value) -> Value {
 }
 
 /// `POST /api/whitelist` HTTP adapter.
+#[cfg(test)]
 pub(super) fn whitelist_post(
     context: &RuntimeContext,
     body: &str,
 ) -> Result<Value, (u16, String)> {
-    let body = parse_object_body(body)?;
-    social_state::apply_whitelist(
-        context,
-        &body,
-        Some(&note_config_before_request),
-        Some(&record_config_publication),
-    )
-    .map_err(SocialError::into_http)
+    whitelist_post_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(CommitError::into_http)
 }
 
-/// `POST /api/conversations/scope` HTTP adapter.
-pub(super) fn conversation_scope(
+/// `POST /api/whitelist` transactional HTTP adapter.
+pub(super) fn whitelist_post_tx(
     context: &RuntimeContext,
     body: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<CommitOutcome<Value>, CommitError> {
     let body = parse_object_body(body)?;
-    social_state::apply_conversation_scope(
-        context,
-        &body,
-        Some(&note_config_before_request),
-        Some(&record_config_publication),
-    )
-    .map_err(SocialError::into_http)
+    crate::config_tx::commit_whitelist(context, &body)
+}
+
+/// `POST /api/conversations/scope` transactional HTTP adapter.
+pub(super) fn conversation_scope_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<CommitOutcome<Value>, CommitError> {
+    let body = parse_object_body(body)?;
+    crate::config_tx::commit_conversation_scope(context, &body)
 }
 
 // ── GET/POST /api/security ───────────────────────────────────────────────────────────────────────
@@ -173,61 +173,75 @@ pub(super) fn security_get(context: &RuntimeContext, cfg: &Value) -> Value {
     })
 }
 
-pub(super) fn security_post(
+pub(super) fn security_post_tx(
     context: &RuntimeContext,
     body: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<CommitOutcome<Value>, CommitError> {
     let body = parse_object_body(body)?;
     if body.get("rehardenStateDir") == Some(&json!(true)) {
-        let _gate = social_state::acquire_gate(context).map_err(SocialError::into_http)?;
-        let dir = state_dir(context).map_err(|error| (503, error))?;
+        let _gate = social_state::acquire_gate(context)?;
+        let dir = state_dir(context).map_err(|error| CommitError::plain(503, error))?;
         let (ok, detail) = harden_state_dir(&dir);
         if !ok {
             crate::safe_println!("[console] ⚠️ 收紧 state/ 权限失败：{detail}");
         }
-        return Ok(json!({ "ok": ok, "hardened": ok, "path": dir }));
+        return Ok(CommitOutcome {
+            value: json!({ "ok": ok, "hardened": ok, "path": dir }),
+            config_diff: None,
+        });
     }
     let confirm = crate::settings::confirm_field(&body)?;
-    let _gate = social_state::acquire_gate(context).map_err(SocialError::into_http)?;
-    let unchanged = raw_config_object(context).map_err(SocialError::into_http)?;
-    let mut file = unchanged.clone();
-    crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
-    let previous_view = security_view(&file);
-    let mut next = file
-        .get("security")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut fields = body.as_object().cloned().unwrap_or_default();
-    fields.remove("confirm");
-    next.extend(fields);
-    if let Some(value) = next.get("interceptNotify").cloned() {
-        if !value.is_boolean() {
-            next.insert("interceptNotify".into(), json!(js_truthy(&value)));
+    crate::config_tx::commit_page_config(context, |ctx| {
+        let unchanged = raw_config_object(ctx).map_err(SocialError::into_http)?;
+        let mut file = unchanged.clone();
+        crate::settings::mirror_into(ctx, &mut file).map_err(|e| (503, e))?;
+        let previous_view = security_view(&file);
+        let mut next = file
+            .get("security")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut fields = body.as_object().cloned().unwrap_or_default();
+        fields.remove("confirm");
+        next.extend(fields);
+        if let Some(value) = next.get("interceptNotify").cloned() {
+            if !value.is_boolean() {
+                next.insert("interceptNotify".into(), json!(js_truthy(&value)));
+            }
         }
-    }
-    file["security"] = Value::Object(next.clone());
-    let changes = crate::settings::console_changes(context, &unchanged, &file)?;
-    let changed: Vec<&crate::settings::Setting> =
-        changes.iter().map(|(setting, _)| *setting).collect();
-    crate::settings::check_confirmation(confirm, &changed)?;
-    if !changes.is_empty() {
-        raw_config_for_write(context).map_err(SocialError::into_http)?;
-        note_config_before_request(context);
-    }
-    crate::settings::apply_changes(context, changes, "administrator", "console")?;
-    social_state::keep_stored_members(context, &mut file).map_err(SocialError::into_http)?;
-    write_json_atomic_for(context, CONFIG_PATH, &file)
-        .map_err(|e| config_write_error(context, e))?;
-    let mut view = previous_view.as_object().cloned().unwrap_or_default();
-    view.extend(next);
-    crate::safe_println!(
-        "[console] 控制台：安全拦截通知已更新（interceptNotify={}）",
-        view.get("interceptNotify")
-            .map(js_string)
-            .unwrap_or_default()
-    );
-    Ok(json!({ "ok": true, "security": Value::Object(view) }))
+        file["security"] = Value::Object(next.clone());
+        let mut view = previous_view.as_object().cloned().unwrap_or_default();
+        view.extend(next);
+        Ok(PageConfigWrite {
+            carried: file.clone(),
+            file,
+            base_for_changes: unchanged,
+            confirm,
+            check_canonical_before_store: true,
+            keep_stored_always: true,
+            prior_wake: None,
+            keep_error_fmt: |key| {
+                (
+                    500,
+                    format!(
+                        "config.json cannot hold {key}: a member on its path is not an object; \
+                         stored settings stand"
+                    ),
+                )
+            },
+            isolated_write_error_503: true,
+            wake_error_prefix: "",
+            finish: Box::new(move |_, _| {
+                crate::safe_println!(
+                    "[console] 控制台：安全拦截通知已更新（interceptNotify={}）",
+                    view.get("interceptNotify")
+                        .map(js_string)
+                        .unwrap_or_default()
+                );
+                Ok(json!({ "ok": true, "security": Value::Object(view) }))
+            }),
+        })
+    })
 }
 
 // ── POST /api/authorize/read ─────────────────────────────────────────────────────────────────────
