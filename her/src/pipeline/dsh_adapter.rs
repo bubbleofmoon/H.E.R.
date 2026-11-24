@@ -1530,6 +1530,7 @@ impl Pipeline {
     /// `[SILENT]` 是模型"我选择不说"的合法出口（JS `isSilentMarker`）。
     /// 没有这一步的话，整段 `[SILENT]` 会被原样发到群里 —— 那是最尴尬的一种 bug：
     /// 它只会出现在"AI 决定闭嘴"的时刻，平时测不到。
+    #[allow(dead_code)]
     pub fn reply(&mut self, target: &Target, text: &str) -> Result<Vec<serde_json::Value>, String> {
         if is_silent_marker(text) {
             println!("[pipeline] {} 选择静默（[SILENT]），不发送", target.key());
@@ -1558,8 +1559,6 @@ impl Pipeline {
     /// 完整一轮：投 prompt → 等回复 → 发回 QQ。
     ///
     /// `live=false` 时只走前半段并打印，不发送（影子模式）。
-    // 保留「不带 failover 的简单路径」：排障时能一眼看到单候选下的行为，
-    // 也方便以后写"只想跑一个候选"的测试。主流程一律走 handle_with_failover。
     #[allow(dead_code)]
     pub async fn handle(&mut self, target: &Target, prompt: &str) -> Result<Option<String>, String> {
         let key = target.key();
@@ -1571,35 +1570,6 @@ impl Pipeline {
         }
         if !self.live {
             println!("[pipeline] dry-run {key}：回复 {} 字，未发送", trimmed.chars().count());
-            return Ok(Some(trimmed));
-        }
-        let sent = self.reply(target, &trimmed)?;
-        println!("[pipeline] {key}：已发送 {} 条", sent.len());
-        Ok(Some(trimmed))
-    }
-
-    /// 与 `handle` 相同，但走带 failover 的 ask（主路径用这个）。
-    ///
-    /// 单独开一个方法而不是改 `handle`：`handle` 是「单候选」的最简路径，
-    /// 诊断/探针还会用到；主路径要的是候选链 + 失败重投。
-    pub async fn handle_with_failover(
-        &mut self,
-        target: &Target,
-        prompt: &str,
-        cfg: &serde_json::Value,
-    ) -> Result<Option<String>, String> {
-        let key = target.key();
-        let key: &str = &key;
-        let reply = self.ask_with_failover(&key, prompt, 180, cfg).await?;
-        let trimmed = reply.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("agent 返回了空回复".to_string());
-        }
-        if !self.live {
-            println!(
-                "[pipeline] dry-run {key}：回复 {} 字，未发送",
-                trimmed.chars().count()
-            );
             return Ok(Some(trimmed));
         }
         let sent = self.reply(target, &trimmed)?;
