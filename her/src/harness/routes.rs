@@ -233,6 +233,8 @@ impl Miss {
 pub(crate) struct Situation {
     /// The route's `retry429`.
     pub retry_429: bool,
+    /// Whether empty answers retry on the same route before failing over.
+    pub retry_empty: bool,
     /// This unchanged request already met a 429 on this route.
     pub rate_limited_before: bool,
     /// Empty answers this unchanged request already got on this route.
@@ -291,7 +293,11 @@ pub(crate) fn decide(miss: &Miss, situation: &Situation) -> Next {
         }
         Miss::Empty => {
             let wait = situation.unit * 2u32.pow(situation.empty_answers.min(EMPTY_RETRIES));
-            if !situation.sent && situation.empty_answers < EMPTY_RETRIES && fits(wait) {
+            if situation.retry_empty
+                && !situation.sent
+                && situation.empty_answers < EMPTY_RETRIES
+                && fits(wait)
+            {
                 return Next::Retry { wait };
             }
             fail_over
@@ -917,9 +923,11 @@ pub(crate) struct OneShotStep {
     pub context: RuntimeContext,
     pub system: String,
     pub input: String,
-    /// True when the caller's `within` bound is shorter than the route's own timeout (shortened timeouts do not mark
-    /// `route_health` as failed).
+    /// True when the caller's `within` bound is shorter than the route's own timeout (shortened
+    /// timeouts do not mark `route_health` as failed).
     pub shortened_by_bound: bool,
+    /// Redacted model id of the last route failure recorded by `ChainExecutor`.
+    pub last_model: Option<String>,
 }
 
 impl RouteStep for OneShotStep {
@@ -1000,29 +1008,41 @@ impl RouteStep for OneShotStep {
                     observe_health: true,
                 };
             }
-            let text = redact_credentials(&response.into_first_text().unwrap_or_default(), ctx.credentials);
-            if let Some(failure) = crate::backend::plain_output_failure(&text) {
-                let miss = if failure.class == "empty-response" {
-                    Miss::Empty
-                } else {
-                    Miss::Failed { class: failure.class }
-                };
-                return StepResult::Missed {
-                    miss,
-                    summary: failure.summary(),
-                    response_usage: Some(Some(usage)),
-                    tokens_charged: 0,
-                    request_bytes,
-                    message_refs: Vec::new(),
-                    observe_health: true,
-                };
-            }
+            let text = redact_credentials(
+                &response.into_first_text().unwrap_or_default(),
+                ctx.credentials,
+            );
+            let text = match super::one_shot::normalize_response_text(&text) {
+                Ok(text) => text,
+                Err(failure) => {
+                    let miss = if failure.class == "empty-response" {
+                        Miss::Empty
+                    } else {
+                        Miss::Failed {
+                            class: failure.class,
+                        }
+                    };
+                    return StepResult::Missed {
+                        miss,
+                        summary: failure.summary(),
+                        response_usage: Some(Some(usage)),
+                        tokens_charged: 0,
+                        request_bytes,
+                        message_refs: Vec::new(),
+                        observe_health: true,
+                    };
+                }
+            };
             StepResult::Answered {
                 value: text,
                 response_usage: Some(Some(usage)),
                 tokens_charged: 0,
             }
         })
+    }
+
+    fn on_route_failure(&mut self, failure: RouteFailure) {
+        self.last_model = Some(failure.model);
     }
 }
 
@@ -1039,6 +1059,7 @@ pub(crate) struct ChainConfig {
     pub record_events: bool,
     pub record_usage: bool,
     pub allow_retries: bool,
+    pub retry_empty: bool,
     pub allow_stream_retry: bool,
     pub complete_on_answer: bool,
     pub fail_action: &'static str,
@@ -1292,6 +1313,7 @@ impl ChainExecutor {
                     };
                     let situation = Situation {
                         retry_429: route.spec.retry_429,
+                        retry_empty: self.cfg.retry_empty,
                         rate_limited_before: self.rate_limited,
                         empty_answers: self.empty_answers,
                         stream_retried: self.stream_retried,
@@ -1508,12 +1530,16 @@ mod tests {
     #[test]
     fn harness_routes_digest_model_falls_back_to_the_first_route() {
         let cfg = routes(vec![route("a"), route("b")]);
-        assert_eq!(crate::digest::digest_model_id(&cfg).as_deref(), Some("model-a"));
+        assert_eq!(crate::harness::one_shot::digest_model_id(&cfg).as_deref(), Some("model-a"));
         let mut own = cfg.clone();
         own["memory"] = json!({"digest": {"model": "d"}});
-        assert_eq!(crate::digest::digest_model_id(&own).as_deref(), Some("d"));
+        assert_eq!(crate::harness::one_shot::digest_model_id(&own).as_deref(), Some("d"));
         let invalid = json!({"harness": {"model": "h", "routes": [{"id": "a"}]}});
-        assert_eq!(crate::digest::digest_model_id(&invalid), None, "an invalid chain is not configured");
+        assert_eq!(
+            crate::harness::one_shot::digest_model_id(&invalid),
+            None,
+            "an invalid chain is not configured"
+        );
     }
 
     #[test]
@@ -1549,6 +1575,7 @@ mod tests {
     fn situation() -> Situation {
         Situation {
             retry_429: true,
+            retry_empty: true,
             rate_limited_before: false,
             empty_answers: 0,
             stream_retried: false,
@@ -1923,6 +1950,7 @@ mod tests {
             record_events: true,
             record_usage: true,
             allow_retries: true,
+            retry_empty: true,
             allow_stream_retry: true,
             complete_on_answer: false,
             fail_action: "the turn ends",

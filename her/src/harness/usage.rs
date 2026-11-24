@@ -391,7 +391,7 @@ mod tests {
         });
         let chain = json!({"routes": [{"id": "first", "model": "digest-173"}, {"id": "second", "model": "other-173"}]});
         let fixture = Fixture::new("digest", chain, port);
-        let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+        let model = crate::harness::one_shot::digest_model(&fixture.context, &fixture.cfg).unwrap();
         assert_eq!(model.complete("system", "input"), Ok("[]".to_string()));
         assert_eq!(model.complete("system", "input"), Ok("[]".to_string()));
         server.join().unwrap();
@@ -432,8 +432,11 @@ mod tests {
         });
         let chain = json!({"routes": [{"id": "first", "model": "digest-173"}]});
         let fixture = Fixture::new("digest-refusal", chain, port);
-        let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
-        assert_eq!(model.complete("system", "input"), Err(crate::digest::ModelError("refusal")));
+        let model = crate::harness::one_shot::digest_model(&fixture.context, &fixture.cfg).unwrap();
+        assert_eq!(
+            model.complete("system", "input"),
+            Err(crate::harness::one_shot::ModelError("refusal"))
+        );
         server.join().unwrap();
         let rows = fixture.rows();
         assert_eq!(rows.len(), 1, "a refused answer is paid for: exactly one usage fact, {rows:?}");

@@ -221,7 +221,7 @@ fn places(usage: &[(String, i64, i64)]) -> Vec<(&str, i64)> {
 fn digest_walk_moves_to_the_next_route_after_an_explicit_error() {
     let relay = Relay::start(vec![("model-a", at_once(Kind::Status(500, ""))), ("model-b", at_once(Kind::Answer("[]")))]);
     let fixture = Fixture::new("explicit", &relay, chain_of(&["a", "b"]));
-    let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+    let model = digest_model(&fixture.context, &fixture.cfg).unwrap();
     assert_eq!(model.complete("system", "input"), Ok("[]".to_string()), "the digest's model port walks the chain");
     assert_eq!(relay.asked(), ["model-a", "model-b"], "the next route after a 500, and nothing after the answer");
     assert_eq!(places(&fixture.usage()), [("b", 1)], "a 500 has no response end; the answer is the walk's second request");
@@ -423,7 +423,7 @@ fn digest_walk_the_digest_model_setting_is_one_route_without_failover_or_route_h
     let mut extra = chain_of(&["a", "b"]);
     extra["memory"] = json!({"digest": {"model": "own-model"}});
     let fixture = Fixture::new("own-model", &relay, extra);
-    let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+    let model = digest_model(&fixture.context, &fixture.cfg).unwrap();
     assert_eq!(model.complete("system", "input"), Err(ModelError("backend")));
     assert_eq!(relay.asked(), ["own-model"], "the digest's own model has no other route");
     assert!(

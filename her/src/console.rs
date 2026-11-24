@@ -3881,24 +3881,29 @@ fn handle_slang_clear(context: &RuntimeContext, body: &str) -> Result<Value, (u1
             format!("无效的 status：{status}，仅支持 candidate/confirmed/rejected 或留空全部删除"),
         ));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let removed = if status.is_empty() {
-        let n = entries.len();
-        entries.clear();
-        n
-    } else {
-        let before = entries.len();
-        entries.retain(|e| e.get("status").and_then(|s| s.as_str()) != Some(status.as_str()));
-        before - entries.len()
-    };
+    let removed = crate::slang::mutate_entries(context, |entries| {
+        if status.is_empty() {
+            let n = entries.len();
+            entries.clear();
+            Ok::<_, (u16, String)>((true, n))
+        } else {
+            let before = entries.len();
+            entries.retain(|e| {
+                e.get("status").and_then(|s| s.as_str()) != Some(status.as_str())
+            });
+            let n = before - entries.len();
+            Ok((n > 0, n))
+        }
+    })
+    .map_err(slang_mutate_error)?;
     if status.is_empty() {
         crate::slang_learn::clear_windows(context).map_err(slang_store_error)?;
         let root = slang_rate_root(context);
-        slang_submit_times().lock().map_err(|_| (503, "黑话限频状态不可用".to_string()))?
+        slang_submit_times()
+            .lock()
+            .map_err(|_| (503, "黑话限频状态不可用".to_string()))?
             .retain(|(stored_root, _), _| stored_root != &root);
     }
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
     Ok(json!({ "ok": true, "removedCount": removed }))
 }
 
@@ -3929,6 +3934,12 @@ fn handle_slang_config_tx(
                 .cloned()
                 .unwrap_or_default();
             for (k, v) in req_obj {
+                if matches!(
+                    k.as_str(),
+                    "learnerPreset" | "workspaceTitle" | "learnerBackend"
+                ) {
+                    continue;
+                }
                 merged.insert(k.clone(), v.clone());
             }
 
@@ -3962,29 +3973,8 @@ fn handle_slang_config_tx(
             if let Some(v) = merged.get("autoResearch").cloned() {
                 merged.insert("autoResearch".into(), json!(v == json!(true)));
             }
-            if let Some(v) = merged.get("learnerPreset").cloned() {
-                merged.insert("learnerPreset".into(), json!(js_string(&v).trim()));
-            }
-            if let Some(v) = merged.get("learnerBackend").cloned() {
-                let id = js_string(&v).trim().to_string();
-                let val = if id.is_empty() {
-                    "dsh".to_string()
-                } else {
-                    id
-                };
-                merged.insert("learnerBackend".into(), json!(val));
-            }
             if let Some(v) = merged.get("learnerFallbackDsh").cloned() {
                 merged.insert("learnerFallbackDsh".into(), json!(v == json!(true)));
-            }
-            if let Some(v) = merged.get("workspaceTitle").cloned() {
-                let t = js_string(&v).trim().to_string();
-                let val = if t.is_empty() {
-                    "QQ 黑话学习".to_string()
-                } else {
-                    t
-                };
-                merged.insert("workspaceTitle".into(), json!(val));
             }
             if let Some(raw) = req_obj.get("inferenceThresholds") {
                 let items: Vec<Value> = match raw {
@@ -4039,19 +4029,20 @@ fn handle_slang_batch_delete(context: &RuntimeContext, body: &str) -> Result<Val
         .map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     let status = req.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
     if !ids.is_empty() {
-        let before = entries.len();
-        entries.retain(|e| {
-            let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            !ids.iter().any(|x| x == id)
-        });
-        let removed = before - entries.len();
-        if removed == 0 {
-            return Err((404, "没有匹配到要删除的黑话".to_string()));
-        }
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+        let removed = crate::slang::mutate_entries(context, |entries| {
+            let before = entries.len();
+            entries.retain(|e| {
+                let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                !ids.iter().any(|x| x == id)
+            });
+            let removed = before - entries.len();
+            if removed == 0 {
+                return Err((404, "没有匹配到要删除的黑话".to_string()));
+            }
+            Ok((true, removed))
+        })
+        .map_err(slang_mutate_error)?;
         return Ok(json!({ "ok": true, "removedCount": removed }));
     }
     if !status.is_empty() && !SLANG_STATUSES.contains(&status.as_str()) {
@@ -4060,10 +4051,15 @@ fn handle_slang_batch_delete(context: &RuntimeContext, body: &str) -> Result<Val
     if status.is_empty() {
         return Err((400, "请提供 ids 或 status".to_string()));
     }
-    let before = entries.len();
-    entries.retain(|e| e.get("status").and_then(|s| s.as_str()) != Some(status.as_str()));
-    let removed = before - entries.len();
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+    let removed = crate::slang::mutate_entries(context, |entries| {
+        let before = entries.len();
+        entries.retain(|e| {
+            e.get("status").and_then(|s| s.as_str()) != Some(status.as_str())
+        });
+        let removed = before - entries.len();
+        Ok::<_, (u16, String)>((removed > 0, removed))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({ "ok": true, "removedCount": removed }))
 }
 
@@ -4090,39 +4086,38 @@ fn handle_slang_batch_confirm(context: &RuntimeContext, body: &str) -> Result<Va
     if ids.is_empty() {
         return Err((400, "请选择要确认的黑话".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let now = crate::sticker::now_iso();
-    let mut confirmed = 0usize;
-    let mut skipped: Vec<Value> = Vec::new();
-    for id in &ids {
-        let Some(pos) = entries
-            .iter()
-            .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        else {
-            skipped.push(json!({ "id": id, "reason": "不存在" }));
-            continue;
-        };
-        let entry = &entries[pos];
-        let content = entry.get("content").cloned().unwrap_or(Value::Null);
-        if entry.get("status").and_then(|v| v.as_str()) != Some("candidate") {
-            skipped.push(json!({ "id": id, "content": content, "reason": "不是候选" }));
-            continue;
+    let (confirmed, skipped_count, skipped) = crate::slang::mutate_entries(context, |entries| {
+        let now = crate::sticker::now_iso();
+        let mut confirmed = 0usize;
+        let mut skipped: Vec<Value> = Vec::new();
+        for id in &ids {
+            let Some(pos) = entries
+                .iter()
+                .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            else {
+                skipped.push(json!({ "id": id, "reason": "不存在" }));
+                continue;
+            };
+            let entry = &entries[pos];
+            let content = entry.get("content").cloned().unwrap_or(Value::Null);
+            if entry.get("status").and_then(|v| v.as_str()) != Some("candidate") {
+                skipped.push(json!({ "id": id, "content": content, "reason": "不是候选" }));
+                continue;
+            }
+            let meaning = entry.get("meaning").and_then(|v| v.as_str()).unwrap_or("");
+            if meaning.trim().is_empty() {
+                skipped.push(json!({ "id": id, "content": content, "reason": "缺少含义" }));
+                continue;
+            }
+            entries[pos]["status"] = json!("confirmed");
+            entries[pos]["updatedAt"] = json!(now);
+            confirmed += 1;
         }
-        let meaning = entry.get("meaning").and_then(|v| v.as_str()).unwrap_or("");
-        if meaning.trim().is_empty() {
-            skipped.push(json!({ "id": id, "content": content, "reason": "缺少含义" }));
-            continue;
-        }
-        entries[pos]["status"] = json!("confirmed");
-        entries[pos]["updatedAt"] = json!(now);
-        confirmed += 1;
-    }
-    if confirmed > 0 {
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-    }
-    let skipped_count = skipped.len();
-    skipped.truncate(20);
+        let skipped_count = skipped.len();
+        skipped.truncate(20);
+        Ok::<_, (u16, String)>((confirmed > 0, (confirmed, skipped_count, skipped)))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({
         "ok": true,
         "confirmedCount": confirmed,
@@ -4142,27 +4137,26 @@ fn handle_slang_batch_reject(context: &RuntimeContext, body: &str) -> Result<Val
     if ids.is_empty() {
         return Err((400, "请选择要拒绝的黑话".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let now = crate::sticker::now_iso();
-    let mut rejected = 0usize;
-    for id in &ids {
-        let Some(pos) = entries
-            .iter()
-            .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        else {
-            continue;
-        };
-        if entries[pos].get("status").and_then(|v| v.as_str()) == Some("rejected") {
-            continue;
+    let rejected = crate::slang::mutate_entries(context, |entries| {
+        let now = crate::sticker::now_iso();
+        let mut rejected = 0usize;
+        for id in &ids {
+            let Some(pos) = entries
+                .iter()
+                .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            else {
+                continue;
+            };
+            if entries[pos].get("status").and_then(|v| v.as_str()) == Some("rejected") {
+                continue;
+            }
+            entries[pos]["status"] = json!("rejected");
+            entries[pos]["updatedAt"] = json!(now);
+            rejected += 1;
         }
-        entries[pos]["status"] = json!("rejected");
-        entries[pos]["updatedAt"] = json!(now);
-        rejected += 1;
-    }
-    if rejected > 0 {
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-    }
+        Ok::<_, (u16, String)>((rejected > 0, rejected))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({ "ok": true, "rejectedCount": rejected }))
 }
 
@@ -6863,35 +6857,45 @@ fn handle_slang_add(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
     if content.is_empty() {
         return Err((400, "黑话内容不能为空".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    if entries.iter().any(|e| e.get("content").and_then(|c| c.as_str()) == Some(content.as_str())) {
-        return Err((400, format!("黑话「{content}」已存在")));
-    }
-    let status = match req.get("status").and_then(|v| v.as_str()) {
-        Some("candidate") => "candidate",
-        _ => "confirmed",
-    };
-    let sources: Vec<Value> = req
-        .get("sources")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| !s.is_empty()).map(|s| json!(s)).collect())
-        .unwrap_or_default();
-    let draft = json!({
-        "content": content,
-        "meaning": req.get("meaning").cloned().unwrap_or(json!("")),
-        "usage": req.get("usage").cloned().unwrap_or(json!("")),
-        "example": req.get("example").cloned().unwrap_or(json!("")),
-        "risk": req.get("risk").cloned().unwrap_or(json!("")),
-        "sources": sources,
-        "status": status,
-        "source": "manual",
-        "count": 1,
-        "evidence": req.get("evidence").cloned().unwrap_or(json!([])),
-    });
-    let entry = crate::slang::normalize_entry(&draft);
-    entries.push(entry.clone());
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+    let entry = crate::slang::mutate_entries(context, |entries| {
+        if entries
+            .iter()
+            .any(|e| e.get("content").and_then(|c| c.as_str()) == Some(content.as_str()))
+        {
+            return Err((400, format!("黑话「{content}」已存在")));
+        }
+        let status = match req.get("status").and_then(|v| v.as_str()) {
+            Some("candidate") => "candidate",
+            _ => "confirmed",
+        };
+        let sources: Vec<Value> = req
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| json!(s))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let draft = json!({
+            "content": content,
+            "meaning": req.get("meaning").cloned().unwrap_or(json!("")),
+            "usage": req.get("usage").cloned().unwrap_or(json!("")),
+            "example": req.get("example").cloned().unwrap_or(json!("")),
+            "risk": req.get("risk").cloned().unwrap_or(json!("")),
+            "sources": sources,
+            "status": status,
+            "source": "manual",
+            "count": 1,
+            "evidence": req.get("evidence").cloned().unwrap_or(json!([])),
+        });
+        let entry = crate::slang::normalize_entry(&draft);
+        entries.push(entry.clone());
+        Ok((true, entry))
+    })
+    .map_err(slang_mutate_error)?;
     crate::safe_println!("[console] 新增黑话「{content}」");
     Ok(json!({ "ok": true, "entry": entry }))
 }
@@ -9969,7 +9973,11 @@ fn handle_tool_log_clear(context: &RuntimeContext) -> Result<Value, (u16, String
 ///   · `limit`   可选，最多送多少条消息进模型；
 ///   · `force`   可选，跳过冷却（默认遵守 `extractCooldownMs`）；
 ///   · `dryRun`  可选，只数窗口、不调模型（回归脚本用，避免真花钱）。
-fn handle_slang_extract(body: &str, cfg: &Value) -> Result<Value, (u16, String)> {
+fn handle_slang_extract(
+    context: &RuntimeContext,
+    body: &str,
+    cfg: &Value,
+) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = req
         .get("key")
@@ -9990,27 +9998,44 @@ fn handle_slang_extract(body: &str, cfg: &Value) -> Result<Value, (u16, String)>
     let dry_run = req.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
     let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(crate::slang_learn::extract_now(
-        cfg, &key, limit, dry_run, force,
+        context, cfg, &key, limit, dry_run, force,
     ))
 }
 
 /// `/api/slang`：黑话词条表。
 fn slang_config_defaults(config: &Value) -> Value {
-    let mut result = json!({"enabled": true, "extractMinMessages": 10, "extractCooldownMs": 300000,
-        "inferenceThresholds": [2,4,8], "injectMax": 8, "learnerPreset": "qq-chat",
-        "workspaceTitle": "QQ 黑话学习", "autoResearch": true,
-        "learnerBackend": "dsh", "learnerFallbackDsh": false});
+    let mut result = json!({
+        "enabled": true,
+        "extractMinMessages": 10,
+        "extractCooldownMs": 300000,
+        "inferenceThresholds": [2, 4, 8],
+        "injectMax": 8,
+        "autoResearch": true,
+        "learnerFallbackDsh": false,
+    });
     if let Some(fields) = config.as_object() {
-        for (key, value) in fields { result[key] = value.clone(); }
+        for (key, value) in fields {
+            if matches!(
+                key.as_str(),
+                "learnerPreset" | "workspaceTitle" | "learnerBackend"
+            ) {
+                continue;
+            }
+            result[key] = value.clone();
+        }
     }
     result
 }
 
 fn handle_slang(context: &RuntimeContext, cfg: &Value, status: &str) -> Value {
-    let loaded = crate::slang::load_entries_checked_for_runtime(context);
+    let loaded = crate::slang::read_entries_locked(context);
     let writable = loaded.is_ok();
-    let entries: Vec<Value> = loaded.unwrap_or_default().into_iter()
-        .filter(|entry| status.is_empty() || entry.get("status").and_then(Value::as_str) == Some(status))
+    let entries: Vec<Value> = loaded
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            status.is_empty() || entry.get("status").and_then(Value::as_str) == Some(status)
+        })
         .collect();
     let slang_cfg = slang_config_defaults(cfg.get("slang").unwrap_or(&Value::Null));
     json!({
@@ -10022,6 +10047,13 @@ fn handle_slang(context: &RuntimeContext, cfg: &Value, status: &str) -> Value {
 
 fn slang_store_error(error: String) -> (u16, String) {
     (503, format!("黑话库不可用：{error}"))
+}
+
+fn slang_mutate_error(error: crate::slang::MutateError<(u16, String)>) -> (u16, String) {
+    match error {
+        crate::slang::MutateError::Store(msg) => slang_store_error(msg),
+        crate::slang::MutateError::Action(err) => err,
+    }
 }
 
 fn slang_rate_root(context: &RuntimeContext) -> String {
@@ -10040,12 +10072,14 @@ fn slang_research(context: &RuntimeContext, cfg: &Value, body: &str) -> Result<V
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let requested: Vec<String> = req.get("ids").and_then(Value::as_array)
         .map(|ids| ids.iter().map(js_string).collect()).unwrap_or_default();
-    let _store = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let ids: Vec<String> = entries.iter().filter(|entry| entry.get("status").and_then(Value::as_str) == Some("candidate"))
+    let entries = crate::slang::read_entries_locked(context).map_err(slang_store_error)?;
+    let ids: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(Value::as_str) == Some("candidate"))
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .filter(|id| requested.is_empty() || requested.iter().any(|want| want == id))
-        .map(str::to_string).collect();
+        .map(str::to_string)
+        .collect();
     if ids.is_empty() { return Err((400, "没有可研究的候选黑话".to_string())); }
     let count = ids.len();
     crate::slang_learn::queue_research(context, cfg, ids).map_err(slang_store_error)?;
@@ -10083,36 +10117,77 @@ fn slang_submit(
     times.push(now);
     drop(table);
 
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    if let Some(existing) = entries.iter().find(|e| e.get("content").and_then(Value::as_str) == Some(content.as_str())) {
-        match existing.get("status").and_then(Value::as_str) {
-            Some("confirmed") => return Ok(json!({"ok": true, "duplicate": true, "status": "confirmed", "entry": crate::slang::public_entry(existing)})),
-            Some("rejected") => return Err((403, "该词已被管理员拒绝，如需重新收录请联系管理员".to_string())),
-            _ => {}
-        }
+    enum SubmitOutcome {
+        ConfirmedDuplicate(Value),
+        Changed { created: bool, entry: Value },
     }
-    let evidence = if evidence_text.is_empty() { vec![] } else {
-        vec![json!({"key": key, "sender": "AI提交", "text": evidence_text.chars().take(200).collect::<String>(), "time": now})]
+    let outcome = crate::slang::mutate_entries(context, |entries| {
+        if let Some(existing) = entries
+            .iter()
+            .find(|e| e.get("content").and_then(Value::as_str) == Some(content.as_str()))
+        {
+            match existing.get("status").and_then(Value::as_str) {
+                Some("confirmed") => {
+                    return Ok((false, SubmitOutcome::ConfirmedDuplicate(existing.clone())));
+                }
+                Some("rejected") => {
+                    return Err((
+                        403,
+                        "该词已被管理员拒绝，如需重新收录请联系管理员".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let evidence = if evidence_text.is_empty() {
+            vec![]
+        } else {
+            vec![json!({
+                "key": key,
+                "sender": "AI提交",
+                "text": evidence_text.chars().take(200).collect::<String>(),
+                "time": now,
+            })]
+        };
+        let (created, entry) = crate::slang_learn::upsert_entry(entries, &content, "", evidence);
+        let entry = entry.ok_or((400, "content 不能为空".to_string()))?;
+        Ok((true, SubmitOutcome::Changed { created, entry }))
+    })
+    .map_err(slang_mutate_error)?;
+    let (created, entry) = match outcome {
+        SubmitOutcome::ConfirmedDuplicate(existing) => {
+            return Ok(json!({
+                "ok": true,
+                "duplicate": true,
+                "status": "confirmed",
+                "entry": crate::slang::public_entry(&existing),
+            }));
+        }
+        SubmitOutcome::Changed { created, entry } => (created, entry),
     };
-    let (created, entry) = crate::slang_learn::upsert_entry(&mut entries, &content, "", evidence);
-    let entry = entry.ok_or((400, "content 不能为空".to_string()))?;
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
     if cfg.pointer("/slang/autoResearch") != Some(&json!(false))
         && (created || crate::slang_learn::research_threshold_reached(cfg, &entry))
     {
         if let Some(id) = entry.get("id").and_then(Value::as_str) {
-            crate::slang_learn::queue_research(context, cfg, vec![id.to_string()]).map_err(slang_store_error)?;
+            crate::slang_learn::queue_research(context, cfg, vec![id.to_string()])
+                .map_err(slang_store_error)?;
         }
     }
     if created {
+        let suffix = if evidence_text.is_empty() { "" } else { "（附语境）" };
         crate::activity::append(
             context,
-            &format!("{key} [reserved2] AI 提交黑话候选：{content}{}", if evidence_text.is_empty() { "" } else { "（附语境）" }),
+            &format!("{key} [reserved2] AI 提交黑话候选：{content}{suffix}"),
         );
         Ok(json!({"ok": true, "entry": crate::slang::public_entry(&entry)}))
+    } else {
+        Ok(json!({
+            "ok": true,
+            "duplicate": true,
+            "status": "candidate",
+            "entry": crate::slang::public_entry(&entry),
+        }))
     }
-    else { Ok(json!({"ok": true, "duplicate": true, "status": "candidate", "entry": crate::slang::public_entry(&entry)})) }
 }
 
 fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &str) -> Option<Result<Value, (u16, String)>> {
@@ -10123,46 +10198,78 @@ fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &
         ("POST", [id, "confirm" | "reject"]) if !id.is_empty() => (*id, parts[1]),
         _ => return None,
     };
-    Some((|| {
-        let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-        let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-        let idx = entries.iter().position(|e| e.get("id").and_then(Value::as_str) == Some(id))
-            .ok_or((404, "黑话不存在".to_string()))?;
-        if action == "delete" {
-            let removed = entries.remove(idx);
-            crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-            return Ok(json!({"ok": true, "removed": removed}));
-        }
-        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let mut entry = entries[idx].clone();
-        if action == "patch" || action == "confirm" {
-            for field in ["meaning", "usage", "example", "risk"] {
-                if req.get(field).is_some() { entry[field] = json!(agent::body_text(&req, field)); }
+    Some(
+        crate::slang::mutate_entries(context, |entries| {
+            let idx = entries
+                .iter()
+                .position(|e| e.get("id").and_then(Value::as_str) == Some(id))
+                .ok_or((404, "黑话不存在".to_string()))?;
+            if action == "delete" {
+                let removed = entries.remove(idx);
+                return Ok((true, json!({"ok": true, "removed": removed})));
             }
-            if let Some(value) = req.get("sources") {
-                let sources: Vec<Value> = value.as_array().map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).take(10).map(|s| json!(s)).collect()).unwrap_or_default();
-                entry["sources"] = json!(sources);
-            }
-        }
-        if action == "patch" {
-            if req.get("content").is_some() {
-                let content = agent::body_text(&req, "content");
-                if entries.iter().enumerate().any(|(n, e)| n != idx && e.get("content").and_then(Value::as_str) == Some(content.as_str())) {
-                    return Err((400, format!("黑话「{content}」已存在")));
+            let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+            let mut entry = entries[idx].clone();
+            if action == "patch" || action == "confirm" {
+                for field in ["meaning", "usage", "example", "risk"] {
+                    if req.get(field).is_some() {
+                        entry[field] = json!(agent::body_text(&req, field));
+                    }
                 }
-                entry["content"] = json!(content);
+                if let Some(value) = req.get("sources") {
+                    let sources: Vec<Value> = value
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(js_string)
+                                .filter(|s| !s.is_empty())
+                                .take(10)
+                                .map(|s| json!(s))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    entry["sources"] = json!(sources);
+                }
             }
-            if let Some(status) = req.get("status").and_then(Value::as_str).filter(|s| SLANG_STATUSES.contains(s)) { entry["status"] = json!(status); }
-            if entry.get("content").and_then(Value::as_str).unwrap_or("").is_empty() { return Err((400, "黑话内容不能为空".to_string())); }
-        } else if action == "confirm" {
-            if entry.get("meaning").and_then(Value::as_str).unwrap_or("").is_empty() { return Err((400, "请先填写含义再确认，否则不会注入 AI 上下文".to_string())); }
-            entry["status"] = json!("confirmed");
-        } else { entry["status"] = json!("rejected"); }
-        entry["updatedAt"] = json!(crate::sticker::now_iso());
-        entries[idx] = entry.clone();
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-        Ok(json!({"ok": true, "entry": entry}))
-    })())
+            if action == "patch" {
+                if req.get("content").is_some() {
+                    let content = agent::body_text(&req, "content");
+                    let dup = entries.iter().enumerate().any(|(n, e)| {
+                        n != idx
+                            && e.get("content").and_then(Value::as_str) == Some(content.as_str())
+                    });
+                    if dup {
+                        return Err((400, format!("黑话「{content}」已存在")));
+                    }
+                    entry["content"] = json!(content);
+                }
+                if let Some(status) = req
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .filter(|s| SLANG_STATUSES.contains(s))
+                {
+                    entry["status"] = json!(status);
+                }
+                if entry.get("content").and_then(Value::as_str).unwrap_or("").is_empty() {
+                    return Err((400, "黑话内容不能为空".to_string()));
+                }
+            } else if action == "confirm" {
+                if entry.get("meaning").and_then(Value::as_str).unwrap_or("").is_empty() {
+                    return Err((
+                        400,
+                        "请先填写含义再确认，否则不会注入 AI 上下文".to_string(),
+                    ));
+                }
+                entry["status"] = json!("confirmed");
+            } else {
+                entry["status"] = json!("rejected");
+            }
+            entry["updatedAt"] = json!(crate::sticker::now_iso());
+            entries[idx] = entry.clone();
+            Ok((true, json!({"ok": true, "entry": entry})))
+        })
+        .map_err(slang_mutate_error),
+    )
 }
 
 /// `/api/socialV2/config`：二代仿真的全部可调参数。
@@ -11303,7 +11410,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
                 Err(error) => (503, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
             }
         }
-        ("POST", "/api/slang/extract") => match handle_slang_extract(&req.body, cfg) {
+        ("POST", "/api/slang/extract") => match handle_slang_extract(context, &req.body, cfg) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
                 code,
@@ -11413,7 +11520,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
             if let Err((status, message)) = sticker_agent_allowed(context, cfg, &key, &req.headers, "slangQuery", "qq_slang_query") {
                 return (status, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": message}).to_string());
             }
-            let entries = match crate::slang::load_entries_checked_for_runtime(context) {
+            let entries = match crate::slang::read_entries_locked(context) {
                 Ok(entries) => entries,
                 Err(error) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
             };
@@ -22633,6 +22740,111 @@ pub(super) mod tests {
         assert_eq!(after["sendDelayMs"], json!(1234), "the acknowledged settings change survives");
         assert_eq!(after["slang"]["injectMax"], json!(5));
         drop(root);
+    }
+
+    #[test]
+    fn slang_config_ignores_retired_dsh_fields_and_preserves_legacy_load() {
+        let (root, context) = fixture_runtime("slang-legacy-config", "token-slang-cfg");
+        let config_path = root.0.join("config/config.json");
+        let mut stored: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        stored["slang"] = json!({
+            "injectMax": 6,
+            "learnerPreset": "qq-chat",
+            "workspaceTitle": "QQ 黑话学习",
+            "learnerBackend": "dsh"
+        });
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let reloaded = context.load_config().unwrap();
+        let view = handle_slang(&context, &reloaded, "");
+        assert_eq!(view["config"]["injectMax"], json!(6));
+        for retired in ["learnerPreset", "workspaceTitle", "learnerBackend"] {
+            assert!(
+                view["config"].get(retired).is_none(),
+                "GET /api/slang must omit retired field {retired}"
+            );
+        }
+
+        let updated = handle_slang_config(
+            &context,
+            &json!({
+                "injectMax": 9,
+                "learnerPreset": "custom-preset",
+                "workspaceTitle": "Custom Title",
+                "learnerBackend": "custom-backend"
+            })
+            .to_string(),
+        )
+        .expect("legacy keys in request should be safely ignored");
+        assert_eq!(updated["ok"], json!(true));
+        assert_eq!(updated["config"]["injectMax"], json!(9));
+        for retired in ["learnerPreset", "workspaceTitle", "learnerBackend"] {
+            assert!(
+                updated["config"].get(retired).is_none(),
+                "POST /api/slang/config must omit retired field {retired}"
+            );
+        }
+        let persisted = context.load_config().unwrap();
+        assert_eq!(persisted["slang"]["injectMax"], json!(9));
+        assert_eq!(persisted["slang"]["learnerBackend"], json!("dsh"));
+        drop(root);
+    }
+
+    #[test]
+    fn handle_slang_extract_requires_runtime_context_and_isolates_state() {
+        let (_root_a, ctx_a) = fixture_runtime("slang-extract-a", "token-extract-a");
+        let (_root_b, ctx_b) = fixture_runtime("slang-extract-b", "token-extract-b");
+        let c = cfg();
+        let learner_a = crate::slang_learn::SlangLearning::new(&ctx_a);
+        assert!(learner_a.feed_window("group:7002", "Alice", "yyds"));
+        let body = json!({ "key": "group:7002", "dryRun": true }).to_string();
+
+        let res_a = handle_slang_extract(&ctx_a, &body, &c).unwrap();
+        let res_b = handle_slang_extract(&ctx_b, &body, &c).unwrap();
+        assert_eq!(res_a["ok"], json!(true));
+        assert_eq!(res_a["messages"], json!(1));
+        assert_eq!(res_b["ok"], json!(true));
+        assert_eq!(res_b["messages"], json!(0));
+    }
+
+    #[test]
+    fn slang_handlers_use_internalized_store_locking() {
+        let (_root, context) = fixture_runtime("slang-internal-lock", "token-slang-lock");
+        let cfg = context.load_config().unwrap();
+        let added = handle_slang_add(
+            &context,
+            &json!({
+                "content": "yyds",
+                "meaning": "永远的神",
+                "status": "candidate"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let id = added["entry"]["id"].as_str().unwrap().to_string();
+        let confirmed = handle_slang_batch_confirm(
+            &context,
+            &json!({ "ids": [id.clone()] }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(confirmed["confirmedCount"], json!(1));
+
+        let patched = slang_item_action(
+            &context,
+            "PATCH",
+            &id,
+            &json!({ "usage": "夸人常用" }).to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(patched["entry"]["usage"], json!("夸人常用"));
+
+        let listed = handle_slang(&context, &cfg, "confirmed");
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+
+        let cleared = handle_slang_clear(&context, &json!({}).to_string()).unwrap();
+        assert_eq!(cleared["removedCount"], json!(1));
+        assert!(crate::slang::read_entries_locked(&context).unwrap().is_empty());
     }
 
     #[test]
