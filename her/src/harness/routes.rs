@@ -2475,9 +2475,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn chain_executor_records_ready_usage_when_cancel_races_step_completion() {
-        let fixture = Fixture::new("cancel-race");
-        let cfg = routes(&[route("a")]);
-        let model = ModelRoute::from_runtime(&fixture.context, &cfg).unwrap();
+        let cfg_routes = json!({"routes": [route("a")]});
+        let fixture = TestFixture::new("cancel-race", cfg_routes, "secret-259-cancel-race");
+        let model = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
         let mut exec = ChainExecutor::new(turn_chain_cfg(&fixture.context, model, "group:9"));
         let mut step = ScriptedStep::new(vec![ScriptAction::Answer {
             text: "late-answer".into(),
