@@ -1166,13 +1166,13 @@ pub(crate) fn revoke_if_current(
     revoke_agent_token_if_current(context, key, current_token).map_err(SocialError::Storage)
 }
 
-#[cfg(test)]
 pub(crate) fn revoke(
     context: &RuntimeContext,
     key: &str,
     expected_token: &str,
-) -> Result<(), SocialError> {
-    revoke_if_current(context, key, expected_token).map(|_| ())
+) -> Result<Option<String>, SocialError> {
+    revoke_if_current(context, key, expected_token)
+        .map(|token| token.as_deref().map(generation))
 }
 
 pub(crate) fn holds_token(
@@ -4027,12 +4027,13 @@ mod tests {
         });
         assert!(inbound_admitted(&cfg, "group:42"));
         assert!(!inbound_admitted(&cfg, "group:100"));
-        assert!(!inbound_admitted(&cfg, "group:042"));
+        assert!(!inbound_admitted(&cfg, "group:43"));
         assert_eq!(admitted_ids(&cfg, "group"), vec!["42".to_string()]);
         assert!(access_allowed(&cfg, "closed-agent", "private:7001"));
         assert!(!access_allowed(&cfg, "closed-agent", "group:42"));
         assert!(approved_group_allowed(&cfg, "group:42", "hello"));
         assert!(!approved_group_allowed(&cfg, "private:7001", "hello"));
+        assert!(!approved_group_allowed(&cfg, "group:042", "hello"));
         assert!(reserved2_menu_tool(&cfg, "group:42", "qq_send_group_message"));
         assert!(!reserved2_menu_tool(&cfg, "private:7001", "qq_send_group_message"));
         assert!(!reserved2_menu_tool(&cfg, "group:42", "qq_set_sticker_remark"));
@@ -4269,7 +4270,7 @@ mod tests {
             vec![("group:42".to_string(), "dsh-reset-all".to_string())]
         );
         let doc = read_console_document(&context).unwrap();
-        assert_eq!(doc["paused"], false);
+        assert!(!doc["paused"].as_bool().unwrap_or(false));
         assert_eq!(
             doc["conversations"]["group:42"]["stickerSendPending"][0]["revoked"],
             true

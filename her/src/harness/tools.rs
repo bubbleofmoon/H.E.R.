@@ -124,12 +124,8 @@ impl Tools {
 
     pub(super) fn revoke(&self) -> Result<Option<String>, String> {
         match &self.authority {
-            Some(a) => crate::social_state::revoke_if_current(
-                &a.context,
-                &a.conversation,
-                &a.token,
-            )
-            .map_err(String::from),
+            Some(a) => crate::social_state::revoke(&a.context, &a.conversation, &a.token)
+                .map_err(String::from),
             None => Ok(None),
         }
     }
