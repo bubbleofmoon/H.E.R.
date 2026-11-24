@@ -230,10 +230,7 @@ export interface SlangConfig {
   extractCooldownMs: number;
   inferenceThresholds: number[];
   injectMax: number;
-  learnerPreset: string;
-  workspaceTitle: string;
   autoResearch: boolean;
-  learnerBackend: string;
   learnerFallbackDsh: boolean;
 }
 

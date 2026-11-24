@@ -10,13 +10,13 @@
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
 //! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
-//! (`chat_setting`, `console::settings_action`); `console_changes` and `apply_changes` store the registry settings a
+//! (`chat_setting`, `config_tx::settings_action`); `console_changes` and `apply_changes` store the registry settings a
 //! console configuration page changes (#177), and `keep_file_members` keeps every console write of `config.json` off
 //! the registry members; `history` lists the audit rows. Each write first seeds the store from
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
 //! `config/config.json.pre-settings`; after it, `write_back` mirrors ordinary stored values into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
-//! (`social_state::acquire_config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
+//! (`config_tx::acquire_config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
@@ -30,7 +30,7 @@
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
 //! a change of a list or the owner is an access change (`Setting::access`), revoked as a whitelist write is
-//! (`social_state::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
+//! (`config_tx::commit_access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
 //! setting never takes the access lists over from `config.json`.
 //!
 //! Scopes (#218): a setting of `registry()` is global. A setting of `conversation_registry()` (`ConversationSetting`)

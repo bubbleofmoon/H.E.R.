@@ -20,6 +20,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,14 @@ const MESSAGE_TEXT_MAX: usize = 200;
 const ITEM_MAX: usize = 20;
 /// 格式修复提示词里最多回显上一次坏输出的字符数。
 const REPAIR_ECHO_MAX: usize = 1000;
+/// Maximum consecutive refusals per batch signature before automatic retries stop.
+pub const REFUSAL_RETRY_CAP: u32 = 3;
+/// Minimum base backoff after a refusal when `extractCooldownMs` is shorter.
+const REFUSAL_MIN_BACKOFF_MS: i64 = 60_000;
+/// Maximum exponential refusal backoff (1 hour).
+const REFUSAL_MAX_BACKOFF_MS: i64 = 3_600_000;
+/// Maximum recent batch signatures retained in `slang-windows.json` for idempotent consume.
+const MAX_CONSUMED_BATCHES: usize = 64;
 
 /// 一条待学习的群消息。旧窗口没有 `windowId`，仍可读取。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +55,36 @@ pub struct SlangMsg {
     pub time: i64,
     #[serde(default, rename = "windowId", skip_serializing_if = "Option::is_none")]
     pub window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ConsumedBatch {
+    key: String,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingUpsert {
+    content: String,
+    evidence: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingCommit {
+    key: String,
+    signature: String,
+    #[serde(rename = "beforeHash")]
+    before_hash: String,
+    batch: Vec<SlangMsg>,
+    upserts: Vec<PendingUpsert>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RefusalRecord {
+    signature: String,
+    attempts: u32,
+    #[serde(rename = "nextRetryAt")]
+    next_retry_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +101,12 @@ struct WindowState {
     consumed_at: HashMap<String, i64>,
     /// key -> 上次抽取开始的时间戳（冷却用）。
     cooldowns: HashMap<String, i64>,
+    /// Recently consumed `(key, batch_signature)` pairs for idempotent retry/restart safety.
+    consumed_batches: Vec<ConsumedBatch>,
+    /// Staged slang store commit waiting for window consumption.
+    pending_commit: Option<PendingCommit>,
+    /// Per-conversation refusal backoff keyed by conversation key and batch signature.
+    refusals: HashMap<String, RefusalRecord>,
     generation: u64,
 }
 
@@ -70,6 +115,27 @@ struct LearningInner {
     state: Mutex<WindowState>,
     extract_lock: tokio::sync::Mutex<()>,
     sync_lock: Mutex<()>,
+}
+
+/// Per-runtime-root learning state so callers like `extract_now` stay isolated by `RuntimeContext`.
+fn runtime_inner(context: &RuntimeContext) -> Arc<LearningInner> {
+    static RUNTIMES: OnceLock<Mutex<HashMap<Option<PathBuf>, Arc<LearningInner>>>> =
+        OnceLock::new();
+    let key = context.runtime_root().map(std::path::Path::to_path_buf);
+    let mut map = RUNTIMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    map.entry(key)
+        .or_insert_with(|| {
+            Arc::new(LearningInner {
+                context: context.clone(),
+                state: Mutex::new(WindowState::default()),
+                extract_lock: tokio::sync::Mutex::new(()),
+                sync_lock: Mutex::new(()),
+            })
+        })
+        .clone()
 }
 
 /// Runtime roots (`None`: the legacy runtime) whose startup catch-up this process already started. The first learning
@@ -128,6 +194,7 @@ impl SlangLearning {
     fn due_retained_windows(&self) -> Result<Vec<String>, String> {
         let context = &self.inner.context;
         let cfg = context.load_config().map_err(|error| error.to_string())?;
+        reconcile_pending_commit(context, &self.inner.state)?;
         let keys: Vec<String> = {
             let mut st = self
                 .inner
@@ -168,6 +235,7 @@ impl SlangLearning {
             key,
             None,
             None,
+            true,
         );
         report_auto_result(Ok(result), key);
     }
@@ -238,6 +306,7 @@ impl SlangLearning {
                 &key_for_worker,
                 None,
                 ticket,
+                true,
             )
         })
         .await;
@@ -321,10 +390,16 @@ pub fn cooldown_ms(cfg: &Value) -> i64 {
     cfg_i64(cfg, &["slang", "extractCooldownMs"], 300_000).max(0)
 }
 
-/// `slang.learnerBackend`, trimmed; blank or absent means `dsh` (the console stores the same value), the default
-/// route (`route_extract`).
+/// `slang.learnerBackend`, trimmed; blank, absent, `"dsh"`, or `"harness"` routes to
+/// `harness::one_shot` (`route_extract`).
 fn learner_backend(cfg: &Value) -> &str {
-    Some(cfg_str(cfg, &["slang", "learnerBackend"], "dsh").trim()).filter(|id| !id.is_empty()).unwrap_or("dsh")
+    match Some(cfg_str(cfg, &["slang", "learnerBackend"], "dsh").trim())
+        .filter(|id| !id.is_empty())
+        .unwrap_or("dsh")
+    {
+        "harness" => "dsh",
+        other => other,
+    }
 }
 
 fn queue_gate(context: &RuntimeContext) -> Result<std::fs::File, String> {
@@ -540,16 +615,59 @@ fn new_window_id() -> String {
 
 // ── 跨进程窗口文件 ──────────────────────────────────────────────────────────
 
-fn read_windows_file(
-    context: &RuntimeContext,
-) -> Result<
-    (
-        indexmap::IndexMap<String, Vec<SlangMsg>>,
-        HashMap<String, i64>,
-        u64,
-    ),
-    String,
-> {
+struct DiskWindows {
+    windows: indexmap::IndexMap<String, Vec<SlangMsg>>,
+    consumed_at: HashMap<String, i64>,
+    generation: u64,
+    consumed_batches: Vec<ConsumedBatch>,
+    pending_commit: Option<PendingCommit>,
+}
+
+impl Default for DiskWindows {
+    fn default() -> Self {
+        Self {
+            windows: indexmap::IndexMap::new(),
+            consumed_at: HashMap::new(),
+            generation: 0,
+            consumed_batches: Vec::new(),
+            pending_commit: None,
+        }
+    }
+}
+
+/// Deterministic SHA-256 signature of a captured batch for `(key, batch)` idempotency and refusal
+/// backoff tracking.
+pub fn batch_signature(key: &str, batch: &[SlangMsg]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"\x1e");
+    hasher.update(batch.len().to_le_bytes());
+    for msg in batch {
+        hasher.update(b"\x1e");
+        hasher.update(msg.window_id.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(msg.time.to_le_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(msg.sender.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(msg.text.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Bounded exponential backoff in milliseconds after `attempts` consecutive refusals of a batch.
+pub fn refusal_backoff_ms(attempts: u32, cooldown: i64) -> i64 {
+    if attempts == 0 {
+        return 0;
+    }
+    let base = cooldown.max(REFUSAL_MIN_BACKOFF_MS);
+    let shift = attempts.saturating_sub(1).min(10);
+    base.saturating_mul(1i64 << shift)
+        .min(REFUSAL_MAX_BACKOFF_MS)
+}
+
+fn read_windows_file(context: &RuntimeContext) -> Result<DiskWindows, String> {
     let text = if context.is_isolated() {
         context
             .read_optional_text(RuntimeArea::Data, "slang-windows.json")
@@ -560,21 +678,20 @@ fn read_windows_file(
             .ok()
     };
     let Some(text) = text else {
-        return Ok((indexmap::IndexMap::new(), HashMap::new(), 0));
+        return Ok(DiskWindows::default());
     };
     let v = match serde_json::from_str::<Value>(&text) {
         Ok(value) => value,
         Err(error) if context.is_isolated() => {
             return Err(format!("候选黑话窗口 JSON 损坏：{error}"));
         }
-        Err(_) => return Ok((indexmap::IndexMap::new(), HashMap::new(), 0)),
+        Err(_) => return Ok(DiskWindows::default()),
     };
     if context.is_isolated() && !v.is_object() {
         return Err("候选黑话窗口结构损坏".to_string());
     }
-    let mut windows = indexmap::IndexMap::new();
-    let mut consumed_at = HashMap::new();
-    let generation = match v.get("generation") {
+    let mut out = DiskWindows::default();
+    out.generation = match v.get("generation") {
         Some(value) if context.is_isolated() => value
             .as_u64()
             .ok_or_else(|| "候选黑话窗口 generation 结构异常".to_string())?,
@@ -601,7 +718,7 @@ fn read_windows_file(
                         })?;
                     messages.push(message);
                 }
-                windows.insert(key.clone(), messages);
+                out.windows.insert(key.clone(), messages);
             }
         }
         if let Some(value) = v.get("consumedAt") {
@@ -612,10 +729,20 @@ fn read_windows_file(
                 let timestamp = timestamp
                     .as_i64()
                     .ok_or_else(|| format!("候选黑话窗口会话 {key} 消费时间结构异常"))?;
-                consumed_at.insert(key.clone(), timestamp);
+                out.consumed_at.insert(key.clone(), timestamp);
             }
         }
-        return Ok((windows, consumed_at, generation));
+        if let Some(value) = v.get("consumedBatches") {
+            out.consumed_batches = serde_json::from_value(value.clone())
+                .map_err(|_| "候选黑话窗口字段 consumedBatches 结构异常".to_string())?;
+        }
+        if let Some(value) = v.get("pendingCommit").filter(|val| !val.is_null()) {
+            out.pending_commit = Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|_| "候选黑话窗口字段 pendingCommit 结构异常".to_string())?,
+            );
+        }
+        return Ok(out);
     }
 
     // Legacy parsing deliberately retains its historical best-effort behavior.
@@ -629,16 +756,24 @@ fn read_windows_file(
                         .collect()
                 })
                 .unwrap_or_default();
-            windows.insert(key.clone(), msgs);
+            out.windows.insert(key.clone(), msgs);
         }
     }
     if let Some(map) = v.get("consumedAt").and_then(|c| c.as_object()) {
-        consumed_at = map
+        out.consumed_at = map
             .iter()
             .filter_map(|(key, value)| Some((key.clone(), value.as_i64()?)))
             .collect();
     }
-    Ok((windows, consumed_at, generation))
+    if let Some(value) = v.get("consumedBatches") {
+        if let Ok(batches) = serde_json::from_value(value.clone()) {
+            out.consumed_batches = batches;
+        }
+    }
+    if let Some(value) = v.get("pendingCommit").filter(|val| !val.is_null()) {
+        out.pending_commit = serde_json::from_value(value.clone()).ok();
+    }
+    Ok(out)
 }
 
 fn write_windows_file(context: &RuntimeContext, state: &WindowState) -> Result<(), String> {
@@ -658,36 +793,97 @@ fn write_windows_file(context: &RuntimeContext, state: &WindowState) -> Result<(
         .iter()
         .map(|(k, v)| (k.clone(), json!(v)))
         .collect();
-    let payload =
-        json!({ "windows": windows, "consumedAt": consumed, "generation": state.generation });
-    let text =
-        serde_json::to_vec(&payload).map_err(|error| format!("序列化黑话窗口失败：{error}"))?;
+    let mut payload = serde_json::Map::new();
+    payload.insert("windows".to_string(), Value::Object(windows));
+    payload.insert("consumedAt".to_string(), Value::Object(consumed));
+    payload.insert("generation".to_string(), json!(state.generation));
+    if !state.consumed_batches.is_empty() {
+        payload.insert(
+            "consumedBatches".to_string(),
+            serde_json::to_value(&state.consumed_batches)
+                .map_err(|error| format!("序列化已消费批次失败：{error}"))?,
+        );
+    }
+    if let Some(pending) = &state.pending_commit {
+        payload.insert(
+            "pendingCommit".to_string(),
+            serde_json::to_value(pending)
+                .map_err(|error| format!("序列化待提交黑话批次失败：{error}"))?,
+        );
+    }
+    let text = serde_json::to_vec(&Value::Object(payload))
+        .map_err(|error| format!("序列化黑话窗口失败：{error}"))?;
     context
         .write_atomic(RuntimeArea::Data, "slang-windows.json", &text)
         .map_err(|error| format!("写黑话窗口失败：{error}"))
+}
+
+fn read_refusals_file(
+    context: &RuntimeContext,
+    memory: &HashMap<String, RefusalRecord>,
+) -> HashMap<String, RefusalRecord> {
+    if !context.is_isolated() {
+        return memory.clone();
+    }
+    let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, "slang-refusals.json")
+    else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_refusals_file(
+    context: &RuntimeContext,
+    refusals: &HashMap<String, RefusalRecord>,
+) -> Result<(), String> {
+    if !context.is_isolated() {
+        return Ok(());
+    }
+    if refusals.is_empty() {
+        let _ = context.remove_file(RuntimeArea::Data, "slang-refusals.json");
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(refusals)
+        .map_err(|error| format!("序列化黑话拒绝退避记录失败：{error}"))?;
+    context
+        .write_atomic(RuntimeArea::Data, "slang-refusals.json", &bytes)
+        .map_err(|error| format!("写黑话拒绝退避记录失败：{error}"))
 }
 
 /// 把磁盘上的窗口合并进内存，并按 `consumedAt` 剪掉已消费的消息。
 ///
 /// 合并而不是覆盖：主循环可能比控制台多几条新消息，控制台也可能刚消费过一批。
 fn sync_with_disk(context: &RuntimeContext, state: &mut WindowState) -> Result<(), String> {
-    let (disk_windows, disk_consumed, generation) = read_windows_file(context)?;
+    let disk = read_windows_file(context)?;
     if context.is_isolated() {
-        if state.generation != generation {
+        if state.generation != disk.generation {
             state.cooldowns.clear();
+            state.refusals.clear();
         }
-        state.generation = generation;
-        state.windows = disk_windows;
-        state.consumed_at = disk_consumed;
+        state.generation = disk.generation;
+        state.windows = disk.windows;
+        state.consumed_at = disk.consumed_at;
+        state.consumed_batches = disk.consumed_batches;
+        state.pending_commit = disk.pending_commit;
         return Ok(());
     }
-    for (key, ts) in disk_consumed {
+    state.pending_commit = disk.pending_commit;
+    for batch in disk.consumed_batches {
+        if !state.consumed_batches.contains(&batch) {
+            state.consumed_batches.push(batch);
+        }
+    }
+    if state.consumed_batches.len() > MAX_CONSUMED_BATCHES {
+        let drop = state.consumed_batches.len() - MAX_CONSUMED_BATCHES;
+        state.consumed_batches.drain(0..drop);
+    }
+    for (key, ts) in disk.consumed_at {
         let slot = state.consumed_at.entry(key).or_insert(ts);
         if ts > *slot {
             *slot = ts;
         }
     }
-    for (key, msgs) in disk_windows {
+    for (key, msgs) in disk.windows {
         let slot = state.windows.entry(key).or_default();
         for m in msgs {
             if !slot
@@ -712,13 +908,21 @@ fn sync_with_disk(context: &RuntimeContext, state: &mut WindowState) -> Result<(
 }
 
 pub fn clear_windows(context: &RuntimeContext) -> Result<(), String> {
+    let inner = runtime_inner(context);
+    let mut mem = inner
+        .state
+        .lock()
+        .map_err(|_| "黑话窗口状态锁失败".to_string())?;
     let _gate = lock_window_file(context)?;
-    let (_, _, generation) = read_windows_file(context)?;
+    let disk = read_windows_file(context)?;
     let reset = WindowState {
-        generation: generation.saturating_add(1),
+        generation: disk.generation.saturating_add(1),
         ..WindowState::default()
     };
-    write_windows_file(context, &reset)
+    write_windows_file(context, &reset)?;
+    let _ = write_refusals_file(context, &HashMap::new());
+    *mem = reset;
+    Ok(())
 }
 
 fn lock_window_file(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
@@ -803,59 +1007,38 @@ fn snapshot_with_runtime(
     Ok(list)
 }
 
-fn snapshot(key: &str, limit: Option<usize>) -> Vec<SlangMsg> {
-    snapshot_with_runtime(&RuntimeContext::legacy(), state(), key, limit).unwrap_or_default()
+fn record_consumed_signature(state: &mut WindowState, key: &str, signature: &str) {
+    let entry = ConsumedBatch {
+        key: key.to_string(),
+        signature: signature.to_string(),
+    };
+    state.consumed_batches.retain(|b| b != &entry);
+    state.consumed_batches.push(entry);
+    if state.consumed_batches.len() > MAX_CONSUMED_BATCHES {
+        let drop = state.consumed_batches.len() - MAX_CONSUMED_BATCHES;
+        state.consumed_batches.drain(0..drop);
+    }
 }
 
-/// 标记 `through` 及更早的消息已消费（两个进程共享这个标记）。
-fn consume_with_runtime(
-    context: &RuntimeContext,
-    state: &Mutex<WindowState>,
-    key: &str,
-    through: i64,
-) -> Result<(), String> {
-    let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
-    let _file_lock = lock_window_file(context)?;
-    sync_with_disk(context, &mut st)?;
-    let before_write = context.is_isolated().then(|| st.clone());
-    let slot = st.consumed_at.entry(key.to_string()).or_insert(through);
-    if through > *slot {
-        *slot = through;
-    }
-    if let Some(win) = st.windows.get_mut(key) {
-        win.retain(|m| m.time > through);
-    }
-    if let Err(error) = write_windows_file(context, &st) {
-        if let Some(before) = before_write {
-            *st = before;
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-/// Remove only the captured batch. New messages can share a timestamp with it, or have an
-/// earlier timestamp after a clock change or import, so time alone cannot identify the batch.
-fn consume_batch_with_runtime(
-    context: &RuntimeContext,
-    state: &Mutex<WindowState>,
+fn remove_batch_from_window(
+    state: &mut WindowState,
     key: &str,
     batch: &[SlangMsg],
-) -> Result<(), String> {
-    if !context.is_isolated() {
-        return consume_with_runtime(
-            context,
-            state,
-            key,
-            batch.last().map(|m| m.time).unwrap_or(0),
-        );
+    isolated: bool,
+) {
+    let previous_cutoff = state.consumed_at.get(key).copied().unwrap_or(0);
+    if !isolated {
+        let through = batch.last().map(|m| m.time).unwrap_or(0);
+        let slot = state.consumed_at.entry(key.to_string()).or_insert(through);
+        if through > *slot {
+            *slot = through;
+        }
+        if let Some(win) = state.windows.get_mut(key) {
+            win.retain(|m| m.time > through);
+        }
+        return;
     }
-    let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
-    let _file_lock = lock_window_file(context)?;
-    sync_with_disk(context, &mut st)?;
-    let before_write = st.clone();
-    let previous_cutoff = st.consumed_at.get(key).copied().unwrap_or(0);
-    if let Some(window) = st.windows.get_mut(key) {
+    if let Some(window) = state.windows.get_mut(key) {
         for captured in batch {
             if let Some(index) = window.iter().position(|message| message == captured) {
                 window.remove(index);
@@ -871,18 +1054,161 @@ fn consume_batch_with_runtime(
         }
     }
     if let Some(through) = batch.last().map(|message| message.time) {
-        let cutoff = st.consumed_at.entry(key.to_string()).or_insert(through);
+        let cutoff = state.consumed_at.entry(key.to_string()).or_insert(through);
         *cutoff = (*cutoff).max(through);
     }
+}
+
+/// Remove only the captured batch, clear any matching pending commit and refusal backoff, and
+/// record the batch signature for idempotency.
+fn consume_batch_with_runtime(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+    key: &str,
+    batch: &[SlangMsg],
+) -> Result<(), String> {
+    let sig = batch_signature(key, batch);
+    let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+    let _file_lock = lock_window_file(context)?;
+    sync_with_disk(context, &mut st)?;
+    let before_write = st.clone();
+    remove_batch_from_window(&mut st, key, batch, context.is_isolated());
+    record_consumed_signature(&mut st, key, &sig);
+    if st
+        .pending_commit
+        .as_ref()
+        .is_some_and(|pending| pending.key == key && pending.signature == sig)
+    {
+        st.pending_commit = None;
+    }
     if let Err(error) = write_windows_file(context, &st) {
-        *st = before_write;
+        if context.is_isolated() {
+            *st = before_write;
+        }
+        return Err(error);
+    }
+    let mut refusals = read_refusals_file(context, &st.refusals);
+    if refusals.remove(key).is_some() {
+        let _ = write_refusals_file(context, &refusals);
+    }
+    st.refusals.remove(key);
+    Ok(())
+}
+
+fn is_batch_consumed(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+    key: &str,
+    signature: &str,
+) -> Result<bool, String> {
+    let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+    let _file_lock = lock_window_file(context)?;
+    sync_with_disk(context, &mut st)?;
+    Ok(st
+        .consumed_batches
+        .iter()
+        .any(|entry| entry.key == key && entry.signature == signature))
+}
+
+fn stage_pending_commit(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+    pending: PendingCommit,
+) -> Result<(), String> {
+    let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+    let _file_lock = lock_window_file(context)?;
+    sync_with_disk(context, &mut st)?;
+    let before_write = st.clone();
+    st.pending_commit = Some(pending);
+    if let Err(error) = write_windows_file(context, &st) {
+        if context.is_isolated() {
+            *st = before_write;
+        }
         return Err(error);
     }
     Ok(())
 }
 
-fn consume(key: &str, through: i64) {
-    let _ = consume_with_runtime(&RuntimeContext::legacy(), state(), key, through);
+fn apply_pending_upserts(entries: &mut Vec<Value>, upserts: &[PendingUpsert]) -> usize {
+    let mut touched = 0usize;
+    for item in upserts {
+        let (_, entry) = upsert_entry(entries, &item.content, "", item.evidence.clone());
+        if entry.is_some() {
+            touched += 1;
+        }
+    }
+    touched
+}
+
+/// Complete any interrupted commit staged in `slang-windows.json` before reading or triggering
+/// another batch. Never holds `slang-windows.lock` and `slang-store.lock` simultaneously.
+fn reconcile_pending_commit(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+) -> Result<(), String> {
+    let pending = {
+        let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+        let _file_lock = lock_window_file(context)?;
+        sync_with_disk(context, &mut st)?;
+        let Some(pending) = st.pending_commit.clone() else {
+            return Ok(());
+        };
+        pending
+    };
+    let _ = slang::reconcile_if_hash(context, &pending.before_hash, |entries| {
+        apply_pending_upserts(entries, &pending.upserts) > 0
+    })?;
+    consume_batch_with_runtime(context, state, &pending.key, &pending.batch)
+}
+
+fn refusal_blocked(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+    key: &str,
+    signature: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+    let _file_lock = lock_window_file(context)?;
+    let refusals = read_refusals_file(context, &st.refusals);
+    let Some(record) = refusals.get(key) else {
+        return Ok(false);
+    };
+    if record.signature != signature {
+        return Ok(false);
+    }
+    Ok(record.attempts >= REFUSAL_RETRY_CAP || now < record.next_retry_at)
+}
+
+fn record_refusal_backoff(
+    context: &RuntimeContext,
+    state: &Mutex<WindowState>,
+    cfg: &Value,
+    key: &str,
+    signature: &str,
+) {
+    let now = now_ms();
+    let cooldown = cooldown_ms(cfg);
+    let Ok(mut st) = state.lock() else {
+        return;
+    };
+    let Ok(_file_lock) = lock_window_file(context) else {
+        return;
+    };
+    let mut refusals = read_refusals_file(context, &st.refusals);
+    let attempts = match refusals.get(key) {
+        Some(prev) if prev.signature == signature => prev.attempts.saturating_add(1),
+        _ => 1,
+    };
+    let backoff = refusal_backoff_ms(attempts, cooldown);
+    let record = RefusalRecord {
+        signature: signature.to_string(),
+        attempts,
+        next_retry_at: now.saturating_add(backoff),
+    };
+    refusals.insert(key.to_string(), record.clone());
+    st.refusals.insert(key.to_string(), record);
+    let _ = write_refusals_file(context, &refusals);
 }
 
 /// 纯函数：阈值 + 冷却判断（方便单测，不碰文件）。
@@ -911,11 +1237,17 @@ fn maybe_trigger_with_runtime(
     cfg: &Value,
     key: &str,
 ) -> Result<bool, String> {
+    reconcile_pending_commit(context, state)?;
     let enabled = enabled(cfg);
     let min = min_messages(cfg);
     let cooldown = cooldown_ms(cfg);
     let now = now_ms();
-    let pending = snapshot_with_runtime(context, state, key, None)?.len();
+    let messages = snapshot_with_runtime(context, state, key, None)?;
+    let pending = messages.len();
+    let sig = batch_signature(key, &messages);
+    if refusal_blocked(context, state, key, &sig, now)? {
+        return Ok(false);
+    }
     let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
     let last = st.cooldowns.get(key).copied().unwrap_or(0);
     if !should_trigger(enabled, pending, min, last, now, cooldown) {
@@ -1273,70 +1605,77 @@ const ROUTE_BACKEND: &str = "harness";
 /// The provider identity of the harness's OpenAI-compatible relay (`docs/agents/harness.md`).
 const ROUTE_PROVIDER: &str = "openai";
 
-/// One tool-less completion of `prompt` on the harness chain's first route (`harness::one_shot`): that route's model and
-/// `maxOutputTokens`, the selected runtime's current relay endpoint and the harness credential, bounded by `timeout_s`;
-/// the prompt is the request's only message. A failure (no valid route, a provider failure class, an empty answer,
-/// diagnostic-shaped output, refusal wording without a JSON array) alerts the owner with metadata only, records a
-/// refusal, and returns its content-free summary; the caller consumes and writes nothing.
-fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str, timeout_s: u64) -> Result<String, String> {
-    use crate::model_failure::Failure;
-    let route = crate::harness::routes::chain(cfg).ok().and_then(|chain| chain.into_iter().next());
-    let model_name = route.as_ref().map_or("unspecified", |route| route.model.as_str());
-    let fail = |failure: Failure| {
-        crate::model_failure::record_refusal(context, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure, Default::default());
-        crate::model_failure::notify(context, cfg, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure);
-        failure.summary()
-    };
-    // Each job reads the selected runtime's current relay endpoint, as the digest jobs do.
-    let current = context.refreshed().ok();
-    let target = route.as_ref().map(|route| crate::harness::one_shot::RouteModel {
-        id: route.id.as_str(),
-        model: route.model.as_str(),
-        effort: route.effort.as_deref(),
-    });
-    let model = crate::harness::one_shot::model_for(
-        current.as_ref().unwrap_or(context),
-        crate::harness::one_shot::Job::SlangLearner,
-        key,
-        target,
-        Duration::from_secs(timeout_s),
-        route.as_ref().map_or(crate::harness::routes::DEFAULT_MAX_OUTPUT_TOKENS, |route| route.max_output_tokens),
-    )
-    .map_err(|error| fail(Failure::new(error.0, error.0)))?;
-    let text = model.complete_failure("", prompt).map_err(fail)?;
-    if text.trim().is_empty() {
-        return Err(fail(Failure::new("empty-response", "EMPTY_ANSWER")));
-    }
-    if let Some(failure) = backend::plain_output_failure(&text) {
-        return Err(fail(failure));
-    }
-    // Both learner jobs answer with a JSON array, so refusal wording without one is a refusal, never an answer.
-    if !text.contains('[') && Failure::is_refusal(&text) {
-        return Err(fail(Failure::new("refusal", "MODEL_REFUSAL")));
-    }
-    Ok(text)
+#[derive(Debug, Clone)]
+struct AskError {
+    is_refusal: bool,
+    summary: String,
 }
 
-/// `slang.learnerFallbackDsh`: after the pinned CLI learner fails, may the corpus go to the default route
-/// (`route_extract`)? Off unless exactly `true`, like `backends.failoverFallback`: a local or free learner never
-/// silently becomes a cloud route. The setting keeps its stored name.
+/// Tool-less completion of `prompt` across the configured harness route chain
+/// (`harness::one_shot`), failing over on route misses/refusals/empty answers. Failures alert
+/// the owner with metadata only, record a refusal, and return their content-free summary without
+/// consuming the batch.
+fn route_extract(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    prompt: &str,
+    timeout_s: u64,
+) -> Result<String, AskError> {
+    let current = context.refreshed().ok();
+    crate::harness::one_shot::slang_complete(
+        current.as_ref().unwrap_or(context),
+        cfg,
+        key,
+        prompt,
+        Duration::from_secs(timeout_s),
+    )
+    .map_err(|err| {
+        crate::model_failure::record_refusal(
+            context,
+            key,
+            ROUTE_BACKEND,
+            ROUTE_PROVIDER,
+            &err.model,
+            &err.failure,
+            Default::default(),
+        );
+        crate::model_failure::notify(
+            context,
+            cfg,
+            key,
+            ROUTE_BACKEND,
+            ROUTE_PROVIDER,
+            &err.model,
+            &err.failure,
+        );
+        AskError {
+            is_refusal: err.failure.class == "refusal",
+            summary: err.failure.summary(),
+        }
+    })
+}
+
+/// `slang.learnerFallbackDsh`: after the pinned CLI learner fails, may the corpus go to the
+/// default route (`route_extract`)? Off unless exactly `true`.
 fn learner_fallback_dsh(cfg: &Value) -> bool {
     cfg.pointer("/slang/learnerFallbackDsh") == Some(&Value::Bool(true))
 }
 
-/// The learner's model port: `slang.learnerBackend` `dsh` (the stored default) is the default route (`route_extract`);
-/// any other id is that pinned CLI backend, whose failure reaches the default route only when
-/// `slang.learnerFallbackDsh` is exactly `true`. Returns (backend name, raw output).
+/// The learner's model port: `slang.learnerBackend` `dsh` / `harness` / blank is the harness
+/// one-shot route chain (`route_extract`); any other id is that pinned CLI backend, whose failure
+/// reaches the default route only when `slang.learnerFallbackDsh` is exactly `true`.
 fn ask_model(
     context: &RuntimeContext,
     cfg: &Value,
     key: &str,
     prompt: &str,
     timeout_s: u64,
-) -> Result<(String, String), String> {
+) -> Result<(String, String), AskError> {
     let backend_id = learner_backend(cfg);
     let mut errors: Vec<String> = Vec::new();
     if backend_id != "dsh" {
+        let mut cli_refusal = false;
         match backend::cli_fallback_by_id_with_runtime(
             context,
             cfg,
@@ -1349,22 +1688,47 @@ fn ask_model(
             Ok((id, _)) => errors.push(format!("{id} 返回空内容")),
             Err(e) => {
                 let failure = crate::model_failure::Failure::classify("", &e);
+                cli_refusal = failure.class == "refusal";
                 let (provider, model) = crate::model_failure::cli_identity(cfg, backend_id);
-                crate::model_failure::record_refusal(context, key, backend_id, &provider, &model, &failure, Default::default());
-                crate::model_failure::notify(context, cfg, key, backend_id, &provider, &model, &failure);
+                crate::model_failure::record_refusal(
+                    context,
+                    key,
+                    backend_id,
+                    &provider,
+                    &model,
+                    &failure,
+                    Default::default(),
+                );
+                crate::model_failure::notify(
+                    context,
+                    cfg,
+                    key,
+                    backend_id,
+                    &provider,
+                    &model,
+                    &failure,
+                );
                 errors.push(format!("{backend_id}: {e}"));
             }
         }
         if !learner_fallback_dsh(cfg) {
-            return Err(errors.join("；"));
+            return Err(AskError {
+                is_refusal: cli_refusal,
+                summary: errors.join("；"),
+            });
         }
-        crate::safe_println!("[slang] 学习后端 {backend_id} 失败，按 slang.learnerFallbackDsh 回落默认模型路由");
+        crate::safe_println!(
+            "[slang] 学习后端 {backend_id} 失败，按 slang.learnerFallbackDsh 回落默认模型路由"
+        );
     }
     match route_extract(context, cfg, key, prompt, timeout_s) {
         Ok(text) => Ok((ROUTE_BACKEND.to_string(), text)),
         Err(e) => {
-            errors.push(format!("{ROUTE_BACKEND}: {e}"));
-            Err(errors.join("；"))
+            errors.push(format!("{ROUTE_BACKEND}: {}", e.summary));
+            Err(AskError {
+                is_refusal: e.is_refusal,
+                summary: errors.join("；"),
+            })
         }
     }
 }
@@ -1476,85 +1840,91 @@ fn research_with_runtime(
     if !enabled(cfg) {
         return Ok(());
     }
-    let candidates = {
-        let _store = slang::store_gate(context)?;
-        slang::load_entries_checked_for_runtime(context)?
-            .into_iter()
-            .filter(|entry| {
-                entry.get("status").and_then(Value::as_str) == Some("candidate")
-                    && entry
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| ids.iter().any(|want| want == id))
-            })
-            .collect::<Vec<_>>()
-    };
+    let candidates = slang::read_entries_locked(context)?
+        .into_iter()
+        .filter(|entry| {
+            entry.get("status").and_then(Value::as_str) == Some("candidate")
+                && entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| ids.iter().any(|want| want == id))
+        })
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(());
     }
     let model_cfg = crate::model_view::with_blacklist(context, cfg);
-    let (_, raw) = ask_model(context, cfg, "internal:slang-research", &research_prompt(&candidates, &model_cfg), 120)?;
+    // Web-research tool-loop lookup stays deferred until one-shot jobs support tool loops.
+    let (_, raw) = ask_model(
+        context,
+        cfg,
+        "internal:slang-research",
+        &research_prompt(&candidates, &model_cfg),
+        120,
+    )
+    .map_err(|err| err.summary)?;
     let results = research_results(&raw);
     if results.is_empty() {
         return Ok(());
     }
-    let _store = slang::store_gate(context)?;
-    let mut entries = slang::load_entries_checked_for_runtime(context)?;
-    let mut changed = false;
-    for result in results {
-        if result.get("confirmed") != Some(&json!(true)) {
-            continue;
-        }
-        let content = result
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let Some(original) = candidates
-            .iter()
-            .find(|entry| entry.get("content").and_then(Value::as_str) == Some(content))
-        else {
-            continue;
-        };
-        let Some(id) = original.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(entry) = entries.iter_mut().find(|entry| {
-            entry.get("id").and_then(Value::as_str) == Some(id)
-                && entry.get("content").and_then(Value::as_str) == Some(content)
-                && entry.get("status").and_then(Value::as_str) == Some("candidate")
-        }) else {
-            continue;
-        };
-        for field in ["meaning", "usage", "example", "risk"] {
-            let text = result
-                .get(field)
+    slang::mutate_entries(context, |entries| {
+        let mut changed = false;
+        for result in results {
+            if result.get("confirmed") != Some(&json!(true)) {
+                continue;
+            }
+            let content = result
+                .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim();
-            if !text.is_empty() {
-                entry[field] = json!(text);
-            }
-        }
-        if let Some(sources) = result.get("sources").and_then(Value::as_array) {
-            let sources = sources
+            let Some(original) = candidates
                 .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .take(10)
-                .collect::<Vec<_>>();
-            if !sources.is_empty() {
-                entry["sources"] = json!(sources);
+                .find(|entry| entry.get("content").and_then(Value::as_str) == Some(content))
+            else {
+                continue;
+            };
+            let Some(id) = original.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(id)
+                    && entry.get("content").and_then(Value::as_str) == Some(content)
+                    && entry.get("status").and_then(Value::as_str) == Some("candidate")
+            }) else {
+                continue;
+            };
+            for field in ["meaning", "usage", "example", "risk"] {
+                let text = result
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if !text.is_empty() {
+                    entry[field] = json!(text);
+                }
             }
+            if let Some(sources) = result.get("sources").and_then(Value::as_array) {
+                let sources = sources
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .take(10)
+                    .collect::<Vec<_>>();
+                if !sources.is_empty() {
+                    entry["sources"] = json!(sources);
+                }
+            }
+            entry["lastInferenceCount"] = entry.get("count").cloned().unwrap_or(json!(0));
+            entry["updatedAt"] = json!(now_iso());
+            changed = true;
         }
-        entry["lastInferenceCount"] = entry.get("count").cloned().unwrap_or(json!(0));
-        entry["updatedAt"] = json!(now_iso());
-        changed = true;
-    }
-    if changed {
-        slang::save_entries_for_runtime(context, &entries)?;
-    }
+        Ok::<_, String>((changed, ()))
+    })
+    .map_err(|err| match err {
+        slang::MutateError::Store(e) | slang::MutateError::Action(e) => e,
+    })?;
     Ok(())
 }
 
@@ -1584,11 +1954,11 @@ pub fn queue_manual_extraction(
 ) -> Result<String, String> {
     let key = {
         let _gate = lock_window_file(context)?;
-        let (windows, _, _) = read_windows_file(context)?;
-        if windows.contains_key(requested) {
+        let disk = read_windows_file(context)?;
+        if disk.windows.contains_key(requested) {
             requested.to_string()
         } else {
-            windows
+            disk.windows
                 .keys()
                 .next()
                 .cloned()
@@ -1602,13 +1972,15 @@ pub fn queue_manual_extraction(
     std::thread::Builder::new()
         .name("slang-extract".to_string())
         .spawn(move || {
+            let inner = runtime_inner(&context);
             let result = extract_once_with_runtime(
                 &context,
-                &Mutex::new(WindowState::default()),
+                &inner.state,
                 &cfg,
                 &worker_key,
                 None,
                 ticket,
+                false,
             );
             if result.get("ok") != Some(&json!(true)) {
                 crate::safe_println!(
@@ -1669,7 +2041,15 @@ fn summary_error(key: &str, messages: usize, error: String) -> Value {
 /// 后端回复格式坏了时用格式修复提示词重问一次；第二次仍坏才**消费掉这批消息**
 /// （避免同一批脏输出每 5 分钟被重试一次）。合法的空数组是成功的「没学到」。
 pub fn extract_once(cfg: &Value, key: &str, limit: Option<usize>) -> Value {
-    extract_once_with_runtime(&RuntimeContext::legacy(), state(), cfg, key, limit, None)
+    extract_once_with_runtime(
+        &RuntimeContext::legacy(),
+        state(),
+        cfg,
+        key,
+        limit,
+        None,
+        true,
+    )
 }
 
 fn extract_once_with_runtime(
@@ -1679,6 +2059,7 @@ fn extract_once_with_runtime(
     key: &str,
     limit: Option<usize>,
     ticket: Option<JobTicket>,
+    check_backoff: bool,
 ) -> Value {
     let _job = match job_gate(context, ticket) {
         Ok(gate) => gate,
@@ -1697,6 +2078,9 @@ fn extract_once_with_runtime(
     if !enabled(cfg) {
         return summary_error(key, 0, "黑话学习已关闭（slang.enabled=false）".to_string());
     }
+    if let Err(error) = reconcile_pending_commit(context, window_state) {
+        return summary_error(key, 0, error);
+    }
     let messages = match snapshot_with_runtime(context, window_state, key, limit) {
         Ok(messages) => messages,
         Err(error) => return summary_error(key, 0, error),
@@ -1707,32 +2091,48 @@ fn extract_once_with_runtime(
     if messages.is_empty() {
         return summary_error(key, 0, "当前没有可学习消息窗口".to_string());
     }
-    extract_with_model(
-        context,
-        window_state,
-        cfg,
-        key,
-        messages,
-        &mut |prompt| ask_model(context, cfg, key, prompt, 120),
-    )
-}
+    let sig = batch_signature(key, &messages);
+    match is_batch_consumed(context, window_state, key, &sig) {
+        Ok(true) => {
+            if let Err(error) = consume_batch_with_runtime(context, window_state, key, &messages) {
+                return summary_error(key, messages.len(), error);
+            }
+            return json!({
+                "ok": true,
+                "key": key,
+                "added": 0,
+                "updated": 0,
+                "messages": messages.len(),
+                "idempotent": true,
+            });
+        }
+        Ok(false) => {}
+        Err(error) => return summary_error(key, messages.len(), error),
+    }
+    if check_backoff {
+        match refusal_blocked(context, window_state, key, &sig, now_ms()) {
+            Ok(true) => {
+                return summary_error(
+                    key,
+                    messages.len(),
+                    "当前批次处于拒绝退避或重试上限中，已跳过".to_string(),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => return summary_error(key, messages.len(), error),
+        }
+    }
 
-/// 模型调用的缝：`ask` 收一段提示词，返回 (后端名, 原始输出)。
-fn extract_with_model(
-    context: &RuntimeContext,
-    window_state: &Mutex<WindowState>,
-    cfg: &Value,
-    key: &str,
-    messages: Vec<SlangMsg>,
-    ask: &mut dyn FnMut(&str) -> Result<(String, String), String>,
-) -> Value {
     let model_cfg = crate::model_view::with_blacklist(context, cfg);
     let prompt = build_extraction_prompt(&messages, &model_cfg);
-    let (backend_id, output) = match ask(&prompt) {
+    let (backend_id, output) = match ask_model(context, cfg, key, &prompt, 120) {
         Ok(v) => v,
         Err(e) => {
-            crate::safe_println!("[slang] 抽取失败 {key}：{e}");
-            return summary_error(key, messages.len(), e);
+            if e.is_refusal {
+                record_refusal_backoff(context, window_state, cfg, key, &sig);
+            }
+            crate::safe_println!("[slang] 抽取失败 {key}：{}", e.summary);
+            return summary_error(key, messages.len(), e.summary);
         }
     };
     let (backend_id, items) = match parse_extraction_checked(&output) {
@@ -1744,13 +2144,21 @@ fn extract_with_model(
                 output.chars().count()
             );
             let model_output = crate::model_view::strip_from_model_text(&output, &model_cfg);
-            let (repair_backend, repair_output) =
-                match ask(&build_repair_prompt(&prompt, &model_output)) {
+            let (repair_backend, repair_output) = match ask_model(
+                context,
+                cfg,
+                key,
+                &build_repair_prompt(&prompt, &model_output),
+                120,
+            ) {
                     Ok(v) => v,
                     Err(e) => {
+                        if e.is_refusal {
+                            record_refusal_backoff(context, window_state, cfg, key, &sig);
+                        }
                         // 后端失败不是「输出坏了」：不消费，下次触发再来。
-                        crate::safe_println!("[slang] 抽取失败 {key}（格式修复）：{e}");
-                        return summary_error(key, messages.len(), e);
+                        crate::safe_println!("[slang] 抽取失败 {key}（格式修复）：{}", e.summary);
+                        return summary_error(key, messages.len(), e.summary);
                     }
                 };
             match parse_extraction_checked(&repair_output) {
@@ -1800,18 +2208,8 @@ fn extract_with_model(
         });
     }
 
-    let _store_gate = match slang::store_gate(context) {
-        Ok(gate) => gate,
-        Err(error) => return summary_error(key, messages.len(), error),
-    };
-    let mut entries = match slang::load_entries_checked_for_runtime(context) {
-        Ok(entries) => entries,
-        Err(error) => return summary_error(key, messages.len(), error),
-    };
-    let mut added = 0usize;
-    let mut updated = 0usize;
+    let mut upserts = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut research_ids = Vec::new();
     for item in &items {
         if !seen.insert(item.content.clone()) {
             continue;
@@ -1826,29 +2224,65 @@ fn extract_with_model(
         } else {
             Vec::new()
         };
-        let (created, entry) = upsert_entry(&mut entries, &item.content, "", evidence);
-        if let Some(entry) = entry {
-            if created {
-                added += 1;
-            } else {
-                updated += 1;
-            }
-            if research_threshold_reached(cfg, &entry) {
-                if let Some(id) = entry.get("id").and_then(Value::as_str) {
-                    research_ids.push(id.to_string());
-                }
-            }
-        }
+        upserts.push(PendingUpsert {
+            content: item.content.clone(),
+            evidence,
+        });
     }
-    if added + updated == 0 {
+    let (mut preview_entries, before_hash) = match slang::read_entries_with_hash_locked(context) {
+        Ok(pair) => pair,
+        Err(error) => return summary_error(key, messages.len(), error),
+    };
+    if apply_pending_upserts(&mut preview_entries, &upserts) == 0 {
         if let Err(error) = consume_batch_with_runtime(context, window_state, key, &messages) {
             return summary_error(key, messages.len(), error);
         }
         return summary_error(key, messages.len(), "解析结果里没有有效词条".to_string());
     }
-    if let Err(e) = slang::save_entries_for_runtime(context, &entries) {
-        crate::safe_println!("[slang] 写黑话库失败：{e}");
-        return summary_error(key, messages.len(), e);
+    let pending = PendingCommit {
+        key: key.to_string(),
+        signature: sig,
+        before_hash,
+        batch: messages.clone(),
+        upserts: upserts.clone(),
+    };
+    if let Err(error) = stage_pending_commit(context, window_state, pending) {
+        return summary_error(key, messages.len(), error);
+    }
+
+    let (added, updated, research_ids) = match slang::mutate_entries(context, |entries| {
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let mut research_ids = Vec::new();
+        for item in &upserts {
+            let (created, entry) =
+                upsert_entry(entries, &item.content, "", item.evidence.clone());
+            if let Some(entry) = entry {
+                if created {
+                    added += 1;
+                } else {
+                    updated += 1;
+                }
+                if research_threshold_reached(cfg, &entry) {
+                    if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                        research_ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        Ok::<_, String>((added + updated > 0, (added, updated, research_ids)))
+    }) {
+        Ok(res) => res,
+        Err(slang::MutateError::Store(e) | slang::MutateError::Action(e)) => {
+            crate::safe_println!("[slang] 写黑话库失败：{e}");
+            return summary_error(key, messages.len(), e);
+        }
+    };
+    if added + updated == 0 {
+        if let Err(error) = consume_batch_with_runtime(context, window_state, key, &messages) {
+            return summary_error(key, messages.len(), error);
+        }
+        return summary_error(key, messages.len(), "解析结果里没有有效词条".to_string());
     }
     if let Err(error) = consume_batch_with_runtime(context, window_state, key, &messages) {
         return summary_error(key, messages.len(), error);
@@ -1901,22 +2335,23 @@ fn report_auto_result(out: Result<Value, tokio::task::JoinError>, key: &str) {
     }
 }
 
-/// 控制台 `POST /api/slang/extract` 用：同步返回摘要。
+/// 控制台 `POST /api/slang/extract` 用：同步返回摘要，按 `context` 隔离窗口与冷却状态。
 ///
 /// `dry_run` 只数窗口、不调模型（回归脚本用它验证端点形状，避免真花钱）。
-/// `force` 跳过冷却（默认不跳，保证「连续调两次，第二次不发模型调用」）。
+/// `force` 跳过冷却与拒绝退避（默认不跳，保证「连续调两次，第二次不发模型调用」）。
 pub fn extract_now(
+    context: &RuntimeContext,
     cfg: &Value,
     key: &str,
     limit: Option<usize>,
     dry_run: bool,
     force: bool,
 ) -> Value {
-    static SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let inner = runtime_inner(context);
     extract_now_with_runtime(
-        &RuntimeContext::legacy(),
-        state(),
-        SYNC_LOCK.get_or_init(|| Mutex::new(())),
+        &inner.context,
+        &inner.state,
+        &inner.sync_lock,
         cfg,
         key,
         limit,
@@ -1937,6 +2372,9 @@ fn extract_now_with_runtime(
 ) -> Value {
     if !enabled(cfg) {
         return summary_error(key, 0, "黑话学习已关闭（slang.enabled=false）".to_string());
+    }
+    if let Err(error) = reconcile_pending_commit(context, window_state) {
+        return summary_error(key, 0, error);
     }
     let pending = match snapshot_with_runtime(context, window_state, key, limit) {
         Ok(messages) => messages,
@@ -1975,13 +2413,10 @@ fn extract_now_with_runtime(
     }
     st.cooldowns.insert(key.to_string(), now);
     drop(st);
-    // 端点跑在控制台的普通线程里，不能再套一层 `block_on`（DSH 回落自己会建
-    // current-thread runtime，嵌套 block_on 会 panic）。这里用进程内的 std Mutex
-    // 串行化手工触发；异步自动任务走上面的 tokio Mutex。
     let Ok(_guard) = sync_lock.lock() else {
         return summary_error(key, pending.len(), "抽取锁失败".to_string());
     };
-    extract_once_with_runtime(context, window_state, cfg, key, limit, None)
+    extract_once_with_runtime(context, window_state, cfg, key, limit, None, !force)
 }
 
 #[cfg(test)]
@@ -2221,31 +2656,42 @@ mod tests {
         snapshot_with_runtime(context, state, "group:retry", None).unwrap()
     }
 
-    /// Runs one extraction with a scripted model: reply `i` answers call `i`.
+    /// Runs one extraction through the unified `OneShot` mock seam: reply `i` answers call `i`.
     fn extract_scripted(
         context: &RuntimeContext,
         state: &Mutex<WindowState>,
-        replies: &[Result<&str, &str>],
+        replies: &[Result<&'static str, &'static str>],
     ) -> (Value, Vec<String>) {
-        let messages = fed_batch(context, state);
-        let mut prompts: Vec<String> = Vec::new();
-        let result = extract_with_model(
+        fed_batch(context, state);
+        let cfg = json!({
+            "consoleToken": "fixture-token",
+            "harness": {"model": "route-model"},
+            "slang": {"enabled": true, "extractMinMessages": 1}
+        });
+        context
+            .write_atomic(
+                RuntimeArea::Config,
+                "config.json",
+                cfg.to_string().as_bytes(),
+            )
+            .unwrap();
+        let fake = route_fake(context, replies.to_vec());
+        let result = extract_once_with_runtime(
             context,
             state,
-            &json!({"slang": {"enabled": true}}),
+            &cfg,
             "group:retry",
-            messages,
-            &mut |prompt| {
-                let reply = replies
-                    .get(prompts.len())
-                    .copied()
-                    .unwrap_or(Err("脚本里没有更多回复"));
-                prompts.push(prompt.to_string());
-                reply
-                    .map(|text| ("fake".to_string(), text.to_string()))
-                    .map_err(str::to_string)
-            },
+            None,
+            None,
+            false,
         );
+        let prompts = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, input)| input.clone())
+            .collect();
         (result, prompts)
     }
 
@@ -2300,17 +2746,34 @@ mod tests {
     fn strip_model_text_repair_echo_keeps_generated_source_ids() {
         let (root, context) = runtime_fixture("strip-repair");
         let state = Mutex::new(WindowState::default());
-        let messages = fed_batch(&context, &state);
-        let mut prompts = Vec::new();
-        let cfg = json!({"slang":{"enabled":true},"socialV2":{"context":{"stripFromModelText":["奸","今天","1"]}}});
-        let result = extract_with_model(&context, &state, &cfg, "group:retry", messages, &mut |prompt| {
-            prompts.push(prompt.to_string());
-            Ok(("fake".into(), if prompts.len() == 1 { "奸malformed output".into() } else { "[]".into() }))
+        fed_batch(&context, &state);
+        let cfg = json!({
+            "consoleToken": "fixture-token",
+            "harness": {"model": "route-model"},
+            "slang": {"enabled": true, "extractMinMessages": 1},
+            "socialV2": {"context": {"stripFromModelText": ["奸", "今天", "1"]}}
         });
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let fake = route_fake(&context, vec![Ok("奸malformed output"), Ok("[]")]);
+        let result =
+            extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
         assert_eq!(result["ok"], true, "{result}");
+        let prompts: Vec<String> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, input)| input.clone())
+            .collect();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts.iter().all(|p| !p.contains('奸') && !p.contains("今天")), "chat input and repair echo are filtered: {prompts:?}");
-        assert!(prompts.iter().all(|p| p.contains("source_id=\"1\"")), "generated attribution is not chat text: {prompts:?}");
+        assert!(
+            prompts.iter().all(|p| !p.contains('奸') && !p.contains("今天")),
+            "chat input and repair echo are filtered: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|p| p.contains("source_id=\"1\"")),
+            "generated attribution is not chat text: {prompts:?}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2402,10 +2865,10 @@ mod tests {
         let (root, context) = runtime_fixture("retry-backend-fail");
         let state = Mutex::new(WindowState::default());
         let (result, prompts) =
-            extract_scripted(&context, &state, &[Ok("not json"), Err("后端超时")]);
+            extract_scripted(&context, &state, &[Ok("not json"), Err("timeout")]);
         assert_eq!(prompts.len(), 2);
         assert_eq!(result["ok"], false, "{result}");
-        assert!(result["error"].as_str().unwrap().contains("后端超时"));
+        assert!(result["error"].as_str().unwrap().contains("timeout"));
         assert_eq!(remaining(&context, &state), 3, "a backend failure is not a malformed reply");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3035,12 +3498,17 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         for (configured, expected) in [
             (json!("  oc-free "), "oc-free"),
             (json!("oc-free"), "oc-free"),
+            (json!("harness"), "dsh"),
             (json!(""), "dsh"),
             (json!("   "), "dsh"),
             (json!(7), "dsh"),
             (json!(null), "dsh"),
         ] {
-            assert_eq!(learner_backend(&json!({"slang":{"learnerBackend":configured.clone()}})), expected, "{configured}");
+            assert_eq!(
+                learner_backend(&json!({"slang": {"learnerBackend": configured.clone()}})),
+                expected,
+                "{configured}"
+            );
         }
         assert_eq!(learner_backend(&json!({})), "dsh");
     }
@@ -3095,7 +3563,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
             vec![Err("quota"), Ok("   "), Ok("I cannot assist with that."), Ok("content_filter"), Err("timeout")],
         );
         for attempt in 1..=4 {
-            let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+            let result =
+                extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
             assert_eq!(result["ok"], false, "attempt {attempt}: {result}");
             assert_eq!(read("slang-windows.json"), windows, "attempt {attempt} consumed the batch");
             assert_eq!(read("slang.json"), slang_store, "attempt {attempt} changed the slang store");
@@ -3118,7 +3587,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let state = Mutex::new(WindowState::default());
         fed_batch(&context, &state);
         let fake = route_fake(&context, vec![Ok(r#"[{"content":"破防","source_id":1}]"#)]);
-        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        let result =
+            extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!((result["backend"].as_str(), result["added"].as_u64()), (Some("harness"), Some(1)), "{result}");
         assert_eq!(remaining(&context, &state), 0, "the learned batch is consumed");
@@ -3136,7 +3606,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let state = Mutex::new(WindowState::default());
         fed_batch(&context, &state);
         route_fake(&context, vec![Ok(r#"[{"content":"content filter","source_id":2}]"#)]);
-        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        let result =
+            extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
         assert_eq!(result["ok"], true, "an answer with a JSON array is never a refusal: {result}");
         assert_eq!(result["added"], 1, "{result}");
         std::fs::remove_dir_all(root).unwrap();
@@ -3150,7 +3621,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let state = Mutex::new(WindowState::default());
         fed_batch(&context, &state);
         let windows = std::fs::read(root.join("data/slang-windows.json")).unwrap();
-        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        let result =
+            extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
         assert_eq!(result["ok"], false, "{result}");
         assert!(
             result["error"].as_str().is_some_and(|error| error.contains("harness: model/backend unconfigured")),
@@ -3178,7 +3650,9 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         std::fs::write(root.join("config/harness-api-key"), "learner-fallback-key").unwrap();
         let context = RuntimeContext::from_root(&root).unwrap_or(context);
         let pinned = json!({"slang":{"learnerBackend":"missing-learner"},"harness":{"model":"route-model"}});
-        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 1).unwrap_err();
+        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 1)
+            .unwrap_err()
+            .summary;
         assert!(error.contains("missing-learner"), "the failing route is named: {error}");
         assert!(!error.contains("harness:"), "no silent cloud route: {error}");
         assert!(
@@ -3186,7 +3660,9 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
             "the corpus must not reach the model route"
         );
         let allowed = json!({"slang":{"learnerBackend":"missing-learner","learnerFallbackDsh":true},"harness":{"model":"route-model"}});
-        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 1).unwrap_err();
+        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 1)
+            .unwrap_err()
+            .summary;
         assert!(error.contains("missing-learner") && error.contains("harness:"), "both routes are reported: {error}");
         assert!(listener.accept().is_ok(), "the allowed fallback asked the model route");
         std::fs::remove_dir_all(root).unwrap();
@@ -3245,7 +3721,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let context = RuntimeContext::from_root(&root).unwrap_or(context);
         let state = Mutex::new(WindowState::default());
         fed_batch(&context, &state);
-        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        let result =
+            extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None, false);
         handle.join().unwrap();
         assert_eq!(result["ok"], false, "{result}");
         let log_text = std::fs::read_to_string(root.join("data/logs/model-refusals.jsonl")).unwrap();
@@ -3258,5 +3735,216 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         assert_eq!(rows[0]["errorClass"], "refusal");
         assert_eq!(rows[0]["errorCode"], "MODEL_REFUSAL");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_between_slang_store_write_and_window_consume_reconciles_idempotently() {
+        // Case A: crash after writing slang.json, before consuming slang-windows.json.
+        let (root, context, _cfg) = route_fixture("crash-after-store");
+        let state = Mutex::new(WindowState::default());
+        let batch = fed_batch(&context, &state);
+        let sig = batch_signature("group:retry", &batch);
+        let (_, before_hash) = slang::read_entries_with_hash_locked(&context).unwrap();
+        let upserts = vec![PendingUpsert {
+            content: "破防".to_string(),
+            evidence: vec![evidence_for("group:retry", &batch[0])],
+        }];
+        stage_pending_commit(
+            &context,
+            &state,
+            PendingCommit {
+                key: "group:retry".to_string(),
+                signature: sig.clone(),
+                before_hash: before_hash.clone(),
+                batch: batch.clone(),
+                upserts: upserts.clone(),
+            },
+        )
+        .unwrap();
+        // Simulate slang.json having been written before the crash.
+        slang::mutate_entries(&context, |entries| {
+            apply_pending_upserts(entries, &upserts);
+            Ok::<_, ()>((true, ()))
+        })
+        .unwrap();
+
+        let fake = route_fake(&context, vec![Ok(r#"[{"content":"破防","source_id":1}]"#)]);
+        let restarted = SlangLearning::new(&context);
+        let due = restarted.due_retained_windows().unwrap();
+        assert!(due.is_empty(), "reconciled batch must not retrigger: {due:?}");
+        assert_eq!(fake.calls.lock().unwrap().len(), 0, "model must not be called again");
+        let entries = slang::read_entries_locked(&context).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["count"], 1, "count must not double-increment on restart");
+        assert_eq!(remaining(&context, &restarted.inner.state), 0, "window is consumed");
+        std::fs::remove_dir_all(root).unwrap();
+
+        // Case B: crash after staging pendingCommit, before writing slang.json.
+        let (root, context, cfg) = route_fixture("crash-before-store");
+        let state = Mutex::new(WindowState::default());
+        let batch = fed_batch(&context, &state);
+        let sig = batch_signature("group:retry", &batch);
+        let (_, before_hash) = slang::read_entries_with_hash_locked(&context).unwrap();
+        let upserts = vec![PendingUpsert {
+            content: "绝绝子".to_string(),
+            evidence: vec![evidence_for("group:retry", &batch[2])],
+        }];
+        stage_pending_commit(
+            &context,
+            &state,
+            PendingCommit {
+                key: "group:retry".to_string(),
+                signature: sig,
+                before_hash,
+                batch,
+                upserts,
+            },
+        )
+        .unwrap();
+        let fake = route_fake(&context, vec![Ok("[]")]);
+        let result = extract_once_with_runtime(
+            &context,
+            &Mutex::new(WindowState::default()),
+            &cfg,
+            "group:retry",
+            None,
+            None,
+            true,
+        );
+        assert_eq!(result["ok"], false, "consumed batch leaves no pending window");
+        assert_eq!(
+            fake.calls.lock().unwrap().len(),
+            0,
+            "pending commit completes without re-asking"
+        );
+        let entries = slang::read_entries_locked(&context).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["content"], "绝绝子");
+        assert_eq!(entries[0]["count"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_refusals_apply_bounded_exponential_backoff_and_cap_per_batch_signature() {
+        assert_eq!(refusal_backoff_ms(0, 300_000), 0);
+        assert_eq!(refusal_backoff_ms(1, 0), REFUSAL_MIN_BACKOFF_MS);
+        assert_eq!(refusal_backoff_ms(2, 0), REFUSAL_MIN_BACKOFF_MS * 2);
+        assert_eq!(refusal_backoff_ms(3, 0), REFUSAL_MIN_BACKOFF_MS * 4);
+        assert_eq!(refusal_backoff_ms(10, 300_000), REFUSAL_MAX_BACKOFF_MS);
+
+        let (root, context) = runtime_fixture("refusal-backoff");
+        let cfg = json!({
+            "consoleToken": "fixture-token",
+            "harness": {"model": "route-model"},
+            "slang": {"enabled": true, "extractMinMessages": 1, "extractCooldownMs": 0}
+        });
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+
+        let fake = route_fake(
+            &context,
+            vec![
+                Err("refusal"),
+                Err("refusal"),
+                Err("refusal"),
+                Ok(r#"[{"content":"破防","source_id":1}]"#),
+            ],
+        );
+        let learning = SlangLearning::new(&context);
+        assert!(learning.try_feed_window("group:retry", "甲", "第一句").unwrap());
+        let batch =
+            snapshot_with_runtime(&context, &learning.inner.state, "group:retry", None).unwrap();
+        let sig1 = batch_signature("group:retry", &batch);
+
+        for attempt in 1..=REFUSAL_RETRY_CAP {
+            assert!(learning.try_maybe_trigger(&cfg, "group:retry").unwrap(), "attempt {attempt}");
+            let res = extract_once_with_runtime(
+                &context,
+                &learning.inner.state,
+                &cfg,
+                "group:retry",
+                None,
+                None,
+                true,
+            );
+            assert_eq!(res["ok"], false, "{res}");
+            assert!(
+                !learning.try_maybe_trigger(&cfg, "group:retry").unwrap(),
+                "attempt {attempt} must enter backoff immediately"
+            );
+            // Simulate backoff time elapsing for retries below the cap; never clear attempts.
+            let mut refusals = read_refusals_file(&context, &HashMap::new());
+            let rec = refusals.get_mut("group:retry").unwrap();
+            assert_eq!(rec.signature, sig1);
+            assert_eq!(rec.attempts, attempt);
+            rec.next_retry_at = 0;
+            write_refusals_file(&context, &refusals).unwrap();
+        }
+
+        // At cap: even across a fresh SlangLearning (restart) with next_retry_at=0, stay capped.
+        let restarted = SlangLearning::new(&context);
+        assert!(
+            !restarted.try_maybe_trigger(&cfg, "group:retry").unwrap(),
+            "capped batch stays suppressed"
+        );
+        assert!(
+            restarted.due_retained_windows().unwrap().is_empty(),
+            "catch-up honors refusal cap"
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), REFUSAL_RETRY_CAP as usize);
+
+        // A new message changes the batch signature, allowing extraction again.
+        assert!(restarted.try_feed_window("group:retry", "乙", "新消息").unwrap());
+        assert!(restarted.try_maybe_trigger(&cfg, "group:retry").unwrap());
+        let ok = extract_once_with_runtime(
+            &context,
+            &restarted.inner.state,
+            &cfg,
+            "group:retry",
+            None,
+            None,
+            true,
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["added"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extract_now_isolates_windows_and_cooldowns_by_runtime_context() {
+        let (root_a, context_a) = runtime_fixture("extract-now-a");
+        let (root_b, context_b) = runtime_fixture("extract-now-b");
+        let cfg = json!({
+            "consoleToken": "fixture-token",
+            "harness": {"model": "route-model"},
+            "slang": {"enabled": true, "extractMinMessages": 1, "extractCooldownMs": 60_000}
+        });
+        std::fs::write(root_a.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root_b.join("config/config.json"), cfg.to_string()).unwrap();
+
+        assert!(SlangLearning::new(&context_a)
+            .try_feed_window("group:1", "甲", "今天又破防了")
+            .unwrap());
+        let fake_a = route_fake(&context_a, vec![Ok(r#"[{"content":"破防","source_id":1}]"#)]);
+        let fake_b = route_fake(&context_b, vec![Ok("[]")]);
+
+        let miss_b = extract_now(&context_b, &cfg, "group:1", None, false, false);
+        assert_eq!(miss_b["ok"], false);
+        assert_eq!(fake_b.calls.lock().unwrap().len(), 0);
+
+        let hit_a = extract_now(&context_a, &cfg, "group:1", None, false, false);
+        assert_eq!(hit_a["ok"], true, "{hit_a}");
+        assert_eq!(hit_a["added"], 1);
+        assert_eq!(fake_a.calls.lock().unwrap().len(), 1);
+
+        // Cooldown is tracked per runtime root as well.
+        assert!(SlangLearning::new(&context_a)
+            .try_feed_window("group:1", "乙", "第二句")
+            .unwrap());
+        let cooled = extract_now(&context_a, &cfg, "group:1", None, false, false);
+        assert_eq!(cooled["skipped"], true, "{cooled}");
+        assert_eq!(cooled["reason"], "cooldown", "{cooled}");
+
+        std::fs::remove_dir_all(root_a).unwrap();
+        std::fs::remove_dir_all(root_b).unwrap();
     }
 }

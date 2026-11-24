@@ -449,7 +449,8 @@ async fn digest_inner(context: &RuntimeContext, cfg: &Value, plan: &Plan, cancel
     }
     let (context, cfg, key, flag) = (context.clone(), cfg.clone(), plan.key.clone(), cancel.clone());
     let mut task = tokio::task::spawn_blocking(move || {
-        let model = crate::digest::model_for(&context, &cfg).map_err(|error| crate::digest::DigestError::Model(error.0))?;
+        let model = crate::harness::one_shot::digest_model(&context, &cfg)
+            .map_err(|error| crate::digest::DigestError::Model(error.0))?;
         crate::digest::Digest::new(&context, &cfg, model.as_ref())
             .run_conversation(&key, &crate::digest::Limits { min_messages: 1, min_interval_ms: 0 }, &*flag)
     });

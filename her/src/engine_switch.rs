@@ -626,7 +626,8 @@ fn summarize(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows
     let failure = |class| format!("conversation handover summary failed ({class})");
     // The joined delivery copy gets the last filter, including token and denied-term checks.
     let data = filtered_text(context, cfg, &data, HISTORY_CHARS, &known).ok_or_else(|| failure("wording"))?;
-    let model = crate::digest::model_for(context, cfg).map_err(|error| failure(error.0))?;
+    let model =
+        crate::harness::one_shot::digest_model(context, cfg).map_err(|error| failure(error.0))?;
     let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).map_err(|error| failure(error.0))?;
     let accepted = crate::harness::handover::accept(&data, &answer).map_err(failure)?;
     filtered_text(context, cfg, &accepted, ROW_CHARS, &known).ok_or_else(|| failure("wording"))

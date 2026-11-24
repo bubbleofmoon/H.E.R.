@@ -1,5 +1,6 @@
 //! One digest run over one conversation's new evidence.
-use super::{evidence, model::DigestModel};
+use super::evidence;
+use crate::harness::one_shot::OneShot;
 use crate::memory::{open_store, DigestCursor, NewMemory};
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
@@ -61,11 +62,11 @@ impl Hold for AtomicBool {
 pub(crate) struct Digest<'a> {
     context: &'a RuntimeContext,
     cfg: &'a Value,
-    model: &'a dyn DigestModel,
+    model: &'a dyn OneShot,
 }
 
 impl<'a> Digest<'a> {
-    pub(crate) fn new(context: &'a RuntimeContext, cfg: &'a Value, model: &'a dyn DigestModel) -> Self {
+    pub(crate) fn new(context: &'a RuntimeContext, cfg: &'a Value, model: &'a dyn OneShot) -> Self {
         Self { context, cfg, model }
     }
 

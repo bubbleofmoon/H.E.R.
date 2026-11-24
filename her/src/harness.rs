@@ -605,6 +605,7 @@ async fn tool_loop(
         record_events: true,
         record_usage: true,
         allow_retries: true,
+        retry_empty: true,
         allow_stream_retry: true,
         complete_on_answer: false,
         fail_action: "the turn ends",

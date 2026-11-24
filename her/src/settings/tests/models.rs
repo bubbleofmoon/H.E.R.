@@ -36,7 +36,10 @@ fn next_turn_budgets(context: &RuntimeContext) -> (usize, u32) {
 /// The model id and the request timeout, in seconds, of the next digest run.
 fn next_digest(context: &RuntimeContext) -> (Option<String>, u64) {
     let cfg = context.load_config().unwrap();
-    (crate::digest::digest_model_id(&cfg), crate::digest::digest_timeout(&cfg).as_secs())
+    (
+        crate::harness::one_shot::digest_model_id(&cfg),
+        crate::harness::one_shot::digest_timeout(&cfg).as_secs(),
+    )
 }
 
 /// The model the next web search asks (`aux_mcp` reads the loader's document).
@@ -263,12 +266,16 @@ fn model_and_cost_readers_take_defaults_and_bounds_from_the_registry() {
         [(json!(0), 1), (json!(1), 1), (json!(600), 600), (json!(601), 600), (json!(-1), 120), (json!(2.5), 120)]
     {
         let cfg = json!({"memory": {"digest": {"timeoutSecs": value}}});
-        assert_eq!(crate::digest::digest_timeout(&cfg).as_secs(), expected, "timeoutSecs {value}");
+        assert_eq!(
+            crate::harness::one_shot::digest_timeout(&cfg).as_secs(),
+            expected,
+            "timeoutSecs {value}"
+        );
         assert_eq!(timeout.integer(&cfg), expected as i64, "timeoutSecs {value}");
     }
     assert_eq!(crate::harness::Limits::from_config(&json!({})).budgets(), (8, 32_768));
     assert_eq!(crate::harness::Limits::from_config(&json!({"harness": "x"})).budgets(), (8, 32_768));
-    assert_eq!(crate::digest::digest_timeout(&json!({})).as_secs(), 120);
+    assert_eq!(crate::harness::one_shot::digest_timeout(&json!({})).as_secs(), 120);
     // A model id is trimmed; empty, not text, too long or with a control character reads as not configured.
     for (value, expected) in [
         (json!(" m1 "), Some("m1")),
@@ -280,15 +287,22 @@ fn model_and_cost_readers_take_defaults_and_bounds_from_the_registry() {
     ] {
         let cfg = json!({"harness": {"model": value}});
         assert_eq!(harness_model.text(&cfg).as_deref(), expected, "harness.model {value}");
-        assert_eq!(crate::digest::digest_model_id(&cfg).as_deref(), expected, "digest fallback {value}");
+        assert_eq!(
+            crate::harness::one_shot::digest_model_id(&cfg).as_deref(),
+            expected,
+            "digest fallback {value}"
+        );
     }
     let digest = |model: Value| {
-        crate::digest::digest_model_id(&json!({"memory": {"digest": {"model": model}}, "harness": {"model": "h"}}))
+        crate::harness::one_shot::digest_model_id(&json!({
+            "memory": {"digest": {"model": model}},
+            "harness": {"model": "h"}
+        }))
     };
     assert_eq!(digest(json!(" d ")).as_deref(), Some("d"));
     assert_eq!(digest(json!("")).as_deref(), Some("h"), "an empty digest model uses the conversation model");
     assert_eq!(digest(json!("a\u{1}b")).as_deref(), Some("h"));
-    assert_eq!(crate::digest::digest_model_id(&json!({})), None);
+    assert_eq!(crate::harness::one_shot::digest_model_id(&json!({})), None);
     let search = |config: Value| crate::aux_search::load_search_config(&config).model;
     assert_eq!(search(json!({})), "deepseek-v4-flash");
     assert_eq!(search(json!({"webSearch": {"model": " m "}})), "m");
@@ -312,7 +326,7 @@ fn model_and_cost_settings_have_no_reader_default() {
     let readers = [
         ("harness.rs", include_str!("../../harness.rs")),
         ("harness/routes.rs", include_str!("../../harness/routes.rs")),
-        ("digest/model.rs", include_str!("../../digest/model.rs")),
+        ("harness/one_shot.rs", include_str!("../../harness/one_shot.rs")),
         ("aux_search.rs", include_str!("../../aux_search.rs")),
     ];
     let owned = [

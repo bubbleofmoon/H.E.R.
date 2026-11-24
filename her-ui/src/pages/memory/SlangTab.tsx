@@ -79,13 +79,6 @@ function diffSlangConfig(
     patch.extractCooldownMs = draft.extractCooldownMs;
   }
   if (draft.injectMax !== saved.injectMax) patch.injectMax = draft.injectMax;
-  if (draft.learnerBackend !== saved.learnerBackend) {
-    patch.learnerBackend = draft.learnerBackend;
-  }
-  if (draft.learnerPreset !== saved.learnerPreset) patch.learnerPreset = draft.learnerPreset;
-  if (draft.workspaceTitle !== saved.workspaceTitle) {
-    patch.workspaceTitle = draft.workspaceTitle;
-  }
   const savedThresholds = normalizeThresholds(saved.inferenceThresholds);
   const nextThresholds = thresholdsDraft.length > 0 ? thresholdsDraft : [2, 4, 8];
   if (!arraysEqual(savedThresholds, nextThresholds)) {
@@ -248,24 +241,6 @@ export const SlangTab: React.FC = () => {
         }
         if (prev.injectMax !== submittedPatch.injectMax && 'injectMax' in submittedPatch) {
           merged.injectMax = prev.injectMax;
-        }
-        if (
-          prev.learnerBackend !== submittedPatch.learnerBackend &&
-          'learnerBackend' in submittedPatch
-        ) {
-          merged.learnerBackend = prev.learnerBackend;
-        }
-        if (
-          prev.learnerPreset !== submittedPatch.learnerPreset &&
-          'learnerPreset' in submittedPatch
-        ) {
-          merged.learnerPreset = prev.learnerPreset;
-        }
-        if (
-          prev.workspaceTitle !== submittedPatch.workspaceTitle &&
-          'workspaceTitle' in submittedPatch
-        ) {
-          merged.workspaceTitle = prev.workspaceTitle;
         }
         return merged;
       });
@@ -1240,45 +1215,6 @@ export const SlangTab: React.FC = () => {
                 value={thresholdsInput}
                 onChange={(e) => setThresholdsInput(e.target.value)}
                 placeholder="2, 4, 8"
-                className={INPUT_CLASS}
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-[11px] text-[var(--text-secondary)]">学习后端 (learnerBackend)</span>
-              <input
-                type="text"
-                disabled={!writable}
-                value={configDraft.learnerBackend}
-                onChange={(e) =>
-                  setConfigDraft((prev) => (prev ? { ...prev, learnerBackend: e.target.value } : prev))
-                }
-                className={INPUT_CLASS}
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-[11px] text-[var(--text-secondary)]">学习预设 (learnerPreset)</span>
-              <input
-                type="text"
-                disabled={!writable}
-                value={configDraft.learnerPreset}
-                onChange={(e) =>
-                  setConfigDraft((prev) => (prev ? { ...prev, learnerPreset: e.target.value } : prev))
-                }
-                className={INPUT_CLASS}
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-[11px] text-[var(--text-secondary)]">学习工作区标题 (workspaceTitle)</span>
-              <input
-                type="text"
-                disabled={!writable}
-                value={configDraft.workspaceTitle}
-                onChange={(e) =>
-                  setConfigDraft((prev) => (prev ? { ...prev, workspaceTitle: e.target.value } : prev))
-                }
                 className={INPUT_CLASS}
               />
             </label>

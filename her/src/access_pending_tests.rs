@@ -355,7 +355,7 @@ fn t192_a_retired_session_stays_recorded_until_its_stop_finished() {
         std::sync::Arc::new(LocalStopper(std::sync::atomic::AtomicBool::new(false)));
     let stopper_dyn: std::sync::Arc<dyn crate::social_state::SessionStopper> = stopper.clone();
     // The CLI entry waits for its background stops, so the failed stop has ended when it returns.
-    let reply = crate::social_state::change_conversation_scope_waiting_with(
+    let reply = crate::config_tx::change_conversation_scope_waiting_with(
         &context,
         GROUP,
         "remove",

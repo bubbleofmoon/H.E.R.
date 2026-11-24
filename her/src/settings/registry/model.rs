@@ -10,8 +10,8 @@ use crate::settings::kinds::{
 };
 use crate::settings::{ConversationSetting, Setting};
 
-/// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which `digest::model` falls back
-/// to); its model id rule also checks each route's model.
+/// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which
+/// `harness::one_shot` falls back to); its model id rule also checks each route's model.
 pub(crate) const HARNESS_MODEL: Setting = Setting {
     key: "harness.model",
     pointer: "/harness/model",
@@ -63,7 +63,7 @@ pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     secret: false,
 };
 
-/// Read by `digest::model`.
+/// Read by `harness::one_shot`.
 pub(crate) const DIGEST_MODEL: Setting = Setting {
     key: "memory.digest.model",
     pointer: "/memory/digest/model",
@@ -76,7 +76,7 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
     secret: false,
 };
 
-/// Read by `digest::model`.
+/// Read by `harness::one_shot`.
 pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     key: "memory.digest.timeoutSecs",
     pointer: "/memory/digest/timeoutSecs",

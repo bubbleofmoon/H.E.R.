@@ -30,7 +30,7 @@ impl Engine {
             return Ok(Self::Dsh);
         }
         if cfg.get("conversationEngines").is_some() {
-            crate::social_state::import_engine_choices(context)?;
+            crate::config_tx::import_engine_choices(context)?;
         }
         Self::read_choice(context, cfg, conversation, mode)
     }

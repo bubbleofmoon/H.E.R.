@@ -297,7 +297,7 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
         ("POST", "/api/settings/conversation/set", owner_set),
         ("POST", "/api/settings/conversation/reset", owner_reset),
     ] {
-        let (status, _, reply) = crate::console_settings::route(
+        let (status, _, reply, _) = crate::console_settings::route(
             crate::console_front::AdminCaller::new(&legacy),
             method,
             path,
@@ -311,7 +311,7 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
     admit_groups(&root, json!([101]));
     let revoked = crate::console_front::revoked_admin_context(&context);
     for (path, body) in [("/api/settings/conversation/set", owner_set), ("/api/settings/conversation/reset", owner_reset)] {
-        let (status, _, reply) = crate::console_settings::route(
+        let (status, _, reply, _) = crate::console_settings::route(
             crate::console_front::AdminCaller::new(&revoked),
             "POST",
             path,
@@ -706,7 +706,7 @@ fn legacy_engine_choices_import_once_before_routing() {
     assert_eq!(set_engine(&context, KEPT_GROUP, json!("dsh")).0, 200);
     let old = json!({KEPT_GROUP: "harness", LOST_GROUP: "harness", "group:91": "harness"});
     write_config(&root, |config| config["conversationEngines"] = old.clone());
-    crate::social_state::import_engine_choices(&context).unwrap();
+    crate::config_tx::import_engine_choices(&context).unwrap();
     assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), LOST_GROUP, true).unwrap(), "harness", "legacy choice must be imported");
     assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), KEPT_GROUP, true).unwrap(), "dsh", "the administrator's stored choice wins");
     assert_eq!(stored_conversations(&root), [KEPT_GROUP, LOST_GROUP]);
@@ -716,7 +716,7 @@ fn legacy_engine_choices_import_once_before_routing() {
     assert_eq!(post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP,"action":"remove","confirm":true})).0, 200);
     assert_eq!(post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP,"action":"admit","confirm":true})).0, 200);
     write_config(&root, |config| config["conversationEngines"] = old);
-    crate::social_state::import_engine_choices(&context).unwrap();
+    crate::config_tx::import_engine_choices(&context).unwrap();
     assert_eq!(stored_conversations(&root), [KEPT_GROUP], "an access clear must survive upgrade replay");
 }
 
@@ -726,7 +726,7 @@ fn legacy_engine_import_skips_and_audits_one_invalid_choice() {
     let old = json!({KEPT_GROUP: {"invalid": true}, LOST_GROUP: "harness"});
     write_config(&root, |config| config["conversationEngines"] = old.clone());
     assert!(
-        crate::social_state::import_engine_choices(&context).is_ok(),
+        crate::config_tx::import_engine_choices(&context).is_ok(),
         "one invalid choice must not abort the import"
     );
     let cfg = context.load_config().unwrap();
@@ -741,7 +741,7 @@ fn legacy_engine_import_skips_and_audits_one_invalid_choice() {
     assert!(before[0]["old"].is_null() && before[0]["new"].is_null());
 
     write_config(&root, |config| config["conversationEngines"] = old);
-    crate::social_state::import_engine_choices(&context).unwrap();
+    crate::config_tx::import_engine_choices(&context).unwrap();
     let (after, _) = history_page(&context, &format!("?conversation={KEPT_GROUP}"));
     assert_eq!(before, after, "replaying a skipped entry must not audit it twice");
 }
@@ -858,7 +858,7 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
         assert_eq!(status, 403, "{path}: {reply}");
     }
     let legacy_ctx = RuntimeContext::legacy();
-    let (status, _, reply) = crate::console_settings::route(
+    let (status, _, reply, _) = crate::console_settings::route(
         crate::console_front::AdminCaller::new(&legacy_ctx),
         "GET",
         "/api/settings/models",

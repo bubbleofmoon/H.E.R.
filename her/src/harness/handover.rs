@@ -13,8 +13,6 @@ use crate::runtime::RuntimeContext;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use serde_json::{json, Value};
 use std::ops::Range;
-#[cfg(test)]
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -331,19 +329,12 @@ fn render(messages: &[ChatMessage]) -> String {
     lines.join("\n")
 }
 
-/// Sets its flag when dropped: a summary's test fake sends nothing more once the summary has stopped waiting for it.
-#[cfg(test)]
-struct AbandonOnExit(Arc<AtomicBool>);
-
-#[cfg(test)]
-impl Drop for AbandonOnExit {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// One summary of `transcript` attributed to `usage_key` and `usage_job`, bounded by
-/// `memory.digest.timeoutSecs` and `deadline - SUMMARY_RESERVE`.
+/// One summary of `transcript` from `harness::one_shot::digest_summarise_async` (a route walk
+/// over `memory.digest.model` alone, else over the harness chain), attributed to `usage_key` and
+/// `usage_job`, bounded by `memory.digest.timeoutSecs` and by the turn's `deadline` less
+/// `SUMMARY_RESERVE`; the walk stops at once on cancellation. The outer error ends the turn
+/// (cancellation); the inner one is the summary's content-free failure class, `timeout` when the
+/// deadline bound passes.
 pub(crate) async fn summarise_text_for(
     context: &RuntimeContext,
     cfg: &Value,
@@ -353,37 +344,16 @@ pub(crate) async fn summarise_text_for(
     cancelled: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<Result<String, &'static str>, Failure> {
-    let bound = deadline.checked_sub(SUMMARY_RESERVE).unwrap_or_else(tokio::time::Instant::now);
-    #[cfg(test)]
-    if let Some(model) = context.test_one_shot(crate::harness::one_shot::Job::Digest) {
-        if tokio::time::Instant::now() >= bound {
-            return Ok(Err("timeout"));
-        }
-        let input = transcript.to_string();
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let _abandon = AbandonOnExit(abandoned.clone());
-        let within = bound.saturating_duration_since(tokio::time::Instant::now());
-        let task = tokio::task::spawn_blocking(move || {
-            model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned)
-        });
-        let joined = tokio::select! { biased;
-            joined = tokio::time::timeout_at(bound, task) => joined,
-            _ = cancelled.changed() => return Err(Failure::Cancelled),
-        };
-        if *cancelled.borrow() {
-            return Err(Failure::Cancelled);
-        }
-        return Ok(match joined {
-            Err(_elapsed) => Err("timeout"),
-            Ok(Err(_join)) => Err("worker"),
-            Ok(Ok(Ok(text))) => accept(transcript, &text),
-            Ok(Ok(Err(error))) => Err(error.0),
-        });
+    if *cancelled.borrow() {
+        return Err(Failure::Cancelled);
     }
+    let bound = deadline
+        .checked_sub(SUMMARY_RESERVE)
+        .unwrap_or_else(tokio::time::Instant::now);
     if tokio::time::Instant::now() >= bound {
         // Still check configuration before returning timeout so unconfigured runtimes report
         // `unconfigured`.
-        if let Err(error) = crate::digest::model_for(context, cfg) {
+        if let Err(error) = crate::harness::one_shot::digest_model(context, cfg) {
             return Ok(Err(error.0));
         }
         return Ok(Err("timeout"));
@@ -393,7 +363,7 @@ pub(crate) async fn summarise_text_for(
     let result = tokio::select! { biased;
         result = tokio::time::timeout_at(
             bound,
-            crate::digest::summarise_async(
+            crate::harness::one_shot::digest_summarise_async(
                 context,
                 cfg,
                 usage_key,
@@ -411,7 +381,7 @@ pub(crate) async fn summarise_text_for(
     }
     match result {
         Err(_elapsed) => Ok(Err("timeout")),
-        Ok(Err(crate::digest::ModelError("cancelled"))) => Err(Failure::Cancelled),
+        Ok(Err(crate::harness::one_shot::ModelError("cancelled"))) => Err(Failure::Cancelled),
         Ok(Err(error)) => Ok(Err(error.0)),
         Ok(Ok(text)) => Ok(accept(transcript, &text)),
     }
