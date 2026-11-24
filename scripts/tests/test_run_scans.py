@@ -140,9 +140,19 @@ class RunScansTests(unittest.TestCase):
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         lines = done.stdout.splitlines()
-        self.assertEqual(lines[0], "scripts/check-repo.py")
+        self.assertIn("scripts/check-repo.py", lines)
         self.assertIn("scripts/tests/test_run_scans.py", lines)
         self.assertIn("scripts/tests/test_checks_workflow.py", lines)
+
+    def test_defaults_cap_workers_at_four_and_schedule_heavy_suites_first(self):
+        mod = load_run_scans()
+        self.assertEqual(mod.DEFAULT_TIMEOUT, 900)
+        self.assertEqual(mod.default_jobs(None), 2)
+        self.assertEqual(mod.default_jobs(2), 2)
+        self.assertEqual(mod.default_jobs(4), 4)
+        self.assertEqual(mod.default_jobs(16), 4)
+        heavy_prefix = tuple(f"scripts/tests/{name}" for name in mod.HEAVY_TEST_SUITES)
+        self.assertEqual(mod.SUITES[: len(heavy_prefix)], heavy_prefix)
 
 
 if __name__ == "__main__":

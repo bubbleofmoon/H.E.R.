@@ -17,7 +17,19 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TIMEOUT = 300
+DEFAULT_TIMEOUT = 900
+
+HEAVY_TEST_SUITES: tuple[str, ...] = (
+    "test_pre_push_hook.py",
+    "test_agent_guard.py",
+    "test_ci_wait.py",
+    "test_gh_public.py",
+    "test_handoff.py",
+    "test_scan_public.py",
+    "test_strip_history.py",
+    "test_checks_workflow.py",
+    "test_merge_check.py",
+)
 
 TEST_SUITES: tuple[str, ...] = (
     "test_agent_guard.py",
@@ -40,9 +52,11 @@ TEST_SUITES: tuple[str, ...] = (
     "test_watch_stream.py",
 )
 
+# Longest-Processing-Time-First order so heavy subprocess suites start immediately.
 SUITES: tuple[str, ...] = (
+    *(f"scripts/tests/{name}" for name in HEAVY_TEST_SUITES),
     "scripts/check-repo.py",
-    *(f"scripts/tests/{name}" for name in TEST_SUITES),
+    *(f"scripts/tests/{name}" for name in TEST_SUITES if name not in HEAVY_TEST_SUITES),
 )
 
 
@@ -136,6 +150,25 @@ def _run_one_suite(rel: str, root: Path, timeout: float) -> SuiteResult:
         )
 
 
+_UNSET = object()
+
+
+def default_jobs(cpu_count: int | None | object = _UNSET) -> int:
+    """Return default worker count capped at 4 so 2-4 vCPU runners avoid subprocess thrashing."""
+    count = os.cpu_count() if cpu_count is _UNSET else cpu_count
+    assert count is None or isinstance(count, int)
+    return min(4, count or 2)
+
+
+def format_result(res: SuiteResult, timeout: float) -> str:
+    """Format one summary line for a completed suite."""
+    if res.returncode == 0:
+        return f"PASS {res.rel} ({res.elapsed:.2f}s)"
+    if res.timed_out:
+        return f"FAIL {res.rel} (exit {res.returncode}, TIMEOUT after {timeout}s, {res.elapsed:.2f}s)"
+    return f"FAIL {res.rel} (exit {res.returncode}, {res.elapsed:.2f}s)"
+
+
 def run_suites(
     suites: Sequence[str],
     root: Path,
@@ -148,7 +181,7 @@ def run_suites(
         print("Ran 0 suites in 0.00s; failures: none", flush=True)
         return 0
 
-    worker_cap = jobs if jobs is not None else min(8, os.cpu_count() or 4)
+    worker_cap = jobs if jobs is not None else default_jobs()
     max_workers = max(1, min(len(suites), worker_cap))
     started = time.monotonic()
 
@@ -157,12 +190,11 @@ def run_suites(
         results = [future.result() for future in futures]
 
     failed: list[str] = []
-    for res in results:
+    for res in sorted(results, key=lambda item: item.rel):
+        print(format_result(res, timeout), flush=True)
         if res.returncode == 0:
-            print(f"PASS {res.rel} ({res.elapsed:.2f}s)", flush=True)
             continue
         failed.append(res.rel)
-        print(f"FAIL {res.rel} (exit {res.returncode}, {res.elapsed:.2f}s)", flush=True)
         for label, text in (("stdout", res.stdout), ("stderr", res.stderr)):
             if text:
                 print(f"  --- {label} ---", flush=True)
