@@ -1049,6 +1049,48 @@ fn take_undo_write_error(
     })
 }
 
+struct UndoWriteFailure {
+    message: String,
+    rolled_back_files: Vec<String>,
+}
+
+fn write_undo_targets<T>(
+    prepared: Vec<T>,
+    file_of: impl Fn(&T) -> &str,
+    mut write_one: impl FnMut(&T) -> Result<(), String>,
+    mut rollback_one: impl FnMut(&T) -> Result<(), String>,
+) -> Result<Vec<String>, UndoWriteFailure> {
+    let mut restored = Vec::with_capacity(prepared.len());
+    let mut written: Vec<T> = Vec::with_capacity(prepared.len());
+    for target in prepared {
+        if let Err(error) = write_one(&target) {
+            let mut message = format!("写回失败 {}: {error}", file_of(&target));
+            let mut rolled_back_files = Vec::new();
+            let mut rollback_errors = Vec::new();
+            for prev in written.into_iter().rev() {
+                let file = file_of(&prev).to_string();
+                match rollback_one(&prev) {
+                    Ok(()) => rolled_back_files.push(file),
+                    Err(rb_err) => rollback_errors.push(format!("{file} ({rb_err})")),
+                }
+            }
+            if !rollback_errors.is_empty() {
+                message.push_str(&format!(
+                    "；回滚已写文件失败：{}",
+                    rollback_errors.join("、")
+                ));
+            }
+            return Err(UndoWriteFailure {
+                message,
+                rolled_back_files,
+            });
+        }
+        restored.push(file_of(&target).to_string());
+        written.push(target);
+    }
+    Ok(restored)
+}
+
 struct PreparedLegacyUndo {
     file: String,
     old: String,
@@ -1066,33 +1108,16 @@ fn write_legacy_undo_file(file: &str, text: &str) -> Result<(), String> {
 fn write_legacy_undo_targets(
     prepared: Vec<PreparedLegacyUndo>,
 ) -> Result<Vec<String>, CommitError> {
-    let mut restored = Vec::with_capacity(prepared.len());
-    let mut written: Vec<PreparedLegacyUndo> = Vec::with_capacity(prepared.len());
-    for target in prepared {
-        if let Err(error) = write_legacy_undo_file(&target.file, &target.old) {
-            let mut message = format!("写回失败 {}: {error}", target.file);
-            let mut rollback_errors = Vec::new();
-            for prev in written.into_iter().rev() {
-                let rb_result = match prev.snapshot.as_deref() {
-                    Some(bytes) => std::fs::write(&prev.file, bytes),
-                    None => std::fs::remove_file(&prev.file),
-                };
-                if let Err(rb_err) = rb_result {
-                    rollback_errors.push(format!("{} ({rb_err})", prev.file));
-                }
-            }
-            if !rollback_errors.is_empty() {
-                message.push_str(&format!(
-                    "；回滚已写文件失败：{}",
-                    rollback_errors.join("、")
-                ));
-            }
-            return Err(CommitError::plain(500, message));
-        }
-        restored.push(target.file.clone());
-        written.push(target);
-    }
-    Ok(restored)
+    write_undo_targets(
+        prepared,
+        |target| &target.file,
+        |target| write_legacy_undo_file(&target.file, &target.old),
+        |prev| match prev.snapshot.as_deref() {
+            Some(bytes) => std::fs::write(&prev.file, bytes).map_err(|e| e.to_string()),
+            None => std::fs::remove_file(&prev.file).map_err(|e| e.to_string()),
+        },
+    )
+    .map_err(|failure| CommitError::plain(500, failure.message))
 }
 
 struct PreparedIsolatedUndo {
@@ -1101,6 +1126,22 @@ struct PreparedIsolatedUndo {
     relative: &'static str,
     snapshot: Option<Vec<u8>>,
     text: String,
+}
+
+struct PreparedConfigUndo {
+    text: String,
+    settings_kept: Vec<&'static str>,
+    wake_changed: bool,
+    unchanged_config: Value,
+    planned: (Value, Option<String>, Option<String>),
+}
+
+struct PreparedIsolatedUndoBatch {
+    targets: Vec<PreparedIsolatedUndo>,
+    settings_kept: Vec<&'static str>,
+    wake_changed: bool,
+    unchanged_config: Value,
+    planned: Option<(Value, Option<String>, Option<String>)>,
 }
 
 fn write_isolated_undo_target(
@@ -1214,13 +1255,12 @@ pub(crate) fn commit_audit_undo(
     })
 }
 
-fn commit_isolated_audit_undo(
+fn validate_isolated_audit_backups(
     context: &RuntimeContext,
     id: &str,
     entry: &Value,
-    confirm: bool,
-    files: Vec<Value>,
-) -> Result<CommitOutcome<Value>, CommitError> {
+    files: &[Value],
+) -> Result<Vec<(String, String)>, CommitError> {
     if entry.get("path").and_then(Value::as_str) == Some("/api/console/token") {
         return Err(CommitError::plain(
             409,
@@ -1234,7 +1274,7 @@ fn commit_isolated_audit_undo(
         ));
     }
     let mut pending: Vec<(String, String)> = Vec::with_capacity(files.len());
-    for f in &files {
+    for f in files {
         let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
         if !["config/config.json", "data/role-map.json"].contains(&file) {
@@ -1271,6 +1311,214 @@ fn commit_isolated_audit_undo(
         }
         pending.push((file.to_string(), old));
     }
+    Ok(pending)
+}
+
+fn snapshot_isolated_undo_targets(
+    context: &RuntimeContext,
+    files: &[Value],
+    pending: &[(String, String)],
+) -> Result<Vec<(RuntimeArea, &'static str, Option<Vec<u8>>)>, CommitError> {
+    let mut snapshots = Vec::with_capacity(pending.len());
+    for (f, (file, _)) in files.iter().zip(pending) {
+        let (area, relative) =
+            crate::console::isolated_audit_file(file).expect("declared file checked above");
+        let current_opt = context.read_optional_text(area, relative).map_err(|_| {
+            CommitError::plain(503, "selected runtime audit target is unavailable")
+        })?;
+        let snapshot = current_opt.as_ref().map(|text| text.as_bytes().to_vec());
+        let current = current_opt.unwrap_or_default();
+        let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
+            Some(expected) if file == "config/config.json" => {
+                crate::console::config_registry_free_sha(&current).as_deref() == Some(expected)
+            }
+            _ => {
+                f.get("afterSha").and_then(Value::as_str)
+                    == Some(crate::console::sha256_hex(&current).as_str())
+            }
+        };
+        if !unchanged {
+            return Err(CommitError::plain(
+                409,
+                format!(
+                    "{file} 在这条审计记录之后又被修改过，撤销会覆盖之后的变更；请先撤销更新的记录"
+                ),
+            ));
+        }
+        snapshots.push((area, relative, snapshot));
+    }
+    Ok(snapshots)
+}
+
+fn prepare_isolated_config_undo(
+    context: &RuntimeContext,
+    old: &str,
+    confirm: bool,
+    config_before: &Value,
+) -> Result<PreparedConfigUndo, CommitError> {
+    let current = raw_config_for_write(context).map_err(|err| {
+        CommitError::plain(
+            503,
+            format!("读取当前配置失败，未撤销：{}", err.message()),
+        )
+    })?;
+    let mut restored_config: Value =
+        serde_json::from_str(old).map_err(|_| CommitError::plain(500, "备份内容不是合法 JSON"))?;
+    match (current.get("consoleToken"), restored_config.as_object_mut()) {
+        (Some(token), Some(object)) => {
+            object.insert("consoleToken".into(), token.clone());
+        }
+        (None, Some(object)) => {
+            object.remove("consoleToken");
+        }
+        _ => {}
+    }
+    let security = crate::settings::security_restore(context, &current, &restored_config)?;
+    let restoring: Vec<&crate::settings::Setting> =
+        security.iter().map(|(setting, _)| *setting).collect();
+    crate::settings::check_confirmation(confirm, &restoring)?;
+    let previewed: Vec<_> = security
+        .iter()
+        .map(|(setting, value)| (*setting, Some(value.clone())))
+        .collect();
+    let mut settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config)
+        .map_err(|key| {
+            CommitError::plain(
+                409,
+                format!(
+                    "the backup cannot keep the current value of {key}; nothing was undone"
+                ),
+            )
+        })?;
+    settings_kept.retain(|key| {
+        !crate::settings::find(key).is_some_and(|setting| setting.confirmed())
+    });
+    let (after, load_error) = match context.effective_config_with(&restored_config, &previewed) {
+        Ok(after) => (after, None),
+        Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
+    };
+    let stored = !security.is_empty();
+    let change = begin_access_change(context, config_before, &after, "audit-undo")?;
+    store_access_changes(context, security, &previewed, &change, "audit-undo")?;
+    let unchanged_config = if stored {
+        Value::Null
+    } else {
+        config_snapshot(context)
+    };
+    if let Err(err) = keep_stored_members(context, &mut restored_config) {
+        let mut commit_err = CommitError::from_social(err);
+        commit_err
+            .message
+            .push_str(&settle_failed_write(context, &unchanged_config, &change));
+        return Err(commit_err);
+    }
+    let wake_changed = current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
+    let text = match serde_json::to_string_pretty(&restored_config) {
+        Ok(text) => text,
+        Err(e) => {
+            let mut msg = e.to_string();
+            msg.push_str(&settle_failed_write(context, &unchanged_config, &change));
+            return Err(CommitError::plain(500, msg));
+        }
+    };
+    Ok(PreparedConfigUndo {
+        text,
+        settings_kept,
+        wake_changed,
+        unchanged_config,
+        planned: (after, load_error, change),
+    })
+}
+
+fn prepare_isolated_undo_targets(
+    context: &RuntimeContext,
+    pending: Vec<(String, String)>,
+    snapshots: Vec<(RuntimeArea, &'static str, Option<Vec<u8>>)>,
+    confirm: bool,
+    config_before: &Value,
+) -> Result<PreparedIsolatedUndoBatch, CommitError> {
+    let mut targets = Vec::with_capacity(pending.len());
+    let mut settings_kept: Vec<&'static str> = Vec::new();
+    let mut wake_changed = false;
+    let mut unchanged_config = Value::Null;
+    let mut planned = None;
+    for ((file, old), (area, relative, snapshot)) in pending.into_iter().zip(snapshots) {
+        let text = if file == "config/config.json" {
+            let cfg = prepare_isolated_config_undo(context, &old, confirm, config_before)?;
+            settings_kept = cfg.settings_kept;
+            wake_changed = cfg.wake_changed;
+            unchanged_config = cfg.unchanged_config;
+            planned = Some(cfg.planned);
+            cfg.text
+        } else {
+            old
+        };
+        targets.push(PreparedIsolatedUndo {
+            file,
+            area,
+            relative,
+            snapshot,
+            text,
+        });
+    }
+    Ok(PreparedIsolatedUndoBatch {
+        targets,
+        settings_kept,
+        wake_changed,
+        unchanged_config,
+        planned,
+    })
+}
+
+fn execute_isolated_undo_writes(
+    context: &RuntimeContext,
+    prepared: Vec<PreparedIsolatedUndo>,
+    pre_store_before: &str,
+    planned: &Option<(Value, Option<String>, Option<String>)>,
+    unchanged_config: &Value,
+    published_diff: &mut Option<ConfigDiff>,
+) -> Result<Vec<String>, CommitError> {
+    let write_result = write_undo_targets(
+        prepared,
+        |target| &target.file,
+        |target| write_isolated_undo_target(context, target, pre_store_before, published_diff),
+        |prev| match prev.snapshot.as_deref() {
+            Some(bytes) => context.write_atomic(prev.area, prev.relative, bytes),
+            None => context.remove_file(prev.area, prev.relative),
+        },
+    );
+    match write_result {
+        Ok(restored) => Ok(restored),
+        Err(mut failure) => {
+            if failure
+                .rolled_back_files
+                .iter()
+                .any(|file| file == "config/config.json")
+            {
+                *published_diff = None;
+            }
+            if let Some((_, _, change)) = planned.as_ref() {
+                failure
+                    .message
+                    .push_str(&settle_failed_write(context, unchanged_config, change));
+            }
+            Err(CommitError::with_diff(
+                500,
+                failure.message,
+                published_diff.take(),
+            ))
+        }
+    }
+}
+
+fn commit_isolated_audit_undo(
+    context: &RuntimeContext,
+    id: &str,
+    entry: &Value,
+    confirm: bool,
+    files: Vec<Value>,
+) -> Result<CommitOutcome<Value>, CommitError> {
+    let pending = validate_isolated_audit_backups(context, id, entry, &files)?;
     let interaction = crate::closed_agent::lock(context).map_err(|e| CommitError::plain(503, e))?;
     finish_pending_before_change(context, &interaction)?;
     let mut settings_kept: Vec<&'static str> = Vec::new();
@@ -1279,190 +1527,25 @@ fn commit_isolated_audit_undo(
     let (config_before, restored, planned) = {
         let _gate = acquire_gate(context)?;
         let pre_store_before = read_config_before(context)?;
-        // Phase 1a: check freshness and snapshot pre-undo raw bytes of all target files
-        // before mutating the store, pending revocations, or any file.
-        let mut snapshots = Vec::with_capacity(pending.len());
-        for (f, (file, _)) in files.iter().zip(&pending) {
-            let (area, relative) =
-                crate::console::isolated_audit_file(file).expect("declared file checked above");
-            let current_opt = context.read_optional_text(area, relative).map_err(|_| {
-                CommitError::plain(503, "selected runtime audit target is unavailable")
-            })?;
-            let snapshot = current_opt.as_ref().map(|text| text.as_bytes().to_vec());
-            let current = current_opt.unwrap_or_default();
-            let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
-                Some(expected) if file == "config/config.json" => {
-                    crate::console::config_registry_free_sha(&current).as_deref()
-                        == Some(expected)
-                }
-                _ => {
-                    f.get("afterSha").and_then(Value::as_str)
-                        == Some(crate::console::sha256_hex(&current).as_str())
-                }
-            };
-            if !unchanged {
-                return Err(CommitError::plain(
-                    409,
-                    format!(
-                        "{file} 在这条审计记录之后又被修改过，撤销会覆盖之后的变更；请先撤销更新的记录"
-                    ),
-                ));
-            }
-            snapshots.push((area, relative, snapshot));
-        }
+        let snapshots = snapshot_isolated_undo_targets(context, &files, &pending)?;
         let config_before = context
             .load_config()
             .map_err(|e| CommitError::plain(503, format!("读取当前配置失败，未撤销：{e}")))?;
-
-        // Phase 1b: prepare and validate every target file in memory before writing any file.
-        let mut prepared = Vec::with_capacity(pending.len());
-        let mut planned: Option<(Value, Option<String>, Option<String>)> = None;
-        let mut unchanged_config = Value::Null;
-        let mut wake_changed = false;
-        for ((file, old), (area, relative, snapshot)) in pending.into_iter().zip(snapshots) {
-            let text = if file == "config/config.json" {
-                let current = raw_config_for_write(context).map_err(|err| {
-                    CommitError::plain(
-                        503,
-                        format!("读取当前配置失败，未撤销：{}", err.message()),
-                    )
-                })?;
-                let mut restored_config: Value = serde_json::from_str(&old)
-                    .map_err(|_| CommitError::plain(500, "备份内容不是合法 JSON"))?;
-                match (current.get("consoleToken"), restored_config.as_object_mut()) {
-                    (Some(token), Some(object)) => {
-                        object.insert("consoleToken".into(), token.clone());
-                    }
-                    (None, Some(object)) => {
-                        object.remove("consoleToken");
-                    }
-                    _ => {}
-                }
-                let security =
-                    crate::settings::security_restore(context, &current, &restored_config)?;
-                let restoring: Vec<&crate::settings::Setting> =
-                    security.iter().map(|(setting, _)| *setting).collect();
-                crate::settings::check_confirmation(confirm, &restoring)?;
-                let previewed: Vec<_> = security
-                    .iter()
-                    .map(|(setting, value)| (*setting, Some(value.clone())))
-                    .collect();
-                settings_kept =
-                    crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
-                        |key| {
-                            CommitError::plain(
-                                409,
-                                format!(
-                                    "the backup cannot keep the current value of {key}; \
-                                     nothing was undone"
-                                ),
-                            )
-                        },
-                    )?;
-                settings_kept.retain(|key| {
-                    !crate::settings::find(key).is_some_and(|setting| setting.confirmed())
-                });
-                let (after, load_error) =
-                    match context.effective_config_with(&restored_config, &previewed) {
-                        Ok(after) => (after, None),
-                        Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
-                    };
-                let stored = !security.is_empty();
-                let change =
-                    begin_access_change(context, &config_before, &after, "audit-undo")?;
-                store_access_changes(context, security, &previewed, &change, "audit-undo")?;
-                let pre_write_unchanged = if stored {
-                    Value::Null
-                } else {
-                    config_snapshot(context)
-                };
-                if let Err(err) = keep_stored_members(context, &mut restored_config) {
-                    let mut commit_err = CommitError::from_social(err);
-                    commit_err
-                        .message
-                        .push_str(&settle_failed_write(context, &pre_write_unchanged, &change));
-                    return Err(commit_err);
-                }
-                wake_changed =
-                    current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
-                let text = match serde_json::to_string_pretty(&restored_config) {
-                    Ok(text) => text,
-                    Err(e) => {
-                        let mut msg = e.to_string();
-                        msg.push_str(&settle_failed_write(
-                            context,
-                            &pre_write_unchanged,
-                            &change,
-                        ));
-                        return Err(CommitError::plain(500, msg));
-                    }
-                };
-                planned = Some((after, load_error, change));
-                unchanged_config = pre_write_unchanged;
-                text
-            } else {
-                old
-            };
-            prepared.push(PreparedIsolatedUndo {
-                file,
-                area,
-                relative,
-                snapshot,
-                text,
-            });
-        }
-
-        // Phase 2: write prepared files; on failure, roll back earlier writes in reverse order.
-        let mut restored = Vec::with_capacity(prepared.len());
-        let mut written: Vec<PreparedIsolatedUndo> = Vec::with_capacity(prepared.len());
-        for target in prepared {
-            let write_result = write_isolated_undo_target(
-                context,
-                &target,
-                &pre_store_before,
-                &mut published_diff,
-            );
-            if let Err(error) = write_result {
-                let mut message = format!("写回失败 {}: {error}", target.file);
-                let mut config_rolled_back = false;
-                let mut rollback_errors = Vec::new();
-                for prev in written.into_iter().rev() {
-                    let rb_result = match prev.snapshot.as_deref() {
-                        Some(bytes) => context.write_atomic(prev.area, prev.relative, bytes),
-                        None => context.remove_file(prev.area, prev.relative),
-                    };
-                    match rb_result {
-                        Ok(()) => {
-                            if prev.file == "config/config.json" {
-                                config_rolled_back = true;
-                            }
-                        }
-                        Err(rb_err) => {
-                            rollback_errors.push(format!("{} ({rb_err})", prev.file));
-                        }
-                    }
-                }
-                if config_rolled_back {
-                    published_diff = None;
-                }
-                if let Some((_, _, change)) = planned.as_ref() {
-                    message.push_str(&settle_failed_write(context, &unchanged_config, change));
-                }
-                if !rollback_errors.is_empty() {
-                    message.push_str(&format!(
-                        "；回滚已写文件失败：{}",
-                        rollback_errors.join("、")
-                    ));
-                }
-                return Err(CommitError::with_diff(500, message, published_diff));
-            }
-            restored.push(target.file.clone());
-            written.push(target);
-        }
-        if wake_changed {
+        let batch =
+            prepare_isolated_undo_targets(context, pending, snapshots, confirm, &config_before)?;
+        settings_kept = batch.settings_kept;
+        let restored = execute_isolated_undo_writes(
+            context,
+            batch.targets,
+            &pre_store_before,
+            &batch.planned,
+            &batch.unchanged_config,
+            &mut published_diff,
+        )?;
+        if batch.wake_changed {
             wake_error = reconcile_default_wake_configs(context, Some(&config_before)).err();
         }
-        (config_before, restored, planned)
+        (config_before, restored, batch.planned)
     };
     let (after, load_error, change) = match planned {
         Some(planned) => planned,
@@ -2518,11 +2601,17 @@ mod tests {
             false,
             "wake reconciliation must not run when a later file write fails"
         );
-        assert!(!root_b
-            .0
-            .join("data")
-            .join(social_state::PENDING_REVOCATIONS)
-            .exists());
+        let pending_file = root_b.0.join("data").join(social_state::PENDING_REVOCATIONS);
+        let pending: Value = if pending_file.exists() {
+            serde_json::from_slice(&std::fs::read(&pending_file).unwrap()).unwrap()
+        } else {
+            json!({ "pending": [] })
+        };
+        assert_eq!(
+            pending["pending"],
+            json!([]),
+            "rolled-back config.json undo must clear its pending revocation"
+        );
     }
 
     #[test]
