@@ -3,8 +3,13 @@ use super::*;
 
 /// One request straight to `console_settings::route`, past the console front.
 fn direct_route(context: &RuntimeContext, method: &str, path: &str, body: &str) -> (u16, Value) {
-    let (status, _, reply) =
-        crate::console_settings::route(crate::console_front::AdminCaller::new(context), method, path, &HashMap::new(), body);
+    let (status, _, reply, _) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(context),
+        method,
+        path,
+        &HashMap::new(),
+        body,
+    );
     (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
 }
 

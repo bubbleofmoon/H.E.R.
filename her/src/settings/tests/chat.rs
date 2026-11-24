@@ -141,18 +141,28 @@ fn chat_settings_get_reads_registry_settings_as_the_next_use_and_hides_everythin
     let all = chat(&context, "settings-get", json!({})).unwrap();
     assert!(!all.to_string().contains("fixture-"), "{all}");
     for name in all["writable"].as_array().unwrap() {
-        assert!(!crate::console::setting_is_secret(name.as_str().unwrap()), "{name}");
+        assert!(!crate::config_tx::setting_is_secret(name.as_str().unwrap()), "{name}");
     }
 
     // A legacy (no-root) context has no settings store: no registry setting is offered, read or written there.
     let legacy = RuntimeContext::legacy();
     let cfg = json!({"socialV2": {"reply": {"wakeQuietMs": 9000}}});
-    let all = crate::console::settings_action("settings-get", &json!({}), &cfg, &legacy).unwrap();
+    let all = crate::config_tx::settings_action("settings-get", &json!({}), &cfg, &legacy).unwrap();
     assert!(all["settings"].get(CHAT_NAME).is_none(), "{all}");
     assert!(!all["writable"].as_array().unwrap().contains(&json!(CHAT_NAME)), "{all}");
-    let one = crate::console::settings_action("settings-get", &json!({"settingKey": CHAT_NAME}), &cfg, &legacy);
+    let one = crate::config_tx::settings_action(
+        "settings-get",
+        &json!({"settingKey": CHAT_NAME}),
+        &cfg,
+        &legacy,
+    );
     assert_eq!(one, Err((403, SETTINGS_READ_REFUSED.to_string())));
-    let set = crate::console::settings_action("settings-set", &json!({"settingKey": CHAT_NAME, "value": 4500}), &cfg, &legacy);
+    let set = crate::config_tx::settings_action(
+        "settings-set",
+        &json!({"settingKey": CHAT_NAME, "value": 4500}),
+        &cfg,
+        &legacy,
+    );
     assert_eq!(set, Err((403, CHAT_WRITE_REFUSED.to_string())));
 }
 
@@ -241,7 +251,11 @@ fn chat_settings_come_from_the_registry_and_are_never_secret() {
             "{}: a dot in a member name makes the chat name ambiguous",
             setting.pointer
         );
-        assert!(!crate::console::setting_is_secret(&name) && !crate::console::setting_is_secret(setting.key), "{name} is a secret");
+        assert!(
+            !crate::config_tx::setting_is_secret(&name)
+                && !crate::config_tx::setting_is_secret(setting.key),
+            "{name} is a secret"
+        );
         let lower = name.to_lowercase();
         for refused in ["allow", "token", "secret", "password", "path", "ownerqq", "consoletoken"] {
             assert!(!lower.contains(refused), "{name} names {refused}");

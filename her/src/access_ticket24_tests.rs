@@ -695,7 +695,7 @@ fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
     let worker_context = context.clone();
     AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
         let _config = acquire_social_state_gate(&worker_context).unwrap();
-        let mut cfg = raw_config_object(&worker_context).unwrap();
+        let mut cfg = crate::social_state::raw_config_object(&worker_context).unwrap();
         cfg["consoleToken"] = json!(rotated);
         worker_context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
     })));

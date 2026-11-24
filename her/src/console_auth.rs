@@ -304,17 +304,23 @@ fn rotation_fixture_cut(at: &str) {
 }
 
 pub(crate) fn rotate_console_token(
-    context: &RuntimeContext, token: &str, configured: bool,
-) -> Result<(), (u16, String)> {
-    let unavailable = |_: String| (503, ROTATION_UNAVAILABLE.into());
+    context: &RuntimeContext,
+    token: &str,
+    configured: bool,
+) -> Result<crate::config_tx::ConfigDiff, crate::config_tx::CommitError> {
+    let unavailable = |_: String| crate::config_tx::CommitError::plain(503, ROTATION_UNAVAILABLE);
     ensure_credentials_ready(context)?;
-    let read_error = || (503, ROTATION_UNAVAILABLE.to_string());
-    let before = context.read_optional_text(RuntimeArea::Config, "config.json")
-        .map_err(|_| read_error())?.ok_or_else(read_error)?;
+    let read_error = || crate::config_tx::CommitError::plain(503, ROTATION_UNAVAILABLE);
+    let before = context
+        .read_optional_text(RuntimeArea::Config, "config.json")
+        .map_err(|_| read_error())?
+        .ok_or_else(read_error)?;
     let cfg = parse_token_config(&before).map_err(unavailable)?;
     let token_file_error = || (500, "console token file is unavailable".to_string());
-    let prior_file = read_rotation_file(context, TOKEN_FILE, 1024 * 1024).map_err(|_| token_file_error())?;
-    let (target, staged) = context.stage_atomic_from(RuntimeArea::Data, TOKEN_FILE, &mut token.as_bytes())
+    let prior_file =
+        read_rotation_file(context, TOKEN_FILE, 1024 * 1024).map_err(|_| token_file_error())?;
+    let (target, staged) = context
+        .stage_atomic_from(RuntimeArea::Data, TOKEN_FILE, &mut token.as_bytes())
         .map_err(|_| token_file_error())?;
     let intent = RotationIntent {
         v: 1,
@@ -325,25 +331,33 @@ pub(crate) fn rotate_console_token(
     };
     let journal = serde_json::to_vec(&intent).map_err(|_| unavailable(String::new()))?;
     let after = config_with_token(cfg, token, configured);
-    let (config_target, staged_config) = context.stage_atomic_from(RuntimeArea::Config, "config.json", &mut after.as_bytes())
+    let (config_target, staged_config) = context
+        .stage_atomic_from(RuntimeArea::Config, "config.json", &mut after.as_bytes())
         .map_err(|_| (500, "console token configuration is unavailable".to_string()))?;
     crate::settings::revoke_browser_sessions(context)?;
     remove_rotation_file(context, crate::console::DESKTOP_GRANTS_FILE).map_err(unavailable)?;
-    context.write_atomic(RuntimeArea::Data, ROTATION_FILE, &journal).map_err(unavailable)?;
+    context
+        .write_atomic(RuntimeArea::Data, ROTATION_FILE, &journal)
+        .map_err(unavailable)?;
     #[cfg(feature = "parity-clock")]
     rotation_fixture_cut("before-token");
-    staged.commit(&mut || {
-        context.revalidate_atomic_target(RuntimeArea::Data, TOKEN_FILE, &target)?;
-        crate::guarded_fs::open_protected_file(&target).map_err(|_| ROTATION_UNAVAILABLE.to_string())?;
-        Ok::<(), String>(())
-    }).map_err(|_| unavailable(String::new()))?;
+    staged
+        .commit(&mut || {
+            context.revalidate_atomic_target(RuntimeArea::Data, TOKEN_FILE, &target)?;
+            crate::guarded_fs::open_protected_file(&target)
+                .map_err(|_| ROTATION_UNAVAILABLE.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(|_| unavailable(String::new()))?;
     #[cfg(feature = "parity-clock")]
     rotation_fixture_cut("after-token");
     let result = (|| {
         let _authority = context.authority_gate()?;
-        staged_config.commit(&mut || {
-            context.revalidate_atomic_target(RuntimeArea::Config, "config.json", &config_target)
-        }).map_err(|_| ROTATION_UNAVAILABLE.to_string())
+        staged_config
+            .commit(&mut || {
+                context.revalidate_atomic_target(RuntimeArea::Config, "config.json", &config_target)
+            })
+            .map_err(|_| ROTATION_UNAVAILABLE.to_string())
     })();
     if result.is_err() {
         let still_old = raw_token_config(context)
@@ -361,8 +375,11 @@ pub(crate) fn rotate_console_token(
     }
     #[cfg(feature = "parity-clock")]
     rotation_fixture_cut("after-config");
-    crate::console::record_config_publication(Ok(before), &after);
-    remove_rotation_file(context, ROTATION_FILE).map_err(unavailable)
+    let diff = crate::config_tx::ConfigDiff { before, after };
+    remove_rotation_file(context, ROTATION_FILE).map_err(|_| {
+        crate::config_tx::CommitError::with_diff(503, ROTATION_UNAVAILABLE, Some(diff.clone()))
+    })?;
+    Ok(diff)
 }
 
 const MEMORY_KIB: u32 = 19 * 1024;

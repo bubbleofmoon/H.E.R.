@@ -22,7 +22,7 @@ pub(crate) const END_TURN: &str =
     "end this turn now: produce your final answer and make no further tool calls";
 pub(crate) const PENDING_REVOCATIONS: &str = "access-revocations-pending.json";
 
-const LEGACY_CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
+pub(crate) const LEGACY_CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 const LEGACY_MODE_PATH: &str = crate::legacy_path!("qq-bridge/state/mode.json");
 const LEGACY_ROLE_STATE_FILE: &str = crate::legacy_path!("qq-bridge/state/current-role.json");
 const LEGACY_SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
@@ -313,7 +313,7 @@ pub(crate) fn legacy_write_error(error: crate::guarded_file::Failure) -> String 
 
 static LEGACY_JSON_WRITE_GATE: Mutex<()> = Mutex::new(());
 
-fn legacy_write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
+pub(crate) fn legacy_write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
     let _gate = LEGACY_JSON_WRITE_GATE
         .lock()
         .map_err(|_| "JSON write gate is poisoned".to_string())?;
@@ -322,7 +322,7 @@ fn legacy_write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
         .map_err(legacy_write_error)
 }
 
-fn config_write_error(context: &RuntimeContext, error: String) -> SocialError {
+pub(crate) fn config_write_error(context: &RuntimeContext, error: String) -> SocialError {
     if context.is_isolated() {
         SocialError::Unavailable("runtime config is unavailable".to_string())
     } else {
@@ -1278,73 +1278,6 @@ pub(crate) fn raw_config_object(context: &RuntimeContext) -> Result<Value, Socia
         ));
     }
     Ok(value)
-}
-
-pub(crate) fn write_selected_config_text_with(
-    context: &RuntimeContext,
-    text: &str,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<(), String> {
-    let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
-        .map_err(|_| "runtime config is invalid".to_string())?;
-    let kept = if context.is_isolated() {
-        let current = context
-            .read_optional_text(RuntimeArea::Config, "config.json")
-            .ok()
-            .flatten()
-            .and_then(|raw| {
-                serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok()
-            })
-            .unwrap_or(Value::Null);
-        crate::settings::keep_file_members(&current, &mut doc)
-            .map_err(crate::settings::direct_change_error)?
-    } else {
-        false
-    };
-    let mirrored = crate::settings::mirror_into(context, &mut doc)?;
-    let backup = doc.get("backup").is_some();
-    if backup {
-        doc["backup"] = crate::config::backup_config(&doc)?;
-    }
-    let normalized = if backup || mirrored || kept {
-        Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
-    } else {
-        None
-    };
-    let text = normalized.as_deref().unwrap_or(text);
-    let before = context
-        .read_optional_text(RuntimeArea::Config, "config.json")
-        .map(Option::unwrap_or_default)
-        .map_err(|e| format!("cannot read config.json before the write: {e}"));
-    context.write_atomic(RuntimeArea::Config, "config.json", text.as_bytes())?;
-    if let Some(callback) = on_publish {
-        callback(before, text);
-    }
-    Ok(())
-}
-
-pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), SocialError> {
-    import_engine_choices_with(context, None)
-}
-
-pub(crate) fn import_engine_choices_with(
-    context: &RuntimeContext,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<(), SocialError> {
-    if !crate::settings::has_legacy_engine_choices(context).map_err(SocialError::from_http)? {
-        return Ok(());
-    }
-    let _gate = acquire_config_gate(context)?;
-    if let Some(config) =
-        crate::settings::import_engine_choices(context).map_err(SocialError::from_http)?
-    {
-        write_selected_config_text_with(context, &config.to_string(), on_publish).map_err(|_| {
-            SocialError::Unavailable(
-                "conversation engine import could not update config.json".to_string(),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 // ── Wait policy & turn observation helpers ───────────────────────────────────────────────────────
@@ -2395,21 +2328,6 @@ pub(crate) fn reset_all_v2_with(
     Ok(json!({ "ok": true }))
 }
 
-pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), SocialError> {
-    if ConversationState::for_runtime(context)
-        .read_document()
-        .map_err(SocialError::from_http)?
-        .is_empty_conversations()
-    {
-        return context
-            .load_config_requiring_settings()
-            .map(drop)
-            .map_err(SocialError::Unavailable);
-    }
-    let _gate = acquire_config_gate(context)?;
-    reconcile_default_wake_configs(context, None)
-}
-
 pub(crate) fn reconcile_default_wake_configs(
     context: &RuntimeContext,
     before: Option<&Value>,
@@ -3024,121 +2942,6 @@ pub(crate) fn forget_access_change(
     write_pending_revocations(context, &pending)
 }
 
-pub(crate) fn config_snapshot(context: &RuntimeContext) -> Value {
-    raw_config_object(context).unwrap_or(Value::Null)
-}
-
-pub(crate) fn settle_failed_write(
-    context: &RuntimeContext,
-    unchanged: &Value,
-    pending: &Option<String>,
-) -> String {
-    if pending.is_none() {
-        return String::new();
-    }
-    let published = raw_config_object(context).map_or(true, |current| &current != unchanged);
-    if published {
-        return concat!(
-            "; the configuration may have been written, so its revocation stays pending ",
-            "and is finished at the next console start or access change"
-        )
-        .to_string();
-    }
-    match forget_access_change(context, pending) {
-        Ok(()) => String::new(),
-        Err(cleanup) => format!("; the recorded revocation stays pending: {cleanup}"),
-    }
-}
-
-fn write_config_object_with(
-    context: &RuntimeContext,
-    value: &Value,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<(), SocialError> {
-    if !context.is_isolated() {
-        return legacy_write_json_atomic(LEGACY_CONFIG_PATH, value)
-            .map_err(|e| config_write_error(context, e));
-    }
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| config_write_error(context, format!("序列化失败：{e}")))?;
-    write_selected_config_text_with(context, &text, on_publish)
-        .map_err(|e| config_write_error(context, e))
-}
-
-fn write_config_or_forget(
-    context: &RuntimeContext,
-    file: &Value,
-    unchanged: &Value,
-    pending: &Option<String>,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<(), SocialError> {
-    let Err(error) = write_config_object_with(context, file, on_publish) else {
-        return Ok(());
-    };
-    let status = error.http_status();
-    let msg = format!("{error}{}", settle_failed_write(context, unchanged, pending));
-    Err(SocialError::from_http((status, msg)))
-}
-
-pub(crate) fn store_access_changes(
-    context: &RuntimeContext,
-    changes: Vec<(&'static crate::settings::Setting, Value)>,
-    previewed: &[(&'static crate::settings::Setting, Option<Value>)],
-    pending: &Option<String>,
-    source: &str,
-) -> Result<Option<String>, SocialError> {
-    crate::settings::apply_changes(context, changes, "administrator", source).map_err(
-        |(status, error)| {
-            SocialError::from_http((
-                status,
-                format!(
-                    "{error}{}",
-                    settle_failed_store_write(context, previewed, pending)
-                ),
-            ))
-        },
-    )
-}
-
-fn settle_failed_store_write(
-    context: &RuntimeContext,
-    previewed: &[(&'static crate::settings::Setting, Option<Value>)],
-    pending: &Option<String>,
-) -> String {
-    if pending.is_none() {
-        return String::new();
-    }
-    if crate::settings::holds_any(context, previewed).unwrap_or(true) {
-        return concat!(
-            "; the change may have been stored, so its revocation stays pending ",
-            "and is finished at the next console start or access change"
-        )
-        .to_string();
-    }
-    match forget_access_change(context, pending) {
-        Ok(()) => String::new(),
-        Err(cleanup) => format!("; the recorded revocation stays pending: {cleanup}"),
-    }
-}
-
-pub(crate) fn keep_stored_members(
-    context: &RuntimeContext,
-    file: &mut Value,
-) -> Result<(), SocialError> {
-    let current = raw_config_object(context)?;
-    crate::settings::keep_registry_values(&current, file)
-        .map(|_| ())
-        .map_err(|key| {
-            SocialError::Storage(format!(
-                concat!(
-                    "config.json cannot hold {}: a member on its path is not an object; ",
-                    "stored settings stand"
-                ),
-                key
-            ))
-        })
-}
-
 pub(crate) fn finish_access_change(
     context: &RuntimeContext,
     interaction_gate: &std::fs::File,
@@ -3160,7 +2963,7 @@ pub(crate) fn finish_access_change(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_access_change_with(
+pub(crate) fn finish_access_change_with(
     context: &RuntimeContext,
     _interaction_gate: &std::fs::File,
     before: &Value,
@@ -3294,7 +3097,7 @@ pub(crate) fn finish_pending_before_change(
     )
 }
 
-fn finish_pending_before_change_with(
+pub(crate) fn finish_pending_before_change_with(
     context: &RuntimeContext,
     interaction_gate: &std::fs::File,
     tracker: &Arc<StopTracker>,
@@ -3335,488 +3138,7 @@ pub(crate) fn finish_pending_revocations_with(
         .map_err(SocialError::Unavailable)
 }
 
-pub(crate) fn access_setting_change(
-    context: &RuntimeContext,
-    authority: crate::persona::Authority<'_>,
-    change: &crate::settings::Change<'_>,
-    commit: impl FnOnce() -> Result<Value, SocialError>,
-) -> Result<Value, SocialError> {
-    let interaction = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
-    finish_pending_before_change(context, &interaction)?;
-    let (before, after, mut reply, pending) = {
-        let _gate = authority().map_err(SocialError::from_http)?;
-        let effective_before = context
-            .load_config()
-            .map_err(|e| SocialError::Unavailable(e.to_string()))?;
-        let raw = raw_config_object(context)?;
-        let previewed =
-            crate::settings::preview(context, change).map_err(SocialError::from_http)?;
-        let effective_after = context
-            .effective_config_with(&raw, &previewed)
-            .unwrap_or_else(|_| json!({}));
-        let pending =
-            begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-        let reply = commit().map_err(|error| {
-            let status = error.http_status();
-            let msg = format!(
-                "{error}{}",
-                settle_failed_store_write(context, &previewed, &pending)
-            );
-            SocialError::from_http((status, msg))
-        })?;
-        (effective_before, effective_after, reply, pending)
-    };
-    let (revoked, failures) = finish_access_change(
-        context,
-        &interaction,
-        &before,
-        &after,
-        "access-revoked",
-        pending,
-    );
-    drop(interaction);
-    if !failures.is_empty() {
-        return Err(SocialError::Storage(format!(
-            "the setting was saved, but the immediate revocation did not finish: {}",
-            failures.join("; ")
-        )));
-    }
-    reply["revoked"] = json!(revoked);
-    Ok(reply)
-}
-
-pub(crate) fn apply_whitelist(
-    context: &RuntimeContext,
-    body: &Value,
-    on_before_store: Option<&dyn Fn(&RuntimeContext)>,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<Value, SocialError> {
-    apply_whitelist_with(
-        context,
-        body,
-        on_before_store,
-        on_publish,
-        StopTracker::global(),
-        default_stopper(),
-    )
-}
-
-pub(crate) fn apply_whitelist_with(
-    context: &RuntimeContext,
-    body: &Value,
-    on_before_store: Option<&dyn Fn(&RuntimeContext)>,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-    tracker: &Arc<StopTracker>,
-    stopper: &Arc<dyn SessionStopper>,
-) -> Result<Value, SocialError> {
-    let confirm = crate::settings::confirm_field(body).map_err(SocialError::from_http)?;
-    let interaction = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
-    let mut repair = context.clone();
-    repair.console_authority = None;
-    finish_pending_before_change_with(&repair, &interaction, tracker, stopper)?;
-    let (before, after, file, pending) = {
-        let _gate = acquire_gate(context)?;
-        let effective_before = context
-            .load_config()
-            .map_err(|e| SocialError::Unavailable(e.to_string()))?;
-        let unchanged = raw_config_object(context)?;
-        let mut file = unchanged.clone();
-        crate::settings::mirror_into(context, &mut file).map_err(SocialError::Unavailable)?;
-        let before = file.clone();
-        let list = |root: &str, kind: &str| -> Value {
-            js_id_list(body.get(root).and_then(|v| v.get(kind))).unwrap_or_else(|| {
-                match before.get(root).and_then(|v| v.get(kind)) {
-                    None | Some(Value::Null) => json!([]),
-                    Some(value) => value.clone(),
-                }
-            })
-        };
-        let root_value = |root: &str| -> Value {
-            let named = ["private", "groups"]
-                .iter()
-                .any(|kind| js_id_list(body.get(root).and_then(|v| v.get(*kind))).is_some());
-            match before.get(root) {
-                Some(configured) if !named && !configured.is_null() => configured.clone(),
-                _ => json!({
-                    "private": list(root, "private"),
-                    "groups": list(root, "groups"),
-                }),
-            }
-        };
-        let allow = root_value("allow");
-        let deny = root_value("deny");
-        let object = file.as_object_mut().expect("config checked above");
-        object.insert("allow".into(), allow);
-        object.insert("deny".into(), deny);
-        if let Some(value) = body.get("ownerQQ") {
-            object.insert("ownerQQ".into(), normalize_owner(Some(value))?);
-        }
-        let mut changes = crate::settings::console_changes(context, &unchanged, &file)
-            .map_err(SocialError::from_http)?;
-        if context.is_isolated() && body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() {
-            let owner = crate::settings::find("ownerQQ").expect("the registry holds the owner");
-            if !owner
-                .read(&crate::settings::overlay(context, unchanged.clone()))
-                .is_null()
-            {
-                changes.push((owner, Value::Null));
-            }
-        }
-        let changed: Vec<&crate::settings::Setting> =
-            changes.iter().map(|(setting, _)| *setting).collect();
-        crate::settings::check_confirmation(confirm, &changed).map_err(SocialError::from_http)?;
-        let previewed: Vec<_> = changes
-            .iter()
-            .map(|(setting, value)| (*setting, Some(value.clone())))
-            .collect();
-        let effective_after = context
-            .effective_config_with(&file, &previewed)
-            .unwrap_or_else(|_| json!({}));
-        let stored = !changes.is_empty();
-        if stored {
-            raw_config_for_write(context)?;
-            if let Some(callback) = on_before_store {
-                callback(context);
-            }
-        }
-        let pending = begin_access_change(
-            context,
-            &effective_before,
-            &effective_after,
-            "access-revoked",
-        )?;
-        store_access_changes(context, changes, &previewed, &pending, "console")?;
-        keep_stored_members(context, &mut file)?;
-        write_config_or_forget(
-            context,
-            &file,
-            if stored { &Value::Null } else { &unchanged },
-            &pending,
-            on_publish,
-        )?;
-        let shown = context
-            .load_config_document()
-            .ok()
-            .filter(Value::is_object)
-            .unwrap_or(file);
-        (effective_before, effective_after, shown, pending)
-    };
-    let (retired, failures) = finish_access_change_with(
-        context,
-        &interaction,
-        &before,
-        &after,
-        "access-revoked",
-        pending,
-        tracker,
-        stopper,
-    );
-    drop(interaction);
-    if !failures.is_empty() {
-        return Err(SocialError::Storage(format!(
-            "白名单已保存，但立即撤销未完成：{}",
-            failures.join("；")
-        )));
-    }
-    let ids = |kind: &str| {
-        policy_list(&file, "allow", kind)
-            .unwrap_or_default()
-            .join(",")
-    };
-    let groups = ids("group");
-    let private = ids("private");
-    crate::safe_println!(
-        "[console] 控制台：白名单已更新（群: {}，私聊: {}，管理员: {}）{}",
-        if groups.is_empty() { "无" } else { &groups },
-        if private.is_empty() { "无" } else { &private },
-        if file["ownerQQ"].is_null() {
-            "未设置".to_string()
-        } else {
-            js_string(&file["ownerQQ"])
-        },
-        if retired.is_empty() {
-            String::new()
-        } else {
-            format!("；已立即撤销 {}", retired.join(","))
-        }
-    );
-    Ok(json!({
-        "ok": true,
-        "allow": file["allow"],
-        "deny": file["deny"],
-        "ownerQQ": file["ownerQQ"],
-    }))
-}
-
-pub(crate) fn apply_conversation_scope(
-    context: &RuntimeContext,
-    body: &Value,
-    on_before_store: Option<&dyn Fn(&RuntimeContext)>,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-) -> Result<Value, SocialError> {
-    apply_conversation_scope_with(
-        context,
-        body,
-        on_before_store,
-        on_publish,
-        StopTracker::global(),
-        default_stopper(),
-    )
-}
-
-pub(crate) fn apply_conversation_scope_with(
-    context: &RuntimeContext,
-    body: &Value,
-    on_before_store: Option<&dyn Fn(&RuntimeContext)>,
-    on_publish: Option<&dyn Fn(Result<String, String>, &str)>,
-    tracker: &Arc<StopTracker>,
-    stopper: &Arc<dyn SessionStopper>,
-) -> Result<Value, SocialError> {
-    let confirm = crate::settings::confirm_field(body).map_err(SocialError::from_http)?;
-    let key = canonical_key(&js_string_or(body.get("conversation"), "")).ok_or_else(|| {
-        SocialError::BadInput("conversation must be group:<id> or private:<id>".to_string())
-    })?;
-    let admit = match body.get("action").and_then(Value::as_str) {
-        Some("admit") => true,
-        Some("remove") => false,
-        _ => {
-            return Err(SocialError::BadInput(
-                "action must be admit or remove".to_string(),
-            ))
-        }
-    };
-    let (kind, id) = key.split_once(':').expect("canonical keys carry a colon");
-    let (field, alias) = if kind == "group" {
-        ("groups", "group")
-    } else {
-        ("private", "privates")
-    };
-    let listed_same = |value: &Value| {
-        normalized_id(value)
-            .and_then(|listed| canonical_key(&format!("{kind}:{listed}")))
-            .is_some_and(|listed| listed == key)
-    };
-    let served_same = |value: &Value| {
-        value
-            .as_str()
-            .and_then(canonical_key)
-            .is_some_and(|served| served == key)
-    };
-    let interaction = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
-    finish_pending_before_change_with(context, &interaction, tracker, stopper)?;
-    let (before, after, changed, pending, mirror_error) = {
-        let _gate = acquire_gate(context)?;
-        let effective_before = context
-            .load_config()
-            .map_err(|e| SocialError::Unavailable(e.to_string()))?;
-        let unchanged = raw_config_object(context)?;
-        let mut file = unchanged.clone();
-        crate::settings::mirror_into(context, &mut file).map_err(SocialError::Unavailable)?;
-        #[cfg(test)]
-        {
-            let hook = SCOPE_AFTER_READ
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            if let Some(hook) = hook {
-                hook(&key);
-            }
-        }
-        let Some(mut served) = file
-            .pointer("/rollout/rustGroups")
-            .and_then(Value::as_array)
-            .cloned()
-        else {
-            return Err(SocialError::Conflict(concat!(
-                "rollout.rustGroups is not configured: ",
-                "the supervisor serves only that explicit list"
-            )
-            .to_string()));
-        };
-        let deny_list = crate::settings::find(&format!("deny.{field}"))
-            .expect("the registry holds the deny lists");
-        let denied_ids = deny_list.read(&file);
-        let wanted = id.parse::<u64>().ok();
-        if admit
-            && denied_ids.as_array().is_some_and(|ids| {
-                ids.iter()
-                    .any(|denied| denied.as_u64().is_some_and(|denied| Some(denied) == wanted))
-            })
-        {
-            return Err(SocialError::Conflict(format!(
-                "{key} is in deny.{field}; remove it from the deny list first"
-            )));
-        }
-        let allow_list = crate::settings::find(&format!("allow.{field}"))
-            .expect("the registry holds the allow lists");
-        let mut listed = allow_list
-            .read(&file)
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let mut changed: Vec<String> = Vec::new();
-        if admit != listed.iter().any(&listed_same) {
-            listed.retain(|value| !listed_same(value));
-            if admit {
-                listed.push(json!(id.parse::<i64>().expect("canonical ids are safe integers")));
-            }
-            if !file["allow"].is_object() {
-                file["allow"] = json!({});
-            }
-            let allow = file["allow"].as_object_mut().expect("allow is an object");
-            allow.remove(alias);
-            allow.insert(field.to_string(), Value::Array(listed));
-            changed.push(format!("allow.{field}"));
-        }
-        if admit != served.iter().any(&served_same) {
-            served.retain(|value| !served_same(value));
-            if admit {
-                served.push(json!(key));
-            }
-            file["rollout"]["rustGroups"] = Value::Array(served);
-            changed.push("rollout.rustGroups".to_string());
-        }
-        if changed.is_empty() {
-            (effective_before.clone(), effective_before, changed, None, None)
-        } else {
-            let changes = crate::settings::console_changes(context, &unchanged, &file)
-                .map_err(SocialError::from_http)?;
-            let settings: Vec<&crate::settings::Setting> =
-                changes.iter().map(|(setting, _)| *setting).collect();
-            crate::settings::check_confirmation(confirm, &settings)
-                .map_err(SocialError::from_http)?;
-            let previewed: Vec<_> = changes
-                .iter()
-                .map(|(setting, value)| (*setting, Some(value.clone())))
-                .collect();
-            let effective_after = context
-                .effective_config_with(&file, &previewed)
-                .unwrap_or_else(|_| json!({}));
-            let stored = !changes.is_empty();
-            if stored {
-                raw_config_for_write(context)?;
-                if let Some(callback) = on_before_store {
-                    callback(context);
-                }
-            }
-            let pending = begin_access_change(
-                context,
-                &effective_before,
-                &effective_after,
-                "access-revoked",
-            )?;
-            let mirror_error =
-                store_access_changes(context, changes, &previewed, &pending, "console")?;
-            if mirror_error.is_none() {
-                keep_stored_members(context, &mut file)?;
-                write_config_or_forget(
-                    context,
-                    &file,
-                    if stored { &Value::Null } else { &unchanged },
-                    &pending,
-                    on_publish,
-                )?;
-            }
-            let effective_after = context.load_config().unwrap_or(effective_after);
-            (
-                effective_before,
-                effective_after,
-                changed,
-                pending,
-                mirror_error,
-            )
-        }
-    };
-    let (retired, failures) = if changed.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        finish_access_change_with(
-            context,
-            &interaction,
-            &before,
-            &after,
-            "access-revoked",
-            pending,
-            tracker,
-            stopper,
-        )
-    };
-    drop(interaction);
-    if !failures.is_empty() {
-        return Err(SocialError::Storage(format!(
-            "conversation scope saved, but the immediate revocation did not finish: {}",
-            failures.join("; ")
-        )));
-    }
-    let target: Vec<String> = after
-        .pointer("/rollout/rustGroups")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let restart = live_restart(context, &target);
-    let gaps = crate::watchdog::rollout_scope_gaps(&after);
-    let mut reply = json!({
-        "ok": true,
-        "conversation": key,
-        "action": if admit { "admit" } else { "remove" },
-        "changed": changed,
-        "revoked": retired,
-        "liveRestart": restart,
-        "scope": { "notAllowed": gaps.not_allowed, "notServed": gaps.not_served },
-    });
-    if let Some(error) = mirror_error {
-        reply["mirrorError"] = json!(error);
-    }
-    Ok(reply)
-}
-
-pub(crate) fn change_conversation_scope(
-    context: &RuntimeContext,
-    conversation: &str,
-    action: &str,
-) -> Result<Value, SocialError> {
-    change_conversation_scope_waiting_with(
-        context,
-        conversation,
-        action,
-        Duration::from_secs(10),
-        StopTracker::global(),
-        default_stopper(),
-    )
-}
-
-pub(crate) fn change_conversation_scope_waiting_with(
-    context: &RuntimeContext,
-    conversation: &str,
-    action: &str,
-    limit: Duration,
-    tracker: &Arc<StopTracker>,
-    stopper: &Arc<dyn SessionStopper>,
-) -> Result<Value, SocialError> {
-    let body = json!({
-        "conversation": conversation,
-        "action": action,
-        "confirm": true,
-    });
-    import_engine_choices(context)?;
-    let result = apply_conversation_scope_with(context, &body, None, None, tracker, stopper);
-    let stopped = tracker.wait(limit);
-    result.map(|mut reply| {
-        if !stopped {
-            reply["sessionStops"] =
-                json!("unfinished: check the retired sessions' tasks in DSH");
-        }
-        reply
-    })
-}
-
-fn live_restart(context: &RuntimeContext, target: &[String]) -> Value {
+pub(crate) fn live_restart(context: &RuntimeContext, target: &[String]) -> Value {
     let Ok(path) = context.resolve_path(
         RuntimeArea::Data,
         &format!("logs/{}", crate::lifecycle::OwnerRole::Live.lock_file()),
@@ -4145,7 +3467,7 @@ mod tests {
         let tracker = Arc::new(StopTracker::new());
         let stopper: Arc<FakeStopper> = FakeStopper::new(false);
         let stopper_dyn: Arc<dyn SessionStopper> = stopper.clone();
-        let reply = change_conversation_scope_waiting_with(
+        let reply = crate::config_tx::change_conversation_scope_waiting_with(
             &context,
             "group:42",
             "remove",
@@ -4185,7 +3507,7 @@ mod tests {
 
         // Guarded test stop timeout reports unfinished without blocking indefinitely.
         let guard = tracker.start_for_test();
-        let timeout_reply = change_conversation_scope_waiting_with(
+        let timeout_reply = crate::config_tx::change_conversation_scope_waiting_with(
             &context,
             "group:42",
             "admit",

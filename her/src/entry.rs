@@ -17,6 +17,7 @@ mod model_text_policy;
 mod model_failure;
 mod mcp_validate;
 mod memory;
+mod config_tx;
 mod social_state;
 mod conversation_state;
 mod memory_actions;

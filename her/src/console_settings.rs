@@ -23,20 +23,27 @@ pub fn is_route(path: &str) -> bool {
 /// it commits and its write-back into `config.json` is done (the store gate is taken inside it,
 /// `settings::store::write_store`).
 pub fn route(
-    caller: AdminCaller<'_>, method: &str, path: &str, query: &HashMap<String, String>, body: &str,
-) -> (u16, &'static str, String) {
+    caller: AdminCaller<'_>,
+    method: &str,
+    path: &str,
+    query: &HashMap<String, String>,
+    body: &str,
+) -> (u16, &'static str, String, Option<crate::config_tx::ConfigDiff>) {
     let context = caller.context();
     // The model route list only reads state, even if startup left a legacy engine map.
-    if (method, path) != ("GET", "/api/settings/models") {
-        if let Err((status, error)) = crate::social_state::import_engine_choices_with(
-            context,
-            Some(&crate::console::record_config_publication),
-        )
-        .map_err(crate::social_state::SocialError::into_http)
+    let import_diff = if (method, path) != ("GET", "/api/settings/models") {
+        match crate::config_tx::import_engine_choices(context)
+            .map_err(crate::social_state::SocialError::into_http)
         {
-            return failure(status, &error);
+            Ok(diff) => diff,
+            Err((status, error)) => {
+                let (status, ctype, body) = failure(status, &error);
+                return (status, ctype, body, None);
+            }
         }
-    }
+    } else {
+        None
+    };
     let result = match (method, path) {
         ("GET", "/api/settings") => crate::settings::view(context),
         ("GET", "/api/settings/conversations") => conversation::list(context),
@@ -52,15 +59,10 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
-            if let Some(setting) = value["setting"].as_str().filter(|_| value["changed"] != false) {
-                if crate::settings::wake_timing::refreshes_default_plan(setting)
-                    && crate::social_state::refresh_default_wake_configs(context).is_err()
-                {
-                    value["wakeRefreshError"] = json!("Settings saved. The default wake plans could not be refreshed.");
-                }
-            }
             match (method, path) {
-                ("GET", "/api/settings" | "/api/settings/history") => models::redact_route_settings(context, &mut value),
+                ("GET", "/api/settings" | "/api/settings/history") => {
+                    models::redact_route_settings(context, &mut value);
+                }
                 ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
                     if value["setting"] == crate::settings::HARNESS_ROUTES.key =>
                 {
@@ -68,9 +70,12 @@ pub fn route(
                 }
                 _ => {}
             }
-            (200, JSON_TYPE, value.to_string())
+            (200, JSON_TYPE, value.to_string(), import_diff)
         }
-        Err((status, message)) => failure(status, &message),
+        Err((status, message)) => {
+            let (status, ctype, body) = failure(status, &message);
+            (status, ctype, body, import_diff)
+        }
     }
 }
 
@@ -132,18 +137,16 @@ thread_local! {
     pub(crate) static AFTER_UNDO_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
-/// access setting revokes like a whitelist write (`social_state::access_setting_change`).
+/// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting.
+/// A change of an access setting revokes like a whitelist write
+/// (`config_tx::commit_access_setting_change`).
 fn access_change(
     context: &RuntimeContext,
     authority: crate::persona::Authority<'_>,
     change: &crate::settings::Change<'_>,
     commit: impl FnOnce() -> Result<Value, (u16, String)>,
 ) -> Result<Value, (u16, String)> {
-    crate::social_state::access_setting_change(context, authority, change, || {
-        commit().map_err(crate::social_state::SocialError::from_http)
-    })
-    .map_err(crate::social_state::SocialError::into_http)
+    crate::config_tx::commit_access_setting_change(context, authority, change, commit)
 }
 
 fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
@@ -162,8 +165,9 @@ fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
         return caller
             .with_authority(|authority| access_change(context, authority, &change, commit));
     }
-    let _gate = caller.gate()?;
-    commit()
+    caller.with_authority(|authority| {
+        crate::config_tx::commit_setting_write(context, authority, commit)
+    })
 }
 
 /// `{"setting": <registry key>}`, plus `"confirm": true` for a security setting: stores the setting's default.
@@ -182,8 +186,9 @@ fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
         return caller
             .with_authority(|authority| access_change(context, authority, &change, commit));
     }
-    let _gate = caller.gate()?;
-    commit()
+    caller.with_authority(|authority| {
+        crate::config_tx::commit_setting_write(context, authority, commit)
+    })
 }
 
 /// `{"entry": <history entry id>}`, plus `"confirm": true` when the entry's setting is a security setting; the reply
@@ -239,8 +244,9 @@ fn undo(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
             access_change(context, authority, &crate::settings::Change::Undo { entry }, commit)
         });
     }
-    let _gate = caller.gate()?;
-    commit()
+    caller.with_authority(|authority| {
+        crate::config_tx::commit_setting_write(context, authority, commit)
+    })
 }
 
 /// `?setting=<key>&conversation=<conversation key>&before=<entry id>`, all optional (#218: a conversation key is

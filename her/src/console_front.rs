@@ -335,7 +335,7 @@ impl<'a> AdminCaller<'a> {
     }
 
     pub(crate) fn gate(&self) -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
-        crate::conversation_state::acquire_config_gate(self.context)
+        crate::config_tx::acquire_config_gate(self.context)
     }
 
     pub(crate) fn with_authority<T>(
@@ -353,9 +353,13 @@ pub(crate) struct VerifiedCaller {
     pub(crate) kind: CallerKind,
     pub(crate) memory: crate::memory_actions::ConsoleCapability,
     pub(crate) browser_acl: Option<crate::memory_actions::BrowserAcl>,
+    pub(crate) config_diff: Option<crate::config_tx::ConfigDiff>,
 }
 
 impl VerifiedCaller {
+    pub(crate) fn record_config_diff(&mut self, diff: Option<crate::config_tx::ConfigDiff>) {
+        self.config_diff = crate::config_tx::merge_diffs(self.config_diff.take(), diff);
+    }
     pub(crate) fn is_admitted(&self) -> bool {
         matches!(
             self.kind,
@@ -982,8 +986,7 @@ pub(crate) fn handle_http_request(
     } else {
         Vec::new()
     };
-    take_config_writes();
-    let (audit_context, status, ctype, mut body, auth_cookies, renewal) =
+    let (audit_context, status, ctype, mut body, auth_cookies, renewal, config_diff) =
         if let Some(mut admission) = admission {
             if let Some(auth_response) = handle_auth_route(req, &admitted_context, port, &admission)
             {
@@ -995,6 +998,7 @@ pub(crate) fn handle_http_request(
                     auth_response.body,
                     auth_response.cookies,
                     renewal,
+                    None,
                 )
             } else {
                 let renewal = admission.renewal.take();
@@ -1004,9 +1008,19 @@ pub(crate) fn handle_http_request(
                     kind,
                     memory: admission.memory,
                     browser_acl: admission.browser_acl,
+                    config_diff: None,
                 };
                 let (status, ctype, body) = route_with_caller(&mut caller, req);
-                (caller.context, status, ctype, body, Vec::new(), renewal)
+                let config_diff = caller.config_diff.take();
+                (
+                    caller.context,
+                    status,
+                    ctype,
+                    body,
+                    Vec::new(),
+                    renewal,
+                    config_diff,
+                )
             }
         } else {
             let mut caller = VerifiedCaller {
@@ -1015,11 +1029,12 @@ pub(crate) fn handle_http_request(
                 kind,
                 memory: crate::memory_actions::ConsoleCapability::Conversation,
                 browser_acl: None,
+                config_diff: None,
             };
             let (status, ctype, body) = route_with_caller(&mut caller, req);
-            (caller.context, status, ctype, body, Vec::new(), None)
+            let config_diff = caller.config_diff.take();
+            (caller.context, status, ctype, body, Vec::new(), None, config_diff)
         };
-    let config_writes = take_config_writes();
     let record_admin = audit && administrator;
     if audit && ((200..300).contains(&status) || record_admin) {
         if let Err(error) = audit_write(
@@ -1029,7 +1044,7 @@ pub(crate) fn handle_http_request(
             &body,
             record_admin,
             &before,
-            config_writes,
+            config_diff,
         ) {
             crate::safe_println!(
                 "[console] ⚠️ 审计记录写入失败（{} {}，状态 {status}）：{error}",
@@ -1613,7 +1628,7 @@ mod tests {
         let caller = AdminCaller::new(&revoked);
         assert_eq!(caller.gate().unwrap_err().0, 401);
 
-        let (s_set, _, b_set) = crate::console_settings::route(
+        let (s_set, _, b_set, _) = crate::console_settings::route(
             caller,
             "POST",
             "/api/settings/set",
