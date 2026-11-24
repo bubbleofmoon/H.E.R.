@@ -121,6 +121,8 @@ impl Fixture {
             "watchdog",
             "start-all",
             "backup",
+            "memory-backup",
+            "memory-restore-test",
             "memory-digest",
             "memory-digest-check",
             "upstream-check",

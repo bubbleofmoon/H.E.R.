@@ -524,6 +524,8 @@ impl Rig {
             "memory-digest",
             "memory-digest-check",
             "backup",
+            "memory-backup",
+            "memory-restore-test",
             "upstream-check",
         ] {
             tasks[task] = json!({"enabled":false});

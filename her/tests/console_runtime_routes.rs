@@ -284,7 +284,16 @@ fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() 
     assert!(installed.status.success(), "install matching fixture task: {installed:?}");
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
-    for task in ["watchdog","memory-digest","memory-digest-check","upstream-check","console-restart","backup"] {
+    for task in [
+        "watchdog",
+        "memory-digest",
+        "memory-digest-check",
+        "upstream-check",
+        "console-restart",
+        "backup",
+        "memory-backup",
+        "memory-restore-test",
+    ] {
         config["tasks"][task] = json!({"enabled":false});
     }
     fs::write(config_file,config.to_string()).unwrap();
@@ -1786,7 +1795,15 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
     let slot = (now_ms() + 20_000).div_euclid(60_000) * 60_000 + 60_000;
     let minute = slot.div_euclid(60_000).rem_euclid(1440);
     config["backup"] = json!({"time":format!("{:02}:{:02}", minute / 60, minute % 60)});
-    for task in ["watchdog", "memory-digest", "memory-digest-check", "upstream-check", "console-restart"] {
+    for task in [
+        "watchdog",
+        "memory-digest",
+        "memory-digest-check",
+        "upstream-check",
+        "console-restart",
+        "memory-backup",
+        "memory-restore-test",
+    ] {
         config["tasks"][task] = json!({"enabled":false});
     }
     config["tasks"]["backup"] = json!({"enabled":true});
@@ -2015,6 +2032,34 @@ fn schedule_list(port: u16, token: &str) -> Value {
 
 fn schedule_entry(list: &Value, id: &str) -> Option<Value> {
     list["entries"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned()
+}
+
+#[test]
+fn schedule_page_lists_nightly_backup_and_monthly_restore_drill() {
+    let workspace = FixtureWorkspace::new("memory-backup-schedule");
+    let root = workspace.root("runtime");
+    let token = "fixture-schedule-console-token-abcdefghij";
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-schedule-agent-token-abcdefghij",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let (port, _) = reserve_distinct_ports();
+    let _console = ConsoleProcess::start(&root, port, &legacy);
+
+    let list = schedule_list(port, token);
+    for (id, repeat) in [
+        ("system:memory-backup", "每天 04:00"),
+        ("system:memory-restore-test", "每月 1 日 05:30"),
+    ] {
+        let entry = schedule_entry(&list, id).expect("memory recovery job is missing from Schedule");
+        assert_eq!(entry["repeat"], repeat);
+        assert!(entry["nextRunAt"].is_i64());
+    }
 }
 
 #[test]

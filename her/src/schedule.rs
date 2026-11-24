@@ -38,7 +38,14 @@ pub(crate) const MIN_REPEAT_MINUTES: u32 = 15;
 pub const REMINDER_GONE: &str = "【提醒内容】这条提醒已被取消或删除。\n\n";
 /// Set once an unreadable store has been logged; cleared by the next good read, so a new failure logs again.
 static PAUSE_READ_FAILURE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub const PAUSABLE_JOBS: &[&str] = &["memory-digest", "memory-digest-check", "backup", "upstream-check"];
+pub const PAUSABLE_JOBS: &[&str] = &[
+    "memory-digest",
+    "memory-digest-check",
+    "backup",
+    "memory-backup",
+    "memory-restore-test",
+    "upstream-check",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
