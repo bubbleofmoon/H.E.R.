@@ -186,6 +186,7 @@ fn journal_line(raw: &str, owner: &str, seq: i64, view: &Value) -> Option<String
     if event["post_type"] != "message" {
         return None; // includes `message_sent` echoes of HER's own notices
     }
+    // Malformed OneBot data (missing/invalid/<=0 `user_id`): drop like the bridge's deserializer.
     let user = crate::protocol_integer(&event["user_id"]).filter(|id| *id > 0)?;
     let self_id = crate::protocol_integer(&event["self_id"]).unwrap_or(0);
     let sender_id = crate::protocol_integer(&event["sender"]["user_id"]);
