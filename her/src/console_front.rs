@@ -78,10 +78,9 @@ impl RoutePolicy {
     }
 
     const fn auth(method: &str, session_cookie: SessionCookiePolicy) -> Self {
-        let body_limit = if matches!(method, "POST") {
-            BodyLimit::Max1Mb
-        } else {
-            BodyLimit::None
+        let body_limit = match method.as_bytes() {
+            [b'P', b'O', b'S', b'T'] => BodyLimit::Max1Mb,
+            _ => BodyLimit::None,
         };
         Self {
             body_limit,

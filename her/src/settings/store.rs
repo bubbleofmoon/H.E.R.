@@ -457,10 +457,10 @@ pub(crate) fn inspect_store(context: &RuntimeContext) -> Result<StoreInspection,
 /// that never checkpoints on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt
 /// meanwhile.
 fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
-    inspect_store(context, true)
+    inspect_once(context, true)
 }
 
-fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, String> {
+fn inspect_once(context: &RuntimeContext, again: bool) -> Result<Inspection, String> {
     let resolve = |name: &str| {
         context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR.to_string())
     };
@@ -493,7 +493,11 @@ fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, St
         let settled = std::time::Instant::now() + SIDECAR_SETTLE;
         while file_len(&shm)?.is_none() {
             if file_len(&wal)?.is_none() {
-                return if again { inspect_store(context, false) } else { Err(STORAGE_ERROR.to_string()) };
+                return if again {
+                    inspect_once(context, false)
+                } else {
+                    Err(STORAGE_ERROR.to_string())
+                };
             }
             if std::time::Instant::now() >= settled {
                 return Err(STORAGE_ERROR.to_string());
