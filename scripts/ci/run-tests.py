@@ -64,8 +64,12 @@ if os.name == 'nt':
 env.setdefault('CARGO_TARGET_DIR', str(root.parent / 'her-ci-target'))
 env.setdefault('HER_INSTALL_ROOT', str(ev / 'unused-install-root'))
 env.setdefault('HER_TASK_SCHEDULER_FILE', str(ev / 'task-scheduler.xml'))
-commands = [('build', 'build --locked --features parity-clock --bins'), ('unit', 'test --locked --features parity-clock --bin her -- --test-threads=1')]
-commands.append(('memory_library', 'test --locked --lib --bins -- --test-threads=1'))
+commands = [
+    ('build', 'build --locked --features parity-clock --bins'),
+    ('unit', 'test --locked --features parity-clock --bin her -- --test-threads=1'),
+    ('herupdate', 'test --locked --features parity-clock --bin herupdate -- --test-threads=1'),
+    ('memory_library', 'test --locked --lib --bins -- --test-threads=1'),
+]
 for path in sorted((root / 'her/tests').glob('*.rs')):
     # Cargo skips a test target whose required-features are absent, and a skip is not a pass:
     # release_install needs both features so the signed fake update feed compiles and runs.

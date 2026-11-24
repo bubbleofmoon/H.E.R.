@@ -501,13 +501,14 @@ pub fn status(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     let settings = settings(cfg)?;
     let state = read_state(context)?;
     let current = current(&InstallRoot::configured()?);
-    let available = state.available.filter(|release| {
-        settings["policy"] != "off"
-            && state.feed_url == settings["feedUrl"].as_str().unwrap()
-            && newer(release, current.as_deref())
-    });
+    let active_feed = settings["policy"] != "off"
+        && state.feed_url == settings["feedUrl"].as_str().unwrap();
+    let available = state
+        .available
+        .filter(|release| active_feed && newer(release, current.as_deref()));
+    let error = state.error.filter(|_| active_feed);
     Ok(
-        json!({"ok":true,"settings":settings,"current":current,"available":available,"lastCheckedAt":state.last_checked_at,"error":state.error,"approval":state.approval,"updateError":state.update_error}),
+        json!({"ok":true,"settings":settings,"current":current,"available":available,"lastCheckedAt":state.last_checked_at,"error":error,"approval":state.approval,"updateError":state.update_error}),
     )
 }
 
@@ -869,7 +870,7 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         let root = approval_installation(context)?;
         let path = root.root().join("releases").join(&approval.release.tag);
         if fs::symlink_metadata(&path).is_ok() {
-            crate::update::verify(&root, &approval.release.tag)?;
+            crate::update::verify_staged(&root, &approval.release.tag, update_gate.as_ref())?;
         } else if let Some(gate) = update_gate.as_ref() {
             install_with_gate(context, &root, &approval.release, &mut lost_alerted, gate)?;
         } else {

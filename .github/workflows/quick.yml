@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'run-tests.py target name(s), comma-separated (unit, memory_library, an her/tests stem, scripts), or alone: lint, check, console_ui'
+        description: 'run-tests.py target name(s), comma-separated (unit, herupdate, memory_library, an her/tests stem, scripts), or alone: lint, check, console_ui'
         required: true
       filter:
         description: 'optional libtest name filter'
