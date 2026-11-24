@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { startFakeWorld, writeCredentials, secretsInText, redactedLogHasNoSecrets, groupLeaks } from './fake-world.mjs';
@@ -104,12 +105,34 @@ function scenarioFor(extra = {}) {
   };
 }
 
-async function waitHttp(port, timeoutMs = 30_000) {
+function loopbackRequest(port, route, { method = 'GET', headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const failed = error => reject(signal?.aborted ? signal.reason : new TypeError('console HTTP request failed', { cause: error }));
+    const request = http.request({
+      host: '127.0.0.1', port, path: route, method,
+      headers: body === undefined ? headers : { ...headers, 'content-length': Buffer.byteLength(body) },
+      signal,
+    }, response => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { text += chunk; });
+      response.once('error', failed);
+      response.once('close', () => {
+        if (!response.complete) failed(new Error('incomplete console HTTP response'));
+      });
+      response.once('end', () => resolve({ status: response.statusCode, text: () => text, json: () => JSON.parse(text) }));
+    });
+    request.once('error', failed);
+    request.end(body);
+  });
+}
+
+export async function waitHttp(port, timeoutMs = 30_000) {
   const deadline = performance.now() + timeoutMs;
   let last;
   while (performance.now() < deadline) {
     try {
-      const request = route => fetch(`http://127.0.0.1:${port}${route}`, { headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))) });
+      const request = route => loopbackRequest(port, route, { headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))) });
       let r = await request('/api/health');
       if (r.status !== 200) r = await request('/api/roles');
       last = {status: r.status};
@@ -139,7 +162,7 @@ export async function waitPromptIdentity(port, child, expected, timeoutMs = 10_0
   while (performance.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`bridge exited before login identity (${child.exitCode})`);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/socialV2/prompt?key=${GROUP_KEY}`, {
+      const response = await loopbackRequest(port, `/api/socialV2/prompt?key=${GROUP_KEY}`, {
         headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))),
       });
       if (response.status !== 200) throw new Error(`prompt readiness returned HTTP ${response.status}`);
@@ -246,7 +269,7 @@ export async function httpCall(side, step) {
   let body;
   if (step.rawBody !== undefined) { body = step.rawBody; headers['content-type'] = step.contentType ?? 'application/json'; }
   else if (step.body !== undefined) { body = JSON.stringify(step.body); headers['content-type'] = step.contentType ?? 'application/json'; }
-  const res = await fetch(`http://127.0.0.1:${side.port}${step.path}`, { method: step.method ?? 'GET', headers, body, signal: AbortSignal.timeout(step.timeoutMs ?? 30_000) });
+  const res = await loopbackRequest(side.port, step.path, { method: step.method ?? 'GET', headers, body, signal: AbortSignal.timeout(step.timeoutMs ?? 30_000) });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { json = null; }

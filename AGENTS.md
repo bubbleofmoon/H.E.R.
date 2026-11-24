@@ -2,7 +2,7 @@
 
 QQ bot bridge in Rust (`her/`, `her-memory/`) (ADR 0004). Terms: `GLOSSARY.md`. Specs and validation evidence live in the vault (`docs/agents/issue-tracker.md`).
 
-Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH support stays until #78 retires it, and memory data and `her-memory/` are protected (`docs/adr/0001-cleanup-retention.md`).
+Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH support stays until #78 retires it, and memory data is protected (`docs/adr/0001-cleanup-retention.md`).
 
 ## Public and vault
 
@@ -22,30 +22,31 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - Start every background process hidden and keep consoles closed; open a window only for an app the owner asked to open.
 - Write agent-facing docs (AGENTS.md, `docs/agents/`) in English.
 
-## Subagent workflow
+## Agent workflow
 
-- Coordinator rules (sizing, the planner, review routing, the merge flow and the Windows coordinator's duties) are in `docs/agents/coordinator.md`; coordinator sessions and planners read it.
-- Hard limits: workers commit to and push only their own ticket branch (`her/<n>-<slug>`, never `main`, never force) and only quota-fallback Claude implementers may dispatch unpinned quick batches and read their run IDs once; they never open, merge or edit pull requests, rerun or cancel CI, post to GitHub, hand off or touch build slot locks by hand. Planners write only their plan file and scratch export and never build or run code; reviewers and planners run git only as plain read commands; reviews never write; gates never change product code or tests. Only the coordinator starts Codex. Codex implement runs are unsandboxed like Claude workers and use the wrapper's pre-run refusals and post-run checks. They commit and push only their own ticket branch and report pending CI targets. The coordinator dispatches and waits. Codex workers never open or merge pull requests, post to GitHub or dispatch CI (`docs/agents/coordinator.md` "Codex runs"). `.claude/hooks/agent-guard.sh` stops plain attempts but is not a sandbox (python is unrestricted), so these limits hold whether or not a call is blocked.
-- Never poll GitHub. Only coordinators wait for CI, through `scripts/ci-wait.py` (see `docs/agents/implementer-protocol.md` "Test loop" and `docs/agents/coordinator.md` "GitHub API budget").
+- Coordinator rules (model routing, two-axis review, merge flow and GitHub API budget) are in `docs/agents/coordinator.md`.
+- Ticket work runs on `her/<n>-<slug>` branches cut from `origin/main` in `C:/her-wt/<ticket>` (never push directly to `main`, never force-push). Merge only through pull requests gated by hosted `checks.yml`.
+- Never poll GitHub. Wait for CI only through `scripts/ci-wait.py` (`docs/agents/coordinator.md` "GitHub API budget").
 - No host needs a local Rust build. Hosted CI compiles, lints, formats and tests Rust. Native checks a gate names follow `docs/agents/rust-validation.md`. Apply only ticket-authorized `fmt-patch` hunks for owned files and follow that doc for partial Clippy patches and CI proof. Local rustfmt and editor tooling are optional.
 - A case called "bounded" or "unlikely" is a finding: fix it or name a follow-up.
-- Stop only processes you started, by recorded PID and creation time, never by name or pattern. Never edit a script a run may be using: write a temporary file beside it and `mv` it into place.
-- Ticket material for a run (prompts, plans, reports, receipts, evidence, carry patches, `PROGRESS.md`) lives under `/root/orch/her/<ticket>/` on Linux and `C:/her-orch/<ticket>/` on Windows, never in the checkout. Workers keep `PROGRESS.md` current so a cut-off run resumes from it.
+- Stop only processes you started, by recorded PID and creation time, never by name or pattern. Never edit a script a run may be using: write a temporary file beside it and move it into place.
+- Ticket run material (prompts, plans, reports, receipts, evidence, `PROGRESS.md`) lives under `C:/her-orch/<ticket>/`, never in the checkout.
 
 ## Agent skills
 
-- Issues: GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (issue `#N` = ticket `N`, labels `windows`/`linux`), see `docs/agents/issue-tracker.md`; who acts next: `docs/agents/baton.md` (a fresh session reads it first). GitHub owns ticket state and blockers.
+- Issues: GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (issue `#N` = ticket `N`), see `docs/agents/issue-tracker.md` and `docs/agents/baton.md`. GitHub owns ticket state and blockers.
 - Domain docs: single-context, `GLOSSARY.md` + `docs/adr/`, see `docs/agents/domain.md`.
 
 ## Child DOX Index
 
 - `her/AGENTS.md`: Crate layout and pointers to the bridge contracts.
+- `her-ui/AGENTS.md`: Embedded console UI contracts and layout.
 - `docs/adr/0001-cleanup-retention.md`: Repository retention.
 - `docs/adr/0002-public-repo-polyform-noncommercial.md`: Public development repo, vault and license.
-- `docs/agents/baton.md`: Who acts next (baton labels, handoff comments); a fresh session starts here.
-- `docs/agents/coordinator.md`: Coordinator workflow.
+- `docs/agents/baton.md`: Single-coordinator operation, owner batons and shared ground rules.
+- `docs/agents/coordinator.md`: Coordinator workflow, model selection and GitHub API budget.
 - `docs/agents/issue-tracker.md`: GitHub Issues, claims, the scanned-text rule (published text versus numeric relation and state operations), wayfinding operations and ready queries.
-- `docs/agents/implementer-protocol.md`: Worker context, evidence and reports.
+- `docs/agents/implementer-protocol.md`: Subagent worker context, evidence and reports.
 - `docs/agents/windows-lifecycle.md`: Windows launchers and scheduler fixtures.
 - `docs/agents/rust-validation.md`: Build slots and validation evidence.
 - `docs/agents/production-ops.md`: Public production rules; procedures live in the vault.

@@ -109,7 +109,29 @@ pub(crate) const OUTBOUND_GUARD: Setting = Setting {
     secret: false,
 };
 
+/// When true, local loopback browsers must sign in with the administrator password instead of
+/// automatic same-user peer sign-in (#303).
+pub(crate) const REQUIRE_PASSWORD_LOCALLY: Setting = Setting {
+    key: "security.requirePasswordLocally",
+    pointer: "/security/requirePasswordLocally",
+    kind: &Switch::new(false),
+    applies: "live",
+    group: SECURITY_GROUP,
+    label: "Require password on this machine",
+    hint: "Require the administrator password even for browsers running as the installing user on this machine. Needs confirmation.",
+    chat: false,
+    secret: false,
+};
+
 /// The group's settings, in registry order.
 pub(super) const SETTINGS: &[Setting] = &[
-    ALLOW_PRIVATE, ALLOW_GROUPS, DENY_PRIVATE, DENY_GROUPS, OWNER, INTERCEPT_NOTIFY, OUTBOUND_GUARD, ROLLOUT_GROUPS,
+    ALLOW_PRIVATE,
+    ALLOW_GROUPS,
+    DENY_PRIVATE,
+    DENY_GROUPS,
+    OWNER,
+    INTERCEPT_NOTIFY,
+    OUTBOUND_GUARD,
+    REQUIRE_PASSWORD_LOCALLY,
+    ROLLOUT_GROUPS,
 ];

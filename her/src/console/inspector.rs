@@ -1,5 +1,5 @@
 //! Read-only console view over the turn ledger and committed harness events.
-use super::{authorized_in, json_result, Request};
+use super::{front::AdminCaller, json_result, Request};
 use crate::harness::store::inspect_events;
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::turn_ledger::{self, Turn};
@@ -37,16 +37,8 @@ pub(crate) fn is_route(path: &str) -> bool {
     matches!(path, PAGE_PATH | CONVERSATIONS | TURN)
 }
 
-pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u16, String, String) {
-    if !authorized_in(context, req, cfg) {
-        return json_result(Err((401, "console authorization required".into())));
-    }
-    if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-        return json_result(Err((
-            403,
-            "the session inspector is restricted to administrators".into(),
-        )));
-    }
+pub(super) fn route(caller: AdminCaller<'_>, cfg: &Value, req: &Request) -> (u16, String, String) {
+    let context = caller.context();
     if req.method != "GET" {
         return json_result(Err((405, "method not allowed".into())));
     }
@@ -236,14 +228,6 @@ fn timeline(context: &RuntimeContext, cfg: &Value, req: &Request) -> Result<Valu
         "live": turn.state.is_open(),
     }))
 }
-
-pub(super) const LINK: &str = r#"<nav aria-label="HER"><a id="her-inspector-link" href="/inspector">会话检查器</a></nav>
-<script>
-(() => {
-  const token = new URLSearchParams(location.search).get('token') || sessionStorage.getItem('consoleToken');
-  if (token) document.getElementById('her-inspector-link').href = '/inspector?' + new URLSearchParams({token});
-})();
-</script>"#;
 
 #[cfg(test)]
 #[path = "inspector_tests.rs"]

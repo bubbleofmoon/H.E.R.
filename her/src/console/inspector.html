@@ -31,7 +31,7 @@
 (() => {
   const byId = id => document.getElementById(id);
   const query = new URLSearchParams(location.search);
-  const token = query.get('token') || sessionStorage.getItem('consoleToken') || '';
+  const token = query.get('token') || sessionStorage.getItem('consoleToken') || localStorage.getItem('consoleToken') || '';
   const status = byId('status');
   const rows = byId('rows');
   const started = new Map();
@@ -51,8 +51,9 @@
   }
 
   async function read(path, values) {
+    const headers = token ? {'x-console-token': token} : {};
     const response = await fetch(path + '?' + new URLSearchParams(values), {
-      headers: {'x-console-token': token},
+      headers,
       cache: 'no-store'
     });
     const body = await response.json();

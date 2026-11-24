@@ -1286,7 +1286,7 @@ impl CliOutputFiles {
             if checked != path {
                 return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
             }
-            crate::guarded_credentials::create_credential(path)
+            crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
                 .map(Stdio::from)
                 .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
         } else {
@@ -1648,23 +1648,10 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     if key.trim().is_empty() {
         return Vec::new();
     }
-    let text = if context.is_isolated() {
-        context.read_text(RuntimeArea::Data, "social-v2.json").ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json")).ok()
+    let Ok(Some(conv)) = crate::conversation_state::ConversationState::for_runtime(context).read(key) else {
+        return Vec::new();
     };
-    let Some(text) = text else { return Vec::new() };
-    let v: Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let token = v
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|s| s.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .trim();
+    let token = conv.token().unwrap_or("").trim();
     if token.is_empty() {
         return Vec::new();
     }

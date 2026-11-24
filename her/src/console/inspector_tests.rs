@@ -398,11 +398,11 @@ fn inspector_get_rejects_foreign_host_and_origin() {
             body: String::new(),
             body_too_large: false,
         };
-        assert_eq!(serve_request(&req, &cfg, &context, 3999).0, 200, "{path}");
+        assert_eq!(serve_request(&req, &cfg, &context, 3999).status, 200, "{path}");
         req.headers
             .insert("host".into(), "foreign.invalid:3999".into());
         assert_eq!(
-            serve_request(&req, &cfg, &context, 3999).0,
+            serve_request(&req, &cfg, &context, 3999).status,
             403,
             "{path} Host"
         );
@@ -410,9 +410,23 @@ fn inspector_get_rejects_foreign_host_and_origin() {
         req.headers
             .insert("origin".into(), "http://foreign.invalid:3999".into());
         assert_eq!(
-            serve_request(&req, &cfg, &context, 3999).0,
+            serve_request(&req, &cfg, &context, 3999).status,
             403,
             "{path} Origin"
+        );
+        req.headers.insert("origin".into(), String::new());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, 3999).status,
+            403,
+            "{path} empty Origin"
+        );
+        req.headers.remove("x-console-token");
+        req.headers
+            .insert("origin".into(), "http://foreign.invalid:3999".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, 3999).status,
+            403,
+            "{path} unauthenticated foreign Origin"
         );
     }
 }
@@ -448,17 +462,94 @@ fn inspector_refuses_mutation_and_agent_headers() {
         body: String::new(),
         body_too_large: false,
     };
-    assert_eq!(serve_request(&req, &cfg, &context, 3999).0, 401);
+    assert_eq!(serve_request(&req, &cfg, &context, 3999).status, 401);
     req.headers
         .insert("x-console-token".into(), "fixture-console".into());
-    let (status, content_type, html) = serve_request(&req, &cfg, &context, 3999);
-    assert_eq!(status, 200);
-    assert_eq!(content_type, "text/html; charset=utf-8");
-    assert!(html.contains(TURN));
+    let resp = serve_request(&req, &cfg, &context, 3999);
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.content_type, "text/html; charset=utf-8");
+    assert!(resp.body.contains(TURN));
     req.headers
         .insert("x-agent-call".into(), "fixture-agent".into());
-    assert_eq!(serve_request(&req, &cfg, &context, 3999).0, 403);
+    assert_eq!(serve_request(&req, &cfg, &context, 3999).status, 403);
     assert_eq!(std::fs::read(ledger).unwrap(), before);
     assert!(!audit.exists());
     assert!(!fixture.0.join("data/conversations.db").exists());
+}
+
+#[test]
+fn inspector_accepts_browser_session_and_rejects_cross_site_browser_requests() {
+    let (_fixture, context, cfg) = fixture();
+    let turn = Recorder::begin(&context, "group:42", "dsh", "message", "", &[], None).unwrap();
+    let port = 3999;
+    let issued = crate::console_auth::auth_first_run_browser(
+        &context,
+        port,
+        &context.effective_console_token(&cfg),
+        "fixture-password-123",
+    )
+    .unwrap();
+    let cookie = crate::console::front::BrowserCookie::Renew {
+        port,
+        digest: issued.id_digest,
+        id: issued.id,
+    }
+    .header()
+    .split_once(';')
+    .unwrap()
+    .0
+    .to_string();
+    let canonical = crate::console_auth::canonical_host(port);
+    let canonical_origin = crate::console_auth::canonical_origin(port);
+
+    for (path, expect_snippet) in [
+        (PAGE_PATH, TURN),
+        (CONVERSATIONS, "\"group:42\""),
+        (TURN, &turn.id),
+    ] {
+        let mut req = Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: HashMap::from([("turnId".into(), turn.id.clone())]),
+            headers: HashMap::from([
+                ("host".into(), canonical.clone()),
+                ("cookie".into(), cookie.clone()),
+                ("sec-fetch-site".into(), "same-origin".into()),
+                ("origin".into(), canonical_origin.clone()),
+            ]),
+            body: String::new(),
+            body_too_large: false,
+        };
+        let ok = serve_request(&req, &cfg, &context, port);
+        assert_eq!(ok.status, 200, "{path}: {}", ok.body);
+        assert!(ok.body.contains(expect_snippet), "{path}");
+
+        req.headers
+            .insert("sec-fetch-site".into(), "cross-site".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, port).status,
+            403,
+            "{path} cross-site"
+        );
+
+        req.headers
+            .insert("sec-fetch-site".into(), "same-origin".into());
+        req.headers
+            .insert("origin".into(), "http://foreign.invalid:3999".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, port).status,
+            403,
+            "{path} foreign origin"
+        );
+
+        req.headers
+            .insert("origin".into(), canonical_origin.clone());
+        req.headers
+            .insert("x-agent-token".into(), "fixture-agent".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, port).status,
+            401,
+            "{path} agent header prevents browser cookie fallback"
+        );
+    }
 }

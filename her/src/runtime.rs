@@ -17,7 +17,6 @@ use crate::guarded_file::{is_link, no_follow};
 const LEGACY_CONFIG: &str = crate::legacy_path!("qq-bridge/config.json");
 const LEGACY_DATA: &str = crate::legacy_path!("qq-bridge/state");
 const LEGACY_RESOURCES: &str = crate::legacy_path!("qq-bridge");
-const LEGACY_SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
 #[cfg(test)]
@@ -78,6 +77,23 @@ enum RuntimeMode {
     Isolated,
 }
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestOneShots(
+    std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(crate::harness::one_shot::Job, std::sync::Arc<dyn crate::harness::one_shot::OneShot>)>,
+        >,
+    >,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestOneShots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestOneShots").finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeContext {
     mode: RuntimeMode,
@@ -89,6 +105,16 @@ pub struct RuntimeContext {
     console_port: Option<u16>,
     dependencies: BTreeMap<String, String>,
     config: Option<Value>,
+    pub(crate) browser_anchors: std::sync::Arc<crate::console_auth::BrowserAnchors>,
+    pub(crate) console_authority: Option<crate::console_auth::ConsoleAuthority>,
+    #[cfg(test)]
+    pub(crate) test_one_shots: TestOneShots,
+}
+
+/// A transport authority lock for this specific runtime handle.
+pub(crate) struct AuthorityGuard<'a> {
+    _lock: fs::File,
+    context: &'a RuntimeContext,
 }
 
 // Thread-local and compiled only for unit tests: each fixture controls its own append.
@@ -161,6 +187,10 @@ impl RuntimeContext {
             console_port: None,
             dependencies: BTreeMap::new(),
             config: None,
+            browser_anchors: Default::default(),
+            console_authority: None,
+            #[cfg(test)]
+            test_one_shots: Default::default(),
         }
     }
 
@@ -178,7 +208,11 @@ impl RuntimeContext {
             return Ok(Self::legacy());
         }
         let (root, port) = Self::parse_isolated_startup_args(args, environment_root)?;
-        let context = Self::isolated(&root)?;
+        let context = if args.iter().any(|arg| arg == "--console-serve") {
+            Self::for_console_recovery(&root)?
+        } else {
+            Self::isolated(&root)?
+        };
         if args.iter().skip(1).any(|arg| arg == "--live")
             && context.dependency_url("onebot_ws").is_none()
         {
@@ -262,7 +296,7 @@ impl RuntimeContext {
             port.ok_or("isolated runtime requires an explicit non-zero console port")?))
     }
 
-    fn isolated(root: &Path) -> Result<Self, &'static str> {
+    fn isolated_with_recovery(root: &Path, allow_pending_restore: bool) -> Result<Self, &'static str> {
         if !root.is_absolute() {
             return Err("runtime root is unavailable: --runtime-root must be an absolute path");
         }
@@ -286,48 +320,59 @@ impl RuntimeContext {
             return Err("runtime root is unavailable");
         }
 
-        let config_file = contained_path(&root, "config/config.json", false)?;
+        let pending = allow_pending_restore && !matches!(
+            resolve_contained_path(&root, "data", crate::restore::RECOVERY_INTENT, PathIntent::ReadOptionalFile)
+                .and_then(|path| {
+                    crate::guarded_fs::open_protected_file(&path)
+                        .map_err(|_| "runtime path is unavailable".to_string())
+                }),
+            Ok(None)
+        );
+        let config_file = if pending {
+            contained_path(&root, "config", true)?.join("config.json")
+        } else {
+            contained_path(&root, "config/config.json", false)?
+        };
         let data_dir = contained_path(&root, "data", true)?;
         let resources_dir = contained_path(&root, "resources", true)?;
         // This directory is a selected fixture root, never inherited from DSH_HOME/USERPROFILE.
         // It may be created lazily by an operation that explicitly writes a user-scoped fixture.
         let dsh_user_dir = root.join("user/dsh");
         let dependencies_file = contained_path(&root, "dependencies.json", false)?;
-        let state_file = contained_path(&root, "data/social-v2.json", false)?;
+        let config = if pending {
+            None
+        } else {
+            let config_text =
+                fs::read_to_string(&config_file).map_err(|_| "runtime config is unavailable")?;
+            let raw_config: Value = serde_json::from_str(config_text.trim_start_matches('\u{feff}'))
+                .map_err(|_| "runtime config is invalid")?;
+            let (config, _) = crate::config::canonical_config(&raw_config)
+                .map_err(|_| "runtime config is invalid")?;
+            crate::backup::Settings::from_config(&root, &config)
+                .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
+            // An empty `consoleToken` means a generated token kept in `data/console-token` (JS
+            // `loadOrCreateConsoleToken`); with neither the console would have no credential.
+            let configured = config
+                .get("consoleToken")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .is_some();
+            let from_file = || {
+                contained_path(&root, "data/console-token", false)
+                    .ok()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .is_some_and(|token| !token.trim().is_empty())
+            };
+            if !config.is_object() || !(configured || from_file()) {
+                return Err("runtime config is invalid");
+            }
 
-        let config_text =
-            fs::read_to_string(&config_file).map_err(|_| "runtime config is unavailable")?;
-        let raw_config: Value = serde_json::from_str(config_text.trim_start_matches('\u{feff}'))
-            .map_err(|_| "runtime config is invalid")?;
-        let (config, _) = crate::config::canonical_config(&raw_config)
-            .map_err(|_| "runtime config is invalid")?;
-        crate::backup::Settings::from_config(&root, &config)
-            .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
-        // An empty `consoleToken` means a generated token kept in `data/console-token` (JS
-        // `loadOrCreateConsoleToken`); with neither the console would have no credential.
-        let configured = config
-            .get("consoleToken")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .is_some();
-        let from_file = || {
-            contained_path(&root, "data/console-token", false)
-                .ok()
-                .and_then(|path| fs::read_to_string(path).ok())
-                .is_some_and(|token| !token.trim().is_empty())
+            let state_file = contained_path(&root, &format!("data/{}", crate::conversation_state::FILE), false)?;
+            crate::conversation_state::validate_startup_document(&state_file)?;
+
+            Some(config)
         };
-        if !config.is_object() || !(configured || from_file()) {
-            return Err("runtime config is invalid");
-        }
-
-        let state_text =
-            fs::read_to_string(&state_file).map_err(|_| "runtime data is unavailable")?;
-        let state: Value =
-            serde_json::from_str(&state_text).map_err(|_| "runtime data is invalid")?;
-        if !state.is_object() {
-            return Err("runtime data is invalid");
-        }
 
         let dependency_text = fs::read_to_string(&dependencies_file)
             .map_err(|_| "runtime dependencies are unavailable")?;
@@ -380,12 +425,24 @@ impl RuntimeContext {
             dsh_user_dir: Some(dsh_user_dir),
             console_port: None,
             dependencies,
-            config: Some(config),
+            config,
+            browser_anchors: Default::default(),
+            console_authority: None,
+            #[cfg(test)]
+            test_one_shots: Default::default(),
         })
+    }
+
+    fn isolated(root: &Path) -> Result<Self, &'static str> {
+        Self::isolated_with_recovery(root, false)
     }
 
     pub(crate) fn from_root(root: &Path) -> Result<Self, &'static str> {
         Self::isolated(root)
+    }
+
+    pub(crate) fn for_console_recovery(root: &Path) -> Result<Self, &'static str> {
+        Self::isolated_with_recovery(root, true)
     }
 
     pub fn config_file(&self) -> &Path {
@@ -411,6 +468,44 @@ impl RuntimeContext {
 
     pub fn console_port(&self) -> Option<u16> {
         self.console_port
+    }
+
+    /// Re-reads the selected runtime's configuration and dependency endpoints from its root while preserving
+    /// request-scoped test overrides on this context.
+    pub(crate) fn refreshed(&self) -> Result<Self, &'static str> {
+        let root = self.runtime_root().ok_or("runtime root is unavailable")?;
+        let mut next = Self::from_root(root)?;
+        next.console_port = self.console_port;
+        #[cfg(test)]
+        {
+            next.test_one_shots = self.test_one_shots.clone();
+        }
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_one_shot(
+        &self,
+        job: crate::harness::one_shot::Job,
+        model: std::sync::Arc<dyn crate::harness::one_shot::OneShot>,
+    ) {
+        let mut models = self.test_one_shots.0.lock().unwrap_or_else(|p| p.into_inner());
+        models.retain(|(existing, _)| *existing != job);
+        models.push((job, model));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_one_shot(
+        &self,
+        job: crate::harness::one_shot::Job,
+    ) -> Option<std::sync::Arc<dyn crate::harness::one_shot::OneShot>> {
+        self.test_one_shots
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(existing, _)| *existing == job)
+            .map(|(_, model)| model.clone())
     }
 
     /// Resolve an internal relative path under the selected runtime area. Existing symlinks,
@@ -439,7 +534,7 @@ impl RuntimeContext {
         resolve_contained_path(root, base_rel, relative, intent).map_err(|_| "runtime path is unavailable")
     }
 
-    fn resolve_path_detailed(&self, area: RuntimeArea, relative: &str, intent: PathIntent) -> Result<PathBuf, String> {
+    pub(crate) fn resolve_path_detailed(&self, area: RuntimeArea, relative: &str, intent: PathIntent) -> Result<PathBuf, String> {
         if !self.is_isolated() { return self.resolve_path(area, relative, intent).map_err(str::to_string); }
         let root = self.runtime_root.as_deref().ok_or("runtime root is unavailable")?;
         let base = match area {
@@ -452,16 +547,79 @@ impl RuntimeContext {
         resolve_contained_path(root, base, relative, intent)
     }
 
-    pub fn read_file(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, &'static str> {
-        let path = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+    fn resolve_read_path_once(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        intent: PathIntent,
+    ) -> Result<PathBuf, ReadAttemptError> {
+        let map_err = |error: String| {
+            if transient_read_resolve(cfg!(windows), &error) {
+                ReadAttemptError::Retry
+            } else {
+                ReadAttemptError::Fatal("runtime path is unavailable")
+            }
+        };
+        let path = self.resolve_path_detailed(area, relative, intent).map_err(map_err)?;
         // Re-resolve immediately before opening to catch a replaced parent/leaf between a prior
         // authorization check and this read. The std filesystem API cannot pin every ancestor
         // handle across Windows junction replacement, so callers still need a trusted runtime root.
-        let checked = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+        let checked = self.resolve_path_detailed(area, relative, intent).map_err(map_err)?;
         if checked != path {
-            return Err("runtime path is unavailable");
+            return Err(ReadAttemptError::Fatal("runtime path is unavailable"));
         }
-        fs::read(path).map_err(|_| "runtime path is unavailable")
+        Ok(path)
+    }
+
+    fn read_bytes_once(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        optional: bool,
+    ) -> Result<Option<Vec<u8>>, ReadAttemptError> {
+        let intent = if optional { PathIntent::ReadOptionalFile } else { PathIntent::ReadFile };
+        let path = self.resolve_read_path_once(area, relative, intent)?;
+        if optional {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if transient_read_io(cfg!(windows), &error) => {
+                    return Err(ReadAttemptError::Retry);
+                }
+                Err(_) => return Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+                Ok(metadata) if !is_link(&metadata) && metadata.is_file() => {}
+                Ok(_) => return Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+            }
+        }
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if transient_read_io(cfg!(windows), &error) => Err(ReadAttemptError::Retry),
+            Err(_) => Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+        }
+    }
+
+    fn read_bytes_retrying(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        optional: bool,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let deadline = std::time::Instant::now() + READ_CONFLICT_WAIT;
+        loop {
+            match self.read_bytes_once(area, relative, optional) {
+                Ok(bytes) => return Ok(bytes),
+                Err(ReadAttemptError::Retry) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(ReadAttemptError::Retry) => return Err("runtime path is unavailable"),
+                Err(ReadAttemptError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    pub fn read_file(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, &'static str> {
+        self.read_bytes_retrying(area, relative, false)?
+            .ok_or("runtime path is unavailable")
     }
 
     pub fn read_text(&self, area: RuntimeArea, relative: &str) -> Result<String, &'static str> {
@@ -479,18 +637,9 @@ impl RuntimeContext {
         if !self.is_isolated() {
             return Err("optional runtime reads require an isolated context");
         }
-        let path = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
-        let checked = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
-        if checked != path {
-            return Err("runtime path is unavailable");
-        }
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => self
-                .read_text(area, relative)
-                .map(Some),
-            _ => Err("runtime path is unavailable"),
-        }
+        self.read_bytes_retrying(area, relative, true)?
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid"))
+            .transpose()
     }
 
     /// `read_optional_text` for a caller that holds no lock, gate or chain and can afford to wait: on
@@ -851,11 +1000,11 @@ impl RuntimeContext {
 
 
     /// Coordinate authority publication with selected sticker request transmission.
-    pub(crate) fn authority_gate(&self) -> Result<std::fs::File, String> {
+    pub(crate) fn authority_gate(&self) -> Result<AuthorityGuard<'_>, String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             match self.open_locked_file(RuntimeArea::Data, "locks/authority.lock") {
-                Ok(file) => return Ok(file),
+                Ok(file) => return Ok(AuthorityGuard { _lock: file, context: self }),
                 Err(error) if error == "runtime file is already locked" && std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -872,54 +1021,77 @@ impl RuntimeContext {
         relative: &str,
         contents: &[u8],
     ) -> Result<(), String> {
-        self.write_atomic_from(area, relative, &mut &contents[..])
+        self.write_atomic_from(area, relative, &mut &contents[..], None)
     }
 
-    /// Stream large restore payloads through the same fsynced, confined replacement boundary.
+    /// Stream a payload through the confined replacement boundary. Full restore already holds authority.
     pub(crate) fn write_atomic_from(
         &self,
         area: RuntimeArea,
         relative: &str,
         input: &mut dyn std::io::Read,
+        authority: Option<&AuthorityGuard<'_>>,
     ) -> Result<(), String> {
-        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        // Every early return below drops `staged`, which removes the temporary file.
-        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db")) {
-            crate::guarded_credentials::stage_settings_file(&target, input)
-        } else {
-            crate::guarded_file::stage(&target, input, None)
+        if authority.is_some_and(|guard| !std::ptr::eq(guard.context, self)) {
+            return Err("transport authority is held for a different runtime".to_string());
         }
-        .map_err(|failure| failure.to_string())?;
-        let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
-        if checked_target != target || is_link(&checked_temp) || !checked_temp.is_file() {
-            return Err("runtime path is unavailable".to_string());
-        }
-        // Social writers already own social-v2.lock. The authority gate is always acquired
-        // after it; submission never acquires social-v2.lock while holding authority.
+        let (target, staged) = self.stage_atomic_from(area, relative, input)
+            .map_err(|failure| failure.to_string())?;
+        // Social writers already own social-v2.lock. Transport authority comes after it.
         let authority_file = matches!((area, relative),
             (RuntimeArea::Config, "config.json") |
-            (RuntimeArea::Data, "social-v2.json" | "mode.json" | "current-role.json"));
-        let _authority = if self.is_isolated() && authority_file {
+            (RuntimeArea::Data, crate::conversation_state::FILE | "mode.json" | "current-role.json"));
+        let _authority = if self.is_isolated() && authority_file && authority.is_none() {
             #[cfg(test)]
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
             });
             Some(self.authority_gate()?)
         } else { None };
-        // Retry only the replacement of the already-fsynced temp, never a mutation or external send.
-        // Confinement is revalidated before every attempt; path-policy failures are never retried.
-        staged
-            .commit(&mut || -> Result<(), String> {
-                if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
-                    return Err("runtime path changed class=leaf".to_string());
-                }
-                Ok(())
-            })
+        staged.commit(&mut || self.revalidate_atomic_target(area, relative, &target))
             .map_err(|failure| failure.to_string())?;
-        // Verify the committed leaf still resolves inside the pinned root.
         self.resolve_path_detailed(area, relative, PathIntent::ReadFile)?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_atomic_from(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        input: &mut dyn std::io::Read,
+    ) -> Result<(PathBuf, crate::guarded_file::Staged), crate::guarded_file::Failure> {
+        use crate::guarded_file::Failure;
+        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)
+            .map_err(Failure::Refused)?;
+        self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
+        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db"
+            | crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
+            | crate::console_auth::ROTATION_FILE | crate::console_auth::DESKTOP_GRANTS_FILE))
+            || (area == RuntimeArea::Data && relative.starts_with("console-restore-recovery/"))
+        {
+            crate::guarded_fs::stage_protected_file(
+                &target,
+                input,
+                crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+            )
+        } else {
+            crate::guarded_file::stage(&target, input, None)
+        }?;
+        self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
+        let temp = fs::symlink_metadata(staged.temp())
+            .map_err(|error| Failure::Io { class: "temp/metadata", error })?;
+        if is_link(&temp) || !temp.is_file() {
+            return Err(Failure::Refused("runtime path is unavailable".to_string()));
+        }
+        Ok((target, staged))
+    }
+
+    pub(crate) fn revalidate_atomic_target(
+        &self, area: RuntimeArea, relative: &str, target: &Path,
+    ) -> Result<(), String> {
+        if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
+            return Err("runtime path changed class=leaf".to_string());
+        }
         Ok(())
     }
 
@@ -936,27 +1108,68 @@ impl RuntimeContext {
         fs::remove_file(path).map_err(|e| format!("cannot remove runtime file: {e}"))
     }
 
+    pub(crate) fn read_protected_data_file(
+        &self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let path = self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
+        crate::guarded_fs::read_protected_file_with_recheck(&path, limit, || {
+            self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadFile)
+                .map_err(str::to_string)
+        })
+    }
+
+    pub(crate) fn remove_protected_data_file(&self, name: &str) -> Result<(), String> {
+        let path = self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
+        crate::guarded_fs::remove_protected_file_with(&path, || {
+            self.remove_file(RuntimeArea::Data, name)
+        })
+    }
+
     pub fn rename_file(
         &self,
         area: RuntimeArea,
         from: &str,
         to: &str,
     ) -> Result<(), String> {
-        let source = self
-            .resolve_path(area, from, PathIntent::ReadFile)
-            .map_err(str::to_string)?;
-        let target = self
-            .resolve_path(area, to, PathIntent::WriteFile)
-            .map_err(str::to_string)?;
-        if target.exists() {
-            return Err("runtime destination already exists".to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut expected_paths: Option<(PathBuf, PathBuf)> = None;
+        loop {
+            let source = self
+                .resolve_path(area, from, PathIntent::ReadFile)
+                .map_err(str::to_string)?;
+            let target = self
+                .resolve_path(area, to, PathIntent::WriteFile)
+                .map_err(str::to_string)?;
+            if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
+                || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
+            {
+                return Err("runtime path is unavailable".to_string());
+            }
+            if let Some((ref expected_source, ref expected_target)) = expected_paths {
+                if &source != expected_source || &target != expected_target {
+                    return Err("runtime path is unavailable".to_string());
+                }
+            } else {
+                expected_paths = Some((source.clone(), target.clone()));
+            }
+            match fs::symlink_metadata(&target) {
+                Ok(_) => return Err("runtime destination already exists".to_string()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect runtime destination: {error}")),
+            }
+            match fs::rename(&source, &target) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if crate::guarded_file::transient(&error)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(format!("cannot rename runtime file: {error}")),
+            }
         }
-        if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
-            || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
-        {
-            return Err("runtime path is unavailable".to_string());
-        }
-        fs::rename(source, target).map_err(|e| format!("cannot rename runtime file: {e}"))
     }
 
     pub fn dependency_url(&self, name: &str) -> Option<&str> {
@@ -1098,179 +1311,7 @@ impl RuntimeContext {
     }
 
     pub fn read_social_state(&self) -> Result<Value, String> {
-        let bytes = if self.is_isolated() {
-            let path = self.resolve_path_detailed(RuntimeArea::Data, "social-v2.json", PathIntent::ReadFile)?;
-            if self.resolve_path_detailed(RuntimeArea::Data, "social-v2.json", PathIntent::ReadFile)? != path {
-                return Err("path changed class=leaf".into());
-            }
-            fs::read(path).map_err(|e| runtime_io_error("leaf/read", &e))?
-        } else {
-            fs::read(LEGACY_SOCIAL_STATE).map_err(|e| runtime_io_error("leaf/read", &e))?
-        };
-        let text = String::from_utf8(bytes).map_err(|_| "kind=InvalidData class=encoding".to_string())?;
-        serde_json::from_str(&text).map_err(|e| format!("social-state/parse kind=InvalidData line={} column={}", e.line(), e.column()))
-    }
-
-    pub fn supports_console_request(&self, method: &str, path: &str) -> bool {
-        let memory_action = path.strip_prefix("/api/memory/");
-        let isolated_memory_route = matches!(method, "GET" | "POST")
-            && matches!(
-                memory_action,
-                Some("write" | "search" | "forget" | "index" | "preview" | "acl" | "settings-get" | "settings-set")
-            );
-        !self.is_isolated()
-            || matches!(
-                (method, path),
-                ("GET", "/api/social")
-                    | ("GET", "/api/dependencies")
-                    | ("POST", "/api/dependencies/check" | "/api/dependencies/approve")
-                    | ("GET", "/api/releases")
-                    | ("GET", "/api/releases/settings")
-                    | ("POST", "/api/releases/settings" | "/api/releases/approve")
-                    | ("GET", "/api/qq/login")
-                    | ("GET", "/api/backups/settings")
-                    | ("GET", "/api/backups")
-                    | ("POST", "/api/backups/settings")
-                    | ("POST", "/api/backups/restore/preview")
-                    | ("POST", "/api/backups/restore")
-                    | ("POST", "/api/social")
-                    | ("POST", "/api/social/state")
-                    | ("POST", "/api/social/flush")
-                    | ("POST", "/api/socialV2/send-message")
-                    | ("POST", "/api/socialV2/send-burst")
-                    | ("POST", "/api/socialV2/send-poke")
-                    | ("POST", "/api/socialV2/send-voice")
-                    | ("POST", "/api/voice/send")
-                    | ("POST", "/api/send/voice")
-                    | ("POST", "/api/socialV2/mark-read")
-                    | ("POST", "/api/socialV2/wake-config")
-                    | ("POST", "/api/socialV2/wait")
-                    | ("GET", "/api/socialV2/message-detail")
-                    | ("GET", "/api/images/message")
-                    | ("GET", "/api/socialV2/forward-message")
-                    | ("POST", "/api/socialV2/forward-media")
-                    | ("GET", "/api/socialV2/sticker-image")
-                    | ("GET", "/api/socialV2/self-image")
-                    | ("POST", "/api/socialV2/send-sticker")
-                    | ("POST", "/api/socialV2/collect-sticker")
-                    | ("POST", "/api/send/group")
-                    | ("POST", "/api/send/private")
-                    | ("POST", "/api/send/reply")
-                    | ("GET", "/api/health")
-                    | ("GET", "/")
-                    | ("GET", "/favicon.ico")
-                    | ("GET", "/apple-touch-icon.png")
-                    | ("GET", "/api/status")
-                    | ("POST", "/api/restart")
-                    | ("GET", "/api/pending")
-                    | ("GET", "/api/whitelist")
-                    | ("POST", "/api/whitelist")
-                    | ("POST", "/api/conversations/scope")
-                    | ("GET", "/api/security")
-                    | ("POST", "/api/security")
-                    | ("POST", "/api/console/token")
-                    | ("POST", "/api/authorize/read")
-                    | ("GET", "/api/audit/recent")
-                    | ("POST", "/api/audit/undo")
-                    | ("POST", "/api/socialV2/reset")
-                    | ("POST", "/api/socialV2/wake")
-                    | ("GET", "/api/model-chain")
-                    | ("GET", "/api/session-models")
-                    | ("POST", "/api/session-models")
-                    | ("GET", "/api/voice/list")
-                    | ("GET", "/api/socialV2/voices")
-                    | ("GET", "/api/socialV2/tool-log")
-                    | ("POST", "/api/socialV2/tool-log/clear")
-                    | ("GET", "/api/roles")
-                    | ("GET", "/api/roles/content")
-                    | ("POST", "/api/roles/create")
-                    | ("POST", "/api/roles/update")
-                    | ("POST", "/api/roles/rename")
-                    | ("POST", "/api/roles/delete")
-                    | ("POST", "/api/roles/limit")
-                    | ("POST", "/api/role")
-                    | ("POST", "/api/role-mode")
-                    | ("POST", "/api/mode")
-                    | ("GET", "/api/presets")
-                    | ("GET", "/api/preset/sim-prompt")
-                    | ("POST", "/api/preset/sim-prompt")
-                    | ("POST", "/api/preset/sim-prompt/restore")
-                    | ("GET", "/api/preset/sim-prompt/backups")
-                    | ("GET", "/api/stickers")
-                    | ("POST", "/api/stickers/note")
-                    | ("POST", "/api/stickers/sync")
-                    | ("POST", "/api/stickers/remark")
-                    | ("GET", "/api/socialV2/sticker-list")
-                    | ("POST", "/api/socialV2/sticker-list")
-                    | ("POST", "/api/socialV2/sticker-note")
-                    | ("POST", "/api/socialV2/sticker-remark")
-                    | ("GET", "/api/tokens/by-provider")
-                    | ("GET", "/api/usage/attribution")
-                    | ("GET", "/api/tokens/summary")
-                    | ("GET", "/api/tokens/series")
-                    | ("GET", "/api/tokens/turns")
-                    | ("GET", "/api/tokens/recent")
-                    | ("GET", "/api/socialV2/memory")
-                    | ("POST", "/api/socialV2/memory-append")
-                    | ("POST", "/api/socialV2/memory-update")
-                    | ("POST", "/api/socialV2/memory-remove")
-                    | ("POST", "/api/socialV2/memory-clear")
-                    | ("GET", "/api/socialV2/config")
-                    | ("POST", "/api/socialV2/config")
-                    | ("GET", "/api/socialV2/state")
-                    | ("GET", "/api/socialV2/prompt")
-                    | ("GET", "/api/socialV2/slang/query")
-                    | ("POST", "/api/socialV2/slang/submit")
-                    | ("GET", "/api/slang")
-                    | ("POST", "/api/slang")
-                    | ("POST", "/api/slang/clear")
-                    | ("POST", "/api/slang/config")
-                    | ("POST", "/api/slang/batch-delete")
-                    | ("POST", "/api/slang/batch-confirm")
-                    | ("POST", "/api/slang/batch-reject")
-                    | ("POST", "/api/slang/research")
-                    | ("POST", "/api/slang/extract")
-                    | ("GET", "/api/socialV2/initial-prompt")
-                    | ("POST", "/api/socialV2/initial-prompt")
-                    | ("GET", "/api/socialV2/states")
-                    | ("GET", "/api/socialV2/activity")
-                    | ("POST", "/api/socialV2/activity")
-                    | ("GET", "/api/socialV2/feedback")
-                    | ("POST", "/api/socialV2/feedback")
-                    | ("POST", "/api/socialV2/feedback-clear")
-                    | ("GET", "/api/socialV2/unread")
-                    | ("POST", "/api/socialV2/wake-snapshot")
-                    | ("GET", "/api/socialV2/recent")
-                    | ("GET", "/api/socialV2/my-recent")
-                    | ("GET", "/api/socialV2/active-members")
-                    | ("GET", "/api/inbound/gaps")
-                    | ("POST", "/api/inbound/gaps/retry")
-                    | ("GET", "/api/socialV2/send-outbox")
-                    | ("GET", "/api/sessions")
-                    | ("POST", "/api/session/reset")
-                    | ("GET", "/api/turns")
-                    | ("POST", "/api/turns/resolve")
-                    | ("GET", "/api/recovery-record")
-            )
-            || (method == "GET" && matches!(path, "/tasks" | "/api/tasks"))
-            || (method == "GET" && matches!(path, "/schedule" | "/api/schedule"))
-            || (method == "POST" && path == "/api/schedule")
-            || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
-            || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
-            || (method == "POST" && path == "/api/memory/archive")
-            || (method == "GET" && path == "/personas")
-            || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
-            || (matches!(method, "GET" | "POST") && crate::console_settings::is_route(path))
-            || path.strip_prefix("/api/slang/").is_some_and(|tail| {
-                let parts: Vec<&str> = tail.split('/').collect();
-                match (method, parts.as_slice()) {
-                    ("PATCH" | "DELETE", [id]) => !id.is_empty(),
-                    ("POST", [id, "confirm" | "reject"]) => !id.is_empty(),
-                    _ => false,
-                }
-            })
-            || crate::console::inspector::is_route(path)
-            || isolated_memory_route
+        crate::conversation_state::read_document(self)
     }
 
     pub fn health_metadata(&self) -> Value {
@@ -1287,7 +1328,7 @@ impl RuntimeContext {
         }
         json!({
             "mode": "isolated",
-            "configLoaded": self.config.is_some(),
+            "configLoaded": self.config.is_some() || (!crate::restore::recovery_pending(self) && self.load_config().is_ok()),
             "dataConfigured": true,
             "resourcesConfigured": self.resources_dir().is_dir(),
             "dependencyNames": dependency_names,
@@ -2606,39 +2647,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn isolated_send_message_route_allowlist_is_exact() {
-        let root = fixture_root("send-message-route-boundary");
-        let isolated = RuntimeContext::from_root(&root)
-            .expect("the selected synthetic runtime is valid");
-
-        assert!(isolated.supports_console_request("POST", "/api/socialV2/send-message"));
-        assert!(isolated.supports_console_request("GET", "/api/socialV2/sticker-image"));
-        // Ticket 21 opened the voice sends (exact method and path).
-        for path in ["/api/socialV2/send-voice", "/api/voice/send", "/api/send/voice"] {
-            assert!(isolated.supports_console_request("POST", path), "{path}");
-        }
-        for (method, path) in [
-            ("GET", "/api/socialV2/send-message"),
-            ("POST", "/api/socialV2/send-message/"),
-            ("POST", "/api/socialV2/send-message-extra"),
-            ("POST", "/api/socialV2/send-poke/"),
-            ("GET", "/api/socialV2/send-poke"),
-            ("GET", "/api/send/group"),
-            ("GET", "/api/send/voice"),
-        ] {
-            assert!(
-                !isolated.supports_console_request(method, path),
-                "isolated route unexpectedly allowed {method} {path}"
-            );
-        }
-
-        let legacy = RuntimeContext::legacy();
-        assert!(legacy.supports_console_request("GET", "/api/socialV2/send-message"));
-        assert!(legacy.supports_console_request("POST", "/api/socialV2/send-poke"));
-        cleanup(&root);
-    }
-
-    #[test]
     fn isolated_context_selection_rejects_early_legacy_probe_dispatch() {
         let root = fixture_root("dispatch-guard");
         let args = vec![
@@ -2983,8 +2991,7 @@ pub(crate) mod tests {
 
         // These flags dispatch through legacy probes before the live service loop in main.rs.
         for early_probe in [
-            "--send-probe", "--ask", "--memory-probe", "--memory-write-probe",
-            "--hot-render", "--index-hint", "--price-probe", "--role-probe",
+            "--send-probe", "--ask", "--price-probe", "--role-probe",
             "--prompt-wrapped", "--rpc-probe", "--slang-parse-test", "--selftest-401",
             "--ab-probe", "--failover-probe", "--sticker-sync", "--wake-replay",
             "--build-prompt", "--dsh-dump", "--dsh-watch", "--dsh-probe", "--dsh-demo",
@@ -3034,293 +3041,6 @@ pub(crate) mod tests {
         let context = RuntimeContext::from_process_args_with_environment(&args, None)
             .expect("no-root arguments continue to select the legacy context");
         assert!(!context.is_isolated());
-    }
-
-    #[test]
-    fn isolated_memory_http_allowlist_exposes_only_context_safe_actions() {
-        let root = fixture_root("memory-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        for action in [
-            "write",
-            "search",
-            "forget",
-            "index",
-            "preview",
-            "acl",
-            "settings-get",
-            "settings-set",
-        ] {
-            assert!(context.supports_console_request("POST", &format!("/api/memory/{action}")));
-            assert!(context.supports_console_request("GET", &format!("/api/memory/{action}")));
-        }
-        for (method, path) in [
-            ("GET", "/api/memory/archive"),
-            ("GET", "/api/memory/settings"),
-            ("GET", "/api/memory/acl/"),
-            ("GET", "/api/memory/"),
-            ("DELETE", "/api/memory/write"),
-            ("PUT", "/api/memory/acl"),
-        ] {
-            assert!(!context.supports_console_request(method, path), "unexpectedly opened {method} {path}");
-        }
-        assert!(context.supports_console_request("POST", "/api/memory/archive"));
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_send_message_http_allowlist_is_method_and_path_exact() {
-        let root = fixture_root("send-message-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        assert!(context.supports_console_request("POST", "/api/socialV2/send-message"));
-        for (method, path) in [
-            ("GET", "/api/socialV2/send-message"),
-            ("POST", "/api/socialV2/send-message/"),
-            ("POST", "/api/socialV2/send-burst/"),
-            ("POST", "/api/socialV2/feedback/"),
-            ("POST", "/api/socialV2/check-send"),
-        ] {
-            assert!(
-                !context.supports_console_request(method, path),
-                "unexpectedly opened {method} {path}"
-            );
-        }
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_sticker_list_http_allowlist_is_method_path_and_query_exact() {
-        let root = fixture_root("sticker-list-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-
-        for path in ["/api/stickers", "/api/socialV2/sticker-list"] {
-            assert!(context.supports_console_request("GET", path));
-        }
-        assert!(context.supports_console_request("POST", "/api/stickers/note"));
-        assert!(context.supports_console_request("POST", "/api/stickers/sync"));
-        assert!(context.supports_console_request("POST", "/api/stickers/remark"));
-        for path in [
-            "/api/socialV2/sticker-list",
-            "/api/socialV2/sticker-note",
-            "/api/socialV2/sticker-remark",
-            "/api/socialV2/send-sticker",
-            "/api/socialV2/collect-sticker",
-        ] {
-            assert!(context.supports_console_request("POST", path), "POST {path}");
-        }
-        // parse_request separates query data from Request.path before this policy check.
-        // A raw query-bearing string is not itself an allowlisted route path.
-        for (method, path) in [
-            ("POST", "/api/stickers"),
-            ("HEAD", "/api/stickers"),
-            ("OPTIONS", "/api/stickers"),
-            ("HEAD", "/api/socialV2/sticker-list"),
-            ("OPTIONS", "/api/socialV2/sticker-list"),
-            ("GET", "/api/stickers/"),
-            ("GET", "/api/socialV2/sticker-list/"),
-            ("GET", "/api/stickers/sync"),
-            ("GET", "/api/stickers/note"),
-            ("GET", "/api/stickers/remark"),
-            ("POST", "/api/stickers/remark/"),
-            ("POST", "/api/stickers/remark?x=1"),
-            ("GET", "/api/stickers/unknown"),
-            ("GET", "/api/stickers2"),
-            ("GET", "/api/socialV2/sticker-note"),
-            ("GET", "/api/stickers?query=cat&count=12"),
-            ("GET", "/api/socialV2/sticker-list?query=cat&count=12"),
-            ("GET", "/api/socialV2/sticker-lists"),
-            ("GET", "/api/socialV2/sticker-list-extra"),
-            ("GET", "/api/socialV2/unknown"),
-        ] {
-            assert!(
-                !context.supports_console_request(method, path),
-                "unexpectedly opened {method} {path}"
-            );
-        }
-
-        let legacy = RuntimeContext::legacy();
-        assert!(legacy.supports_console_request("POST", "/api/stickers/note"));
-        assert!(legacy.supports_console_request("POST", "/api/socialV2/sticker-list"));
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_mode_switch_route_is_post_only() {
-        let root = fixture_root("mode-switch-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        assert!(context.supports_console_request("POST", "/api/mode"));
-        for (method, path) in [("GET", "/api/mode"), ("PUT", "/api/mode"), ("POST", "/api/mode/"), ("POST", "/api/mode/extra")] {
-            assert!(!context.supports_console_request(method, path), "unexpectedly opened {method} {path}");
-        }
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_role_management_http_allowlist_is_method_and_path_exact() {
-        let root = fixture_root("role-management-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        for path in [
-            "/api/roles/update",
-            "/api/roles/rename",
-            "/api/roles/delete",
-            "/api/roles/limit",
-            "/api/role",
-            "/api/role-mode",
-        ] {
-            assert!(
-                context.supports_console_request("POST", path),
-                "expected exact role-management route POST {path} to be allowed"
-            );
-        }
-        for (method, path) in [
-            ("GET", "/api/roles/update"),
-            ("PUT", "/api/roles/update"),
-            ("GET", "/api/roles/rename"),
-            ("POST", "/api/roles/rename/"),
-            ("POST", "/api/roles/delete/extra"),
-            ("GET", "/api/roles/limit"),
-            ("POST", "/api/role/"),
-            ("GET", "/api/role-mode"),
-            ("POST", "/api/role-mode/extra"),
-        ] {
-            assert!(
-                !context.supports_console_request(method, path),
-                "unexpectedly opened role-management route {method} {path}"
-            );
-        }
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_usage_and_social_memory_state_allowlist_is_method_and_path_exact() {
-        let root = fixture_root("usage-social-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        for (method, path) in [
-            ("GET", "/api/tokens/by-provider"),
-            ("GET", "/api/usage/attribution"),
-            ("GET", "/api/tokens/summary"),
-            ("GET", "/api/tokens/series"),
-            ("GET", "/api/tokens/turns"),
-            ("GET", "/api/tokens/recent"),
-            ("GET", "/api/socialV2/memory"),
-            ("POST", "/api/socialV2/memory-append"),
-            ("POST", "/api/socialV2/memory-update"),
-            ("POST", "/api/socialV2/memory-remove"),
-            ("POST", "/api/socialV2/memory-clear"),
-            ("GET", "/api/socialV2/config"),
-            ("POST", "/api/socialV2/config"),
-            ("GET", "/api/socialV2/state"),
-            ("GET", "/api/socialV2/states"),
-            ("GET", "/api/socialV2/activity"),
-            ("POST", "/api/socialV2/activity"),
-            ("GET", "/api/socialV2/unread"),
-            ("GET", "/api/socialV2/prompt"),
-            ("GET", "/api/socialV2/initial-prompt"),
-            ("POST", "/api/socialV2/initial-prompt"),
-            ("GET", "/api/socialV2/recent"),
-            ("GET", "/api/socialV2/my-recent"),
-            ("GET", "/api/socialV2/active-members"),
-            ("GET", "/api/socialV2/send-outbox"),
-            ("GET", "/api/sessions"),
-            ("GET", "/api/pending"),
-            ("POST", "/api/session/reset"),
-            ("GET", "/api/turns"),
-            ("POST", "/api/turns/resolve"),
-            ("GET", "/api/recovery-record"),
-            ("POST", "/api/restart"),
-            // Ticket 24 opened access, security, token, audit, reset and manual wake.
-            ("POST", "/api/whitelist"),
-            ("GET", "/api/security"),
-            ("POST", "/api/security"),
-            ("POST", "/api/console/token"),
-            ("POST", "/api/authorize/read"),
-            ("GET", "/api/audit/recent"),
-            ("POST", "/api/audit/undo"),
-            ("POST", "/api/socialV2/reset"),
-            ("POST", "/api/socialV2/wake"),
-        ] {
-            assert!(
-                context.supports_console_request(method, path),
-                "expected exact route {method} {path} to be allowed"
-            );
-        }
-        for (method, path) in [
-            ("POST", "/api/tokens/reset"),
-            ("POST", "/api/tokens/summary"),
-            ("GET", "/api/tokens/summary/"),
-            ("GET", "/api/tokens/unknown"),
-            ("GET", "/api/usage/attribution/extra"),
-            ("POST", "/api/socialV2/memory"),
-            ("GET", "/api/socialV2/memory-append"),
-            ("POST", "/api/socialV2/memory-append/"),
-            ("PUT", "/api/socialV2/config"),
-            ("POST", "/api/socialV2/state"),
-            ("PUT", "/api/socialV2/activity"),
-            ("GET", "/api/socialV2/mark-read"),
-            ("GET", "/api/socialV2/wake-config"),
-            ("GET", "/api/socialV2/states/"),
-            ("GET", "/api/pending/"),
-            ("POST", "/api/pending"),
-            ("GET", "/api/turns/"),
-            ("GET", "/api/session/reset"),
-            ("POST", "/api/sessions"),
-            ("PUT", "/api/socialV2/initial-prompt"),
-            ("POST", "/api/socialV2/prompt"),
-            ("GET", "/api/socialV2/initial-prompt/"),
-            ("GET", "/api/audit/recent/"),
-            ("GET", "/api/audit/undo"),
-            ("PUT", "/api/security"),
-            ("GET", "/api/console/token"),
-            ("GET", "/api/socialV2/reset"),
-            ("GET", "/api/socialV2/wake"),
-            ("POST", "/api/socialV2/wake/"),
-            ("POST", "/api/workspace/reset"),
-        ] {
-            assert!(
-                !context.supports_console_request(method, path),
-                "unexpectedly opened {method} {path}"
-            );
-        }
-        let legacy = RuntimeContext::legacy();
-        assert!(legacy.supports_console_request("POST", "/api/tokens/reset"));
-        assert!(legacy.supports_console_request("GET", "/api/pending"));
-        cleanup(&root);
-    }
-
-    #[test]
-    fn isolated_resource_http_allowlist_is_method_and_path_exact() {
-        let root = fixture_root("resource-http-allowlist");
-        let context = RuntimeContext::isolated(&root).unwrap();
-        for (method, path) in [
-            ("GET", "/"),
-            ("GET", "/favicon.ico"),
-            ("GET", "/apple-touch-icon.png"),
-            ("GET", "/api/voice/list"),
-            ("GET", "/api/socialV2/voices"),
-            ("GET", "/api/socialV2/tool-log"),
-            ("POST", "/api/socialV2/tool-log/clear"),
-        ] {
-            assert!(
-                context.supports_console_request(method, path),
-                "expected exact resource route {method} {path} to be allowed"
-            );
-        }
-        for (method, path) in [
-            ("POST", "/"),
-            ("GET", "/favicon.ico/"),
-            ("POST", "/apple-touch-icon.png"),
-            ("POST", "/api/voice/list"),
-            ("POST", "/api/socialV2/voices"),
-            ("POST", "/api/socialV2/tool-log"),
-            ("GET", "/api/socialV2/tool-log/clear"),
-            ("POST", "/api/socialV2/tool-log/clear/"),
-            ("GET", "/api/voice/list/extra"),
-        ] {
-            assert!(
-                !context.supports_console_request(method, path),
-                "unexpectedly opened resource route {method} {path}"
-            );
-        }
-        cleanup(&root);
     }
 
     #[test]
@@ -3417,6 +3137,105 @@ pub(crate) mod tests {
         cleanup(&root);
         let _ = fs::remove_file(outside);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_file_retries_transient_sharing_hold_and_refuses_existing_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = fixture_root("rename-transient-sharing");
+        let context = RuntimeContext::from_root(&root).unwrap();
+        context
+            .write_atomic(RuntimeArea::Data, "armed.json", b"{\"ok\":true}")
+            .unwrap();
+        let armed_path = root.join("data/armed.json");
+        let claimed_path = root.join("data/claimed.json");
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&armed_path)
+            .unwrap();
+        let direct = fs::rename(&armed_path, &claimed_path).unwrap_err();
+        assert!(crate::guarded_file::transient(&direct), "{direct:?}");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(holder);
+        });
+        context
+            .rename_file(RuntimeArea::Data, "armed.json", "claimed.json")
+            .unwrap();
+        release.join().unwrap();
+        assert!(!armed_path.exists());
+        assert_eq!(
+            context.read_text(RuntimeArea::Data, "claimed.json").unwrap(),
+            "{\"ok\":true}"
+        );
+
+        context
+            .write_atomic(RuntimeArea::Data, "armed.json", b"{\"second\":true}")
+            .unwrap();
+        let error = context
+            .rename_file(RuntimeArea::Data, "armed.json", "claimed.json")
+            .unwrap_err();
+        assert_eq!(error, "runtime destination already exists");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn windows_read_conflict_policy_never_retries_missing_or_policy_failures() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let sharing = std::io::Error::from_raw_os_error(32);
+        assert!(transient_read_io(true, &denied));
+        assert!(transient_read_io(true, &sharing));
+        assert!(!transient_read_io(true, &missing));
+        assert!(!transient_read_io(false, &denied));
+        assert!(!transient_read_io(false, &sharing));
+
+        assert!(transient_read_resolve(
+            true,
+            "class=leaf/metadata kind=PermissionDenied os=Some(5)"
+        ));
+        assert!(transient_read_resolve(
+            true,
+            "class=path/canonicalize kind=Uncategorized os=Some(32)"
+        ));
+        assert!(!transient_read_resolve(
+            true,
+            "class=leaf/metadata kind=NotFound os=Some(2)"
+        ));
+        assert!(!transient_read_resolve(true, "runtime path policy rejected class=path"));
+        assert!(!transient_read_resolve(
+            true,
+            "runtime path has non-file leaf or non-directory parent"
+        ));
+        assert!(!transient_read_resolve(
+            false,
+            "class=leaf/metadata kind=PermissionDenied os=Some(5)"
+        ));
+    }
+}
+
+enum ReadAttemptError {
+    Retry,
+    Fatal(&'static str),
+}
+
+const READ_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn transient_read_io(windows: bool, error: &std::io::Error) -> bool {
+    windows
+        && (error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33)))
+}
+
+fn transient_read_resolve(windows: bool, error: &str) -> bool {
+    windows
+        && (error.starts_with("class=leaf/metadata ")
+            || error.starts_with("class=path/canonicalize "))
+        && (error.contains("kind=PermissionDenied")
+            || error.contains("os=Some(5)")
+            || error.contains("os=Some(32)")
+            || error.contains("os=Some(33)"))
 }
 
 fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {
@@ -3471,35 +3290,7 @@ fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBu
 }
 
 pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
-    let Some(authority) = url.strip_prefix("http://") else {
-        return false;
-    };
-    if authority
-        .chars()
-        .any(|ch| matches!(ch, '/' | '?' | '#' | '@'))
-    {
-        return false;
-    }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((host, rest)) = bracketed.split_once(']') else {
-            return false;
-        };
-        let Some(port) = rest.strip_prefix(':') else {
-            return false;
-        };
-        (host, port)
-    } else {
-        let Some((host, port)) = authority.rsplit_once(':') else {
-            return false;
-        };
-        (host, port)
-    };
-    if port.parse::<u16>().map(|value| value != 0).unwrap_or(false) == false {
-        return false;
-    }
-    host.parse::<IpAddr>()
-        .map(|address| address.is_loopback())
-        .unwrap_or(false)
+    crate::loopback_http::LoopbackEndpoint::parse(url).is_ok()
 }
 
 /// Validate a single canonical live conversation key from either the CLI or a rollout array.

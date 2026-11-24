@@ -2,8 +2,9 @@
 // changes one, the access change's side effects, undo on the settings page and through the console audit, the old
 // routes through the store, the admin agent mode's owner, the seed and the registry.
 use super::*;
+use crate::social_state::inbound_admitted;
 
-const SECURITY_KEYS: [&str; 8] = [
+const SECURITY_KEYS: [&str; 9] = [
     "allow.private",
     "allow.groups",
     "deny.private",
@@ -11,6 +12,7 @@ const SECURITY_KEYS: [&str; 8] = [
     "ownerQQ",
     "security.interceptNotify",
     "security.outboundGuard",
+    "security.requirePasswordLocally",
     "rollout.rustGroups",
 ];
 const KEPT: &str = "group:7001";
@@ -41,7 +43,11 @@ fn set(context: &RuntimeContext, body: Value) -> (u16, Value) {
 
 /// The recorded pending revocations.
 fn pending_revocations(root: &FixtureRoot) -> Vec<Value> {
-    match std::fs::read(root.0.join("data").join(access::PENDING_REVOCATIONS)) {
+    match std::fs::read(
+        root.0
+            .join("data")
+            .join(crate::social_state::PENDING_REVOCATIONS),
+    ) {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap()["pending"].as_array().cloned().unwrap_or_default(),
         Err(_) => Vec::new(),
     }

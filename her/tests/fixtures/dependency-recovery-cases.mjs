@@ -8,12 +8,13 @@
 // A case passes when every assertion holds; the exit code is 0 only then. Cases poll the fake world's log, the run
 // record and the ledger; there are no fixed sleeps except where a bounded absence ("nothing else arrives") is the claim.
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { developmentRoot } from '../../../scripts/fixture-paths.mjs';
 import { pathToFileURL } from 'node:url';
 import {
-  startRustSide, httpCall, sleep, waitFor, dshCalls, privateTextsTo, groupLeaksOf, scanSideForSecrets, readState,
+  startRustSide, httpCall, waitHttp, waitPromptIdentity, sleep, waitFor, dshCalls, privateTextsTo, groupLeaksOf, scanSideForSecrets, readState,
   CONSOLE_TOKEN, GROUP, GROUP_KEY, GROUP2_KEY, OWNER, OWNER_KEY, TOKENS, convRecord, defaultWake, onebotResponder, baseConfig,
 } from './rust-world.mjs';
 
@@ -54,6 +55,42 @@ const base = (over = {}) => ({
 const modelAlert = (provider = 'pa', model = 'ma', cls = 'backend', code = 'upstream') => `[group:420042] 模型/后端回合失败：backend=dsh provider=${provider} model=${model} class=${cls} code=${code}`;
 
 const CASES = {
+  async 'rust-world-native-console-transport'(ctx) {
+    const observed = [];
+    const expected = { nickname: 'fixture bot', userId: '401' };
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      observed.push({ path: req.url, method: req.method, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') });
+      res.writeHead(req.url === '/api/health' ? 404 : 200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ self: expected }));
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    try {
+      const { port } = server.address();
+      assert.equal(await waitHttp(port, 5000), true);
+      assert.deepEqual((await waitPromptIdentity(port, { exitCode: null }, expected, 5000)).self, expected);
+      const rawBody = '{"fixture":"测试"}';
+      assert.equal((await httpCall({ port }, { path: '/fixture', method: 'POST', rawBody, contentType: 'application/json; charset=utf-8' })).status, 200);
+      assert.deepEqual(observed.map(entry => entry.path), ['/api/health', '/api/roles', `/api/socialV2/prompt?key=${GROUP_KEY}`, '/fixture']);
+      for (const entry of observed) {
+        assert.ok(!Object.keys(entry.headers).some(name => name.startsWith('sec-fetch-')), `${entry.path} must send no Fetch Metadata`);
+        assert.equal(entry.headers['x-console-token'], CONSOLE_TOKEN);
+      }
+      assert.equal(observed[3].method, 'POST');
+      assert.equal(observed[3].body, rawBody);
+      assert.equal(observed[3].headers['content-type'], 'application/json; charset=utf-8');
+      assert.equal(Number(observed[3].headers['content-length']), Buffer.byteLength(rawBody));
+    } finally {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+    const side = await ctx.start(base());
+    assert.equal((await api(side, '/api/roles')).status, 200);
+  },
   // 401 after a DSH restart changed the signing secret: every call heals once, nothing is retried more than once, and the
   // prompt is delivered exactly once.
   async 'reauth-401-rotation-call-counts'(ctx) {

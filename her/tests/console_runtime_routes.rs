@@ -606,6 +606,10 @@ impl ConsoleProcess {
     }
 
     fn start_with(root: &Path, port: u16, dsh_home: &Path, peer_sid: Option<&str>, install: Option<&Path>) -> Self {
+        Self::start_with_env(root, port, dsh_home, peer_sid, install, &[])
+    }
+
+    fn start_with_env(root: &Path, port: u16, dsh_home: &Path, peer_sid: Option<&str>, install: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
         command
             .arg("--console-serve")
@@ -621,6 +625,7 @@ impl ConsoleProcess {
             .env("USERPROFILE", dsh_home.join("synthetic-user-profile"))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        command.envs(env.iter().copied());
         if let Some(sid) = peer_sid { command.env("HER_TEST_DESKTOP_PEER_SID_HEX", sid); }
         if let Some(install) = install { command.env("HER_INSTALL_ROOT", install); }
         hide_process_window(&mut command);
@@ -857,8 +862,9 @@ fn http_request(
     let agent_header = agent_token
         .map(|token| format!("X-Agent-Token: {token}\r\n"))
         .unwrap_or_default();
+    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") { "her.localhost" } else { "127.0.0.1" };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.as_bytes().len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
@@ -888,6 +894,503 @@ fn http_request(
         status,
         body: body.to_string(),
     })
+}
+
+const BROWSER_MACHINE: &str = "fixture-browser-admin-machine";
+const BROWSER_CHOSEN: &str = "fixture-browser-chosen-machine";
+const BROWSER_WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+struct BrowserFixture {
+    workspace: FixtureWorkspace,
+    root: PathBuf,
+    home: PathBuf,
+    port: u16,
+}
+
+impl BrowserFixture {
+    fn new(label: &str) -> Self {
+        let workspace = FixtureWorkspace::new(label);
+        let root = workspace.root("runtime");
+        let home = prepare_runtime_root(&root, BROWSER_MACHINE, "fixture-browser-agent",
+            "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+        let (port, _) = reserve_distinct_ports();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_her-cli"));
+        cmd.args(["console", "set-password", "--runtime-root"]).arg(&root)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        hide_process_window(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        writeln!(child.stdin.take().unwrap(), "{BROWSER_MACHINE}\nfixture account password\nfixture account password").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "create schema v3: {}", String::from_utf8_lossy(&output.stderr));
+        fs::write(root.join("data/console-auth-generation"), [119; 32]).unwrap();
+        Self { workspace, root, home, port }
+    }
+
+    fn db(&self) -> rusqlite::Connection {
+        let db = rusqlite::Connection::open(self.root.join("data/settings.db")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db
+    }
+
+    fn cookie(&self, id: [u8; 32], token: &str, last: i64) -> String {
+        let origin = format!("http://her.localhost:{}", self.port);
+        let digest: [u8; 32] = Sha256::digest(id).into();
+        let token_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let restore = fs::read(self.root.join("data/console-auth-generation")).unwrap();
+        self.db().execute(
+            "INSERT INTO console_browser_sessions SELECT ?1,?2,?3,auth_generation,?4,?5,?5,?6,
+             (SELECT coalesce(max(issued_seq),0)+1 FROM console_browser_sessions) FROM console_auth_state WHERE id=1",
+            rusqlite::params![digest.as_slice(), origin, token_digest.as_slice(), restore, last, last + BROWSER_WEEK_MS],
+        ).unwrap();
+        format!("her_browser_{}_{}={}", self.port, URL_SAFE_NO_PAD.encode(digest), URL_SAFE_NO_PAD.encode(id))
+    }
+
+    fn start(&self) -> ConsoleProcess {
+        ConsoleProcess::start(&self.root, self.port, &self.home)
+    }
+
+    fn request(&self, method: &str, path: &str, cookie: &str, body: Option<Value>) -> (HttpResponse, String) {
+        let host = format!("her.localhost:{}", self.port);
+        let origin = format!("http://{host}");
+        raw_browser_http(self.port, method, path, &host, &[
+            ("Cookie", cookie), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin"),
+            ("Content-Type", "application/json; charset=utf-8"),
+        ], &body.map(|value| value.to_string()).unwrap_or_default()).unwrap()
+    }
+}
+
+fn fixture_wall_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn raw_browser_http(
+    port: u16, method: &str, path: &str, host: &str, headers: &[(&str, &str)], body: &str,
+) -> Result<(HttpResponse, String), String> {
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    socket.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+    for (name, value) in headers { request.push_str(&format!("{name}: {value}\r\n")); }
+    request.push_str("\r\n");
+    request.push_str(body);
+    socket.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    socket.read_to_string(&mut response).map_err(|e| e.to_string())?;
+    let (headers, body) = response.split_once("\r\n\r\n").ok_or("incomplete response")?;
+    let status = headers.split_whitespace().nth(1).and_then(|code| code.parse().ok()).ok_or("invalid HTTP status")?;
+    Ok((HttpResponse { status, body: body.into() }, headers.into()))
+}
+
+#[test]
+fn browser_admin_can_set_backup_destination_and_rotate_token() {
+    let fixture = BrowserFixture::new("cookie-backup-rotate");
+    initialize_memory_fixture(&fixture.root);
+    let dest = fixture.workspace.root("chosen backups");
+    let cookie = fixture.cookie([21; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+    let _console = fixture.start();
+    expect_json(fixture.request("POST", "/api/backups/settings", &cookie, Some(json!({"dir":dest,"keepDays":3}))).0,
+        200, "a browser administrator can change the backup destination");
+    fixture.db().execute("DELETE FROM console_browser_sessions", []).unwrap();
+    assert_eq!(fixture.request("GET", "/api/backups/settings", &cookie, None).0.status, 401);
+    let triggered = expect_json(http_request(fixture.port, "POST", "/api/tasks/backup/run", Some(BROWSER_MACHINE), None,
+        Some(&json!({"requestId":"fixture-browser-backup"}))).unwrap(), 202, "backup starts with native authority");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let id = triggered["runId"].as_str().unwrap();
+    loop {
+        let run = expect_json(http_request(fixture.port, "GET", &format!("/api/tasks/runs/{id}"), Some(BROWSER_MACHINE), None, None).unwrap(), 200, "backup receipt");
+        if run["run"]["endedAt"].is_i64() {
+            assert_eq!(run["run"]["state"], "succeeded", "{run}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "backup did not finish");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(fs::read_dir(&dest).unwrap().filter_map(Result::ok).any(|file| file.path().extension().is_some_and(|ext| ext == "zip")));
+    let mut token = BROWSER_MACHINE.to_owned();
+    for (id, body, generated) in [([22; 32], json!({"token":BROWSER_CHOSEN}), false), ([23; 32], json!({}), true)] {
+        let cookie = fixture.cookie(id, &token, fixture_wall_ms() - 200);
+        let (response, headers) = fixture.request("POST", "/api/console/token", &cookie, Some(body));
+        let reply = expect_json(response, 200, "browser authority can rotate the machine credential");
+        assert_eq!(reply["generated"], generated);
+        token = reply["token"].as_str().unwrap().to_owned();
+        assert!(!token.is_empty());
+        if !generated { assert_eq!(token, BROWSER_CHOSEN); }
+        assert_eq!(fs::read_to_string(fixture.root.join("data/console-token")).unwrap(), token);
+        let cfg: Value = serde_json::from_slice(&fs::read(fixture.root.join("config/config.json")).unwrap()).unwrap();
+        assert_eq!(cfg["consoleToken"], if generated { "" } else { &token });
+        let name = cookie.split_once('=').unwrap().0;
+        assert!(headers.contains(&format!("Set-Cookie: {name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")));
+        assert_eq!(fixture.request("GET", "/api/status", &cookie, None).0.status, 401);
+        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(&token), None, None).unwrap().status, 200);
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn console_token_rotation_recovers_between_publications() {
+    for (cut, live) in [("after-token", BROWSER_CHOSEN), ("before-token", BROWSER_MACHINE), ("after-config", BROWSER_CHOSEN)] {
+        let fixture = BrowserFixture::new("rotation-publication-cut");
+        let cookie = fixture.cookie([19; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+        let mut console = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None, &[("HER_TEST_ROTATION_CUT", cut)]);
+        let response = http_request(fixture.port, "POST", "/api/console/token", Some(BROWSER_MACHINE), None, Some(&json!({"token":BROWSER_CHOSEN})));
+        assert!(response.is_err(), "fixture must cut the rotating response");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(exit) = console.child.try_wait().unwrap() {
+                assert_eq!(exit.code(), Some(86));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(fixture.root.join("data/console-token-rotation").is_file());
+        drop(console);
+        let _console = fixture.start();
+        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(live), None, None).unwrap().status, 200,
+            "reconciled machine proof must work after the console restarts");
+        let obsolete = if live == BROWSER_MACHINE { BROWSER_CHOSEN } else { BROWSER_MACHINE };
+        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(obsolete), None, None).unwrap().status, 401);
+        assert!(!fixture.root.join("data/console-token-rotation").exists());
+        assert_eq!(fixture.request("GET", "/api/status", &cookie, None).0.status, 401);
+        #[cfg(windows)]
+        if cut != "before-token" {
+            let issued = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(live), None, Some(&json!({}))).unwrap(), 200, "native proof uses the reconciled token file");
+            assert_eq!(http_request(fixture.port, "GET", "/api/status", issued["session"].as_str(), None, None).unwrap().status, 200);
+        }
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn day_zero_grant_cannot_replay_on_day_six_after_day_eight() {
+    let fixture = BrowserFixture::new("clock-observation-across-restart");
+    let epoch = 1_700_000_000_i64 * 1000;
+    let day = 24 * 60 * 60 * 1000_i64;
+    let retained = fixture.cookie([11; 32], BROWSER_MACHINE, epoch);
+    let _control = fixture.cookie([12; 32], BROWSER_MACHINE, epoch + 6 * day);
+    let start = |at: i64| {
+        ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
+            &[("HER_PARITY_EPOCH_MS", &at.to_string())])
+    };
+    let original = start(epoch);
+    let clock = || fixture.db().query_row("SELECT clock_high_water_ms FROM console_auth_state", [], |row| row.get::<_, i64>(0)).unwrap();
+    assert_eq!(fixture.db().query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    let advance = fixture.workspace.root("clock");
+    drop(original);
+    let console = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
+        &[("HER_PARITY_EPOCH_MS", &epoch.to_string()), ("HER_PARITY_ADVANCE_FILE", advance.to_str().unwrap())]);
+    fs::write(advance, (8 * day).to_string()).unwrap();
+    let absent_id = [13; 32];
+    let absent: [u8; 32] = Sha256::digest(absent_id).into();
+    let absent = format!("her_browser_{}_{}={}", fixture.port, URL_SAFE_NO_PAD.encode(absent), URL_SAFE_NO_PAD.encode(absent_id));
+    assert_eq!(fixture.request("GET", "/api/status", &absent, None).0.status, 401);
+    assert!(clock() >= epoch + 8 * day, "a missing grant must still advance the durable clock");
+    let rows = || fixture.db().query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap();
+    assert_eq!(rows(), 2, "validation of an unrelated grant leaves the retained row alone");
+    assert_eq!(fixture.db().query_row("SELECT min(expires_ms) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap(),
+        epoch + BROWSER_WEEK_MS);
+    drop(console);
+    let _restarted = start(epoch + 6 * day);
+    assert_eq!(rows(), 0, "startup must revoke every grant before the first cookie is used");
+    assert!((epoch + 6 * day..epoch + 7 * day).contains(&clock()));
+    assert_eq!(fixture.request("GET", "/api/status", &retained, None).0.status, 401);
+}
+
+#[cfg(windows)]
+#[test]
+fn desktop_sign_in_admits_browser_session_with_installing_user_peer() {
+    let fixture = BrowserFixture::new("desktop-browser-auth");
+    private_token_file(&fixture.root, BROWSER_MACHINE);
+    let cookie = fixture.cookie([72; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+    let console = fixture.start();
+    let reply = expect_json(fixture.request("POST", "/api/desktop/sign-in", &cookie, Some(json!({}))).0, 200,
+        "browser desktop issuance requires a live cookie and the verified Windows peer");
+    let host = format!("127.0.0.1:{}", fixture.port);
+    let origin = format!("http://her.localhost:{}", fixture.port);
+    let canonical = format!("her.localhost:{}", fixture.port);
+    let issued = reply["session"].as_str().unwrap();
+    assert_eq!(raw_browser_http(fixture.port, "GET", "/settings", &host, &[("x-console-token", issued), ("Sec-Fetch-Mode", "navigate")], "").unwrap().0.status, 200);
+    for marker in [
+        ("Origin", origin.as_str()),
+        ("Sec-Fetch-Site", "same-origin"),
+        ("Referer", origin.as_str()),
+        ("Cookie", ""),
+    ] {
+        let (response, _) = raw_browser_http(fixture.port, "POST", "/api/desktop/sign-in", &canonical,
+            &[("x-console-token", BROWSER_MACHINE), ("Content-Type", "application/json"), marker], "{}").unwrap();
+        assert!(matches!(response.status, 401 | 403), "browser marker {} must refuse a raw-only proof", marker.0);
+    }
+    let native = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(BROWSER_MACHINE), None, Some(&json!({}))).unwrap(), 200,
+        "the native file proof retains its transport");
+    assert_eq!(http_request(fixture.port, "GET", "/api/status", native["session"].as_str(), None, None).unwrap().status, 200);
+    drop(console);
+    let foreign_sid = format!("0101{}", "0".repeat(20));
+    let _other = ConsoleProcess::start_with_peer_sid(&fixture.root, fixture.port, &fixture.home, Some(&foreign_sid));
+    assert_eq!(fixture.request("POST", "/api/desktop/sign-in", &cookie, Some(json!({}))).0.status, 403,
+        "a browser cookie must still pass the installing-user peer check");
+}
+
+#[test]
+fn served_pages_select_browser_or_desktop_transport() {
+    let fixture = BrowserFixture::new("browser-page-transport");
+    let cookie = fixture.cookie([15; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+    let _console = fixture.start();
+    let port = fixture.port;
+    let canonical = format!("her.localhost:{port}");
+    let alias = format!("127.0.0.1:{port}");
+    for page in [
+        "/",
+        "/settings",
+        "/conversations",
+        "/models",
+        "/persona",
+        "/schedule",
+        "/login",
+        "/setup",
+    ] {
+        let (served, response_headers) = fixture.request("GET", page, &cookie, None);
+        assert_eq!(served.status, 200, "{page} accepts a browser cookie");
+        assert!(
+            response_headers.contains("Content-Security-Policy:")
+                && response_headers.contains("script-src 'self'")
+                && response_headers.contains("style-src 'self'"),
+            "{page} missing strict CSP header: {response_headers}"
+        );
+        assert!(!served.body.contains("<script>"), "{page} must not inline script");
+        let redirected = raw_browser_http(
+            port,
+            "GET",
+            &format!("{page}?token={BROWSER_MACHINE}"),
+            &alias,
+            &[],
+            "",
+        )
+        .unwrap();
+        assert_eq!(redirected.0.status, 302, "{page} on old host redirects");
+        let location = format!("Location: http://{canonical}{page}");
+        assert!(redirected.1.lines().any(|header| header == location.as_str()));
+        assert!(!redirected.1.contains(BROWSER_MACHINE));
+    }
+    for (legacy, target) in [
+        ("/personas", "/persona"),
+        ("/tasks", "/schedule"),
+        ("/settings/conversations", "/conversations"),
+        ("/settings/models", "/models"),
+    ] {
+        let (canonical_redirect, headers) = fixture.request("GET", legacy, &cookie, None);
+        assert_eq!(canonical_redirect.status, 302, "{legacy} redirects on canonical host");
+        let path_location = format!("Location: {target}");
+        assert!(headers.lines().any(|header| header == path_location.as_str()), "{headers}");
+
+        let (alias_redirect, alias_headers) = raw_browser_http(
+            port,
+            "GET",
+            &format!("{legacy}?token={BROWSER_MACHINE}"),
+            &alias,
+            &[],
+            "",
+        )
+        .unwrap();
+        assert_eq!(alias_redirect.status, 302, "{legacy} redirects from alias host");
+        let canonical_location = format!("Location: http://{canonical}{target}");
+        assert!(
+            alias_headers.lines().any(|header| header == canonical_location.as_str()),
+            "{alias_headers}"
+        );
+        assert!(!alias_headers.contains(BROWSER_MACHINE));
+    }
+    let duplicate = |headers: &[(&str, &str)]| raw_browser_http(port, "GET", "/api/status", &canonical, headers, "").unwrap().0.status;
+    let origin = format!("http://{canonical}");
+    assert_eq!(duplicate(&[("Cookie", &cookie), ("Cookie", &cookie)]), 401);
+    assert_eq!(duplicate(&[("Cookie", &cookie), ("Origin", &origin), ("Origin", &origin)]), 403);
+    assert_eq!(duplicate(&[("Cookie", &cookie), ("Host", &canonical)]), 403);
+    assert_eq!(duplicate(&[("Cookie", &cookie), ("x-console-token", "")]), 401);
+    assert_eq!(duplicate(&[("Cookie", &cookie), ("x-agent-call", "")]), 401);
+    assert_eq!(raw_browser_http(port, "GET", "/api/status?token=", &canonical, &[("Cookie", &cookie)], "").unwrap().0.status, 401);
+    assert_eq!(raw_browser_http(port, "GET", "/api/status", &alias, &[("x-console-token", BROWSER_MACHINE)], "").unwrap().0.status, 200);
+    assert_eq!(raw_browser_http(port, "GET", "/api/status", &alias, &[("x-console-token", BROWSER_MACHINE), ("Sec-Fetch-Mode", "cors")], "").unwrap().0.status,
+        401, "a browser may not use a raw machine token");
+    if std::env::var_os("CI").is_some() || std::env::var_os("HER_TEST_CHROMIUM").is_some() {
+        let mut cmd = Command::new("node");
+        cmd.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/console-browser-origin.mjs"))
+            .arg(port.to_string()).arg(fixture.workspace.root("chromium-profile"))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        hide_process_window(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(cookie.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "Chromium console origin fixture: {}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+#[test]
+fn browser_release_banner_opens_schedule_with_cookie() {
+    let fixture = BrowserFixture::new("browser-release-link");
+    let cookie = fixture.cookie([15; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+    let _console = fixture.start();
+    let (served, headers) = fixture.request("GET", "/", &cookie, None);
+    assert_eq!(served.status, 200);
+    assert!(headers.contains("Content-Security-Policy:") && headers.contains("script-src 'self'"));
+    assert_eq!(fixture.request("GET", "/schedule", &cookie, None).0.status, 200);
+    assert_eq!(fixture.request("GET", "/api/releases", &cookie, None).0.status, 200);
+}
+
+#[cfg(feature = "parity-clock")]
+struct RestartFixture<'a> {
+    fixture: &'a BrowserFixture,
+    supervisor: ConsoleProcess,
+    original: ConsoleProcess,
+    pause: PathBuf,
+    cut: PathBuf,
+}
+
+#[cfg(feature = "parity-clock")]
+impl<'a> RestartFixture<'a> {
+    fn start(fixture: &'a BrowserFixture) -> Self {
+        let config = fixture.root.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        cfg["backends"]["mcpRustBridge"] = json!(true);
+        cfg["rollout"]["rustGroups"] = json!([]);
+        cfg["consolePort"] = json!(fixture.port);
+        cfg["update"]["policy"] = json!("off");
+        cfg["tasks"]["watchdog"]["enabled"] = json!(false);
+        fs::write(config, cfg.to_string()).unwrap();
+        let pause = fixture.workspace.root("pause-restart");
+        let cut = fixture.workspace.root("cut-restart-queue");
+        let original = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
+            &[("HER_TEST_RESTART_QUEUE_CUT", cut.to_str().unwrap())]);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_her"));
+        cmd.args(["supervise", "--runtime-root"]).arg(&fixture.root)
+            .env("HER_TEST_RESTART_PAUSE_FILE", &pause)
+            .env_remove("HER_RUNTIME_ROOT")
+            .env("HER_INSTALL_ROOT", fixture.workspace.root("test-install"))
+            .env("DSH_HOME", &fixture.home)
+            .stdout(Stdio::null()).stderr(Stdio::null());
+        hide_process_window(&mut cmd);
+        let mut supervisor = ConsoleProcess { child: cmd.spawn().unwrap(), port: 0 };
+        let marker = fixture.root.join("data/logs/rbridge-supervisor.lock.owner.json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if marker.is_file() { break; }
+            assert!(supervisor.child.try_wait().unwrap().is_none(), "supervisor quit before acquiring ownership");
+            assert!(Instant::now() < deadline, "supervisor owner marker never published");
+            thread::sleep(Duration::from_millis(25));
+        }
+        Self { fixture, supervisor, original, pause, cut }
+    }
+
+    fn request(&self, id: &str, token: &str) -> HttpResponse {
+        http_request(self.fixture.port, "POST", "/api/restart", Some(token), None,
+            Some(&json!({"requestId":id,"confirm":true}))).unwrap()
+    }
+
+    fn queued(&self) -> PathBuf { self.fixture.root.join("data/lifecycle/console-restart.json") }
+
+    fn receipt(&self, id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            if let Ok(response) = http_request(self.fixture.port, "GET", "/api/tasks/runs", Some(BROWSER_MACHINE), None, None) {
+                if let Ok(value) = serde_json::from_str::<Value>(&response.body) {
+                    if let Some(run) = value["runs"].as_array().into_iter().flatten()
+                        .find(|run| run["requestId"] == id && run["endedAt"].is_i64())
+                    {
+                        return run.clone();
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "restart did not settle");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn pid(&self) -> u64 {
+        expect_json(http_request(self.fixture.port, "GET", "/api/health", None, None, None).unwrap(), 200, "owned console liveness")
+            ["pid"].as_u64().unwrap()
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+impl Drop for RestartFixture<'_> {
+    fn drop(&mut self) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_her-cli"));
+        cmd.args(["stop", "--confirm", "--runtime-root"]).arg(&self.fixture.root)
+            .env("HER_INSTALL_ROOT", self.fixture.workspace.root("test-install"))
+            .stdout(Stdio::null()).stderr(Stdio::null());
+        hide_process_window(&mut cmd);
+        let _ = cmd.status();
+        let _ = self.supervisor.child.try_wait();
+        let _ = self.original.child.try_wait();
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn supervised_restart_releases_config_gate_before_readiness() {
+    let fixture = BrowserFixture::new("supervised-start-config");
+    let cookie = fixture.cookie([43; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
+    let restart = RestartFixture::start(&fixture);
+    let mut pid = restart.pid();
+    for (id, browser) in [("fixture-raw-restart", false), ("fixture-cookie-restart", true)] {
+        let response = if browser {
+            fixture.request("POST", "/api/restart", &cookie, Some(json!({"confirm":true,"requestId":id}))).0
+        } else {
+            restart.request(id, BROWSER_MACHINE)
+        };
+        expect_json(response, 202, "enqueue supervised restart");
+        let receipt = restart.receipt(id);
+        assert_eq!(receipt["state"], "succeeded", "replacement must finish startup after taking the config gate: {receipt}");
+        let replacement = restart.pid();
+        assert_ne!(replacement, pid);
+        pid = replacement;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while restart.queued().exists() {
+            assert!(Instant::now() < deadline, "settled queue was not cleared");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "parity-clock"))]
+#[test]
+fn queued_desktop_restart_is_revoked_by_same_value_rotation() {
+    let fixture = BrowserFixture::new("queued-desktop-restart");
+    private_token_file(&fixture.root, BROWSER_MACHINE);
+    let restart = RestartFixture::start(&fixture);
+    fs::write(&restart.pause, []).unwrap();
+    let issued = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(BROWSER_MACHINE), None, Some(&json!({}))).unwrap(), 200, "real Windows desktop handshake");
+    let old = restart.pid();
+    let id = "fixture-desktop-restart";
+    expect_json(restart.request(id, issued["session"].as_str().unwrap()), 202, "queue a desktop restart");
+    expect_json(http_request(fixture.port, "POST", "/api/console/token", Some(BROWSER_MACHINE), None, Some(&json!({"token":BROWSER_MACHINE}))).unwrap(), 200, "same-value rotation revokes queued desktop grant");
+    fs::remove_file(&restart.pause).unwrap();
+    assert_eq!(restart.receipt(id)["state"], "failed", "revoked queued desktop proof must refuse at execution");
+    assert_eq!(restart.pid(), old, "revoked desktop proof must leave the original console running");
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn deferred_restart_publishes_and_recovers_queue_record() {
+    let fixture = BrowserFixture::new("deferred-restart-record");
+    let restart = RestartFixture::start(&fixture);
+    fs::write(&restart.pause, []).unwrap();
+    fs::write(&restart.cut, []).unwrap();
+    let id = "fixture-atomic-restart";
+    expect_json(restart.request(id, BROWSER_MACHINE), 503, "a staged queue cut never publishes");
+    assert!(!restart.queued().exists(), "the final restart path must have no partial record at the publication cut");
+    fs::remove_file(&restart.cut).unwrap();
+    fs::write(restart.queued(), b"{torn").unwrap();
+    expect_json(restart.request(id, BROWSER_MACHINE), 503, "fresh torn queue refuses reuse");
+    assert_eq!(fs::read(restart.queued()).unwrap().as_slice(), b"{torn");
+    fs::OpenOptions::new().write(true).open(restart.queued()).unwrap().set_modified(
+        SystemTime::now() - Duration::from_secs(301),
+    ).unwrap();
+    expect_json(restart.request(id, BROWSER_MACHINE), 202, "expired unreadable record may be replaced");
+    let queue: Value = serde_json::from_slice(&fs::read(restart.queued()).unwrap()).unwrap();
+    assert_eq!(queue["v"], 2);
+    assert_eq!(queue["requestId"], id);
+    let duplicate = expect_json(restart.request(id, BROWSER_MACHINE), 202, "preserve valid queue dedupe");
+    assert_eq!(duplicate["duplicate"], true);
+    fs::remove_file(&restart.pause).unwrap();
+    assert_eq!(restart.receipt(id)["state"], "succeeded");
 }
 
 fn wait_for_health(process: &mut ConsoleProcess) -> Result<Value, String> {
@@ -1040,17 +1543,10 @@ fn backup_console_settings_preserve_raw_config_and_apply_to_the_next_run() {
     assert_eq!(settings["time"], "04:00");
     assert_eq!(settings["includeState"], true);
     assert!(settings["dir"].is_null());
-    let page = http_request(port, "GET", "/tasks", Some(token), None, None).unwrap();
+    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("id=\"backup-settings\""), "task console must expose backup settings");
-    let script = page.body.split_once("<script>").unwrap().1.split_once("</script>").unwrap().0;
-    let script_file = workspace.root("backup-page.js");
-    fs::write(&script_file, script).unwrap();
-    let mut syntax = Command::new("node");
-    syntax.arg("--check").arg(&script_file).env_remove("NODE_OPTIONS").env_remove("NODE_PATH");
-    hide_process_window(&mut syntax);
-    let syntax = syntax.output().expect("page syntax checker must start and be reaped");
-    assert!(syntax.status.success(), "served page JavaScript must parse: {}", String::from_utf8_lossy(&syntax.stderr));
+    assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
     let posted = json!({"dir":"next backup's output","keepDays":2,"time":"06:30","includeState":false});
     let saved = expect_json(http_request(port, "POST", "/api/backups/settings", Some(token), None, Some(&posted)).unwrap(), 200, "save backup settings");
     assert_eq!(saved["settings"]["keepDays"], 2);
@@ -1197,9 +1693,10 @@ fn backup_console_list_reports_archive_time_size_verification_and_failed_attempt
     assert_eq!(attempts[0]["runId"], failed["runId"]);
     assert_eq!(attempts[0]["state"], "failed");
     assert_eq!(fs::read(destination.join("personal.zip")).unwrap(), b"unrelated");
-    let page = http_request(port, "GET", "/tasks", Some(token), None, None).unwrap();
+    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("id=\"backup-list\""), "task console must expose the backup list");
+    assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
     drop(console);
 }
 
@@ -1492,7 +1989,8 @@ fn task_page_and_history_are_available_only_to_the_current_administrator() {
     assert_eq!(tasks["tasks"].as_array().unwrap().iter().find(|task| task["id"] == "upstream-check").unwrap()["enabled"], false);
     assert!(!tasks["tasks"].as_array().unwrap().iter().any(|task| task["id"] == "ab-report"));
     assert_eq!(tasks["legacy"].as_array().unwrap().iter().find(|task| task["name"] == "QQBot-ABReport").unwrap()["disposition"], "retired");
-    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 200);
+    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    assert_eq!(http_request(port, "GET", "/schedule", Some(token), None, None).unwrap().status, 200);
     assert_eq!(http_request(port, "GET", "/api/tasks", Some(token), Some(agent), None).unwrap().status, 403);
     let run = json!({"requestId":"fixture-request-01"});
     assert_eq!(http_request(port, "POST", "/api/tasks/not-a-task/run", Some(token), None, Some(&run)).unwrap().status, 404);
@@ -1546,7 +2044,7 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     assert_eq!(http_request(port, "GET", "/api/schedule", Some(token), Some(agent), None).unwrap().status, 403);
     let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("/api/schedule") && page.body.contains("tab-history"));
+    assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
 
     let now = schedule_list(port, token)["now"].as_i64().unwrap();
     let publish_timers = |published_at: i64| {
@@ -1827,16 +2325,16 @@ fn revoked_console_credential_cancels_a_queued_task_before_it_starts() {
     config["tasks"] = json!({"nodePath":fake_node, "installRoot":root});
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     let (port, _) = reserve_distinct_ports();
-    let console = ConsoleProcess::start(&root, port, &legacy);
-    fs::create_dir_all(root.join("data/locks")).unwrap();
-    let gate = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join("data/locks/social-v2.lock")).unwrap();
-    gate.try_lock().unwrap();
+    let pause = workspace.root("task-admission-pause");
+    fs::write(&pause, []).unwrap();
+    let console = ConsoleProcess::start_with_env(&root, port, &legacy, None, None,
+        &[("HER_TEST_TASK_ADMISSION_PAUSE", pause.to_str().unwrap())]);
     let body = json!({"requestId":"fixture-revoked-request"});
     let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&body)).unwrap(), 202, "queued task");
     let id = started["runId"].as_str().unwrap();
     config["consoleToken"] = json!("fixture-replacement-console-token");
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
-    drop(gate);
+    fs::remove_file(pause).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let response = http_request(port, "GET", &format!("/api/tasks/runs/{id}"), Some("fixture-replacement-console-token"), None, None).unwrap();
@@ -3245,12 +3743,12 @@ fn console_page_voice_and_tool_log_routes_stay_in_each_selected_root() {
     let page_a = http_request(console_a.port, "GET", "/", Some(token_a), None, None)
         .expect("request selected A console page");
     assert_eq!(page_a.status, 200, "selected A page: {}", page_a.body);
-    assert!(page_a.body.contains("selected-a-page"));
+    assert!(page_a.body.to_ascii_lowercase().contains("<!doctype html>"));
     assert!(!page_a.body.contains("selected-b"));
     let page_b = http_request(console_b.port, "GET", "/", Some(token_b), None, None)
         .expect("request selected B console page");
     assert_eq!(page_b.status, 200, "selected B page: {}", page_b.body);
-    assert!(page_b.body.contains("selected-b-page"));
+    assert!(page_b.body.to_ascii_lowercase().contains("<!doctype html>"));
     assert!(!page_b.body.contains("selected-a"));
     let cross_console_page = http_request(console_a.port, "GET", "/", Some(token_b), None, None)
         .expect("reject B console token at A page");
@@ -3562,19 +4060,19 @@ fn console_page_voice_and_tool_log_routes_stay_in_each_selected_root() {
 
     fs::remove_file(root_a.join("resources/public/console.html"))
         .expect("remove only selected A console page");
-    let missing_page = http_request(console_a.port, "GET", "/", Some(token_a), None, None)
-        .expect("request missing selected A console page");
+    let embedded_page_a = http_request(console_a.port, "GET", "/", Some(token_a), None, None)
+        .expect("request embedded A console page after deleting disk html");
     assert_eq!(
-        missing_page.status, 500,
-        "missing selected page: {}",
-        missing_page.body
+        embedded_page_a.status, 200,
+        "embedded SPA must not read disk console.html: {}",
+        embedded_page_a.body
     );
-    assert!(!missing_page.body.contains("selected-b"));
+    assert!(embedded_page_a.body.to_ascii_lowercase().contains("<!doctype html>"));
     let b_page_after_a_missing =
         http_request(console_b.port, "GET", "/", Some(token_b), None, None)
             .expect("verify B page after selected A page removal");
     assert_eq!(b_page_after_a_missing.status, 200);
-    assert!(b_page_after_a_missing.body.contains("selected-b-page"));
+    assert!(b_page_after_a_missing.body.to_ascii_lowercase().contains("<!doctype html>"));
 }
 
 #[test]
@@ -4665,7 +5163,200 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     assert_eq!(call("/api/backups/restore/preview", Some(token), None, &body).status, 400);
     assert!(!root.join("data/lifecycle/desired-state.json").exists());
     assert_eq!(http_request(port, "GET", "/api/health", None, None, None).unwrap().status, 200);
-    let page = http_request(port, "GET", "/tasks", Some(token), None, None).unwrap();
-    assert!(page.body.contains("/api/backups/restore/preview") && page.body.contains("restore-scope"));
+    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
+    assert_eq!(page.status, 200);
+    assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
     drop(console);
+}
+
+#[test]
+fn local_browser_auto_sign_in_over_loopback_tcp() {
+    let fixture = BrowserFixture::new("local-auto-sign-in");
+    let canonical = format!("her.localhost:{}", fixture.port);
+
+    #[cfg(windows)]
+    {
+        let console = fixture.start();
+        let (cross_site, cross_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "cross-site")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(cross_site.status, 200);
+        assert!(!cross_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+
+        let (page, page_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(page.status, 200, "{}", page.body);
+        let set_cookie = page_headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .expect("auto sign-in issues browser session cookie");
+        let cookie_pair = set_cookie.split(';').next().unwrap().trim().to_string();
+        assert!(cookie_pair.starts_with(&format!("her_browser_{}_", fixture.port)));
+
+        let (status_res, _) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/api/auth/status",
+            &canonical,
+            &[("Cookie", &cookie_pair), ("Sec-Fetch-Site", "same-origin")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(status_res.status, 200, "{}", status_res.body);
+        let parsed: Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(parsed["authenticated"], json!(true));
+        assert_eq!(parsed["authKind"], json!("browser"));
+        assert_eq!(parsed["requirePasswordLocally"], json!(false));
+        assert_eq!(parsed["localAutoSignInAvailable"], json!(true));
+
+        let (toggle, _) = fixture.request(
+            "POST",
+            "/api/settings/set",
+            &cookie_pair,
+            Some(json!({"setting": "security.requirePasswordLocally", "value": true, "confirm": true})),
+        );
+        assert_eq!(toggle.status, 200, "{}", toggle.body);
+
+        let (after_toggle, after_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(after_toggle.status, 200);
+        assert!(!after_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        drop(console);
+
+        let mismatch = ConsoleProcess::start_with_peer_sid(
+            &fixture.root,
+            fixture.port,
+            &fixture.home,
+            Some("00"),
+        );
+        let reset_cfg = http_request(
+            fixture.port,
+            "POST",
+            "/api/settings/set",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({"setting": "security.requirePasswordLocally", "value": false, "confirm": true})),
+        )
+        .unwrap();
+        assert_eq!(reset_cfg.status, 200, "{}", reset_cfg.body);
+        let (other_user, other_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(other_user.status, 200);
+        assert!(!other_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        drop(mismatch);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let console = fixture.start();
+        let (page, headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(page.status, 200);
+        assert!(!headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        let (status_res, _) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/api/auth/status",
+            &canonical,
+            &[("Sec-Fetch-Site", "same-origin")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(status_res.status, 200, "{}", status_res.body);
+        let parsed: Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(parsed["authenticated"], json!(false));
+        assert_eq!(parsed["localAutoSignInAvailable"], json!(false));
+        drop(console);
+    }
 }

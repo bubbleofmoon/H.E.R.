@@ -50,6 +50,30 @@
     },
     {
       "path": "her/Cargo.lock",
+      "value": "3-6-1-0-8-9-2",
+      "line_sha256": "1a1d-1bcf-8b04-5da0-a143-1be0-6be4-e8ca-eede-b6af-dc8d-29bf-ac72-e567-bff7-c6f1",
+      "reason": "SHA256 of the crates.io argon2 0.5.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-7-0-0-3-4-9",
+      "line_sha256": "1a1d-1bcf-8b04-5da0-a143-1be0-6be4-e8ca-eede-b6af-dc8d-29bf-ac72-e567-bff7-c6f1",
+      "reason": "SHA256 of the crates.io argon2 0.5.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-1-1-6-2-2-1-3-1-8",
+      "line_sha256": "c089-a42d-2cae-615b-12bb-4050-7841-b261-5c97-8180-6fa3-abe4-28e2-14bf-743a-ec47",
+      "reason": "SHA256 of the crates.io base64ct 1.8.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "4-0-7-4-5-2-6-0",
+      "line_sha256": "9232-1ac2-24c1-2674-30d6-9fc3-a237-1cf3-df6a-09e1-8f2b-33b5-77b5-b7bd-134c-fac8",
+      "reason": "SHA256 of the crates.io password-hash 0.5.0 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
       "value": "3-2-0-1-1-9-5-7-9",
       "line_sha256": "981d-2ddd-91f2-12a6-3ce0-070e-2110-d5e9-d0c3-ee9f-f7bf-2a4e-a22d-f78c-5802-6cc0",
       "reason": "SHA256 of a registry dependency archive"
@@ -5897,6 +5921,24 @@
       "value": "0-0-1-0-0-0-0-0",
       "line_sha256": "7e4e-69db-4311-1098-2d06-cf68-afda-61b0-af8b-5d44-9fa0-8334-55f9-59d3-b67e-9c79",
       "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "5e2a-34ac-b084-da09-601c-5bc5-2d19-9025-f76e-a003-182d-9d73-15b5-7ef9-b36a-fbe8",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "191e-176f-a4bf-529e-6857-61f8-898e-4453-277d-2cf7-b9a9-7977-0e81-2bee-e728-3c85",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "e590-dcac-6177-0c91-5de4-029a-5af3-30e6-98d6-c1d0-36da-5749-f07a-e820-7488-58b3",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
     }
   ],
   "path_exceptions": [
