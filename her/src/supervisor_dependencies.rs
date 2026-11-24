@@ -10,26 +10,6 @@ use std::time::{Duration, Instant};
 
 #[path = "supervisor_relay.rs"]
 mod relay;
-
-#[cfg(all(test, windows))]
-pub(crate) fn credential_file_is_private(path: &std::path::Path, settings: bool) -> bool {
-    relay::credential_file_is_private(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn create_credential_file(path: &std::path::Path, settings: bool) -> std::io::Result<std::fs::File> {
-    relay::windows_create_credential(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn restrict_credential_path(path: &std::path::Path, metadata: &std::fs::Metadata, settings: bool) -> Result<(), String> {
-    if settings {
-        relay::windows_private_settings(path, metadata)
-    } else {
-        relay::windows_private(path, metadata)
-    }
-    .map_err(String::from)
-}
 #[path = "dependency_upgrade.rs"]
 pub(crate) mod upgrades;
 
@@ -2340,7 +2320,6 @@ fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
 
 #[cfg(windows)]
 mod os {
-    pub(super) use super::relay::windows_private as private;
     use super::*;
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -2506,7 +2485,6 @@ mod os {
 
 #[cfg(unix)]
 mod os {
-    pub(super) use super::relay::unix_private as private;
     use super::*;
     /// npm runs as its own process group so a stop reaches its descendants.
     pub struct NpmTree(std::process::Child);

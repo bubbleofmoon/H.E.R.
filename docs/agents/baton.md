@@ -1,48 +1,16 @@
-# Baton: who acts next on a ticket
+# Baton and single-coordinator operation
 
-Binding for both coordinators (Windows and Linux). Tickets are GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (`docs/agents/issue-tracker.md`); this file says who must act on an issue next and how a fresh session picks up. Hand off with `scripts/handoff.sh` / `scripts/handoff.ps1`.
+Development runs on a single Windows Antigravity coordinator against `bubbleofmoon/H.E.R.` (`docs/agents/issue-tracker.md`). Multi-host Linux↔Windows baton ping-pong and the background baton watcher daemon (`scripts/issue_watch.py`, `scripts/handoff.*`) are retired unless explicitly re-enabled.
 
-## Labels
+## Owner batons (`baton:owner`)
 
-- `baton:windows`: the Windows coordinator acts next. `baton:linux`: the Linux coordinator acts next. `baton:owner`: a decision only the owner (the administrator) can make.
-- At most one baton label per issue. No baton means nobody owes an action (a closed issue, or an open one still blocked).
-- Host labels route implementation. Linux handles portable work and plans host-native work. Implementation requiring the Windows host carries the `windows` label. A cross-host baton may request a native check or an answer.
-
-## Handing over
-
-1. Write the comment to a body file whose first line is `**Handoff → windows**`, `**Handoff → linux**` or `**Handoff → owner**`.
-2. Run `scripts/handoff.sh <issue> <linux|windows|owner> <body-file>` (`scripts/handoff.ps1` on Windows). It changes nothing and exits non-zero when the heading does not match the side, the issue is not open, the repository has no `baton:<side>` label or the public scan refuses the body. Otherwise it posts the comment through `scripts/gh-public` first, so the receiver never wakes to a stale comment, then one `gh issue edit` removes every other `baton:*` label and adds `baton:<side>`. Exit 4 means `gh` failed after the scan passed. If it failed posting the comment, the comment may or may not be on the issue and the baton did not move: check the issue first. If it failed moving the label, the comment is posted: run the `gh issue edit` line it prints.
-
-The comment must stand on its own; the receiver reads nothing else first:
-
-- **State:** where the work stands (what is merged, what is in a worktree or branch, what failed).
-- **Commit:** the exact commit (and branch or PR) the receiver starts from.
-- **Do:** what the receiver should do.
-- **Done when:** what counts as finished, and who gets the baton back.
-- **Links:** spec section, related issues, evidence or report paths (paths only — never their contents).
-
-Hand over when: your side merged a ticket that unblocks one of the other side's; you need the other side to do something on an issue (merge first, verify on its platform, relabel, answer a question); you finish what the other side asked; or the owner must decide (`owner`, with the question, the options and your recommendation). When the owner answers, whoever sees the answer passes the baton to the side that acts on it.
-
-Keep your own baton while you work on an issue, and before ending a session hand off to your own side with a comment that records the current state, so a fresh session of your side can resume from it. Shared or broad changes (build scripts, CI, `AGENTS.md`, docs indexes, test fixtures, large merges) are announced on the issue that caused them, with a handoff when the other side must act.
-
-## A fresh session
-
-A new or cleared session never acts on chat memory alone. It:
-
-1. reads this file (and `AGENTS.md` if not loaded);
-2. lists the open issues carrying its own baton label: `gh issue list -R bubbleofmoon/H.E.R. --label baton:<side> --state open`, and the ready queue with the helper in `docs/agents/issue-tracker.md`;
-3. on each, does what the newest handoff comment addressed to it asks, starting from the commit it names (checking worktrees, running workers and their reports against that state);
-4. passes the baton when done, with `scripts/handoff`.
-
-Read the queue when a session starts and after each handoff, and keep the watcher running in between (see "Watcher"). The owner's queue is the issues carrying `baton:owner`.
-
-## Watcher
-
-`python -I scripts/issue_watch.py --machine linux` (or `windows`, `owner`), started hidden in the background, wakes a coordinator when its baton lands. Every 3 minutes (`--interval`, at least 180 s) it asks GitHub for open issues on `bubbleofmoon/H.E.R.` (`--repo` for another repository) carrying `baton:<machine>`, with a conditional request: when nothing changed GitHub answers 304, which costs nothing against the rate limit. It prints `BATON #<n> <title> <url>` and exits when the label lands on an issue, newly or again after leaving. On an issue it already holds, a new comment whose first line starts with `**Handoff → <machine>` prints `HANDOFF #<n> <title> <comment url>` and exits too; it reads that issue's comments when the listing's comment count or `updated_at` changes (and once more while the last update is under a minute old, because a change in the same second shows in neither), with `since=` the last read's `updated_at` minus 10 minutes, and reports each such comment whose id it has not yet reported (the state keeps the newest 50 handoff ids per issue; a first sighting records the existing ones without reporting them), never judging by position, count or creation second, so a comment deleted or replaced meanwhile hides nothing; a read of several pages walks to the last page and back, so a deletion between pages hides nothing either; the first failed read stops further reads until the next poll, a rate-limit wait it asked for is kept across restarts in the state file (`retry_after`), and `--once` exits 2 when a comment read gets no answer; a comment posted after the listing may wake it one poll early, never twice. Other comments, pushes and progress elsewhere never wake it. It exits after every event, so start it again after acting on the baton, recording its PID and creation time like every background process. `--follow` (it excludes `--once`) keeps it running instead: it prints each `BATON` or `HANDOFF` line flushed at once, before it writes the state (a stop in between repeats the event, never loses it), and waits one interval (a comment read's rate-limit wait when that is longer) before the next poll, so a coordinator can stream it through the Monitor tool without restarting it between events; the polling, ETag, rate-limit and state rules are the same, a poll GitHub did not answer is retried at the next interval, and only exit 2 (an API failure or 100 or more batons) or a signal ends it. It does not compute readiness or claims. Its state file is `~/.her-baton-watch-<machine>-<owner>-<repo>.json`, one per repository (each name part keeps letters, digits, `.` and `_`, anything else is written as `%XX`), and is replaced atomically. A rate limit (403 or 429 with `Retry-After` or `X-RateLimit-Reset`) is waited out, at most an hour at a time but never less than the interval, and a 403 that names a secondary rate limit without either header for 180 s. `--once` polls once and prints the newly held issues or `no batons`, and exits 2 when GitHub does not answer. Exit 2 is also an API failure, 100 or more batons on one side or a malformed `--repo`: read the message before restarting.
+- Add `baton:owner` when an open issue is blocked on an administrator decision (or production action).
+- Post a concise scanned comment via `scripts/gh-public.ps1` stating the **question**, **options**, and **recommendation**.
+- Once the owner answers, remove `baton:owner` and resume or close the issue.
+- Open issues without `baton:owner` are either ready for the coordinator (all blockers closed) or blocked on another issue.
 
 ## Shared ground rules
 
-- Only coordinators merge, and only through a pull request whose CI is green on a head that contains the current `origin/main` (`issue-tracker.md` "Pull requests and merging").
-- Production, its config, tokens, tasks and data are touched only from the Windows machine and only with the owner's go-ahead at the time. Production incident detail stays in the vault.
-- Never write the production root `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay` and `~/.dsh`) or `memory.db` from either machine. Production is read-only for development and every production edit is the owner’s own action under the vault operating procedures (`docs/agents/production-ops.md`). The one exception is the #67 move, which the Windows coordinator runs on the owner's relayed go (the same file). Tests never contact real QQ, DSH, model or TTS services.
-- Never `@`-mention in comments: that notifies real GitHub accounts.
+- Merge only through a pull request with green `checks` CI on a head containing current `origin/main` (`docs/agents/issue-tracker.md` "Pull requests and merging").
+- Production is read-only from development: never write `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay`, `~/.dsh`) or `memory.db`, and never contact real QQ, DSH, model or TTS services (`docs/agents/production-ops.md`).
+- Never `@`-mention usernames in GitHub comments.

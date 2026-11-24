@@ -239,6 +239,13 @@ class RunTests(unittest.TestCase):
         result = self.run_tests('--only', 'harness_e2e')
         self.assertEqual(self.run_names(result.stdout), ['build', 'harness_e2e'], result.stdout + result.stderr)
 
+    def test_herupdate_runs_the_binary_test_target(self):
+        result = self.run_tests('--only', 'herupdate')
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        self.assertEqual(self.run_names(result.stdout), ['build', 'herupdate'], out)
+        self.assertIn('--bin herupdate -- --test-threads=1', self.cargo_log.read_text())
+
     def test_only_unknown_name_exits_2_listing_valid_names(self):
         result = self.run_tests('--only', 'nope')
         self.assertEqual(result.returncode, 2)

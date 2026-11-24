@@ -2,10 +2,14 @@
 use super::*;
 
 /// One request straight to `console_settings::route`, past the console front.
-fn direct_route(
-    context: &RuntimeContext, method: &str, path: &str, body: &str, authority: crate::persona::Authority<'_>,
-) -> (u16, Value) {
-    let (status, _, reply) = crate::console_settings::route(context, method, path, &HashMap::new(), body, false, authority);
+fn direct_route(context: &RuntimeContext, method: &str, path: &str, body: &str) -> (u16, Value) {
+    let (status, _, reply, _) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(context),
+        method,
+        path,
+        &HashMap::new(),
+        body,
+    );
     (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
 }
 
@@ -316,15 +320,13 @@ fn settings_undo_cut_off_before_its_audit_row_changes_nothing() {
 
 #[test]
 fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input() {
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
     let legacy = RuntimeContext::legacy();
     for (method, path, body) in [
         ("GET", "/api/settings/history", ""),
         ("POST", "/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#),
         ("POST", "/api/settings/undo", r#"{"entry":1}"#),
     ] {
-        let (status, reply) = direct_route(&legacy, method, path, body, &granted);
+        let (status, reply) = direct_route(&legacy, method, path, body);
         assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
     }
 
@@ -336,8 +338,9 @@ fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input()
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
     // The authority re-checks the console credential under the configuration gate before anything is written.
+    let revoked = crate::console_front::revoked_admin_context(&context);
     for (path, body) in [("/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#), ("/api/settings/undo", r#"{"entry":1}"#)] {
-        let (status, reply) = direct_route(&context, "POST", path, body, &revoked);
+        let (status, reply) = direct_route(&revoked, "POST", path, body);
         assert_eq!(status, 401, "{path}: {reply}");
     }
     for (request, status, error) in [
@@ -440,4 +443,45 @@ fn settings_undo_of_a_migration_entry_is_refused_and_revisions_continue_after_th
     let (status, body) = set_quiet(&context, json!(5000));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["revision"], 4, "the seed, the change and the undo each took a revision");
+}
+
+#[test]
+fn settings_undo_and_preview_never_503_under_concurrent_apply_loop() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let (_root, context) = settings_fixture("settings undo concurrent loop");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let barrier = std::sync::Barrier::new(2);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            for value in 1001..=1030 {
+                let applied = crate::settings::apply(
+                    &context,
+                    QUIET_KEY,
+                    &json!(value),
+                    "administrator",
+                    "console",
+                )
+                .unwrap();
+                assert_eq!(applied.value, json!(value));
+                std::thread::yield_now();
+            }
+            stop.store(true, SeqCst);
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            let mut rounds = 0usize;
+            while !stop.load(SeqCst) || rounds < 10 {
+                let (entries, _) = history_page(&context, "");
+                let entry = entries[0]["entry"].clone();
+                let undo = post(&context, "/api/settings/undo", json!({"entry": entry}));
+                assert!(matches!(undo.0, 200 | 409), "unexpected undo status: {undo:?}");
+                rounds += 1;
+            }
+        });
+    });
+    assert!(matches!(next_use_quiet(&context), Some(v) if (1000..=1030).contains(&v)));
 }

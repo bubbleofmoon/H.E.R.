@@ -125,6 +125,49 @@ fn held_ports_stay_bound_until_this_thread_releases_them() {
     assert!(TcpListener::bind(("127.0.0.1", port)).is_ok(), "release_held frees the port for the next child");
 }
 
+#[test]
+fn port_custody_holds_ports_across_other_spawns_until_explicit_release() {
+    let mut custody = ports::PortCustody::new();
+    let [first, second] = custody.reserve_many();
+    assert_ne!(first, second);
+    assert!(TcpListener::bind(("127.0.0.1", first)).is_err());
+    assert!(TcpListener::bind(("127.0.0.1", second)).is_err());
+
+    // Thread-local release_held must never release explicit PortCustody reservations.
+    ports::release_held();
+    assert!(TcpListener::bind(("127.0.0.1", first)).is_err());
+    assert!(TcpListener::bind(("127.0.0.1", second)).is_err());
+
+    assert!(custody.release(first));
+    assert!(TcpListener::bind(("127.0.0.1", first)).is_ok());
+    assert!(TcpListener::bind(("127.0.0.1", second)).is_err());
+
+    custody.release_all();
+    assert!(TcpListener::bind(("127.0.0.1", second)).is_ok());
+}
+
+#[test]
+fn concurrent_mock_server_serves_fast_requests_while_a_zero_byte_client_stays_open() {
+    use crate::support::http_mock::{
+        http_json_call, ConcurrentMockServer, MockAction, MockResponse,
+    };
+    let server = ConcurrentMockServer::start(|req, _| {
+        MockAction::Reply(MockResponse::json(200, &json!({"path": req.path})))
+    });
+    // Hold an idle TCP connection open without sending any bytes (simulating a stalling probe).
+    let _stalled = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+    let started = std::time::Instant::now();
+    let (status, body) =
+        http_json_call(server.port(), "GET", "/api/settings/describe", &[], None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["path"], "/api/settings/describe");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "idle client stalled concurrent request for {:?}",
+        started.elapsed()
+    );
+}
+
 fn post(port: u16, path: &str, body: &Value) -> Value {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream

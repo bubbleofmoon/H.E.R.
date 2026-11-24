@@ -345,7 +345,7 @@ fn turn_id(value: &str) -> &str {
 }
 
 #[derive(Default)]
-struct Conversation {
+struct ConversationReport {
     turns: Vec<Value>,
     timing: Vec<Value>,
     paused: Vec<Value>,
@@ -363,7 +363,7 @@ fn stats(mut times: Vec<f64>) -> Value {
     };
     json!({"medianMs":median,"maxMs":times.last()})
 }
-impl Conversation {
+impl ConversationReport {
     fn into_json(self, key: String) -> Value {
         let mut outcomes = BTreeMap::<String, usize>::new();
         for t in &self.turns {
@@ -411,7 +411,7 @@ fn collect(args: &Args) -> (Value, i32) {
     let in_window = |at: i64| at <= now && since.is_none_or(|lower| at >= lower);
     let selected = |k: &str| key(k) && args.key.as_deref().is_none_or(|wanted| wanted == k);
     let mut sources = BTreeMap::new();
-    let mut conversations = BTreeMap::<String, Conversation>::new();
+    let mut conversations = BTreeMap::<String, ConversationReport>::new();
     let mut groups = BTreeMap::<String, Vec<Value>>::new();
     let source = Source::read(&args.root, "data/turn-ledger.jsonl", |row| {
         let id = str_field(&row, "turn");

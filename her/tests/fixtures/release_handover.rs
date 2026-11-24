@@ -807,6 +807,113 @@ fn approved_console_update_installs_and_hands_over_only_after_confirmation() {
 }
 
 #[test]
+fn launch_refuses_an_installed_tag_below_the_recovered_version_floor() {
+    let fixture = Portable::new();
+    let root = fixture.f.root.join("install");
+    fs::write(fixture.image("v0.0.0", "SHA256SUMS.minisig"), b"invalid").unwrap();
+    let below_floor = "v0.0.1";
+    fs::create_dir(root.join("releases").join(below_floor)).unwrap();
+    for image in ["her.exe", "her-cli.exe", "herupdate.exe"] {
+        fs::write(fixture.image(below_floor, image), b"verified fixture bytes").unwrap();
+    }
+    fixture.f.sign_directory(below_floor, 1, "primary");
+    // Recovered v1.2.3 is above the candidate; even the candidate's authentic helper
+    // must never be published. The candidate is above the selected v0.0.0.
+    let helper = root.join("herupdate.exe");
+    fs::remove_file(&helper).unwrap();
+    let mut command = fixture.command(&fixture.image("v0.0.0", "her-cli.exe"));
+    command
+        .args(["release", "handover", "--runtime-root"])
+        .arg(fixture.runtime())
+        .args(["--tag", below_floor]);
+    let out = fixture.output(&mut command, Duration::from_secs(20));
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        !helper.exists(),
+        "a tag below the recovered floor published a helper"
+    );
+    let alert: Value =
+        serde_json::from_slice(&fs::read(root.join("update-alert.json")).unwrap()).unwrap();
+    assert_eq!(alert["failed"], below_floor);
+    assert_eq!(
+        alert["reason"],
+        "release checksum signature missing, invalid or untrusted"
+    );
+}
+
+#[test]
+fn supervisor_install_keeps_the_delivered_lost_current_alert() {
+    let fixture = Portable::new();
+    let root = fixture.f.root.join("install");
+    fs::write(fixture.image("v0.0.0", "SHA256SUMS.minisig"), b"invalid").unwrap();
+    let mut feed = fixture.f.feed();
+    feed[0]["tag_name"] = "v1.2.4".into();
+    fixture.f.set_feed(feed);
+    {
+        let mut replies = fixture.f.replies.lock().unwrap();
+        let sums = String::from_utf8(replies["/SHA256SUMS"].clone())
+            .unwrap()
+            .replace("v1.2.3 1", "v1.2.4 1");
+        replies.insert("/SHA256SUMS".into(), sums.into_bytes());
+    }
+    fixture.f.sign("primary");
+
+    let path = fixture.runtime().join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["consoleToken"] = "fixture-release-token".into();
+    config["ownerQQ"] = 42.into();
+    config["update"] = json!({"policy":"notify","feedUrl":format!("{}/feed", fixture.f.url)});
+    fs::write(path, config.to_string()).unwrap();
+    let port = config["consolePort"].as_u64().unwrap() as u16;
+    let status = || {
+        let (code, body) = http(port, "GET", "/api/releases", "", true, false);
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let alert = || {
+        fs::read(root.join("update-alert.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null)
+    };
+    fixture.wait(|| status()["available"]["tag"] == "v1.2.4" && alert()["delivered"] == true);
+    let delivered = alert();
+    assert_eq!(delivered["failed"], "v0.0.0");
+    assert_eq!(
+        delivered["reason"],
+        "current release metadata unverifiable; using verified installed authority"
+    );
+
+    // Let the approved install authenticate, then stop it before handover can write an alert.
+    fixture
+        .f
+        .replies
+        .lock()
+        .unwrap()
+        .insert("/her.exe".into(), b"bad image".to_vec());
+    let signatures_before_install = fixture.f.count("/SHA256SUMS.minisig");
+    let (code, body) = http(
+        port,
+        "POST",
+        "/api/releases/approve",
+        r#"{"confirm":true,"tag":"v1.2.4"}"#,
+        true,
+        false,
+    );
+    assert_eq!(code, 200, "{body}");
+    fixture.wait(|| status()["updateError"] == "release checksum mismatch: her.exe");
+    assert_eq!(
+        fixture.f.count("/SHA256SUMS.minisig"),
+        signatures_before_install + 1
+    );
+    assert_eq!(
+        alert(),
+        delivered,
+        "supervisor installation must reuse the discovery alert marker"
+    );
+}
+
+#[test]
 fn auto_update_waits_for_the_turn_ledger_before_installing() {
     let fixture = Portable::new();
     fixture.fault(json!({"pauseBeforeStart":["v1.2.3"]}));
@@ -920,6 +1027,7 @@ impl UpdateGateway {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1277,6 +1385,14 @@ fn auto_update_rechecks_a_turn_paused_during_trial_before_retirement() {
     );
     fixture.assert_healthy("v0.0.0");
     fixture.assert_adopted();
+    // Wait for the aborted auto-handover helper child to finish exiting and release
+    // update-restore.lock before sending manual approval on slow CI runners.
+    let lock_path = fixture.runtime().join("data/locks/update-restore.lock");
+    fixture.wait(|| match fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(file) => file.try_lock().is_ok(),
+        Err(_) => false,
+    });
     // Manual approval retains its existing drain semantics: a durable pause
     // with no active pipeline does not veto the owner's explicit decision.
     let port = cfg["consolePort"].as_u64().unwrap() as u16;

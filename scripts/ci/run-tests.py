@@ -64,7 +64,12 @@ if os.name == 'nt':
 env.setdefault('CARGO_TARGET_DIR', str(root.parent / 'her-ci-target'))
 env.setdefault('HER_INSTALL_ROOT', str(ev / 'unused-install-root'))
 env.setdefault('HER_TASK_SCHEDULER_FILE', str(ev / 'task-scheduler.xml'))
-commands = [('build', 'build --locked --features parity-clock --bins'), ('unit', 'test --locked --features parity-clock --bin her -- --test-threads=1')]
+commands = [
+    ('build', 'build --locked --features parity-clock --bins'),
+    ('unit', 'test --locked --features parity-clock --bin her -- --test-threads=1'),
+    ('herupdate', 'test --locked --features parity-clock --bin herupdate -- --test-threads=1'),
+    ('memory_library', 'test --locked --lib --bins -- --test-threads=1'),
+]
 for path in sorted((root / 'her/tests').glob('*.rs')):
     # Cargo skips a test target whose required-features are absent, and a skip is not a pass:
     # release_install needs both features so the signed fake update feed compiles and runs.
@@ -101,11 +106,12 @@ passed_by_target = {}
 for name, command in commands:
     python_target = name in ('scripts', 'dsh_contract')
     print(f'RUN {name}: ' + ('python ' if python_target else 'cargo ') + command, flush=True)
+    crate = 'her-memory' if name == 'memory_library' else 'her'
     if args.slot_ticket:
         slot_command = command
-        if args.slot_worktree:
+        if args.slot_worktree or crate != 'her':
             subcommand, rest = command.split(' ', 1)
-            slot_command = subcommand + ' --manifest-path "' + str(root / 'her/Cargo.toml') + '" ' + rest
+            slot_command = subcommand + ' --manifest-path "' + str((args.slot_worktree or root) / crate / 'Cargo.toml') + '" ' + rest
         cmd = ['powershell.exe', '-NoProfile', '-File', str(args.slot_script or root / 'scripts/cargo-slot.ps1'),
                '-Ticket', args.slot_ticket, '-WorkTree', str(args.slot_worktree or root), '-EvidenceDir', str(ev),
                '-RunName', name, '-Cargo', slot_command]
@@ -126,7 +132,7 @@ for name, command in commands:
                 err.write(b'scripts: unavailable: no snapshot from this run\n')
                 code = 1
             else:
-                code = subprocess.run(cmd, cwd=root / 'her', env=env, stdout=out, stderr=err,
+                code = subprocess.run(cmd, cwd=root / crate, env=env, stdout=out, stderr=err,
                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).returncode
         (ev / (name + '.exit.txt')).write_text(str(code) + '\n')
         if name == 'build' and not code and scripts_selected:

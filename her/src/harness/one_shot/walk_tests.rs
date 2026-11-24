@@ -1,9 +1,11 @@
 //! #238: the digest's route walk (`RouteWalk`) on a scripted loopback relay; no real model service is contacted.
 use super::*;
+use crate::harness::{route_health, usage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// The harness credential of every fixture; one test puts it into a route id and a model.
 const SECRET: &str = "synthetic-model-key-238";
@@ -219,7 +221,7 @@ fn places(usage: &[(String, i64, i64)]) -> Vec<(&str, i64)> {
 fn digest_walk_moves_to_the_next_route_after_an_explicit_error() {
     let relay = Relay::start(vec![("model-a", at_once(Kind::Status(500, ""))), ("model-b", at_once(Kind::Answer("[]")))]);
     let fixture = Fixture::new("explicit", &relay, chain_of(&["a", "b"]));
-    let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+    let model = digest_model(&fixture.context, &fixture.cfg).unwrap();
     assert_eq!(model.complete("system", "input"), Ok("[]".to_string()), "the digest's model port walks the chain");
     assert_eq!(relay.asked(), ["model-a", "model-b"], "the next route after a 500, and nothing after the answer");
     assert_eq!(places(&fixture.usage()), [("b", 1)], "a 500 has no response end; the answer is the walk's second request");
@@ -325,7 +327,7 @@ fn digest_walk_a_request_cut_by_the_walk_bound_is_no_route_health() {
     // The bound (400 ms) is less than the route's own timeout (1 s): the request it cuts is no route failure.
     let relay = Relay::start(vec![("model-a", after(5000, Kind::Answer("[]")))]);
     let fixture = Fixture::new("cut", &relay, chain_of(&["a"]));
-    let abandoned = AtomicBool::new(false);
+    let abandoned = Arc::new(AtomicBool::new(false));
     let walk = fixture.walk(Duration::from_secs(1));
     assert_eq!(
         walk.complete_within("system", "input", Duration::from_millis(400), &abandoned),
@@ -421,7 +423,7 @@ fn digest_walk_the_digest_model_setting_is_one_route_without_failover_or_route_h
     let mut extra = chain_of(&["a", "b"]);
     extra["memory"] = json!({"digest": {"model": "own-model"}});
     let fixture = Fixture::new("own-model", &relay, extra);
-    let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+    let model = digest_model(&fixture.context, &fixture.cfg).unwrap();
     assert_eq!(model.complete("system", "input"), Err(ModelError("backend")));
     assert_eq!(relay.asked(), ["own-model"], "the digest's own model has no other route");
     assert!(
@@ -439,8 +441,29 @@ fn digest_walk_records_name_routes_without_the_credential() {
     assert_eq!(fixture.walk(Duration::from_secs(10)).complete("system", "input"), Ok("[]".to_string()));
     let failovers = fixture.records("failover-step");
     assert!(failovers.len() == 1 && failovers[0].contains("route r-[REDACTED] (backend)"), "{failovers:?}");
-    let ledger = std::fs::read_to_string(fixture.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let page =
+        crate::recovery_log::page(&fixture.context, &crate::run_record::Query::default()).unwrap();
+    assert_eq!(page.records[0].trigger, crate::run_record::Trigger::Digest);
+    let ledger = std::fs::read_to_string(fixture.root.join("data/token-usage-rust.jsonl"))
+        .unwrap_or_default();
     assert!(!ledger.is_empty() && !ledger.contains(SECRET), "the ledger never keeps the credential");
+
+    // Also verify answering digest route itself redacts route id & model in the ledger row.
+    let model_c = format!("c-{SECRET}");
+    let relay_ans = Relay::start(vec![(model_c.as_str(), at_once(Kind::Answer("[]")))]);
+    let extra_ans = json!({
+        "harness": {"routes": [{"id": format!("id-{SECRET}"), "model": model_c}]}
+    });
+    let fixture_ans = Fixture::new("credential-ans", &relay_ans, extra_ans);
+    assert_eq!(
+        fixture_ans.walk(Duration::from_secs(10)).complete("system", "input"),
+        Ok("[]".to_string())
+    );
+    let ans_ledger =
+        std::fs::read_to_string(fixture_ans.root.join("data/token-usage-rust.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(ans_ledger.lines().next().unwrap()).unwrap();
+    assert_eq!(row["route"], "id-[REDACTED]");
+    assert_eq!(row["model"], "c-[REDACTED]");
 }
 
 #[test]

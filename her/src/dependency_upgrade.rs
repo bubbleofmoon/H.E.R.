@@ -517,7 +517,7 @@ fn change_pin(
     expected: &Value,
     replacement: &Value,
 ) -> Result<(), String> {
-    let _gate = crate::console::acquire_social_state_gate(context).map_err(|(_, e)| e)?;
+    let _gate = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
     let current = context.load_config().map_err(str::to_string)?;
     if &current["dependencies"][name] != expected {
         return Err("dependency configuration changed; pin replacement refused".into());
@@ -636,10 +636,12 @@ fn install_snow(
     guard_destination(&staging)?;
     fs::create_dir(&staging).map_err(|_| "SnowLuma staging cannot be created")?;
     let result = (|| {
-        os::private(
+        crate::guarded_fs::restrict_entry(
             &staging,
             &fs::metadata(&staging).map_err(|_| "SnowLuma staging is unavailable")?,
-        )?;
+            crate::guarded_fs::AclPolicy::OwnerOnly,
+        )
+        .map_err(String::from)?;
         let bytes = crate::release::fetch(
             candidate
                 .archive

@@ -22,94 +22,44 @@
 //! 这一版只做 `load` + `recent` + `stats`；`summary` / `series` / `conversation`
 //! 是下一批（它们都建立在同一份载入结果上）。
 
+mod storage;
+
+pub use storage::{LedgerStorage, DEFAULT_MAX_LINES};
+#[cfg(test)]
+pub use storage::{LEDGER_FILE, LEDGER_FILES, RUST_LEDGER_FILE};
+
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::pricing::{normalize_usage, price_usage, Buckets, PriceTable};
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 
-pub const LEDGER_FILE: &str = crate::legacy_path!("qq-bridge/state/token-usage.jsonl");
-/// Rust 自己的账本。**只写这份**：与 JS 各写各的，避免 Windows 上 append 交错损坏。
-/// 放在 Rust 自己的 state 目录（与 rust-heartbeat / rust-sessions 同处）。
-pub const RUST_LEDGER_FILE: &str = crate::legacy_path!("state/token-usage-rust.jsonl");
-/// 读取方要合并的全部账本（顺序只影响 `t` 相同的记录谁先重放）。
-pub const LEDGER_FILES: [&str; 2] = [LEDGER_FILE, RUST_LEDGER_FILE];
-/// 活会话表：QQ key ↔ DSH sessionId。账本反查 key 时优先用它。
-pub const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
-
-/// Rust 接管后写账本的入口：追加一行到 **Rust 自己的**账本（与 JS `appendLine` 同格式）。
-///
-/// 不再写 `token-usage.jsonl`：两个进程同时 append 同一文件会在 Windows 上交错出坏行。
 pub fn append_record(record: &Value) -> Result<(), String> {
-    append_record_to(RUST_LEDGER_FILE, record)
+    LedgerStorage::append_record(record)
 }
 
-/// Append a Rust usage record to the selected runtime. Isolated runs never consult the legacy
-/// ledger constants; the resolver validates the candidate leaf before opening it.
 pub fn append_record_for_runtime(
     context: &RuntimeContext,
     record: &Value,
 ) -> Result<(), String> {
-    if !context.is_isolated() {
-        return append_record(record);
-    }
-    let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化账本记录失败：{e}"))?;
-    line.push(b'\n');
-    context.append_bytes(RuntimeArea::Data, "token-usage-rust.jsonl", &line)
+    LedgerStorage::append_record_for_runtime(context, record)
 }
 
-/// 追加一行到指定账本文件。
-///
-/// 单独暴露 `path` 是为了单测能在临时文件上验证「跑一轮 → 多一行」，
-/// 不用碰生产账本（那是会算钱的数据）。
 pub fn append_record_to(path: &str, record: &Value) -> Result<(), String> {
-    append_record_at(Path::new(path), record, false, None)
+    LedgerStorage::append_record_to(path, record)
 }
 
-/// Retain the append lock until the guarded record is flushed and synced.
 pub(crate) fn append_record_to_durable(path: &str, record: &Value) -> Result<(), String> {
-    append_record_at(Path::new(path), record, true, None)
+    LedgerStorage::append_record_to_durable(path, record)
 }
 
-/// The turn ledger is the only legacy append caller allowed a conflict budget.
-pub(crate) fn append_turn_record_to(path: &str, record: &Value, durable: bool, deadline: Option<std::time::Instant>) -> Result<(), String> {
-    append_record_at(Path::new(path), record, durable, deadline)
-}
-
-fn append_record_at(path: &Path, record: &Value, durable: bool, deadline: Option<std::time::Instant>) -> Result<(), String> {
-    use std::io::Write;
-    use crate::runtime::{append_io, lock_append_file, runtime_io_error, write_append_all};
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建账本目录失败：{e}"))?;
-        }
-    }
-    let mut line = serde_json::to_string(record).map_err(|e| format!("序列化账本记录失败：{e}"))?;
-    line.push('\n');
-    let mut file = append_io(deadline, || std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path))
-        .map_err(|e| format!("打开账本失败：{}", runtime_io_error("append/open", &e)))?;
-    // The check and the write must not interleave with another appender (an in-flight write can look torn).
-    lock_append_file(&file, deadline).map_err(|e| format!("锁账本失败：{}", runtime_io_error("append/lock", &e)))?;
-    // A torn last line from a crash stays its own line; this record starts a new one.
-    if append_io(deadline, || crate::runtime::ends_mid_line(&mut file)).map_err(|e| format!("检查账本失败：{}", runtime_io_error("append/tail", &e)))? {
-        line.insert(0, '\n');
-    }
-    write_append_all(&mut file, line.as_bytes(), deadline)
-        .map_err(|e| format!("写账本失败：{}", runtime_io_error("append/write", &e)))?;
-    append_io(deadline, || file.flush())
-        .map_err(|e| format!("刷新账本失败：{}", runtime_io_error("append/flush", &e)))?;
-    if durable {
-        #[cfg(test)]
-        crate::runtime::append_test_hook("sync", line.as_bytes())?;
-        append_io(deadline, || file.sync_all())
-            .map_err(|e| format!("同步账本失败：{}", runtime_io_error("append/sync", &e)))?;
-    }
-    Ok(())
+pub(crate) fn append_turn_record_to(
+    path: &str,
+    record: &Value,
+    durable: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String> {
+    LedgerStorage::append_turn_record_to(path, record, durable, deadline)
 }
 
 /// 一条单轮采样。
@@ -129,6 +79,9 @@ pub struct Sample {
     pub provider: String,
     /// `harness` for a sample of the harness route module (`harness::usage`), which DSH never saw; empty for DSH's.
     pub engine: String,
+    pub route: Option<String>,
+    pub job: Option<String>,
+    pub attempt_id: Option<String>,
     pub buckets: Buckets,
 }
 
@@ -156,18 +109,14 @@ pub struct Ledger {
     pub seen_order: Vec<String>,
     pub evicted_order: Vec<String>,
     pub sample_order: Vec<(String, i64, i64, i64)>,
-    /// 活会话表反查：sessionId → QQ key（来自 `state/sessions.json`）。
-    ///
-    /// 为什么需要：JS 的 `keyOf()` 是「先问活会话表，查不到才退回日志里的 key」。
-    /// 同一段历史在日志里可能记成 `internal:黑话学习`，但它现在绑在 `group:7003` ——
-    /// 只看日志就会把同一个会话算成两个。实测就是这么炸的：
-    /// JS 显示 3 个会话，Rust 多出一个「internal:黑话学习」，总额跟着对不上。
     pub resolved: HashMap<String, String>,
+    /// Attempt ids already present in ingested `"turn"` records (`attemptId`).
+    pub recorded_attempts: HashSet<String>,
 }
 
 impl Ledger {
     /// 空账本 + 活会话表反查（sessionId → key）。
-    fn empty(path: &str, sessions_json: Option<&str>) -> Ledger {
+    pub(super) fn empty(path: &str, sessions_json: Option<&str>) -> Ledger {
         let mut ledger = Ledger {
             file: path.to_string(),
             ..Default::default()
@@ -189,25 +138,13 @@ impl Ledger {
         ledger
     }
 
-    /// 读**单份**文件并重建状态。文件不存在 = 首次运行，回空账本（不是错误）。
-    ///
-    /// 按文件原顺序重放（与旧行为一致）；需要合并两份账本时用 [`Ledger::load_all`]。
-    ///
-    /// 只给单测用：生产路径必须走 `load_all`，否则会漏掉另一个进程写的账本。
     #[cfg(test)]
     pub fn load(path: &str) -> Ledger {
-        let mut ledger = Ledger::empty(path, None);
-        let rows = read_rows(&[path]);
-        ledger.ingest(rows);
-        ledger
+        LedgerStorage::load_single(path)
     }
 
-    /// 读**两份**账本（JS + Rust）并合并：先按 `t` 排序，再按顺序重放。
-    ///
-    /// 控制台的 `/api/tokens/*`、`/api/usage/attribution` 一律走这里 ——
-    /// 只读一份会漏掉另一个进程写的记录（表现为"钱花了但账上看不到"）。
     pub fn load_all() -> Ledger {
-        Self::load_paths(&LEDGER_FILES)
+        LedgerStorage::load_all()
     }
 
     /// Rebuild the merged ledger from already-selected source contents. This is the shared seam
@@ -227,40 +164,16 @@ impl Ledger {
     /// Load both selected-runtime ledgers and the selected-runtime session map. Missing candidate
     /// files are treated as an empty source, while invalid paths and non-UTF-8 files fail closed.
     pub fn load_all_for_runtime(context: &RuntimeContext) -> Result<Ledger, String> {
-        if !context.is_isolated() {
-            return Ok(Self::load_all());
-        }
-        let js_text = context
-            .read_optional_text(RuntimeArea::Data, "token-usage.jsonl")
-            .map_err(|error| error.to_string())?;
-        let rust_text = context
-            .read_optional_text(RuntimeArea::Data, "token-usage-rust.jsonl")
-            .map_err(|error| error.to_string())?;
-        let sessions_json = context
-            .read_optional_text(RuntimeArea::Data, "sessions.json")
-            .map_err(|error| error.to_string())?;
-        Ok(Self::load_all_from_sources(
-            js_text.as_deref(),
-            rust_text.as_deref(),
-            sessions_json.as_deref(),
-        ))
+        LedgerStorage::load_all_for_runtime(context)
     }
 
     /// 合并任意多份账本（单测用临时文件走这条）。
     pub fn load_paths(paths: &[&str]) -> Ledger {
-        let sessions = std::fs::read_to_string(SESSIONS_FILE).ok();
-        let mut ledger = Ledger::empty(
-            paths.first().copied().unwrap_or(LEDGER_FILE),
-            sessions.as_deref(),
-        );
-        let mut rows = read_rows(paths);
-        order_merged(&mut rows);
-        ledger.ingest(rows);
-        ledger
+        LedgerStorage::load_paths(paths)
     }
 
     /// 按给定顺序重放行（坏行计数跳过，不影响整份读取）。
-    fn ingest(&mut self, rows: Vec<(i64, usize, usize, String)>) {
+    pub(super) fn ingest(&mut self, rows: Vec<(i64, usize, usize, String)>) {
         for (_, _, _, line) in rows {
             self.journal_lines += 1;
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -347,6 +260,13 @@ impl Ledger {
                 true
             }
             "turn" => {
+                if let Some(id) = record
+                    .get("attemptId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.recorded_attempts.insert(id.to_string());
+                }
                 let Some(turn) = record.get("turn").and_then(|v| v.as_i64()) else {
                     return false;
                 };
@@ -396,6 +316,19 @@ impl Ledger {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        route: record
+                            .get("route")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        job: record
+                            .get("job")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        attempt_id: record
+                            .get("attemptId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
                         buckets,
                     },
                 );
@@ -1242,15 +1175,11 @@ pub fn conversation(&self, table: &PriceTable, key: &str, turn_limit: i64) -> Op
 }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     crate::parity_clock::now_ms() as i64
 }
 
-/// 读出多份账本的所有非空行，附带排序键 `(t, 文件序号, 行序号)`。
-///
-/// 文件不存在 = 跳过（首次运行，不是错误）。解析不出 `ts` 的行按 0 排在最前，
-/// 由 `ingest` 统一计入 `dropped_lines` —— 这里不丢行，也不假装它没坏。
-fn read_rows(paths: &[&str]) -> Vec<(i64, usize, usize, String)> {
+pub(super) fn read_rows(paths: &[&str]) -> Vec<(i64, usize, usize, String)> {
     let mut rows: Vec<(i64, usize, usize, String)> = Vec::new();
     for (file_idx, path) in paths.iter().enumerate() {
         let Ok(raw) = std::fs::read_to_string(path) else {
@@ -1261,10 +1190,7 @@ fn read_rows(paths: &[&str]) -> Vec<(i64, usize, usize, String)> {
     rows
 }
 
-/// 合并顺序。单份账本保持文件行序（与 JS `load()` 逐行重放一致，决定会话与分组的出现次序）；
-/// 多份账本才按 `(t, 文件序号, 行序号)` 稳定排序，让跨文件的记录按时间参与合并。
-/// seq 幂等规则与淘汰规则与顺序无关，排序只影响出现次序与「同一会话 key 取最后一条」。
-fn order_merged(rows: &mut [(i64, usize, usize, String)]) {
+pub(super) fn order_merged(rows: &mut [(i64, usize, usize, String)]) {
     let files: std::collections::BTreeSet<usize> = rows.iter().map(|r| r.1).collect();
     if files.len() > 1 {
         rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
@@ -1819,6 +1745,225 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn pure_compaction_folds_oldest_samples_into_evict_preserving_totals_and_base_coverage() {
+        let table = PriceTable::default();
+        let b = json!({"cacheMiss": 50, "cacheHit": 0, "cacheWrite": 0, "output": 5});
+        let b10 = json!({"cacheMiss": 100, "cacheHit": 0, "cacheWrite": 0, "output": 10});
+        let b40 = json!({"cacheMiss": 40, "cacheHit": 10, "cacheWrite": 0, "output": 8});
+        let b20 = json!({"cacheMiss": 20, "cacheHit": 0, "cacheWrite": 0, "output": 4});
+        let b30 = json!({"cacheMiss": 30, "cacheHit": 0, "cacheWrite": 0, "output": 6});
+        let rows = vec![
+            json!({"k":"base","t":100,"sid":"s1","seq":2,"key":"group:1",
+                "model":"deepseek-flash","provider":"official","b":b})
+            .to_string(),
+            json!({"k":"turn","t":110,"sid":"s1","seq":1,"turn":1,"step":0,"retry":0,
+                "key":"group:1","model":"deepseek-flash","provider":"official","b":b})
+            .to_string(),
+            json!({"k":"turn","t":200,"sid":"s1","seq":3,"turn":2,"step":0,"retry":0,
+                "key":"group:1","model":"deepseek-flash","provider":"official",
+                "engine":"harness","route":"r-a","job":"turn","attemptId":"att-1","b":b10})
+            .to_string(),
+            json!({"k":"turn","t":300,"sid":"s2","seq":0,"turn":1,"step":0,"retry":0,
+                "key":"group:2","model":"deepseek-flash","provider":"harness",
+                "engine":"harness","route":"r-b","job":"summary","b":b40})
+            .to_string(),
+            json!({"k":"turn","t":400,"sid":"s1","seq":4,"turn":3,"step":0,"retry":0,
+                "key":"group:1","model":"deepseek-flash","provider":"official",
+                "engine":"harness","route":"r-a","job":"turn","attemptId":"att-2","b":b20})
+            .to_string(),
+            json!({"k":"turn","t":500,"sid":"s2","seq":0,"turn":2,"step":0,"retry":0,
+                "key":"group:2","model":"deepseek-flash","provider":"harness",
+                "engine":"harness","route":"r-b","job":"turn","attemptId":"att-3","b":b30})
+            .to_string(),
+        ];
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let ledger = ledger_from(&refs);
+        let before = ledger.summary(&table, 50);
+        // Keep newest 2 samples (t=400, t=500); evict t=110 (covered), t=200 (live), t=300 (live).
+        let compacted = ledger.compact_in_memory(&table, 2, 1_000);
+        let after = compacted.summary(&table, 50);
+
+        assert_eq!(compacted.samples.len(), 2);
+        assert_eq!(after["totals"]["buckets"], before["totals"]["buckets"]);
+        assert!(
+            (after["totals"]["cost"].as_f64().unwrap()
+                - before["totals"]["cost"].as_f64().unwrap())
+            .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            compacted.samples[&("s1".into(), 3, 0, 0)].attempt_id.as_deref(),
+            Some("att-2")
+        );
+        assert_eq!(
+            compacted.samples[&("s2".into(), 2, 0, 0)].route.as_deref(),
+            Some("r-b")
+        );
+        // Re-compacting again preserves totals identically.
+        let again = compacted.compact_in_memory(&table, 1, 2_000);
+        let after_again = again.summary(&table, 50);
+        assert_eq!(again.samples.len(), 1);
+        assert_eq!(after_again["totals"]["buckets"], before["totals"]["buckets"]);
+        assert!(
+            (after_again["totals"]["cost"].as_f64().unwrap()
+                - before["totals"]["cost"].as_f64().unwrap())
+            .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn ledger_storage_compacts_file_and_recovers_interrupted_sidecar_and_reset() {
+        let dir = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-ledger-compact-{}",
+            crate::turn_ledger::mint_id("")
+        )));
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(dir.clone());
+        for sub in ["config", "data", "resources"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.join("config/config.json"),
+            br#"{"consoleToken":"fixture-compact-token-123456"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("data/social-v2.json"), b"{}").unwrap();
+        let deps = json!({
+            "dsh": "http://127.0.0.1:1",
+            "model": "http://127.0.0.1:2",
+            "onebot": "http://127.0.0.1:3",
+        });
+        std::fs::write(dir.join("dependencies.json"), deps.to_string()).unwrap();
+        let context = RuntimeContext::from_root(&dir).unwrap();
+        let table = PriceTable::default();
+
+        for i in 0..8i64 {
+            let row = json!({
+                "k": "turn",
+                "t": 1_700_000_000_000i64 + i,
+                "sid": "harness-p/group:1",
+                "seq": 0,
+                "turn": i + 1,
+                "step": 0,
+                "retry": 0,
+                "key": "group:1",
+                "model": "deepseek-flash",
+                "provider": "harness",
+                "engine": "harness",
+                "route": "primary",
+                "job": "turn",
+                "attemptId": format!("att-{i}"),
+                "b": { "cacheMiss": 10, "cacheHit": 0, "cacheWrite": 0, "output": 5 },
+            });
+            LedgerStorage::append_record_for_runtime(&context, &row).unwrap();
+        }
+        let before = LedgerStorage::load_all_for_runtime(&context)
+            .unwrap()
+            .summary(&table, 50);
+        // Below threshold: no rewrite.
+        assert!(!LedgerStorage::compact_for_runtime(&context, &table, 9, 3).unwrap());
+        // At threshold: compacts to 3 kept samples + 1 evict row.
+        assert!(LedgerStorage::compact_for_runtime(&context, &table, 8, 3).unwrap());
+        assert!(!dir.join("data/token-usage-rust.jsonl.compact").exists());
+        let raw = std::fs::read_to_string(dir.join("data/token-usage-rust.jsonl")).unwrap();
+        assert_eq!(raw.lines().count(), 4, "1 evict + 3 kept samples");
+        let after = LedgerStorage::load_all_for_runtime(&context)
+            .unwrap()
+            .summary(&table, 50);
+        assert_eq!(after["totals"]["buckets"], before["totals"]["buckets"]);
+
+        // Simulate crash between truncate and write completion: empty main file + sidecar.
+        std::fs::write(dir.join("data/token-usage-rust.jsonl.compact"), &raw).unwrap();
+        std::fs::write(dir.join("data/token-usage-rust.jsonl"), b"").unwrap();
+        let recovered = LedgerStorage::load_all_for_runtime(&context)
+            .unwrap()
+            .summary(&table, 50);
+        assert_eq!(recovered["totals"]["buckets"], before["totals"]["buckets"]);
+
+        // Reset removes both ledgers and sidecar cleanly.
+        LedgerStorage::reset(&context).unwrap();
+        assert_eq!(std::fs::read(dir.join("data/token-usage-rust.jsonl")).unwrap(), b"");
+        assert!(!dir.join("data/token-usage-rust.jsonl.compact").exists());
+    }
+
+    #[test]
+    fn pure_attribution_and_reconciliation_planner_match_contract() {
+        let table = PriceTable::default();
+        let rows = vec![
+            json!({"k":"turn","t":1_700_000_000_000i64,"sid":"dsh-1","seq":1,"turn":1,"step":1,
+                "retry":0,"key":"group:1","model":"deepseek-flash","provider":"official",
+                "b":{"cacheMiss":100,"cacheHit":0,"cacheWrite":0,"output":10}})
+            .to_string(),
+            json!({"k":"turn","t":1_700_000_001_000i64,"sid":"h/group:1","seq":0,"turn":10,
+                "step":0,"retry":0,"key":"group:1","model":"deepseek-flash","provider":"harness",
+                "engine":"harness","route":"r1","job":"turn","attemptId":"att-known",
+                "b":{"cacheMiss":50,"cacheHit":0,"cacheWrite":0,"output":5}})
+            .to_string(),
+            json!({"k":"turn","t":1_700_000_002_000i64,"sid":"h/group:1","seq":0,"turn":11,
+                "step":0,"retry":0,"key":"group:1","model":"deepseek-flash","provider":"harness",
+                "engine":"harness","route":"r1","job":"turn",
+                "b":{"cacheMiss":25,"cacheHit":0,"cacheWrite":0,"output":3}})
+            .to_string(),
+        ];
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let l = ledger_from(&refs);
+        let start_day = crate::pricing::beijing_parts(1_700_000_000_000).2;
+        let attr = l.dsh_attribution(&table, &start_day, 1_700_000_005_000);
+        assert_eq!(attr.samples, 1, "only DSH sample enters attribution");
+        let resp = attr.to_response(
+            7,
+            &start_day,
+            &start_day,
+            &table,
+            DshTotals {
+                turns: 3,
+                tokens: 210.0,
+                cost: 0.0,
+            },
+        );
+        assert_eq!(resp["unattributed"]["turns"], 2);
+
+        let b_legacy = Buckets {
+            cache_miss: 25.0,
+            cache_hit: 0.0,
+            cache_write: 0.0,
+            output: 3.0,
+            reasoning: 0.0,
+        };
+        let candidates = vec![
+            ReconcileCandidate {
+                attempt_id: "att-known".into(),
+                key: "group:1".into(),
+                model: "deepseek-flash".into(),
+                ended_ms: 1_700_000_001_000,
+                buckets: None,
+            },
+            ReconcileCandidate {
+                attempt_id: "att-legacy-1".into(),
+                key: "group:1".into(),
+                model: "deepseek-flash".into(),
+                ended_ms: 1_700_000_002_500,
+                buckets: Some(b_legacy),
+            },
+            ReconcileCandidate {
+                attempt_id: "att-legacy-dup".into(),
+                key: "group:1".into(),
+                model: "deepseek-flash".into(),
+                ended_ms: 1_700_000_002_600,
+                buckets: Some(b_legacy),
+            },
+        ];
+        // att-known skipped by attemptId; att-legacy-1 matched 1-to-1; att-legacy-dup missing.
+        assert_eq!(plan_harness_reconciliation(&l, &candidates), vec![2]);
+    }
 }
 
 /// 写入规则：只留下账本里还没有、或序号更新的采样与基线（重放、重连、恢复不会重复记账）。
@@ -1923,14 +2068,470 @@ pub fn harvest_candidates(
     rows
 }
 
+/// Pure attribution aggregate across DSH-comparable samples (`/api/usage/attribution`).
+#[derive(Debug, Default, Clone)]
+pub struct AttributionAgg {
+    pub turns: HashSet<(String, i64)>,
+    pub tokens: f64,
+    pub cost: f64,
+}
+
+impl AttributionAgg {
+    fn add(&mut self, sid: &str, turn: i64, tokens: f64, cost: f64) {
+        self.turns.insert((sid.to_string(), turn));
+        self.tokens += tokens;
+        self.cost += cost;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "turns": self.turns.len() as i64,
+            "tokens": self.tokens,
+            "cost": self.cost,
+        })
+    }
+}
+
+/// Pure bridge vs. DSH usage attribution summary.
+#[derive(Debug, Default, Clone)]
+pub struct DshAttribution {
+    pub our: AttributionAgg,
+    pub samples: i64,
+    pub by_key: BTreeMap<String, AttributionAgg>,
+    pub by_provider: BTreeMap<String, AttributionAgg>,
+}
+
+/// DSH total summary passed into `DshAttribution::to_response`.
+#[derive(Debug, Clone, Copy)]
+pub struct DshTotals {
+    pub turns: i64,
+    pub tokens: f64,
+    pub cost: f64,
+}
+
+impl DshAttribution {
+    /// Combine bridge attribution with `.dshw-usage.json` totals for `/api/usage/attribution`.
+    pub fn to_response(
+        &self,
+        days: i64,
+        today: &str,
+        start_day: &str,
+        table: &PriceTable,
+        dsh: DshTotals,
+    ) -> Value {
+        let token_sort_key = |v: &Value| v.get("tokens").and_then(|t| t.as_f64()).unwrap_or(0.0);
+        let mut by_key_rows: Vec<Value> = self
+            .by_key
+            .iter()
+            .map(|(k, a)| {
+                let mut row = a.to_json();
+                row["key"] = json!(k);
+                row
+            })
+            .collect();
+        by_key_rows.sort_by(|a, b| {
+            token_sort_key(b)
+                .partial_cmp(&token_sort_key(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut by_provider_rows: Vec<Value> = self
+            .by_provider
+            .iter()
+            .map(|(p, a)| {
+                let mut row = a.to_json();
+                row["provider"] = json!(p);
+                row
+            })
+            .collect();
+        by_provider_rows.sort_by(|a, b| {
+            token_sort_key(b)
+                .partial_cmp(&token_sort_key(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let unattributed_turns = dsh.turns - self.samples;
+        let unattributed_tokens = dsh.tokens - self.our.tokens;
+        let unattributed_cost = dsh.cost - self.our.cost;
+        let note = "DSH 总账（.dshw-usage.json）减去桥接账本（token-usage.jsonl 里带 key 的记录）。\
+差额没有被吞掉：可能是 Web GUI / CLI 探针等没有 QQ 会话归属的调用，也可能是回合刚跑完、\
+总账尚未落盘（此时为负）。dshTotal.turns 与 unattributed.turns 都按 LLM 请求计（总账事件\
+条数减去账本里带 key 的 usage 采样数 our.samples）；our.turns 是账本里的对话轮数，不参与相减。";
+        json!({
+            "ok": true,
+            "days": days,
+            "symbol": table.symbol,
+            "window": { "fromDay": start_day, "toDay": today },
+            "our": {
+                "turns": self.our.turns.len() as i64,
+                "tokens": self.our.tokens,
+                "cost": self.our.cost,
+                "samples": self.samples,
+            },
+            "dshTotal": {
+                "turns": dsh.turns,
+                "tokens": dsh.tokens,
+                "cost": dsh.cost,
+                "events": dsh.turns,
+            },
+            "unattributed": {
+                "turns": unattributed_turns,
+                "tokens": unattributed_tokens,
+                "cost": unattributed_cost,
+                "note": note,
+            },
+            "byKey": by_key_rows,
+            "byProvider": by_provider_rows,
+        })
+    }
+}
+
+/// Pure output of token ledger compaction (`Ledger::compact_plan` / `compact_jsonl`).
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    #[cfg(test)]
+    pub records: Vec<Value>,
+    pub jsonl: String,
+    pub evicted_attempt_ids: Vec<String>,
+    pub compacted: bool,
+}
+
+#[derive(Default)]
+struct EvictAccum {
+    key: Option<String>,
+    t: i64,
+    buckets: Buckets,
+    cost: f64,
+    peak: f64,
+    off: f64,
+    estimated: bool,
+    dropped: i64,
+    max_seq: i64,
+}
+
+/// Pure candidate metadata for reconciling `conversations.db` completed attempts into the ledger.
+#[derive(Clone, Debug)]
+pub struct ReconcileCandidate {
+    pub attempt_id: String,
+    pub key: String,
+    pub model: String,
+    pub ended_ms: i64,
+    pub buckets: Option<Buckets>,
+}
+
+/// Pure startup crash-reconciliation planner: returns the indices of `candidates` not yet
+/// recorded in `existing`, matching by `attemptId` first and 1-to-1 legacy `(key, model, buckets,
+/// timestamp)` when `attemptId` was absent pre-upgrade.
+pub fn plan_harness_reconciliation(
+    existing: &Ledger,
+    candidates: &[ReconcileCandidate],
+) -> Vec<usize> {
+    let legacy_pool: Vec<&Sample> = existing
+        .sample_order
+        .iter()
+        .filter_map(|sk| existing.samples.get(sk))
+        .filter(|s| {
+            s.attempt_id.is_none()
+                && s.engine == crate::harness::usage::ENGINE
+                && s.job.as_deref() == Some(crate::harness::usage::TURN)
+        })
+        .collect();
+    let mut legacy_used = vec![false; legacy_pool.len()];
+    let mut missing = Vec::new();
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if existing.recorded_attempts.contains(&candidate.attempt_id) {
+            continue;
+        }
+        if let Some(buckets) = candidate.buckets {
+            if let Some((pos, _)) = legacy_pool.iter().enumerate().find(|(i, s)| {
+                !legacy_used[*i]
+                    && s.key.as_deref() == Some(candidate.key.as_str())
+                    && s.model == candidate.model
+                    && s.buckets == buckets
+                    && (s.t - candidate.ended_ms).abs() <= 10_000
+            }) {
+                legacy_used[pos] = true;
+                continue;
+            }
+        }
+        missing.push(idx);
+    }
+    missing
+}
+
+impl Ledger {
+    /// Pure attribution math over DSH-comparable samples from `start_day` (Beijing YYYY-MM-DD).
+    pub fn dsh_attribution(
+        &self,
+        table: &PriceTable,
+        start_day: &str,
+        now: i64,
+    ) -> DshAttribution {
+        let mut out = DshAttribution::default();
+        for s in self.dsh_comparable_samples() {
+            let Some(key) = s
+                .key
+                .clone()
+                .or_else(|| self.key_of(&s.session_id))
+                .filter(|k| !k.is_empty())
+            else {
+                continue;
+            };
+            let at = if s.t != 0 { s.t } else { now };
+            if crate::pricing::beijing_parts(at).2.as_str() < start_day {
+                continue;
+            }
+            let (_, cost) = price_usage(&s.buckets, &s.model, at, table);
+            let tokens = s.buckets.total();
+            out.our.add(&s.session_id, s.turn, tokens, cost.total);
+            let provider = if s.provider.is_empty() {
+                "unknown".to_string()
+            } else {
+                s.provider.clone()
+            };
+            out.by_key
+                .entry(key)
+                .or_default()
+                .add(&s.session_id, s.turn, tokens, cost.total);
+            out.by_provider
+                .entry(provider)
+                .or_default()
+                .add(&s.session_id, s.turn, tokens, cost.total);
+            out.samples += 1;
+        }
+        out
+    }
+
+    /// Pure compaction math: retain the newest `keep_samples` samples and fold older live samples
+    /// per session into `"evict"` summary records (matching DSH's `evict` / `base` semantics so
+    /// totals, tiers, and conversation views stay invariant).
+    pub fn compact_plan(&self, table: &PriceTable, keep_samples: usize, at: i64) -> CompactionPlan {
+        let mut ordered: Vec<(usize, &Sample)> = self
+            .sample_order
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, sk)| self.samples.get(sk).map(|s| (idx, s)))
+            .collect();
+        ordered.sort_by_key(|(idx, s)| (s.t, *idx));
+        let evict_count = ordered.len().saturating_sub(keep_samples);
+        let (to_evict, to_keep) = ordered.split_at(evict_count);
+
+        let mut evicts: HashMap<String, EvictAccum> = HashMap::new();
+        let mut evict_sids: Vec<String> = Vec::new();
+        for sid in &self.evicted_order {
+            let Some(gone) = self.evicted.get(sid) else {
+                continue;
+            };
+            let covered = self.eviction_covered(sid, gone);
+            let acc = EvictAccum {
+                key: gone
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.key_of(sid)),
+                t: self.session_seen.get(sid).copied().unwrap_or(0),
+                buckets: if covered {
+                    Buckets::default()
+                } else {
+                    gone.get("buckets").map(value_to_buckets).unwrap_or_default()
+                },
+                cost: if covered {
+                    0.0
+                } else {
+                    gone.get("cost").and_then(Value::as_f64).unwrap_or(0.0)
+                },
+                peak: if covered {
+                    0.0
+                } else {
+                    gone.pointer("/byTier/peak")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                },
+                off: if covered {
+                    0.0
+                } else {
+                    gone.pointer("/byTier/off")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                },
+                estimated: !covered
+                    && gone
+                        .get("estimated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                dropped: gone.get("dropped").and_then(Value::as_i64).unwrap_or(0),
+                max_seq: gone.get("maxSeq").and_then(Value::as_i64).unwrap_or(-1),
+            };
+            evicts.insert(sid.clone(), acc);
+            evict_sids.push(sid.clone());
+        }
+
+        let mut evicted_attempt_ids = Vec::new();
+        for (_, s) in to_evict {
+            if let Some(id) = &s.attempt_id {
+                evicted_attempt_ids.push(id.clone());
+            }
+            if !evicts.contains_key(&s.session_id) {
+                evict_sids.push(s.session_id.clone());
+            }
+            let acc = evicts.entry(s.session_id.clone()).or_insert_with(|| EvictAccum {
+                key: s.key.clone().or_else(|| self.key_of(&s.session_id)),
+                max_seq: -1,
+                ..Default::default()
+            });
+            if acc.key.is_none() {
+                acc.key = s.key.clone().or_else(|| self.key_of(&s.session_id));
+            }
+            acc.t = acc.t.max(s.t);
+            acc.dropped += 1;
+            acc.max_seq = acc.max_seq.max(s.seq);
+            let is_live = match self.baselines.get(&s.session_id) {
+                Some(b) => s.seq > b.get("seq").and_then(Value::as_i64).unwrap_or(-1),
+                None => true,
+            };
+            if is_live {
+                let sample_at = if s.t != 0 { s.t } else { at };
+                let (rates, cost) = price_usage(&s.buckets, &s.model, sample_at, table);
+                acc.buckets = acc.buckets.add(&s.buckets);
+                acc.cost += cost.total;
+                if tier_slot(&rates.tier) == 0 {
+                    acc.peak += cost.total;
+                } else {
+                    acc.off += cost.total;
+                }
+                acc.estimated |= rates.estimated;
+            }
+        }
+
+        let mut records = Vec::with_capacity(
+            evict_sids.len() + self.base_order.len() + to_keep.len(),
+        );
+        for sid in evict_sids {
+            let Some(acc) = evicts.get(&sid) else {
+                continue;
+            };
+            let mut row = json!({
+                "k": "evict",
+                "t": acc.t,
+                "sid": sid,
+                "b": buckets_json(&acc.buckets),
+                "cost": acc.cost,
+                "peak": acc.peak,
+                "off": acc.off,
+                "estimated": acc.estimated,
+                "dropped": acc.dropped,
+                "maxSeq": acc.max_seq,
+            });
+            if let (Some(key), Some(obj)) = (&acc.key, row.as_object_mut()) {
+                obj.insert("key".into(), json!(key));
+            }
+            records.push(row);
+        }
+        for sid in &self.base_order {
+            let Some(base) = self.baselines.get(sid) else {
+                continue;
+            };
+            let mut row = json!({
+                "k": "base",
+                "t": base.get("t").and_then(Value::as_i64).unwrap_or(0),
+                "sid": sid,
+                "seq": base.get("seq").and_then(Value::as_i64).unwrap_or(-1),
+                "b": base.get("buckets").cloned().unwrap_or_else(|| json!({})),
+            });
+            if let Some(obj) = row.as_object_mut() {
+                for field in ["key", "model", "provider"] {
+                    if let Some(val) = base.get(field).filter(|v| !v.is_null()) {
+                        obj.insert(field.into(), val.clone());
+                    }
+                }
+            }
+            records.push(row);
+        }
+        for (_, s) in to_keep {
+            records.push(sample_to_record(s));
+        }
+
+        let jsonl: String = records.iter().map(|r| format!("{r}\n")).collect();
+        let compacted = evict_count > 0 || self.journal_lines > records.len();
+        CompactionPlan {
+            #[cfg(test)]
+            records,
+            jsonl,
+            evicted_attempt_ids,
+            compacted,
+        }
+    }
+
+    /// Pure in-memory compaction returning the compacted `Ledger` without touching disk.
+    #[cfg(test)]
+    pub fn compact_in_memory(
+        &self,
+        table: &PriceTable,
+        keep_samples: usize,
+        at: i64,
+    ) -> Ledger {
+        let plan = self.compact_plan(table, keep_samples, at);
+        let mut out = Ledger {
+            file: self.file.clone(),
+            resolved: self.resolved.clone(),
+            ..Default::default()
+        };
+        for record in &plan.records {
+            out.journal_lines += 1;
+            if !out.apply(record) {
+                out.dropped_lines += 1;
+            }
+        }
+        out
+    }
+}
+
+fn sample_to_record(s: &Sample) -> Value {
+    let mut row = json!({
+        "k": "turn",
+        "t": s.t,
+        "sid": s.session_id,
+        "seq": s.seq,
+        "turn": s.turn,
+        "step": s.step,
+        "retry": s.retry,
+        "model": s.model,
+        "provider": s.provider,
+        "b": buckets_json(&s.buckets),
+    });
+    if let Some(obj) = row.as_object_mut() {
+        if let Some(key) = &s.key {
+            obj.insert("key".into(), json!(key));
+        }
+        if !s.engine.is_empty() {
+            obj.insert("engine".into(), json!(s.engine));
+        }
+        if let Some(route) = &s.route {
+            obj.insert("route".into(), json!(route));
+        }
+        if let Some(job) = &s.job {
+            obj.insert("job".into(), json!(job));
+        }
+        if let Some(attempt_id) = &s.attempt_id {
+            obj.insert("attemptId".into(), json!(attempt_id));
+        }
+    }
+    row
+}
+
+/// Pure JSONL-level compaction helper shared by `LedgerStorage`.
+pub fn compact_jsonl(
+    raw: &str,
+    sessions_json: Option<&str>,
+    table: &PriceTable,
+    keep_samples: usize,
+    at: i64,
+) -> CompactionPlan {
+    let ledger = Ledger::load_all_from_sources(None, Some(raw), sessions_json);
+    ledger.compact_plan(table, keep_samples, at)
+}
+
 /// 读取运行时账本、按 `plan_appends` 过滤后追加到 Rust 自己的账本。返回实际写入的行数。
 pub fn append_planned(context: &RuntimeContext, candidates: &[Value]) -> Result<usize, String> {
-    let existing = Ledger::load_all_for_runtime(context)?;
-    let fresh = plan_appends(&existing, candidates);
-    for row in &fresh {
-        append_record_for_runtime(context, row)?;
-    }
-    Ok(fresh.len())
+    LedgerStorage::append_planned(context, candidates)
 }
 
 #[cfg(test)]

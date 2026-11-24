@@ -131,6 +131,10 @@ const RESERVED2: &[&str] = &[
     "web_search",
     "web_fetch",
     "snowluma_status",
+    super::reminders::CREATE,
+    super::reminders::LIST,
+    super::reminders::CHANGE,
+    super::reminders::CANCEL,
 ];
 
 /// `RESERVED2` plus the owner-only ACL and settings tools.
@@ -180,6 +184,10 @@ const RESERVED2_OWNER: &[&str] = &[
     "web_search",
     "web_fetch",
     "snowluma_status",
+    super::reminders::CREATE,
+    super::reminders::LIST,
+    super::reminders::CHANGE,
+    super::reminders::CANCEL,
 ];
 
 /// The digest is one completion over stored evidence.
