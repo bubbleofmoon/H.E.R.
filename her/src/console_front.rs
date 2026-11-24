@@ -833,6 +833,17 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
     {
         return Some(*policy);
     }
+    if crate::console::inspector::is_route(path) {
+        return Some(
+            RoutePolicy::admin("the session inspector is restricted to administrators").with_cookie(
+                if method == "GET" {
+                    SessionCookiePolicy::Renew
+                } else {
+                    SessionCookiePolicy::NoRenew
+                },
+            ),
+        );
+    }
     if matches!(method, "GET" | "POST") && crate::console_settings::is_route(path) {
         let body_limit = if method == "POST" && path.starts_with("/api/settings/") {
             BodyLimit::Max1Mb
@@ -1246,23 +1257,30 @@ fn origin_host(origin: &str) -> String {
     }
 }
 
-/// CSRF guard for non-GET requests after console credential admission.
+/// CSRF guard for non-GET requests and session inspector GET routes.
 pub(super) fn cross_site_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
-    if req.method == "GET" {
-        return None;
+    let inspector_get = req.method == "GET" && crate::console::inspector::is_route(&req.path);
+    if !inspector_get {
+        if req.method == "GET" {
+            return None;
+        }
+        let content_type = req
+            .headers
+            .get("content-type")
+            .map(|v| v.to_lowercase())
+            .unwrap_or_default();
+        if !content_type.contains("application/json") {
+            return Some((
+                415,
+                json!({"ok": false, "error": "请求必须是 application/json"}),
+            ));
+        }
     }
-    let content_type = req
+    if let Some(origin) = req
         .headers
-        .get("content-type")
-        .map(|v| v.to_lowercase())
-        .unwrap_or_default();
-    if !content_type.contains("application/json") {
-        return Some((
-            415,
-            json!({"ok": false, "error": "请求必须是 application/json"}),
-        ));
-    }
-    if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
+        .get("origin")
+        .filter(|o| inspector_get || !o.is_empty())
+    {
         let host = origin_host(origin);
         if !allowed_hosts(port).contains(&host) {
             return Some((403, json!({"ok": false, "error": "跨站请求被拒绝"})));
@@ -1511,7 +1529,9 @@ fn admit_selected_request(
     } else {
         (None, None, None)
     };
+    let inspector_get = req.method == "GET" && crate::console::inspector::is_route(&req.path);
     if (proof.is_some()
+        || inspector_get
         || (memory_route
             && req
                 .headers
@@ -2534,7 +2554,9 @@ pub(crate) fn handle_http_request(
     let task_log_read = req.method == "GET"
         && req.path.starts_with("/api/tasks/runs/")
         && req.path.ends_with("/log");
-    let audit = (req.method != "GET" && req.path.starts_with("/api/"))
+    let audit = (req.method != "GET"
+        && req.path.starts_with("/api/")
+        && !crate::console::inspector::is_route(&req.path))
         || (admitted_context.is_isolated() && task_log_read);
     let before = if audit && !task_log_read {
         match audit_snapshot(&admitted_context) {
@@ -3196,6 +3218,9 @@ mod tests {
             ("GET", "/api/dependencies"),
             ("GET", "/api/qq/login"),
             ("GET", "/api/auth/status"),
+            ("GET", "/inspector"),
+            ("GET", "/api/inspector/conversations"),
+            ("GET", "/api/inspector/turn"),
         ] {
             let resp = admin_call(method, path, HashMap::new(), "{}", Some("agent-tok-123"));
             assert_eq!(resp.status, 403, "{method} {path}: {}", resp.body);
@@ -3251,6 +3276,17 @@ mod tests {
 
         assert!(supports_request(&context, "GET", "/api/tasks"));
         assert!(!supports_request(&context, "POST", "/api/tasks"));
+        for path in [
+            "/inspector",
+            "/api/inspector/conversations",
+            "/api/inspector/turn",
+        ] {
+            assert!(supports_request(&context, "GET", path), "GET {path}");
+            assert!(
+                supports_request(&context, "POST", path),
+                "POST {path} reaches 405"
+            );
+        }
     }
 
     #[test]

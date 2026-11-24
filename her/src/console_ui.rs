@@ -23,7 +23,10 @@ pub(crate) fn legacy_redirect(path: &str) -> Option<&'static str> {
 /// and paths containing dotted segments (such as `/favicon.ico/`) so API routers and 404 handlers
 /// keep their own contracts.
 pub(crate) fn resolve_asset(path: &str) -> Option<&'static EmbeddedAsset> {
-    if path == "/api" || path.starts_with("/api/") {
+    if path == "/api"
+        || path.starts_with("/api/")
+        || crate::console::inspector::is_route(path)
+    {
         return None;
     }
     if let Some(exact) = UI_ASSETS.iter().find(|asset| asset.path == path) {
@@ -96,6 +99,8 @@ mod tests {
         assert!(resolve_asset("/api/status").is_none());
         assert!(resolve_asset("/api/unknown").is_none());
         assert!(resolve_asset("/api").is_none());
+        assert!(resolve_asset("/inspector").is_none());
+        assert!(!is_ui_page_request("GET", "/inspector"));
         assert!(resolve_asset("/assets/does-not-exist.js").is_none());
         assert!(resolve_asset("/missing-file.txt").is_none());
         let _ = is_stub();

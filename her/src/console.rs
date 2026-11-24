@@ -38,6 +38,8 @@ mod voice_http;
 mod access;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
+#[path = "console/inspector.rs"]
+pub(crate) mod inspector;
 #[path = "console_front.rs"]
 pub(crate) mod front;
 use crate::dsh::rpc_for as dsh_rpc_for;
@@ -10505,6 +10507,10 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
             json!({"ok": false, "error": "this route is restricted to administrators"}).to_string(),
         )
     };
+    if inspector::is_route(&req.path) {
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        return inspector::route(admin_caller, cfg, req);
+    }
     if crate::console_settings::is_route(&req.path) {
         let Some(admin_caller) = caller.admin() else { return admin_required(); };
         if !context.is_isolated() {
