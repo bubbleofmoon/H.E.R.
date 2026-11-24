@@ -1026,6 +1026,103 @@ pub(crate) fn change_conversation_scope_waiting_with(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static ISOLATED_UNDO_WRITE_FAIL: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+    static LEGACY_UNDO_WRITE_FAIL: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_undo_write_error(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<(String, String)>>>,
+    file: &str,
+) -> Option<String> {
+    slot.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.as_ref().is_some_and(|(target, _)| target == file) {
+            borrow.take().map(|(_, error)| error)
+        } else {
+            None
+        }
+    })
+}
+
+struct PreparedLegacyUndo {
+    file: String,
+    old: String,
+    snapshot: Option<Vec<u8>>,
+}
+
+fn write_legacy_undo_file(file: &str, text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(error) = take_undo_write_error(&LEGACY_UNDO_WRITE_FAIL, file) {
+        return Err(error);
+    }
+    std::fs::write(file, text).map_err(|e| e.to_string())
+}
+
+fn write_legacy_undo_targets(
+    prepared: Vec<PreparedLegacyUndo>,
+) -> Result<Vec<String>, CommitError> {
+    let mut restored = Vec::with_capacity(prepared.len());
+    let mut written: Vec<PreparedLegacyUndo> = Vec::with_capacity(prepared.len());
+    for target in prepared {
+        if let Err(error) = write_legacy_undo_file(&target.file, &target.old) {
+            let mut message = format!("写回失败 {}: {error}", target.file);
+            let mut rollback_errors = Vec::new();
+            for prev in written.into_iter().rev() {
+                let rb_result = match prev.snapshot.as_deref() {
+                    Some(bytes) => std::fs::write(&prev.file, bytes),
+                    None => std::fs::remove_file(&prev.file),
+                };
+                if let Err(rb_err) = rb_result {
+                    rollback_errors.push(format!("{} ({rb_err})", prev.file));
+                }
+            }
+            if !rollback_errors.is_empty() {
+                message.push_str(&format!(
+                    "；回滚已写文件失败：{}",
+                    rollback_errors.join("、")
+                ));
+            }
+            return Err(CommitError::plain(500, message));
+        }
+        restored.push(target.file.clone());
+        written.push(target);
+    }
+    Ok(restored)
+}
+
+struct PreparedIsolatedUndo {
+    file: String,
+    area: RuntimeArea,
+    relative: &'static str,
+    snapshot: Option<Vec<u8>>,
+    text: String,
+}
+
+fn write_isolated_undo_target(
+    context: &RuntimeContext,
+    target: &PreparedIsolatedUndo,
+    pre_store_before: &str,
+    published_diff: &mut Option<ConfigDiff>,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(error) = take_undo_write_error(&ISOLATED_UNDO_WRITE_FAIL, &target.file) {
+        return Err(error);
+    }
+    if target.file == "config/config.json" {
+        write_selected_config_text(context, &target.text).map(|mut diff| {
+            diff.before = pre_store_before.to_string();
+            *published_diff = Some(diff);
+        })
+    } else {
+        context.write_atomic(target.area, target.relative, target.text.as_bytes())
+    }
+}
+
 pub(crate) fn commit_audit_undo(
     context: &RuntimeContext,
     body: &str,
@@ -1049,14 +1146,25 @@ pub(crate) fn commit_audit_undo(
     if context.is_isolated() {
         return commit_isolated_audit_undo(context, id, &entry, confirm, files);
     }
-    let mut restored: Vec<String> = Vec::new();
-    for f in files {
+    // Phase 1: validate all inputs and snapshot pre-undo contents before writing any file.
+    let mut prepared = Vec::with_capacity(files.len());
+    let mut wake_before: Option<Value> = None;
+    for f in &files {
         let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
         if !crate::console::AUDIT_FILES.contains(&file) {
             return Err(CommitError::plain(
                 400,
                 format!("拒绝恢复未声明的文件：{file}"),
+            ));
+        }
+        if prepared
+            .iter()
+            .any(|existing: &PreparedLegacyUndo| existing.file == file)
+        {
+            return Err(CommitError::plain(
+                400,
+                format!("审计记录包含重复的目标文件：{file}"),
             ));
         }
         if !crate::console::audit_backup_allowed_for(context, backup) {
@@ -1070,19 +1178,35 @@ pub(crate) fn commit_audit_undo(
         let backup_cfg: Value = serde_json::from_str(&old).map_err(|_| {
             CommitError::plain(500, format!("备份内容不是合法 JSON，拒绝写入：{backup}"))
         })?;
-        let before = (file == LEGACY_CONFIG_PATH)
-            .then(|| context.load_config_requiring_settings())
-            .transpose()
-            .map_err(|error| CommitError::plain(503, error))?;
-        std::fs::write(file, &old)
-            .map_err(|e| CommitError::plain(500, format!("写回失败 {file}: {e}")))?;
-        if let Some(before) =
-            before.filter(|cfg| cfg["socialV2"]["wake"] != backup_cfg["socialV2"]["wake"])
-        {
-            reconcile_default_wake_configs(context, Some(&before))
-                .map_err(CommitError::from_social)?;
+        if file == LEGACY_CONFIG_PATH {
+            let before = context
+                .load_config_requiring_settings()
+                .map_err(|error| CommitError::plain(503, error))?;
+            if before["socialV2"]["wake"] != backup_cfg["socialV2"]["wake"] {
+                wake_before = Some(before);
+            }
         }
-        restored.push(file.to_string());
+        let snapshot = match std::fs::read(file) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(CommitError::plain(
+                    503,
+                    format!("读取目标文件失败 {file}: {err}"),
+                ));
+            }
+        };
+        prepared.push(PreparedLegacyUndo {
+            file: file.to_string(),
+            old,
+            snapshot,
+        });
+    }
+    // Phase 2: write all prepared files with rollback on failure, then reconcile wake plans.
+    let restored = write_legacy_undo_targets(prepared)?;
+    if let Some(before) = wake_before {
+        reconcile_default_wake_configs(context, Some(&before))
+            .map_err(CommitError::from_social)?;
     }
     Ok(CommitOutcome {
         value: json!({ "ok": true, "id": id, "restored": restored }),
@@ -1109,7 +1233,7 @@ fn commit_isolated_audit_undo(
             format!("审计记录 {id} 没有改动文件，没有可恢复的内容"),
         ));
     }
-    let mut pending = Vec::with_capacity(files.len());
+    let mut pending: Vec<(String, String)> = Vec::with_capacity(files.len());
     for f in &files {
         let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
@@ -1117,6 +1241,12 @@ fn commit_isolated_audit_undo(
             return Err(CommitError::plain(
                 400,
                 format!("拒绝恢复未声明的文件：{file}"),
+            ));
+        }
+        if pending.iter().any(|(existing, _)| existing == file) {
+            return Err(CommitError::plain(
+                400,
+                format!("审计记录包含重复的目标文件：{file}"),
             ));
         }
         if !crate::console::audit_backup_allowed_for(context, backup) {
@@ -1149,15 +1279,17 @@ fn commit_isolated_audit_undo(
     let (config_before, restored, planned) = {
         let _gate = acquire_gate(context)?;
         let pre_store_before = read_config_before(context)?;
+        // Phase 1a: check freshness and snapshot pre-undo raw bytes of all target files
+        // before mutating the store, pending revocations, or any file.
+        let mut snapshots = Vec::with_capacity(pending.len());
         for (f, (file, _)) in files.iter().zip(&pending) {
             let (area, relative) =
                 crate::console::isolated_audit_file(file).expect("declared file checked above");
-            let current = context
-                .read_optional_text(area, relative)
-                .map_err(|_| {
-                    CommitError::plain(503, "selected runtime audit target is unavailable")
-                })?
-                .unwrap_or_default();
+            let current_opt = context.read_optional_text(area, relative).map_err(|_| {
+                CommitError::plain(503, "selected runtime audit target is unavailable")
+            })?;
+            let snapshot = current_opt.as_ref().map(|text| text.as_bytes().to_vec());
+            let current = current_opt.unwrap_or_default();
             let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
                 Some(expected) if file == "config/config.json" => {
                     crate::console::config_registry_free_sha(&current).as_deref()
@@ -1176,15 +1308,18 @@ fn commit_isolated_audit_undo(
                     ),
                 ));
             }
+            snapshots.push((area, relative, snapshot));
         }
         let config_before = context
             .load_config()
             .map_err(|e| CommitError::plain(503, format!("读取当前配置失败，未撤销：{e}")))?;
-        let mut restored = Vec::with_capacity(pending.len());
+
+        // Phase 1b: prepare and validate every target file in memory before writing any file.
+        let mut prepared = Vec::with_capacity(pending.len());
         let mut planned: Option<(Value, Option<String>, Option<String>)> = None;
         let mut unchanged_config = Value::Null;
-        for (file, old) in pending {
-            let mut wake_changed = false;
+        let mut wake_changed = false;
+        for ((file, old), (area, relative, snapshot)) in pending.into_iter().zip(snapshots) {
             let text = if file == "config/config.json" {
                 let current = raw_config_for_write(context).map_err(|err| {
                     CommitError::plain(
@@ -1236,45 +1371,96 @@ fn commit_isolated_audit_undo(
                 let change =
                     begin_access_change(context, &config_before, &after, "audit-undo")?;
                 store_access_changes(context, security, &previewed, &change, "audit-undo")?;
-                keep_stored_members(context, &mut restored_config)?;
-                wake_changed =
-                    current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
-                let text = serde_json::to_string_pretty(&restored_config)
-                    .map_err(|e| CommitError::plain(500, e.to_string()))?;
-                planned = Some((after, load_error, change));
-                unchanged_config = if stored {
+                let pre_write_unchanged = if stored {
                     Value::Null
                 } else {
                     config_snapshot(context)
                 };
+                if let Err(err) = keep_stored_members(context, &mut restored_config) {
+                    let mut commit_err = CommitError::from_social(err);
+                    commit_err
+                        .message
+                        .push_str(&settle_failed_write(context, &pre_write_unchanged, &change));
+                    return Err(commit_err);
+                }
+                wake_changed =
+                    current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
+                let text = match serde_json::to_string_pretty(&restored_config) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        let mut msg = e.to_string();
+                        msg.push_str(&settle_failed_write(
+                            context,
+                            &pre_write_unchanged,
+                            &change,
+                        ));
+                        return Err(CommitError::plain(500, msg));
+                    }
+                };
+                planned = Some((after, load_error, change));
+                unchanged_config = pre_write_unchanged;
                 text
             } else {
                 old
             };
-            let write_result = if file == "config/config.json" {
-                write_selected_config_text(context, &text).map(|mut diff| {
-                    diff.before = pre_store_before.clone();
-                    published_diff = Some(diff);
-                })
-            } else {
-                let (area, relative) = crate::console::isolated_audit_file(&file)
-                    .expect("declared file checked above");
-                context.write_atomic(area, relative, text.as_bytes())
-            };
+            prepared.push(PreparedIsolatedUndo {
+                file,
+                area,
+                relative,
+                snapshot,
+                text,
+            });
+        }
+
+        // Phase 2: write prepared files; on failure, roll back earlier writes in reverse order.
+        let mut restored = Vec::with_capacity(prepared.len());
+        let mut written: Vec<PreparedIsolatedUndo> = Vec::with_capacity(prepared.len());
+        for target in prepared {
+            let write_result = write_isolated_undo_target(
+                context,
+                &target,
+                &pre_store_before,
+                &mut published_diff,
+            );
             if let Err(error) = write_result {
-                let mut message = format!("写回失败 {file}: {error}");
-                if let Some((_, _, change)) =
-                    planned.as_ref().filter(|_| file == "config/config.json")
-                {
+                let mut message = format!("写回失败 {}: {error}", target.file);
+                let mut config_rolled_back = false;
+                let mut rollback_errors = Vec::new();
+                for prev in written.into_iter().rev() {
+                    let rb_result = match prev.snapshot.as_deref() {
+                        Some(bytes) => context.write_atomic(prev.area, prev.relative, bytes),
+                        None => context.remove_file(prev.area, prev.relative),
+                    };
+                    match rb_result {
+                        Ok(()) => {
+                            if prev.file == "config/config.json" {
+                                config_rolled_back = true;
+                            }
+                        }
+                        Err(rb_err) => {
+                            rollback_errors.push(format!("{} ({rb_err})", prev.file));
+                        }
+                    }
+                }
+                if config_rolled_back {
+                    published_diff = None;
+                }
+                if let Some((_, _, change)) = planned.as_ref() {
                     message.push_str(&settle_failed_write(context, &unchanged_config, change));
+                }
+                if !rollback_errors.is_empty() {
+                    message.push_str(&format!(
+                        "；回滚已写文件失败：{}",
+                        rollback_errors.join("、")
+                    ));
                 }
                 return Err(CommitError::with_diff(500, message, published_diff));
             }
-            if wake_changed {
-                wake_error =
-                    reconcile_default_wake_configs(context, Some(&config_before)).err();
-            }
-            restored.push(file);
+            restored.push(target.file.clone());
+            written.push(target);
+        }
+        if wake_changed {
+            wake_error = reconcile_default_wake_configs(context, Some(&config_before)).err();
         }
         (config_before, restored, planned)
     };
@@ -2058,6 +2244,436 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.0.join("config/config.json")).unwrap(),
             diff.before
+        );
+    }
+
+    struct UndoWriteFailGuard;
+
+    impl Drop for UndoWriteFailGuard {
+        fn drop(&mut self) {
+            ISOLATED_UNDO_WRITE_FAIL.with(|slot| *slot.borrow_mut() = None);
+            LEGACY_UNDO_WRITE_FAIL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn seed_multi_file_audit(
+        root: &TestDir,
+        id: &str,
+        role_map_backup: &str,
+        role_map_current: Option<&str>,
+        config_backup: &str,
+        config_current: &str,
+        role_map_first: bool,
+    ) {
+        let blob_dir = root.0.join("data/audit/blobs").join(id);
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(blob_dir.join("role-map.json"), role_map_backup).unwrap();
+        std::fs::write(blob_dir.join("config.json"), config_backup).unwrap();
+        match role_map_current {
+            Some(text) => std::fs::write(root.0.join("data/role-map.json"), text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(root.0.join("data/role-map.json"));
+            }
+        }
+        std::fs::write(root.0.join("config/config.json"), config_current).unwrap();
+        let role_entry = json!({
+            "file": "data/role-map.json",
+            "backup": format!("audit/blobs/{id}/role-map.json"),
+            "afterSha": crate::console::sha256_hex(role_map_current.unwrap_or("")),
+        });
+        let cfg_entry = json!({
+            "file": "config/config.json",
+            "backup": format!("audit/blobs/{id}/config.json"),
+            "afterSha": crate::console::sha256_hex(config_current),
+            "afterRegistryFreeSha": crate::console::config_registry_free_sha(config_current),
+        });
+        let files = if role_map_first {
+            json!([role_entry, cfg_entry])
+        } else {
+            json!([cfg_entry, role_entry])
+        };
+        let entry = json!({
+            "id": id,
+            "ts": 1000,
+            "method": "POST",
+            "path": "/api/socialV2/config",
+            "status": 200,
+            "files": files,
+        });
+        std::fs::write(root.0.join("data/audit/audit.jsonl"), format!("{entry}\n")).unwrap();
+    }
+
+    #[test]
+    fn commit_audit_undo_multi_file_409_refusal_leaves_earlier_role_map_untouched() {
+        // Case 1: keep_registry_values conflict (409) when role-map is listed before config.
+        let (root_keep, ctx_keep) = fixture(
+            "audit-undo-409-keep",
+            json!({
+                "ownerQQ": 7001,
+                "allow": { "groups": [42], "private": [7001] },
+                "socialV2": { "reply": { "wakeQuietMs": 8000 } }
+            }),
+        );
+        let cfg_current = std::fs::read_to_string(root_keep.0.join("config/config.json")).unwrap();
+        let mut cfg_backup_val: Value = serde_json::from_str(&cfg_current).unwrap();
+        cfg_backup_val["socialV2"] = json!({ "reply": false });
+        let cfg_backup = serde_json::to_string_pretty(&cfg_backup_val).unwrap();
+        let role_current = r#"{"default":"current-role"}"#;
+        let role_backup = r#"{"default":"restored-role"}"#;
+        seed_multi_file_audit(
+            &root_keep,
+            "tx-keep-409",
+            role_backup,
+            Some(role_current),
+            &cfg_backup,
+            &cfg_current,
+            true,
+        );
+        let err = commit_audit_undo(&ctx_keep, &json!({ "id": "tx-keep-409" }).to_string())
+            .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert!(err.message.contains("reply.wakeQuietMs"), "{}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(root_keep.0.join("data/role-map.json")).unwrap(),
+            role_current,
+            "earlier role-map.json must stay untouched when config fails with 409"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_keep.0.join("config/config.json")).unwrap(),
+            cfg_current
+        );
+
+        // Case 2: missing security confirmation (409) when role-map is listed before config.
+        let (root_sec, ctx_sec) = fixture(
+            "audit-undo-409-confirm",
+            json!({
+                "ownerQQ": 7001,
+                "allow": { "groups": [42], "private": [7001] }
+            }),
+        );
+        let sec_current = std::fs::read_to_string(root_sec.0.join("config/config.json")).unwrap();
+        let mut sec_backup_val: Value = serde_json::from_str(&sec_current).unwrap();
+        sec_backup_val["allow"]["groups"] = json!([42, 43]);
+        let sec_backup = serde_json::to_string_pretty(&sec_backup_val).unwrap();
+        seed_multi_file_audit(
+            &root_sec,
+            "tx-confirm-409",
+            role_backup,
+            Some(role_current),
+            &sec_backup,
+            &sec_current,
+            true,
+        );
+        let err = commit_audit_undo(&ctx_sec, &json!({ "id": "tx-confirm-409" }).to_string())
+            .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert!(err.message.contains("allow.groups"), "{}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(root_sec.0.join("data/role-map.json")).unwrap(),
+            role_current,
+            "earlier role-map.json must stay untouched when confirmation is missing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_sec.0.join("config/config.json")).unwrap(),
+            sec_current
+        );
+    }
+
+    #[test]
+    fn commit_audit_undo_multi_file_later_write_failure_rolls_back_first_file() {
+        let _guard = UndoWriteFailGuard;
+
+        // Order A: role-map written first (existing), config fails second -> role-map restored.
+        let (root_a, ctx_a) = fixture(
+            "audit-undo-rb-role",
+            json!({
+                "ownerQQ": 7001,
+                "allow": { "groups": [42], "private": [7001] },
+                "notes": "current"
+            }),
+        );
+        let cfg_current = std::fs::read_to_string(root_a.0.join("config/config.json")).unwrap();
+        let mut cfg_backup_val: Value = serde_json::from_str(&cfg_current).unwrap();
+        cfg_backup_val["notes"] = json!("restored");
+        let cfg_backup = serde_json::to_string_pretty(&cfg_backup_val).unwrap();
+        let role_current = r#"{"default":"current-role"}"#;
+        let role_backup = r#"{"default":"restored-role"}"#;
+        seed_multi_file_audit(
+            &root_a,
+            "tx-rb-role",
+            role_backup,
+            Some(role_current),
+            &cfg_backup,
+            &cfg_current,
+            true,
+        );
+        ISOLATED_UNDO_WRITE_FAIL.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "config/config.json".into(),
+                "injected config failure".into(),
+            ))
+        });
+        let err = commit_audit_undo(&ctx_a, &json!({ "id": "tx-rb-role" }).to_string())
+            .unwrap_err();
+        assert_eq!(err.status, 500);
+        assert!(err.message.contains("injected config failure"), "{}", err.message);
+        assert!(err.config_diff.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root_a.0.join("data/role-map.json")).unwrap(),
+            role_current,
+            "first written role-map.json must roll back to its pre-undo bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_a.0.join("config/config.json")).unwrap(),
+            cfg_current
+        );
+
+        // Order A2: role-map absent before undo, written first, config fails second -> removed.
+        seed_multi_file_audit(
+            &root_a,
+            "tx-rb-remove",
+            role_backup,
+            None,
+            &cfg_backup,
+            &cfg_current,
+            true,
+        );
+        ISOLATED_UNDO_WRITE_FAIL.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "config/config.json".into(),
+                "injected config failure".into(),
+            ))
+        });
+        let err = commit_audit_undo(&ctx_a, &json!({ "id": "tx-rb-remove" }).to_string())
+            .unwrap_err();
+        assert_eq!(err.status, 500);
+        assert!(
+            !root_a.0.join("data/role-map.json").exists(),
+            "role-map.json that did not exist before undo must be removed on rollback"
+        );
+
+        // Order B: config written first (with wake change), role-map fails second -> config rolled
+        // back and wake reconciliation skipped.
+        let (root_b, ctx_b) = fixture(
+            "audit-undo-rb-cfg",
+            json!({
+                "ownerQQ": 7001,
+                "allow": { "groups": [42], "private": [7001] },
+                "socialV2": { "wake": { "recommendedPoke": false } },
+                "notes": "current"
+            }),
+        );
+        let plan_before = crate::wake::default_wake_plan(&ctx_b.load_config().unwrap());
+        assert_eq!(plan_before["triggers"]["poke"], false);
+        ctx_b
+            .write_atomic(
+                RuntimeArea::Data,
+                "social-v2.json",
+                json!({
+                    "paused": false,
+                    "conversations": { "group:42": { "wakeConfig": plan_before } }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let cfg_b_current = std::fs::read_to_string(root_b.0.join("config/config.json")).unwrap();
+        let mut cfg_b_backup_val: Value = serde_json::from_str(&cfg_b_current).unwrap();
+        cfg_b_backup_val["socialV2"]["wake"]["recommendedPoke"] = json!(true);
+        cfg_b_backup_val["notes"] = json!("restored");
+        let cfg_b_backup = serde_json::to_string_pretty(&cfg_b_backup_val).unwrap();
+        seed_multi_file_audit(
+            &root_b,
+            "tx-rb-cfg",
+            role_backup,
+            Some(role_current),
+            &cfg_b_backup,
+            &cfg_b_current,
+            false,
+        );
+        ISOLATED_UNDO_WRITE_FAIL.with(|slot| {
+            *slot.borrow_mut() =
+                Some(("data/role-map.json".into(), "injected role-map failure".into()))
+        });
+        let err = commit_audit_undo(&ctx_b, &json!({ "id": "tx-rb-cfg" }).to_string())
+            .unwrap_err();
+        assert_eq!(err.status, 500);
+        assert!(err.message.contains("injected role-map failure"), "{}", err.message);
+        assert!(
+            err.config_diff.is_none(),
+            "rolled-back config.json must not report a published ConfigDiff"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_b.0.join("config/config.json")).unwrap(),
+            cfg_b_current,
+            "first written config.json must roll back to its pre-undo bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_b.0.join("data/role-map.json")).unwrap(),
+            role_current
+        );
+        assert_eq!(
+            ctx_b.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]
+                ["triggers"]["poke"],
+            false,
+            "wake reconciliation must not run when a later file write fails"
+        );
+        assert!(!root_b
+            .0
+            .join("data")
+            .join(social_state::PENDING_REVOCATIONS)
+            .exists());
+    }
+
+    #[test]
+    fn commit_audit_undo_multi_file_happy_path_restores_all_files() {
+        let live_token = "fixture-config-tx-token-abcdefgh";
+        let (root, context) = fixture(
+            "audit-undo-multi-happy",
+            json!({
+                "consoleToken": live_token,
+                "ownerQQ": 7001,
+                "allow": { "groups": [42], "private": [7001] },
+                "socialV2": { "wake": { "recommendedPoke": false } },
+                "notes": "after-edit"
+            }),
+        );
+        let plan_before = crate::wake::default_wake_plan(&context.load_config().unwrap());
+        assert_eq!(plan_before["triggers"]["poke"], false);
+        context
+            .write_atomic(
+                RuntimeArea::Data,
+                "social-v2.json",
+                json!({
+                    "paused": false,
+                    "conversations": { "group:42": { "wakeConfig": plan_before } }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let cfg_current = std::fs::read_to_string(root.0.join("config/config.json")).unwrap();
+        let mut cfg_backup_val: Value = serde_json::from_str(&cfg_current).unwrap();
+        cfg_backup_val["consoleToken"] = json!("[redacted]");
+        cfg_backup_val["socialV2"]["wake"]["recommendedPoke"] = json!(true);
+        cfg_backup_val["notes"] = json!("before-edit");
+        let cfg_backup = serde_json::to_string_pretty(&cfg_backup_val).unwrap();
+        let role_current = r#"{"default":"after-role"}"#;
+        let role_backup = r#"{"default":"before-role"}"#;
+        seed_multi_file_audit(
+            &root,
+            "tx-multi-happy",
+            role_backup,
+            Some(role_current),
+            &cfg_backup,
+            &cfg_current,
+            true,
+        );
+
+        let outcome = commit_audit_undo(&context, &json!({ "id": "tx-multi-happy" }).to_string())
+            .unwrap();
+        assert_eq!(outcome.value["ok"], true);
+        assert_eq!(
+            outcome.value["restored"],
+            json!(["data/role-map.json", "config/config.json"])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("data/role-map.json")).unwrap(),
+            role_backup
+        );
+        let restored_cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.0.join("config/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_cfg["notes"], "before-edit");
+        assert_eq!(restored_cfg["consoleToken"], live_token);
+        assert_eq!(restored_cfg["socialV2"]["wake"]["recommendedPoke"], true);
+        let diff = outcome.config_diff.expect("multi-file undo returns ConfigDiff");
+        assert_eq!(diff.before, cfg_current);
+        assert_eq!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]
+                ["triggers"]["poke"],
+            true,
+            "wake reconciliation runs after all files are written"
+        );
+    }
+
+    #[test]
+    fn write_legacy_undo_targets_rolls_back_earlier_files_on_failure() {
+        let _guard = UndoWriteFailGuard;
+        let dir = TestDir::new("legacy-undo-rb");
+        let first_path = dir.0.join("first.json");
+        let second_path = dir.0.join("second.json");
+        let first_key = first_path.to_string_lossy().to_string();
+        let second_key = second_path.to_string_lossy().to_string();
+
+        std::fs::write(&first_path, r#"{"state":"before"}"#).unwrap();
+        LEGACY_UNDO_WRITE_FAIL.with(|slot| {
+            *slot.borrow_mut() = Some((second_key.clone(), "disk full".into()));
+        });
+        let err = write_legacy_undo_targets(vec![
+            PreparedLegacyUndo {
+                file: first_key.clone(),
+                old: r#"{"state":"restored"}"#.into(),
+                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
+            },
+            PreparedLegacyUndo {
+                file: second_key.clone(),
+                old: r#"{"role":"restored"}"#.into(),
+                snapshot: None,
+            },
+        ])
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            r#"{"state":"before"}"#,
+            "legacy rollback must restore pre-undo bytes of earlier written file"
+        );
+        assert!(!second_path.exists());
+
+        // When an earlier file did not exist before undo, rollback removes it.
+        LEGACY_UNDO_WRITE_FAIL.with(|slot| {
+            *slot.borrow_mut() = Some((first_key.clone(), "disk full".into()));
+        });
+        let err = write_legacy_undo_targets(vec![
+            PreparedLegacyUndo {
+                file: second_key.clone(),
+                old: r#"{"role":"restored"}"#.into(),
+                snapshot: None,
+            },
+            PreparedLegacyUndo {
+                file: first_key.clone(),
+                old: r#"{"state":"restored"}"#.into(),
+                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
+            },
+        ])
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+        assert!(!second_path.exists());
+
+        // Happy path restores both files.
+        let restored = write_legacy_undo_targets(vec![
+            PreparedLegacyUndo {
+                file: first_key.clone(),
+                old: r#"{"state":"restored"}"#.into(),
+                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
+            },
+            PreparedLegacyUndo {
+                file: second_key.clone(),
+                old: r#"{"role":"restored"}"#.into(),
+                snapshot: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(restored, vec![first_key, second_key]);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            r#"{"state":"restored"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            r#"{"role":"restored"}"#
         );
     }
 }
