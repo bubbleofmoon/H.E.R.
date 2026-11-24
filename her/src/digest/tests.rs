@@ -146,22 +146,62 @@ fn her_own_journal_frames_are_filtered_for_onebot_account_id_variants() {
     string_self["self_id"] = json!("1000");
     journal_message(&context, key, 1, string_self);
 
+    let mut string_user = group_text(1000, "synthetic string user notice");
+    string_user["user_id"] = json!("1000");
+    journal_message(&context, key, 2, string_user);
+
     let mut nested_self = group_text(5002, "synthetic nested sender notice");
     nested_self["sender"]["user_id"] = json!("1000");
-    journal_message(&context, key, 2, nested_self);
+    journal_message(&context, key, 3, nested_self);
 
     let mut peer = group_text(5002, "synthetic peer message");
     peer["self_id"] = json!("1000");
     peer["user_id"] = json!("5002");
     peer["sender"]["user_id"] = json!("5002");
-    journal_message(&context, key, 3, peer);
+    journal_message(&context, key, 4, peer);
 
     let model = Fake::new(vec![]);
-    assert_eq!(run(&context, &model, key, &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
+    assert_eq!(run(&context, &model, key, &ANY), Ok(Outcome::Written { through: 4, memories: 0 }));
     let inputs = model.inputs();
     assert!(inputs[0].contains("synthetic peer message"));
     assert!(!inputs[0].contains("synthetic string self notice"), "string self ID let an own frame reach the digest");
+    assert!(
+        !inputs[0].contains("synthetic string user notice"),
+        "string user ID equal to self_id let an own frame reach the digest"
+    );
     assert!(!inputs[0].contains("synthetic nested sender notice"), "nested sender ID let an own frame reach the digest");
+}
+
+#[test]
+fn her_own_frames_pass_without_positive_self_id_unless_message_sent() {
+    let (_root, context) = fixture(Some("chat"), CFG(), "http://127.0.0.1:1");
+    let key = "group:77";
+    let mut missing_self = group_text(1000, "missing self id frame");
+    missing_self.as_object_mut().unwrap().remove("self_id");
+    journal_message(&context, key, 1, missing_self);
+
+    let mut zero_self = group_text(1000, "zero self id frame");
+    zero_self["self_id"] = json!(0);
+    journal_message(&context, key, 2, zero_self);
+
+    let mut negative_self = group_text(1000, "negative self id frame");
+    negative_self["self_id"] = json!(-1);
+    journal_message(&context, key, 3, negative_self);
+
+    let mut echo = group_text(1000, "message sent without self id");
+    echo.as_object_mut().unwrap().remove("self_id");
+    echo["post_type"] = json!("message_sent");
+    journal_message(&context, key, 4, echo);
+
+    let model = Fake::new(vec![]);
+    let out = run(&context, &model, key, &ANY);
+    assert_eq!(out, Ok(Outcome::Written { through: 4, memories: 0 }));
+    let inputs = model.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert!(inputs[0].contains("#1 乙：missing self id frame"), "{}", inputs[0]);
+    assert!(inputs[0].contains("#2 乙：zero self id frame"), "{}", inputs[0]);
+    assert!(inputs[0].contains("#3 乙：negative self id frame"), "{}", inputs[0]);
+    assert!(!inputs[0].contains("message sent without self id"), "{}", inputs[0]);
 }
 
 #[test]
