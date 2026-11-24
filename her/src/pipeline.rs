@@ -624,10 +624,6 @@ pub fn patch_token_line(prompt: &str, token: &str) -> String {
 }
 
 impl Pipeline {
-    pub fn new(cfg: &serde_json::Value, live: bool) -> Result<Self, String> {
-        Self::new_with_runtime(&RuntimeContext::legacy(), cfg, live)
-    }
-
     pub fn new_with_runtime(
         context: &RuntimeContext,
         cfg: &serde_json::Value,

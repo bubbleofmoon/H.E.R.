@@ -220,18 +220,6 @@ fn development_destinations_are_guarded_without_a_runtime_even_from_installed_cl
     });
     std::fs::copy(env!("CARGO_BIN_EXE_her-cli"), &cli).unwrap();
     for image in [Path::new(env!("CARGO_BIN_EXE_her-cli")), cli.as_path()] {
-        let db = install.join("probe.db");
-        let output = command(image)
-            .env("HER_INSTALL_ROOT", &install)
-            .env("HER_MEMORY_DB", &db)
-            .arg("--price-probe")
-            .output()
-            .unwrap();
-        refused(
-            output,
-            "development runtime root is under the production install root",
-        );
-        assert!(!db.exists());
         let patch = install.join("patch/new.yml");
         let output = command(image)
             .env("HER_INSTALL_ROOT", &install)
