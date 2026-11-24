@@ -32,7 +32,9 @@ class RunScansTests(unittest.TestCase):
     def test_repo_completeness_matches_test_suites_on_disk(self):
         mod = load_run_scans()
         discovered = mod.discover_test_suites(ROOT / "scripts" / "tests")
-        self.assertEqual(tuple(discovered), mod.TEST_SUITES)
+        self.assertEqual(discovered, sorted(mod.TEST_SUITES))
+        self.assertEqual(len(set(mod.SUITES)), len(mod.SUITES))
+        self.assertLessEqual(set(mod.HEAVY_TEST_SUITES), set(mod.TEST_SUITES))
         self.assertEqual(mod.check_completeness(ROOT), [])
         self.assertIn("scripts/check-repo.py", mod.SUITES)
         self.assertIn("scripts/tests/test_run_scans.py", mod.SUITES)
@@ -47,11 +49,32 @@ class RunScansTests(unittest.TestCase):
         (tests_dir / "test_alpha.py").write_text("print('ok')\n", encoding="utf-8")
         (tests_dir / "test_unlisted.py").write_text("print('ok')\n", encoding="utf-8")
 
-        problems = mod.check_completeness(tmp, test_suites=("test_alpha.py", "test_missing.py"))
+        problems = mod.check_completeness(
+            tmp,
+            test_suites=("test_alpha.py", "test_missing.py"),
+            heavy_suites=(),
+        )
         joined = "\n".join(problems)
         self.assertIn("test_unlisted.py", joined)
         self.assertIn("test_missing.py", joined)
         self.assertNotIn("test_alpha.py", joined)
+
+    def test_completeness_rejects_duplicate_and_unknown_heavy_suites(self):
+        mod = load_run_scans()
+        tmp = Path(tempfile.mkdtemp(prefix="run-scans-heavy-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tests_dir = tmp / "scripts" / "tests"
+        tests_dir.mkdir(parents=True)
+        (tests_dir / "test_alpha.py").write_text("print('ok')\n", encoding="utf-8")
+
+        problems = mod.check_completeness(
+            tmp,
+            test_suites=("test_alpha.py",),
+            heavy_suites=("test_alpha.py", "test_alpha.py", "test_unknown.py"),
+        )
+        joined = "\n".join(problems)
+        self.assertIn("test_alpha.py: listed more than once in HEAVY_TEST_SUITES", joined)
+        self.assertIn("test_unknown.py: listed in HEAVY_TEST_SUITES but missing from TEST_SUITES", joined)
 
     def test_run_suites_executes_passing_suites_in_parallel_and_returns_zero(self):
         mod = load_run_scans()
@@ -148,6 +171,10 @@ class RunScansTests(unittest.TestCase):
         mod = load_run_scans()
         self.assertEqual(mod.DEFAULT_TIMEOUT, 900)
         self.assertEqual(mod.default_jobs(None), 2)
+        self.assertEqual(mod.default_jobs(0), 2)
+        self.assertEqual(mod.default_jobs(-3), 2)
+        self.assertEqual(mod.default_jobs(False), 2)
+        self.assertEqual(mod.default_jobs(True), 2)
         self.assertEqual(mod.default_jobs(2), 2)
         self.assertEqual(mod.default_jobs(4), 4)
         self.assertEqual(mod.default_jobs(16), 4)

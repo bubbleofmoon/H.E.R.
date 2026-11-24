@@ -31,32 +31,25 @@ HEAVY_TEST_SUITES: tuple[str, ...] = (
     "test_merge_check.py",
 )
 
-TEST_SUITES: tuple[str, ...] = (
-    "test_agent_guard.py",
+FAST_TEST_SUITES: tuple[str, ...] = (
     "test_check_repo.py",
-    "test_checks_workflow.py",
     "test_ci_suite.py",
-    "test_ci_wait.py",
     "test_codex_task.py",
-    "test_gh_public.py",
-    "test_handoff.py",
     "test_issue_watch.py",
-    "test_merge_check.py",
     "test_plan_export.py",
-    "test_pre_push_hook.py",
     "test_quick_workflow.py",
     "test_run_scans.py",
-    "test_scan_public.py",
     "test_snowluma_export.py",
-    "test_strip_history.py",
     "test_watch_stream.py",
 )
+
+TEST_SUITES: tuple[str, ...] = HEAVY_TEST_SUITES + FAST_TEST_SUITES
 
 # Longest-Processing-Time-First order so heavy subprocess suites start immediately.
 SUITES: tuple[str, ...] = (
     *(f"scripts/tests/{name}" for name in HEAVY_TEST_SUITES),
     "scripts/check-repo.py",
-    *(f"scripts/tests/{name}" for name in TEST_SUITES if name not in HEAVY_TEST_SUITES),
+    *(f"scripts/tests/{name}" for name in FAST_TEST_SUITES),
 )
 
 
@@ -80,14 +73,23 @@ def discover_test_suites(tests_dir: Path) -> list[str]:
 def check_completeness(
     root: Path,
     test_suites: Sequence[str] = TEST_SUITES,
+    heavy_suites: Sequence[str] = HEAVY_TEST_SUITES,
 ) -> list[str]:
-    """Return problem descriptions if TEST_SUITES and disk test_*.py files diverge."""
+    """Return problem descriptions if TEST_SUITES, HEAVY_TEST_SUITES, and disk test_*.py diverge."""
     problems: list[str] = []
     seen: set[str] = set()
     for name in test_suites:
         if name in seen:
             problems.append(f"scripts/tests/{name}: listed more than once in TEST_SUITES")
         seen.add(name)
+
+    heavy_seen: set[str] = set()
+    for name in heavy_suites:
+        if name in heavy_seen:
+            problems.append(f"scripts/tests/{name}: listed more than once in HEAVY_TEST_SUITES")
+        heavy_seen.add(name)
+        if name not in seen:
+            problems.append(f"scripts/tests/{name}: listed in HEAVY_TEST_SUITES but missing from TEST_SUITES")
 
     on_disk = set(discover_test_suites(root / "scripts" / "tests"))
     for name in sorted(on_disk - seen):
@@ -156,8 +158,8 @@ _UNSET = object()
 def default_jobs(cpu_count: int | None | object = _UNSET) -> int:
     """Return default worker count capped at 4 so 2-4 vCPU runners avoid subprocess thrashing."""
     count = os.cpu_count() if cpu_count is _UNSET else cpu_count
-    assert count is None or isinstance(count, int)
-    return min(4, count or 2)
+    valid = count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 2
+    return min(4, valid)
 
 
 def format_result(res: SuiteResult, timeout: float) -> str:
