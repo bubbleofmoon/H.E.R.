@@ -358,12 +358,35 @@ fn ancestors_checked(
     Ok(true)
 }
 
+const DELETE_PENDING_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const DELETE_PENDING_RETRY_STEP: Duration = Duration::from_millis(5);
+
+/// Whether an I/O error is Windows `ERROR_ACCESS_DENIED` (5) or `ERROR_DELETE_PENDING` (303),
+/// which `symlink_metadata` can return while an open handle keeps a deleted file delete-pending.
+fn is_windows_delete_pending_denial(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING};
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            .is_some_and(|code| code == ERROR_ACCESS_DENIED || code == ERROR_DELETE_PENDING)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Checks one entry before its permissions change: outside any protected root, no redirected
 /// part, a regular file or directory, and on Unix owned by this account with one link.
 /// `Ok(None)` when a listed entry vanished: the OS reports the entry itself missing, also after a
 /// guard failed, an ancestor reported missing or the ownership check failed (Unix: the entry was
-/// unlinked as its metadata was read) because the entry was removed meanwhile. Any other
-/// read failure refuses. The version folder itself (`listed == false`) must exist.
+/// unlinked as its metadata was read) because the entry was removed meanwhile. On Windows, a
+/// listed entry returning `ERROR_ACCESS_DENIED` (delete-pending while open handles close) retries
+/// briefly up to 250 ms before failing closed. Any other read failure refuses. The version folder
+/// itself (`listed == false`) must exist.
 fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, String> {
     inspect_with(path, listed, &|entry| std::fs::symlink_metadata(entry))
 }
@@ -375,14 +398,51 @@ fn inspect_with(
     listed: bool,
     stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<Option<std::fs::Metadata>, String> {
-    if crate::install_root::check_runtime(path, false).is_err() {
-        return if listed && gone(path) {
-            Ok(None)
-        } else {
-            Err(named("relay path is protected", path))
-        };
+    inspect_with_guard(
+        path,
+        listed,
+        &|entry| crate::install_root::check_runtime(entry, false),
+        stat,
+    )
+}
+
+fn inspect_with_guard(
+    path: &Path,
+    listed: bool,
+    guard: &dyn Fn(&Path) -> Result<(), String>,
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Option<std::fs::Metadata>, String> {
+    if let Err(mut error) = guard(path) {
+        let deadline = Instant::now() + DELETE_PENDING_RETRY_BUDGET;
+        loop {
+            if listed && gone(path) {
+                return Ok(None);
+            }
+            if !listed
+                || !cfg!(windows)
+                || !error.starts_with("guard path cannot be ")
+                || Instant::now() >= deadline
+            {
+                return Err(named("relay path is protected", path));
+            }
+            std::thread::sleep(DELETE_PENDING_RETRY_STEP);
+            match guard(path) {
+                Ok(()) => break,
+                Err(next) => error = next,
+            }
+        }
     }
-    let meta = match stat(path) {
+    let mut result = stat(path);
+    if listed && result.as_ref().is_err_and(is_windows_delete_pending_denial) {
+        let deadline = Instant::now() + DELETE_PENDING_RETRY_BUDGET;
+        while result.as_ref().is_err_and(is_windows_delete_pending_denial)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(DELETE_PENDING_RETRY_STEP);
+            result = stat(path);
+        }
+    }
+    let meta = match result {
         Ok(meta) => meta,
         Err(error) if listed && vanished(&error) => return Ok(None),
         Err(error) => {
@@ -420,10 +480,12 @@ fn inspect_with(
 }
 
 /// Makes one entry private with `private`. `Ok(None)` when a listed entry vanished: the OS
-/// reported it missing and a fresh inspection finds it gone. A missing report for an entry that
-/// still exists (a child that vanished while a directory's ACL propagated) is retried once, with
-/// the fresh inspection, so a replacement link is refused. Any other failure refuses, even for an
-/// entry that is gone by then; the version folder (`listed == false`) is never skipped.
+/// reported it missing (or on Windows `CreateFileW` failed with `Win32 error 5`, which also occurs
+/// while a deleted entry is delete-pending) and a fresh inspection finds it gone. A missing report
+/// for an entry that still exists (a child that vanished while a directory's ACL propagated) is
+/// retried once, with the fresh inspection, so a replacement link is refused; a `CreateFileW`
+/// access denial for an entry that still exists refuses immediately. Any other failure refuses,
+/// even for an entry that is gone by then; the version folder (`listed == false`) is never skipped.
 fn protect_entry(
     path: &Path,
     expected_dir: bool,
@@ -433,14 +495,21 @@ fn protect_entry(
     let mut expected_dir = expected_dir;
     let mut retried = false;
     loop {
-        let reason = match private(path, expected_dir) {
+        let (reason, retry_if_present) = match private(path, expected_dir) {
             Ok(outcome) => return Ok(Some(outcome)),
+            Err(AclError::Refused(reason))
+                if listed
+                    && cfg!(windows)
+                    && reason.ends_with(": CreateFileW failed (Win32 error 5)") =>
+            {
+                (reason, false)
+            }
             Err(AclError::Refused(reason)) => return Err(reason),
-            Err(AclError::Missing(reason)) => reason,
+            Err(AclError::Missing(reason)) => (reason, true),
         };
         match inspect(path, listed)? {
             None => return Ok(None),
-            Some(_) if retried => return Err(reason),
+            Some(_) if !retry_if_present || retried => return Err(reason),
             Some(fresh) => {
                 expected_dir = fresh.is_dir();
                 retried = true;
@@ -609,7 +678,11 @@ mod native_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            if std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            } else {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
         }
     }
 
@@ -991,51 +1064,74 @@ mod native_tests {
         std::fs::remove_file(&part0).unwrap();
 
         // Race active read/write/delete-shared part handles and rotation/deletion against sweeps.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = {
-            let requests = requests.clone();
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let mut previous: Option<PathBuf> = None;
-                for i in 1..=120usize {
-                    let part = requests.join(format!("request-log-parts-request-body-{i}"));
-                    let share = if i % 2 == 0 {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE
+        struct WorkerGuard {
+            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = self.handle.take() {
+                    if std::thread::panicking() {
+                        let _ = handle.join();
                     } else {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                    };
-                    let mut w = std::fs::OpenOptions::new()
-                        .create_new(true)
-                        .read(true)
-                        .write(true)
-                        .share_mode(share)
-                        .open(&part)
-                        .unwrap();
-                    w.write_all(b"synthetic request body").unwrap();
-                    let r = std::fs::OpenOptions::new()
-                        .read(true)
-                        .share_mode(share)
-                        .open(&part)
-                        .unwrap();
-                    if i % 2 == 1 {
-                        // Delete while read/write/delete-shared handles remain open.
-                        std::fs::remove_file(&part).unwrap();
-                        drop(r);
-                        drop(w);
-                    } else {
-                        drop(r);
-                        drop(w);
-                        if let Some(old) = previous.take() {
-                            std::fs::remove_file(&old).unwrap();
-                        }
-                        previous = Some(part);
+                        handle.join().unwrap();
                     }
                 }
-                if let Some(old) = previous.take() {
-                    std::fs::remove_file(&old).unwrap();
-                }
-                done.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
+            }
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker = WorkerGuard {
+            done: done.clone(),
+            handle: Some({
+                let requests = requests.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut previous: Option<PathBuf> = None;
+                    for i in 1..=120usize {
+                        if done.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let part = requests.join(format!("request-log-parts-request-body-{i}"));
+                        let share = if i % 2 == 0 {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE
+                        } else {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                        };
+                        let mut w = std::fs::OpenOptions::new()
+                            .create_new(true)
+                            .read(true)
+                            .write(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        w.write_all(b"synthetic request body").unwrap();
+                        let r = std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        if i % 2 == 1 {
+                            // Delete while read/write/delete-shared handles remain open.
+                            std::fs::remove_file(&part).unwrap();
+                            drop(r);
+                            drop(w);
+                        } else {
+                            drop(r);
+                            drop(w);
+                            if let Some(old) = previous.take() {
+                                std::fs::remove_file(&old).unwrap();
+                            }
+                            previous = Some(part);
+                        }
+                    }
+                    if let Some(old) = previous.take() {
+                        std::fs::remove_file(&old).unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            }),
         };
 
         let mut sweeps = 0usize;
@@ -1043,8 +1139,281 @@ mod native_tests {
             restrict(&fixture.0).unwrap();
             sweeps += 1;
         }
-        worker.join().unwrap();
+        if let Some(handle) = worker.handle.take() {
+            handle.join().unwrap();
+        }
         restrict(&fixture.0).unwrap();
+    }
+
+    #[test]
+    fn listed_entry_with_transient_access_denied_then_not_found_is_skipped() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|entry| {
+            assert_eq!(entry, part.as_path());
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n <= 2 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Err(std::io::Error::from_raw_os_error(2))
+            }
+        });
+        assert_eq!(result.map(|found| found.is_some()), Ok(false));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn listed_entry_with_transient_access_denied_then_present_continues_inspection() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|entry| {
+            if entry == part.as_path() {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n <= 2 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+            }
+            std::fs::symlink_metadata(entry)
+        });
+        assert_eq!(result.map(|found| found.is_some()), Ok(true));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn listed_entry_with_persistent_access_denied_fails_closed() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert!(
+            calls.get() > 1,
+            "expected bounded retries before failing closed, got {}",
+            calls.get()
+        );
+    }
+
+    #[test]
+    fn listed_entry_with_access_denied_then_other_error_fails_with_last_error() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n == 1 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Err(std::io::Error::from_raw_os_error(32))
+            }
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(32),
+            ))
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn unlisted_entry_with_access_denied_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, false, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_with_synthetic_permission_denied_without_os_code_fails_immediately() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission denied",
+            ))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic permission denied",
+                ),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_guard_failure_with_transient_access_denied_recovers() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let stat_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                let n = guard_calls.get() + 1;
+                guard_calls.set(n);
+                if n <= 2 {
+                    Err("guard path cannot be inspected: permission denied".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &|_| {
+                stat_calls.set(stat_calls.get() + 1);
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+        );
+        assert_eq!(result.map(|found| found.is_some()), Ok(false));
+        assert_eq!(guard_calls.get(), 3);
+        assert_eq!(stat_calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_guard_failure_with_persistent_access_denied_fails_closed() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-2");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                guard_calls.set(guard_calls.get() + 1);
+                Err("guard path cannot be inspected: permission denied".into())
+            },
+            &|_| Err(std::io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(named("relay path is protected", &part))
+        );
+        assert!(
+            guard_calls.get() > 1,
+            "expected bounded retries before failing closed, got {}",
+            guard_calls.get()
+        );
+    }
+
+    #[test]
+    fn listed_entry_protected_root_guard_failure_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-3");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                guard_calls.set(guard_calls.get() + 1);
+                Err("development runtime root is under the production install root".into())
+            },
+            &|_| Err(std::io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(named("relay path is protected", &part))
+        );
+        assert_eq!(guard_calls.get(), 1);
+    }
+
+    #[test]
+    fn protect_entry_skips_listed_create_file_access_denied_when_entry_vanished() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, true, |p, _| {
+            calls += 1;
+            std::fs::remove_file(p).unwrap();
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Ok(None));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn protect_entry_refuses_listed_create_file_access_denied_when_entry_still_exists() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-2");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, true, |_, _| {
+            calls += 1;
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Err(reason));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn protect_entry_refuses_unlisted_create_file_access_denied_even_if_vanished() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-3");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, false, |p, _| {
+            calls += 1;
+            std::fs::remove_file(p).unwrap();
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Err(reason));
+        assert_eq!(calls, 1);
     }
 }
 
@@ -1654,5 +2023,74 @@ mod unix_tests {
             assert!(result.is_err(), "{target_seam:?}: {result:?}");
             assert_eq!(mode(&target), 0o644, "{target_seam:?}");
         }
+    }
+
+    #[test]
+    fn listed_entry_with_errno_5_on_unix_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unlisted_entry_with_errno_5_on_unix_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, false, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_with_synthetic_permission_denied_without_os_code_fails_immediately() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission denied",
+            ))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic permission denied",
+                ),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
     }
 }
