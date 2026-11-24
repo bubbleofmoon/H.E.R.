@@ -254,6 +254,12 @@ class WorkflowContract(unittest.TestCase):
             self.assertIn("needs: [changes, ui-build]", block, job)
             self.assertIn("if: needs.changes.outputs.code == 'true'", block, job)
 
+        dsh_contract = self.job_block(text, "dsh-contract")
+        self.assertIn("name: DSH credential contract (ubuntu-22.04)", dsh_contract)
+        self.assertIn("needs: changes", dsh_contract)
+        self.assertIn("if: needs.changes.outputs.code == 'true'", dsh_contract)
+        self.assertIn('python -I "$PUBLIC_TREE/scripts/ci/dsh-contract.py"', dsh_contract)
+
         windows = self.job_block(text, "tests-windows")
         self.assertIn("needs: [changes, ui-build]", windows)
         self.assertIn("if: github.event_name == 'push' && needs.changes.outputs.code == 'true'", windows)
@@ -279,7 +285,7 @@ class WorkflowContract(unittest.TestCase):
         gate = self.job_block(text, "gate")
 
         self.assertIn("name: checks-gate", gate)
-        self.assertIn("needs: [changes, scans, ui-build, lint, tests]", gate)
+        self.assertIn("needs: [changes, scans, ui-build, lint, tests, dsh-contract]", gate)
         self.assertIn("if: always()", gate)
         for expr in (
             "needs.changes.result",
@@ -288,6 +294,7 @@ class WorkflowContract(unittest.TestCase):
             "needs.ui-build.result",
             "needs.lint.result",
             "needs.tests.result",
+            "needs.dsh-contract.result",
         ):
             self.assertIn(expr, gate)
 
@@ -295,9 +302,11 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn('"$UI_BUILD_RESULT" != "skipped"', gate)
         self.assertIn('"$LINT_RESULT" != "skipped"', gate)
         self.assertIn('"$TESTS_RESULT" != "skipped"', gate)
+        self.assertIn('"$DSH_CONTRACT_RESULT" != "skipped"', gate)
         self.assertIn('if [ "$UI_BUILD_RESULT" != "success" ]; then', gate)
         self.assertIn('if [ "$LINT_RESULT" != "success" ]; then', gate)
         self.assertIn('if [ "$TESTS_RESULT" != "success" ]; then', gate)
+        self.assertIn('if [ "$DSH_CONTRACT_RESULT" != "success" ]; then', gate)
 
 
 if __name__ == "__main__":

@@ -278,6 +278,8 @@ jobs:
           retention-days: 7
   dsh-contract:
     name: DSH credential contract (ubuntu-22.04)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # This fixture needs unprivileged user and network namespaces.
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -389,7 +391,7 @@ jobs:
   # Always-run merge-gate aggregator so branch rulesets can require one stable check across code and docs-only PRs.
   gate:
     name: checks-gate
-    needs: [changes, scans, ui-build, lint, tests]
+    needs: [changes, scans, ui-build, lint, tests, dsh-contract]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -400,11 +402,12 @@ jobs:
       UI_BUILD_RESULT: ${{ needs.ui-build.result }}
       LINT_RESULT: ${{ needs.lint.result }}
       TESTS_RESULT: ${{ needs.tests.result }}
+      DSH_CONTRACT_RESULT: ${{ needs.dsh-contract.result }}
     steps:
       - name: Verify required checks
         shell: bash
         run: |
-          echo "changes=$CHANGES_RESULT code=$CODE_CHANGED scans=$SCANS_RESULT ui-build=$UI_BUILD_RESULT lint=$LINT_RESULT tests=$TESTS_RESULT"
+          echo "changes=$CHANGES_RESULT code=$CODE_CHANGED scans=$SCANS_RESULT ui-build=$UI_BUILD_RESULT lint=$LINT_RESULT tests=$TESTS_RESULT dsh-contract=$DSH_CONTRACT_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "FAIL: changes job did not succeed ($CHANGES_RESULT)" >&2
             exit 1
@@ -426,6 +429,10 @@ jobs:
               echo "FAIL: tests job unexpected result on docs-only change ($TESTS_RESULT)" >&2
               exit 1
             fi
+            if [ "$DSH_CONTRACT_RESULT" != "skipped" ] && [ "$DSH_CONTRACT_RESULT" != "success" ]; then
+              echo "FAIL: dsh-contract job unexpected result on docs-only change ($DSH_CONTRACT_RESULT)" >&2
+              exit 1
+            fi
             echo "PASS: docs-only checks green"
             exit 0
           fi
@@ -439,6 +446,10 @@ jobs:
           fi
           if [ "$TESTS_RESULT" != "success" ]; then
             echo "FAIL: tests job did not succeed ($TESTS_RESULT)" >&2
+            exit 1
+          fi
+          if [ "$DSH_CONTRACT_RESULT" != "success" ]; then
+            echo "FAIL: dsh-contract job did not succeed ($DSH_CONTRACT_RESULT)" >&2
             exit 1
           fi
           echo "PASS: code checks green"
