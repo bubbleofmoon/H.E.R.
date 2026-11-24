@@ -29,6 +29,8 @@ pub enum Schedule {
     /// Every `minutes` (a divisor of a day), at `offset` minutes past local midnight and every period after.
     Every { minutes: u32, offset: u32 },
     Daily { hour: u32, minute: u32 },
+    /// The first day of each month at the given local hour and minute.
+    Monthly { hour: u32, minute: u32 },
     /// Only by hand.
     Manual,
 }
@@ -41,6 +43,7 @@ impl Schedule {
             }
             Schedule::Every { minutes, offset } => format!("每 {minutes} 分钟（偏移 {offset} 分）"),
             Schedule::Daily { hour, minute } => format!("每天 {hour:02}:{minute:02}"),
+            Schedule::Monthly { hour, minute } => format!("每月 1 日 {hour:02}:{minute:02}"),
             Schedule::Manual => "仅手动".to_string(),
         }
     }
@@ -51,13 +54,16 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
     let after = Timestamp::from_millisecond(after_ms).ok()?;
     match schedule {
         Schedule::Manual => None,
-        Schedule::Daily { hour, minute } if hour < 24 && minute < 60 => {
+        Schedule::Daily { hour, minute } | Schedule::Monthly { hour, minute }
+            if hour < 24 && minute < 60 =>
+        {
             let mut date = after.to_zoned(zone.clone()).date();
             loop {
                 let civil = date.at(hour as i8, minute as i8, 0, 0);
                 let slot = zone.to_ambiguous_timestamp(civil);
                 // A missing wall time is skipped. A repeated wall time runs only on its first occurrence.
-                if !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
+                let is_scheduled_day = !matches!(schedule, Schedule::Monthly { .. }) || date.day() == 1;
+                if is_scheduled_day && !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
                     let stamp = slot.earlier().ok()?;
                     if stamp > after {
                         return Some(stamp.as_millisecond());
@@ -66,7 +72,7 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
                 date = date.tomorrow().ok()?;
             }
         }
-        Schedule::Daily { .. } => None,
+        Schedule::Daily { .. } | Schedule::Monthly { .. } => None,
         Schedule::Every { minutes, offset } => {
             let period = i64::from(minutes) * 60_000;
             if period == 0 || 86_400_000 % period != 0 {
@@ -99,6 +105,8 @@ pub enum TaskId {
     MemoryDigest,
     MemoryDigestCheck,
     Backup,
+    MemoryBackup,
+    MemoryRestoreTest,
     UpstreamCheck,
 }
 
@@ -110,6 +118,8 @@ impl TaskId {
             TaskId::MemoryDigest => "memory-digest",
             TaskId::MemoryDigestCheck => "memory-digest-check",
             TaskId::Backup => "backup",
+            TaskId::MemoryBackup => "memory-backup",
+            TaskId::MemoryRestoreTest => "memory-restore-test",
             TaskId::UpstreamCheck => "upstream-check",
         }
     }
@@ -217,6 +227,30 @@ pub const REGISTRY: &[TaskDef] = &[
         runs_when_held: false,
         chat_output: false,
         timeout: Duration::from_secs(60),
+        replaces: None,
+    },
+    TaskDef {
+        id: TaskId::MemoryBackup,
+        title: "记忆备份",
+        effect: "在本地创建记忆库快照，保留最近 14 份",
+        schedule: Schedule::Daily { hour: 4, minute: 0 },
+        action: TaskAction::Internal,
+        enabled_by_default: true,
+        runs_when_held: false,
+        chat_output: false,
+        timeout: Duration::from_secs(3600),
+        replaces: None,
+    },
+    TaskDef {
+        id: TaskId::MemoryRestoreTest,
+        title: "记忆恢复测试",
+        effect: "在临时运行目录中恢复并验证最近的记忆备份",
+        schedule: Schedule::Monthly { hour: 5, minute: 30 },
+        action: TaskAction::Internal,
+        enabled_by_default: true,
+        runs_when_held: false,
+        chat_output: false,
+        timeout: Duration::from_secs(3600),
         replaces: None,
     },
 ];
@@ -532,7 +566,24 @@ pub struct CommandExecutor {
     running_allowed: Option<Box<dyn Fn(&TaskDef) -> bool + Send + Sync>>,
 }
 
-pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<std::fs::File>, String> + Send + Sync>;
+pub struct AdmissionGuard(#[allow(dead_code)] AdmissionLock);
+
+enum AdmissionLock {
+    Scheduled(std::fs::File),
+    Manual(crate::conversation_state::Gate),
+}
+
+impl AdmissionGuard {
+    pub(crate) fn scheduled(lock: std::fs::File) -> Self {
+        Self(AdmissionLock::Scheduled(lock))
+    }
+
+    pub(crate) fn manual(gate: crate::conversation_state::Gate) -> Self {
+        Self(AdmissionLock::Manual(gate))
+    }
+}
+
+pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<AdmissionGuard>, String> + Send + Sync>;
 
 struct TaskChild {
     #[cfg(windows)]
@@ -611,7 +662,13 @@ impl Executor for CommandExecutor {
             }
             // Long internal jobs recheck desired state themselves; release the configuration gate
             // before waiting for dependencies, queuing memory_write work or streaming a backup.
-            if matches!(def.id, TaskId::MemoryDigest | TaskId::MemoryDigestCheck | TaskId::Backup) { drop(admission); }
+            if matches!(
+                def.id,
+                TaskId::MemoryDigest | TaskId::MemoryDigestCheck | TaskId::Backup
+                    | TaskId::MemoryBackup | TaskId::MemoryRestoreTest
+            ) {
+                drop(admission);
+            }
             return (self.internal)(def, run, cancel);
         }
         let spec = match (self.resolve)(def) {
@@ -859,6 +916,31 @@ mod tests {
         assert_eq!(next_due(Schedule::Every { minutes: 7, offset: 0 }, MIDNIGHT, tz), None, "must divide a day");
         // UTC zone: 03:00 UTC is 11:00 at UTC+8
         assert_eq!(next_due(daily3, MIDNIGHT, &TimeZone::UTC), Some(MIDNIGHT + 11 * H));
+    }
+
+    #[test]
+    fn next_due_monthly_crosses_the_year_boundary() {
+        let schedule = Schedule::Monthly { hour: 5, minute: 30 };
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let before = ms("2026-12-31T23:59:59Z");
+        let january = ms("2027-01-01T05:30:00Z");
+        let february = ms("2027-02-01T05:30:00Z");
+
+        assert_eq!(next_due(schedule, before, &TimeZone::UTC), Some(january));
+        assert_eq!(next_due(schedule, january, &TimeZone::UTC), Some(february));
+    }
+
+    #[test]
+    fn next_due_monthly_follows_dst_and_uses_the_first_folded_time() {
+        let schedule = Schedule::Monthly { hour: 1, minute: 30 };
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let october = ms("2026-10-01T05:30:00Z");
+        let november = ms("2026-11-01T05:30:00Z");
+        let december = ms("2026-12-01T06:30:00Z");
+
+        assert_eq!(next_due(schedule, october, &zone), Some(november));
+        assert_eq!(next_due(schedule, november, &zone), Some(december));
     }
 
     #[test]

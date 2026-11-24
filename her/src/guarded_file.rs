@@ -269,7 +269,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn transient(error: &io::Error) -> bool {
+pub(crate) fn transient(error: &io::Error) -> bool {
     cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
@@ -296,6 +296,129 @@ fn replace(temp: &Path, target: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 fn replace(temp: &Path, target: &Path) -> io::Result<()> {
     fs::rename(temp, target)
+}
+
+/// The hard links of an open file.
+#[cfg(unix)]
+pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().map(|metadata| metadata.nlink())
+}
+
+/// The hard links of an open file.
+#[cfg(windows)]
+pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
+/// Ensure every component of `path` exists as a plain directory (never a symlink or reparse point).
+pub(crate) fn ensure_plain_directory(path: &Path) -> Result<(), Failure> {
+    for part in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if part.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(part) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(part) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(Failure::Io { class: "dir/create", error }),
+                }
+            }
+            Err(error) => return Err(Failure::Io { class: "dir/inspect", error }),
+        }
+        let metadata = fs::symlink_metadata(part).map_err(io_failure("dir/inspect"))?;
+        if !metadata.is_dir() || is_link(&metadata) {
+            return Err(Failure::Refused(
+                "directory component is redirected or not a directory".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read-only check that every existing ancestor of `path` is a plain directory (no links).
+pub(crate) fn is_plain_directory(path: &Path) -> bool {
+    let mut any = false;
+    for part in path.ancestors() {
+        if part.as_os_str().is_empty() {
+            continue;
+        }
+        any = true;
+        if !fs::symlink_metadata(part).is_ok_and(|meta| meta.is_dir() && !is_link(&meta)) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Open an existing regular file without following links or reparse points; optionally require a single hard link.
+pub(crate) fn open_no_follow_regular(path: &Path, single_link: bool) -> io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    no_follow(&mut options);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    if single_link && file_link_count(&file)? != 1 {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    Ok(Some(file))
+}
+
+/// Read at most `max` bytes from a regular file opened without following links or reparse points.
+pub(crate) fn read_bounded_no_follow(
+    path: &Path,
+    max: u64,
+    single_link: bool,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_no_follow_regular(path, single_link)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guarded file oversized",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Stage using `open` and atomically commit `target` with `before_each` revalidation.
+pub(crate) fn publish_atomic_with(
+    target: &Path,
+    input: &mut dyn Read,
+    open: impl FnOnce(&Path) -> io::Result<File>,
+    before_each: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), Failure> {
+    stage_with(target, input, open)?.commit(before_each)
 }
 
 #[cfg(test)]
@@ -497,6 +620,58 @@ mod tests {
         drop(reader);
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert!(temps(&dir).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ensure_and_is_plain_directory_create_and_verify_folders() {
+        let dir = temp_dir("plain-dir");
+        let nested = dir.join("a").join("b");
+        assert!(!is_plain_directory(&nested));
+        ensure_plain_directory(&nested).unwrap();
+        assert!(nested.is_dir());
+        assert!(is_plain_directory(&nested));
+        let file = dir.join("not-a-dir");
+        fs::write(&file, b"x").unwrap();
+        assert!(ensure_plain_directory(&file.join("child")).is_err());
+        assert!(!is_plain_directory(&file.join("child")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_and_read_bounded_no_follow_handles_missing_oversized_and_publish() {
+        let dir = temp_dir("bounded-read");
+        let missing = dir.join("missing.bin");
+        assert!(open_no_follow_regular(&missing, true).unwrap().is_none());
+        assert!(read_bounded_no_follow(&missing, 16, true).unwrap().is_none());
+
+        let target = dir.join("data.bin");
+        publish_atomic_with(
+            &target,
+            &mut &b"hello world"[..],
+            |temp| OpenOptions::new().write(true).create_new(true).open(temp),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(read_bounded_no_follow(&target, 11, true).unwrap(), Some(b"hello world".to_vec()));
+        let oversized = read_bounded_no_follow(&target, 10, true).unwrap_err();
+        assert_eq!(oversized.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_no_follow_regular_refuses_symlinks_and_shared_hard_links() {
+        let dir = temp_dir("no-follow-unix");
+        let real = dir.join("real.txt");
+        fs::write(&real, b"secret").unwrap();
+        let sym = dir.join("sym.txt");
+        std::os::unix::fs::symlink(&real, &sym).unwrap();
+        assert!(open_no_follow_regular(&sym, false).is_err());
+        let alias = dir.join("alias.txt");
+        fs::hard_link(&real, &alias).unwrap();
+        assert!(open_no_follow_regular(&real, false).unwrap().is_some());
+        assert!(open_no_follow_regular(&real, true).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }

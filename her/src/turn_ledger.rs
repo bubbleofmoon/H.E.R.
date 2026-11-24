@@ -33,9 +33,10 @@ pub fn read_records(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     read_records_in(context, false)
 }
 
-/// `read_records` that waits out a Windows lock violation for `APPEND_CONFLICT_WAIT` and names the OS error
-/// when it gives up. Only for a caller that holds no lock, gate or chain (a console read view): the
-/// default read stays one-shot for the scheduler, cancellation, send and token paths.
+/// `read_records` that waits out a Windows lock violation for `APPEND_CONFLICT_WAIT` and names
+/// the OS error when it gives up. Only for a caller that holds no send-chain, token-publication,
+/// hub or tick lock (console read views and `reset_count`): the default read stays one-shot for
+/// the scheduler, cancellation, send and token paths.
 pub fn read_records_waiting(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     read_records_in(context, true)
 }
@@ -212,16 +213,21 @@ pub fn is_reset_of(record: &Value, key: &str) -> bool {
         Some(k) if k == key || k == "*" => true,
         Some(POLICY_RESET) => {
             let mode = record.get("mode").and_then(Value::as_str).unwrap_or("");
-            !crate::console::access_allowed(record.get("policy").unwrap_or(&Value::Null), mode, key)
+            !crate::social_state::access_allowed(
+                record.get("policy").unwrap_or(&Value::Null),
+                mode,
+                key,
+            )
         }
         _ => false,
     }
 }
 
 /// How many resets of `key` (or of every conversation) the ledger holds; a queued job compares
-/// the count it saw at dispatch.
+/// the count it saw at dispatch. Waits out Windows append locks (`OS 32/33`) for dispatch, pre-turn
+/// checks, and session creation (callers hold no send-chain, token-publication, hub, or tick lock).
 pub fn reset_count(context: &RuntimeContext, key: &str) -> Result<usize, String> {
-    Ok(read_records(context)?.iter().filter(|r| is_reset_of(r, key)).count())
+    Ok(read_records_waiting(context)?.iter().filter(|r| is_reset_of(r, key)).count())
 }
 
 /// A fresh identifier for a turn or a JSON-RPC call (UUID-shaped, unique per process and time).

@@ -40,9 +40,10 @@ fn serve_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, std::th
     let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..n {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     (context, server)
@@ -55,6 +56,23 @@ fn wake(context: &RuntimeContext, cfg: &Value, rpc: &str) -> crate::prompt::DshW
 fn section(text: &str, name: &str) -> String {
     text.split(&format!("【简报节 {name}】\n")).nth(1)
         .map(|rest| rest.split("\n\n【").next().unwrap().to_string()).unwrap_or_default()
+}
+
+#[test]
+fn dsh_wake_snapshot_applies_model_view_strip() {
+    let (_root, context, mut cfg) = layered_wake_fixture("wake snapshot strip", true);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["v0.2.1", "无需重复查询"]);
+    let (context, server) = serve_packets(&context, 1);
+    let rendered = wake(&context, &cfg, "rpc-snapshot-strip");
+    server.join().unwrap();
+
+    let (_, snapshot) = rendered.text.rsplit_once("【本次消息快照】\n").unwrap();
+    let (packet, guidance) = snapshot.split_once('\n').unwrap();
+    let packet: Value = serde_json::from_str(packet).unwrap();
+    assert_eq!(packet["messages"][0]["text"], "deepseek-v4.1-flash ");
+    assert_eq!(packet["readThroughSeq"], 1);
+    assert!(guidance.contains("以上消息已提供"));
+    assert!(!guidance.contains("无需重复查询"), "snapshot guidance retained the configured strip literal");
 }
 
 #[test]

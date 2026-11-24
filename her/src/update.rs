@@ -93,13 +93,14 @@ pub(crate) fn admission_alert(
     lost_alerted: &mut Option<String>,
 ) -> Result<(), String> {
     let (failed, reason) = match authority {
-        Ok(authority) => {
-            let alerted = std::mem::replace(lost_alerted, authority.lost.clone());
-            match &authority.lost {
-                Some(tag) if alerted.as_ref() != Some(tag) => (tag.clone(), LOST_CURRENT),
-                _ => return Ok(()),
+        Ok(authority) => match &authority.lost {
+            Some(tag) if lost_alerted.as_ref() != Some(tag) => (tag.clone(), LOST_CURRENT),
+            Some(_) => return Ok(()),
+            None => {
+                *lost_alerted = None;
+                return Ok(());
             }
-        }
+        },
         Err(_) => (
             link_tag(root, "current")
                 .ok()
@@ -116,21 +117,24 @@ pub(crate) fn admission_alert(
     }
     let mut alert = UpdateAlert::new(&failed, "unchanged", reason);
     alert.rollback = "preserved".into();
-    store_alert(root, &alert)
+    store_alert(root, &alert)?;
+    if reason == LOST_CURRENT {
+        *lost_alerted = Some(failed);
+    }
+    Ok(())
+}
+fn restore_gate_path(root: &InstallRoot) -> PathBuf {
+    root.root().join("runtime/data/locks/update-restore.lock")
 }
 /// A rollback holds the update-restore gate throughout, so a `pending` alert is still in
 /// progress only while someone else holds that gate; otherwise its helper died and it is stale.
 fn rollback_active(root: &InstallRoot, restore_gate: Option<&fs::File>) -> bool {
-    restore_gate.is_none()
-        && release_store::installation_gate(
-            &root.root().join("runtime/data/locks/update-restore.lock"),
-        )
-        .is_err()
+    restore_gate.is_none() && release_store::installation_gate(&restore_gate_path(root)).is_err()
 }
 /// Only contention on the update-restore gate means a rollback may still be running; any other
 /// gate failure leaves an alert deliverable, so a broken lock path cannot suppress delivery.
 fn restore_gate_contended(root: &InstallRoot) -> bool {
-    release_store::gate_contended(&root.root().join("runtime/data/locks/update-restore.lock"))
+    release_store::gate_contended(&restore_gate_path(root))
 }
 fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
     use crate::release_signature;
@@ -259,8 +263,22 @@ impl Authority {
         release_signature::verify_with_keys(sums, signature, &identity.keys)
     }
 }
-/// Returns the verified candidate helper bytes.
-pub(crate) fn verify(root: &InstallRoot, tag: &str) -> Result<Vec<u8>, String> {
+/// Supervisor retries of an installed candidate may write a refusal under the restore gate.
+/// Pass `Some(gate)` when the caller already holds `update-restore.lock`.
+#[allow(dead_code)]
+pub(crate) fn verify_staged(
+    root: &InstallRoot,
+    tag: &str,
+    restore_gate: Option<&fs::File>,
+) -> Result<(), String> {
+    let _gate = match restore_gate {
+        Some(_) => None,
+        None => Some(handover_gate(root)?),
+    };
+    verify(root, tag).map(drop)
+}
+/// Returns the verified candidate helper bytes. The caller holds the update-restore gate.
+fn verify(root: &InstallRoot, tag: &str) -> Result<Vec<u8>, String> {
     let result = authority(root).and_then(|authority| verify_candidate(root, tag, &authority));
     if result.is_err() {
         let kept = link_tag(root, "current")
@@ -338,34 +356,44 @@ pub(crate) fn signature_refusal(
     save_alert(root, &alert)
 }
 
-/// Only HER images in the same physical release can authorize each other.
-pub fn same_release_image(expected: &str, observed: &str) -> bool {
-    let (Ok(a), Ok(b)) = (fs::canonicalize(expected), fs::canonicalize(observed)) else {
-        return false;
-    };
-    let her = |p: &Path| {
-        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            ["her", "her-cli", "her.exe", "her-cli.exe"]
-                .iter()
-                .any(|s| n.eq_ignore_ascii_case(s))
-        })
-    };
-    her(&a) && her(&b) && a.parent() == b.parent()
-}
-
-/// Release membership for retiring recorded owners even after an image is lost.
-/// This alone grants no process authority: callers must still verify PID/start/exe.
-pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) -> bool {
-    let image = Path::new(image);
-    if !image
-        .file_name()
+fn is_her_binary_name(path: &Path) -> bool {
+    path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             ["her", "her-cli", "her.exe", "her-cli.exe"]
                 .iter()
                 .any(|her| name.eq_ignore_ascii_case(her))
         })
-    {
+}
+
+/// Only HER images in the same physical release can authorize each other.
+#[allow(dead_code)]
+pub fn same_release_image(expected: &str, observed: &str) -> bool {
+    let (Ok(a), Ok(b)) = (fs::canonicalize(expected), fs::canonicalize(observed)) else {
+        return false;
+    };
+    is_her_binary_name(&a) && is_her_binary_name(&b) && a.parent() == b.parent()
+}
+
+/// Exact caller/owner executable (including normalized Windows case/separators or canonical
+/// resolution) or same-directory `her`/`her-cli` sibling twin.
+#[allow(dead_code)]
+pub fn same_release_twin(expected: &str, observed: &str) -> bool {
+    if crate_identity_equal(expected, observed) || same_release_image(expected, observed) {
+        return true;
+    }
+    fs::canonicalize(expected)
+        .ok()
+        .zip(fs::canonicalize(observed).ok())
+        .is_some_and(|(a, b)| a == b)
+}
+
+/// Release membership for retiring recorded owners even after an image is lost.
+/// This alone grants no process authority: callers must still verify PID/start/exe.
+#[allow(dead_code)]
+pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) -> bool {
+    let image = Path::new(image);
+    if !is_her_binary_name(image) {
         return false;
     }
     let (Some(parent), Ok(release)) = (image.parent(), release_path(root, tag)) else {
@@ -379,8 +407,9 @@ pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) ->
 
 /// Trial authority is read-only and restricted to the installed current release.
 /// It never participates in process adoption or termination authorization.
+#[allow(dead_code)]
 pub fn health_image(caller: &str, owner: &str) -> bool {
-    if same_release_image(caller, owner) || crate_identity_equal(caller, owner) {
+    if same_release_twin(caller, owner) {
         return true;
     }
     let Some(selected) = std::env::var_os("HER_TRIAL_CURRENT") else {
@@ -389,17 +418,46 @@ pub fn health_image(caller: &str, owner: &str) -> bool {
     let Ok(root) = InstallRoot::configured() else {
         return false;
     };
-    if root.require_release_image(Path::new(caller)).is_err() {
+    let caller_path = Path::new(caller);
+    if root.require_release_image(caller_path).is_err() {
         return false;
     }
-    let (Ok(selected), Ok(current)) = (
-        fs::canonicalize(selected),
-        fs::canonicalize(root.root().join("current")),
-    ) else {
+    let Ok(caller_canonical) = fs::canonicalize(caller_path) else {
         return false;
     };
-    selected == current && same_release_image(&selected.join("her.exe").to_string_lossy(), owner)
+    let Some(caller_tag) = caller_canonical
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    if !is_her_binary_name(&caller_canonical)
+        || release_store::version(caller_tag).is_none()
+        || release_path(&root, caller_tag)
+            .and_then(|dir| fs::canonicalize(dir).map_err(|_| String::new()))
+            .ok()
+            .as_deref()
+            != caller_canonical.parent()
+    {
+        return false;
+    }
+    let Ok(Some(current_tag)) = link_tag(&root, "current") else {
+        return false;
+    };
+    let Ok(current_release) = release_path(&root, &current_tag)
+        .and_then(|dir| fs::canonicalize(dir).map_err(|_| String::new()))
+    else {
+        return false;
+    };
+    let Ok(selected_canonical) = fs::canonicalize(selected) else {
+        return false;
+    };
+    selected_canonical == current_release
+        && release_owner_image(&root, &current_tag, owner)
+        && same_release_image(&current_release.join("her.exe").to_string_lossy(), owner)
 }
+#[allow(dead_code)]
 fn crate_identity_equal(a: &str, b: &str) -> bool {
     if cfg!(windows) {
         a.replace('/', "\\")
@@ -409,17 +467,45 @@ fn crate_identity_equal(a: &str, b: &str) -> bool {
     }
 }
 
+/// Probe an existing owner gate without creating files or following links.
+/// Returns `Some(identity)` only when the OS lock is actively held and its
+/// bounded, non-redirected `.owner.json` marker matches `v == 1` and `expected_role`.
+#[allow(dead_code)]
+pub(crate) fn probe_held_owner_identity(
+    lock_path: &Path,
+    expected_role: &str,
+) -> Option<ProcessIdentity> {
+    let lock = crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
+    match lock.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => {}
+        _ => return None,
+    }
+    drop(lock);
+    let mut marker_os = lock_path.as_os_str().to_os_string();
+    marker_os.push(".owner.json");
+    let marker_path = PathBuf::from(marker_os);
+    let bytes = crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
+    let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if marker["v"].as_u64() != Some(1) || marker["role"].as_str() != Some(expected_role) {
+        return None;
+    }
+    serde_json::from_value::<ProcessIdentity>(marker["identity"].clone()).ok()
+}
+
 /// Publish the verified helper outside releases and run it hidden. The helper
 /// judges the trial before it retires the existing supervisor.
 pub fn launch(root: &InstallRoot, target: &str, old: &ProcessIdentity) -> Result<u32, String> {
     launch_mode(root, target, old, false, false)
 }
-pub fn launch_automatic(
+#[allow(dead_code)]
+pub fn launch_with_gate(
     root: &InstallRoot,
     target: &str,
     old: &ProcessIdentity,
+    automatic: bool,
+    gate: fs::File,
 ) -> Result<u32, String> {
-    launch_mode(root, target, old, false, true)
+    launch_mode_with_gate(root, target, old, false, automatic, gate)
 }
 pub fn launch_recovery(
     root: &InstallRoot,
@@ -435,10 +521,18 @@ fn launch_mode(
     recovery: bool,
     automatic: bool,
 ) -> Result<u32, String> {
+    let gate = handover_gate(root)?;
+    launch_mode_with_gate(root, target, old, recovery, automatic, gate)
+}
+fn launch_mode_with_gate(
+    root: &InstallRoot,
+    target: &str,
+    old: &ProcessIdentity,
+    recovery: bool,
+    automatic: bool,
+    gate: fs::File,
+) -> Result<u32, String> {
     use std::process::Stdio;
-    let gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
     // Publish exactly the helper bytes that were verified; never reread the file.
     let bytes = if recovery {
         let (current, last_good, _) = startup_selection(root)?;
@@ -545,6 +639,19 @@ pub fn wall_clock_ms() -> i64 {
 }
 fn alert_gate(root: &InstallRoot) -> Result<fs::File, String> {
     state_gate(root, "update-alert.lock")
+}
+/// Pending-alert probes hold the alert gate while briefly testing the restore gate.
+/// Retry under that gate after contention so a probe cannot refuse handover. The
+/// restore attempt never waits, since existing restore holders may write alerts.
+pub(crate) fn handover_gate(root: &InstallRoot) -> Result<fs::File, String> {
+    let path = restore_gate_path(root);
+    match release_store::installation_gate(&path) {
+        Err(error) if error == "another release installation or restore is running" => {
+            let _alert = alert_gate(root)?;
+            release_store::installation_gate(&path)
+        }
+        result => result,
+    }
 }
 fn read_alert(root: &InstallRoot) -> Result<Option<UpdateAlert>, String> {
     let path = root.root().join("update-alert.json");
@@ -840,6 +947,52 @@ mod claim_tests {
     /// The whole alert file, so a deferral that rewrote any byte shows.
     fn alert_bytes(root: &InstallRoot) -> Vec<u8> {
         fs::read(root.root().join("update-alert.json")).unwrap()
+    }
+
+    #[test]
+    fn deferred_lost_current_alert_is_recorded_after_delivery() {
+        let root = install("deferred-lost-current");
+        let previous = pending(&root.0);
+        let mut authority = authority(&root.0).unwrap();
+        authority.lost = Some(RETIRING.into());
+        let authority = Ok(authority);
+        let mut alerted = None;
+
+        admission_alert(&root.0, &authority, None, &mut alerted).unwrap();
+        assert_eq!(stored(&root.0).reason, "fixture rollback");
+        complete_alert(&root.0, &previous.id).unwrap();
+        admission_alert(&root.0, &authority, None, &mut alerted).unwrap();
+        assert_eq!(
+            stored(&root.0).reason,
+            LOST_CURRENT,
+            "deferred loss must be recorded on the next admission"
+        );
+        assert_eq!(alerted.as_deref(), Some(RETIRING));
+    }
+
+    #[test]
+    fn staged_verification_preserves_a_rollback_in_progress() {
+        let root = install("staged-during-rollback");
+        fs::create_dir_all(root.0.root().join("releases/v2.0.0")).unwrap();
+        let rollback = pending(&root.0);
+        let gate = hold_restore_gate(&root.0);
+        let before = alert_bytes(&root.0);
+
+        let result = verify_staged(&root.0, "v2.0.0", None);
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a staged verification must preserve the in-progress rollback alert"
+        );
+        assert!(result.is_err());
+        finish_rollback(&root.0, &rollback.id, "restored").unwrap();
+        drop(gate);
+
+        assert_eq!(
+            verify_staged(&root.0, "v2.0.0", None).unwrap_err(),
+            crate::release_signature::REFUSED
+        );
+        assert_eq!(stored(&root.0).failed, "v2.0.0");
     }
 
     #[test]
