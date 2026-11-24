@@ -934,7 +934,10 @@ mod tests {
             ).unwrap();
             hub.context = RuntimeContext::from_root(&root).unwrap();
         }
-        hub.context = hub.context.with_console_port(console.local_addr().unwrap().port());
+        hub.context = hub
+            .context
+            .clone()
+            .with_console_port(console.local_addr().unwrap().port());
         hub.ready.clear();
         // The captured base deadline has passed. Engagement keeps the effective deadline open
         // until the test withdraws the extension while the wake or cap check is in flight.
@@ -3063,10 +3066,21 @@ pub struct Hub {
     closing_seen: HashMap<String, Value>,
     closing_misses: HashMap<String, u32>,
     slang: crate::slang_learn::SlangLearning,
+    #[cfg(test)]
+    slang_catch_up: Option<std::thread::JoinHandle<()>>,
     /// Member-name and quoted-message lookups (and their caches) for inbound text; built on first use.
     lookups: Option<chat::Lookups>,
     /// Ticket 33: when a Schedule store error was last logged (at most one line a minute; the hub ticks every 500 ms).
     schedule_log_at: i64,
+}
+
+#[cfg(test)]
+impl Drop for Hub {
+    fn drop(&mut self) {
+        if let Some(handle) = self.slang_catch_up.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Hub {
@@ -3081,6 +3095,11 @@ impl Hub {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let slang = crate::slang_learn::SlangLearning::new(context);
+        #[cfg(test)]
+        let slang_catch_up = slang.start_catch_up();
+        #[cfg(not(test))]
+        let _ = slang.start_catch_up();
         Self {
             #[cfg(test)]
             state_read_failure_after: std::cell::Cell::new(None),
@@ -3131,11 +3150,9 @@ impl Hub {
                 })
                 .unwrap_or_default(),
             closing_misses: HashMap::new(),
-            slang: {
-                let slang = crate::slang_learn::SlangLearning::new(context);
-                slang.start_catch_up();
-                slang
-            },
+            slang,
+            #[cfg(test)]
+            slang_catch_up,
             lookups: None,
             schedule_log_at: 0,
         }
