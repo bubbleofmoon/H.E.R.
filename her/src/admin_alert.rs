@@ -259,10 +259,19 @@ struct PrivateJob {
     body: String,
     key: String,
     gap_ids: Vec<i64>,
+    route_alert: Option<(String, u64)>,
 }
 
 fn deliver_private(job: PrivateJob) -> bool {
-    let PrivateJob { context, cfg, owner, body, key, gap_ids } = job;
+    let PrivateJob {
+        context,
+        cfg,
+        owner,
+        body,
+        key,
+        gap_ids,
+        route_alert,
+    } = job;
     // The queue admission is durable, but not a send attempt. Persist uncertainty
     // before touching the network, so a crash cannot automatically duplicate a send.
     if !gap_ids.is_empty() {
@@ -271,6 +280,21 @@ fn deliver_private(job: PrivateJob) -> bool {
             Ok(false) => return false,
             Err(error) => {
                 note(&context, &key, Outcome::Failed, &format!("gap notice checkpoint failed: {error}"));
+                return false;
+            }
+        }
+    }
+    if let Some((ref chain_hash, episode)) = route_alert {
+        match crate::harness::route_health::begin_alert_delivery(&context, chain_hash, episode) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                note(
+                    &context,
+                    &key,
+                    Outcome::Failed,
+                    &format!("route alert checkpoint failed: {error}"),
+                );
                 return false;
             }
         }
@@ -286,6 +310,20 @@ fn deliver_private(job: PrivateJob) -> bool {
         });
         if let Err(error) = saved {
             note(&context, &key, Outcome::Failed, &format!("gap notice outcome checkpoint failed: {error}"));
+        }
+    }
+    if let Some((ref chain_hash, episode)) = route_alert {
+        if matches!(outcome, Err(crate::onebot::SendError::NotCommitted(_))) {
+            if let Err(error) =
+                crate::harness::route_health::release_alert_delivery(&context, chain_hash, episode)
+            {
+                note(
+                    &context,
+                    &key,
+                    Outcome::Failed,
+                    &format!("route alert release failed: {error}"),
+                );
+            }
         }
     }
     match outcome {
@@ -309,10 +347,26 @@ fn send_private(context: &RuntimeContext, cfg: &Value, owner: i64, body: String,
     send_private_with_gaps(context, cfg, owner, body, key, Vec::new())
 }
 
-fn send_private_with_gaps(context: &RuntimeContext, cfg: &Value, owner: i64, body: String, key: String, gap_ids: Vec<i64>) -> bool {
+fn send_private_job(
+    context: &RuntimeContext,
+    cfg: &Value,
+    owner: i64,
+    body: String,
+    key: String,
+    gap_ids: Vec<i64>,
+    route_alert: Option<(String, u64)>,
+) -> bool {
     static OUTBOX: OnceLock<Outbox<PrivateJob>> = OnceLock::new();
     let outbox = OUTBOX.get_or_init(|| Outbox::start(32, |job| { deliver_private(job); }));
-    let accepted = outbox.submit(PrivateJob { context: context.clone(), cfg: cfg.clone(), owner, body, key: key.clone(), gap_ids });
+    let accepted = outbox.submit(PrivateJob {
+        context: context.clone(),
+        cfg: cfg.clone(),
+        owner,
+        body,
+        key: key.clone(),
+        gap_ids,
+        route_alert,
+    });
     if !accepted {
         crate::safe_println!("[notify] 管理员通知队列已满，丢弃：{key}");
         note(context, &key, Outcome::Failed, "the alert queue is full; the message was dropped");
@@ -321,7 +375,16 @@ fn send_private_with_gaps(context: &RuntimeContext, cfg: &Value, owner: i64, bod
 }
 
 /// Decide, then send or record the skip. Background calls report admission; waiting calls report delivery.
-fn notify_with(context: &RuntimeContext, cfg: &Value, budget: Budget, text: &str, dedupe_key: &str, wait: bool, gap_ids: Vec<i64>) -> bool {
+fn notify_with(
+    context: &RuntimeContext,
+    cfg: &Value,
+    budget: Budget,
+    text: &str,
+    dedupe_key: &str,
+    wait: bool,
+    gap_ids: Vec<i64>,
+    route_alert: Option<(String, u64)>,
+) -> bool {
     let Some(owner) = owner_id(cfg) else {
         crate::safe_println!("[notify] 未配置 ownerQQ，只写日志：{}", crate::activity::slice(&crate::activity::redact(context, text), 160));
         return false;
@@ -343,11 +406,27 @@ fn notify_with(context: &RuntimeContext, cfg: &Value, budget: Budget, text: &str
     }
     let body = prepare_body(text, |t| crate::activity::redact(context, t));
     if !wait {
-        return send_private_with_gaps(context, cfg, owner, body, dedupe_key.to_string(), gap_ids);
+        return send_private_job(
+            context,
+            cfg,
+            owner,
+            body,
+            dedupe_key.to_string(),
+            gap_ids,
+            route_alert,
+        );
     }
     // A short-lived restore CLI must observe completion before process::exit. Bound the
     // whole attempt, including scheduling/connect/write/read, even if a peer trickles bytes.
-    let job = PrivateJob { context: context.clone(), cfg: cfg.clone(), owner, body, key: dedupe_key.to_string(), gap_ids };
+    let job = PrivateJob {
+        context: context.clone(),
+        cfg: cfg.clone(),
+        owner,
+        body,
+        key: dedupe_key.to_string(),
+        gap_ids,
+        route_alert,
+    };
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new().name("restore-alert".into()).spawn(move || {
         let _ = tx.send(deliver_private(job));
@@ -367,40 +446,63 @@ fn notify_with(context: &RuntimeContext, cfg: &Value, budget: Budget, text: &str
 /// JS `notifyOwnerQQ`: one private message to `ownerQQ`, at most one per `dedupe_key` per minute and ten per hour for
 /// the whole process. The body is redacted and cut to 800 characters.
 pub fn notify_owner(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
-    notify_with(context, cfg, Budget::Js, text, dedupe_key, false, Vec::new())
+    notify_with(context, cfg, Budget::Js, text, dedupe_key, false, Vec::new(), None)
 }
 
 /// JS `notifyAdmin` as the source intends it (accepted deviation 21; JS crashes before sending): a private message to
 /// `ownerQQ`, deduplicated per `kind` (one per minute) and counted in the same ten-per-hour budget as the other
 /// JS-texted alerts. Without `ownerQQ` it is only logged.
 pub fn notify_admin(context: &RuntimeContext, cfg: &Value, kind: &str, text: &str) -> bool {
-    notify_with(context, cfg, Budget::Js, text, &admin_key(kind), false, Vec::new())
+    notify_with(context, cfg, Budget::Js, text, &admin_key(kind), false, Vec::new(), None)
 }
 
 /// A Rust-only owner notice (accepted deviation 22: DSH recovered, failed or queued chat turn, SnowLuma degraded or
 /// recovered, interrupted events, inbound gaps, a turn resumed but never handed back). Same rule as the JS-texted alerts
 /// (one per key per minute, ten per hour) on its own budget.
 pub fn notify_notice(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
-    notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, Vec::new())
+    notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, Vec::new(), None)
 }
 
 /// A memory-layer alert (`briefing::alert_empty`): one per key per minute, ten per hour, on its own budget.
 pub fn notify_memory(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
-    notify_with(context, cfg, Budget::Memory, text, dedupe_key, false, Vec::new())
+    notify_with(context, cfg, Budget::Memory, text, dedupe_key, false, Vec::new(), None)
 }
 
 /// Queue an already claimed gap notice. The worker checkpoints uncertainty before
 /// I/O and records only confirmed delivery; known refusals become pending again.
 /// Admission failures are released by the caller. Unknown sends are never retried.
 pub fn notify_gap_notice(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str, ids: &[i64]) -> bool {
-    notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, ids.to_vec())
+    notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, ids.to_vec(), None)
+}
+
+/// Queue an already claimed all-routes-failed alert. The worker marks `alerted = true` only when
+/// delivery reaches the network boundary (`begin_alert_delivery`) and releases it on `NotCommitted`
+/// failures, so a crash before worker execution never loses the alert.
+pub fn notify_route_alert(
+    context: &RuntimeContext,
+    cfg: &Value,
+    text: &str,
+    dedupe_key: &str,
+    chain_hash: String,
+    episode: u64,
+) -> bool {
+    notify_with(
+        context,
+        cfg,
+        Budget::Notice,
+        text,
+        dedupe_key,
+        false,
+        Vec::new(),
+        Some((chain_hash, episode)),
+    )
 }
 
 /// Wait at most 35 seconds for one notice delivery attempt. False includes limiter skips,
 /// failures and unknown completion. The caller owns any persisted retry policy; restore
 /// callers do not retry, while QQ login episodes remain pending until confirmed delivery.
 pub fn notify_notice_wait(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
-    notify_with(context, cfg, Budget::Notice, text, dedupe_key, true, Vec::new())
+    notify_with(context, cfg, Budget::Notice, text, dedupe_key, true, Vec::new(), None)
 }
 
 #[cfg(test)]

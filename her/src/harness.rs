@@ -197,6 +197,7 @@ impl Failure {
 }
 
 enum ModelFailure {
+    Cancelled(Option<Box<StreamEnd>>),
     Dropped(String),
     /// HTTP 429, with the wait the response asked for (`rate_limit_wait`).
     RateLimited {
@@ -588,6 +589,7 @@ async fn tool_loop(
     recalled: &mut &[i64],
 ) -> Result<Event, Failure> {
     let session = history.session.clone();
+    let mut attempt_id = history.attempt.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds, checkpoint_clipped) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
@@ -631,6 +633,7 @@ async fn tool_loop(
                 progress,
                 deadline,
                 cancelled: &cancelled,
+                attempt_id: &mut attempt_id,
             };
             chain.next_answer(&mut turn_step, &mut cancel).await
         };
@@ -807,10 +810,15 @@ struct TurnStep<'turn> {
     progress: &'turn std::sync::Mutex<Progress>,
     deadline: tokio::time::Instant,
     cancelled: &'turn watch::Receiver<bool>,
+    attempt_id: &'turn mut String,
 }
 
 impl<'turn> routes::RouteStep for TurnStep<'turn> {
     type Output = TurnStepOutput;
+
+    fn attempt_id(&self) -> Option<&str> {
+        Some(self.attempt_id.as_str())
+    }
 
     fn step<'a>(
         &'a mut self,
@@ -826,8 +834,9 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
                 return abort(failure);
             }
             if ctx.attempt_index > 0 {
-                if let Err(reason) = self.store.next_attempt(self.request, ctx.route_idx) {
-                    return abort(Failure::Failed(reason));
+                match self.store.next_attempt(self.request, ctx.route_idx) {
+                    Ok(attempt) => *self.attempt_id = attempt,
+                    Err(reason) => return abort(Failure::Failed(reason)),
                 }
             }
             self.progress.lock().unwrap_or_else(|p| p.into_inner()).model = ctx.route.model.clone();
@@ -905,10 +914,18 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
                 offered,
                 max_tokens,
                 self.request.limits.image_input,
+                self.cancelled,
             )
             .await;
             let end = match outcome {
                 Ok(end) => end,
+                Err(ModelFailure::Cancelled(end)) => {
+                    return routes::StepResult::Abort {
+                        abort: routes::StepAbort::Cancelled,
+                        response_usage: end.map(|e| e.captured_usage),
+                        tokens_charged: 0,
+                    };
+                }
                 Err(ModelFailure::Stopped { reason, end }) => {
                     let response_usage = Some(end.captured_usage.clone());
                     let tokens_charged = match charge_of(&end) {
@@ -1087,6 +1104,7 @@ async fn model_step(
     tools: Vec<genai::chat::Tool>,
     max_tokens: u32,
     image_input: bool,
+    cancelled: &watch::Receiver<bool>,
 ) -> Result<StreamEnd, ModelFailure> {
     // The pinned adapter drops delta.refusal. Preserve only its presence at the wire
     // boundary; never retain the provider's refusal text in diagnostics or history.
@@ -1130,8 +1148,18 @@ async fn model_step(
         )
         .await
         .map_err(model_error)?;
+    let mut cancel = routes::Cancellation::from_watch(cancelled.clone());
     let mut end = None;
-    while let Some(event) = response.stream.next().await {
+    loop {
+        let next = tokio::select! { biased;
+            event = response.stream.next() => event,
+            _ = cancel.cancelled() => {
+                return Err(ModelFailure::Cancelled(end.map(Box::new)));
+            }
+        };
+        let Some(event) = next else {
+            break;
+        };
         match event {
             Ok(ChatStreamEvent::End(value)) => end = Some(value),
             Ok(_) => {}

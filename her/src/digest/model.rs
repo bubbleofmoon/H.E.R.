@@ -24,10 +24,15 @@ pub(crate) fn model_for(context: &RuntimeContext, cfg: &Value) -> Result<Arc<dyn
     one_shot::walk_for(context, Job::Digest, usage::DIGEST_KEY, walk_of(cfg), timeout(cfg), MAX_TOKENS)
 }
 
-/// Async digest walk for async callers (`harness::handover::summarise_text`), bypassing the sync bridge.
+/// Async one-shot walk for async callers (`harness::handover`), bypassing the sync bridge and
+/// attributing usage under `key` and `job` (`usage::SUMMARY` for handover, `usage::DIGEST` for
+/// digest).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn summarise_async(
     context: &RuntimeContext,
     cfg: &Value,
+    key: &str,
+    usage_job: &'static str,
     system: &str,
     input: &str,
     within: Duration,
@@ -41,8 +46,8 @@ pub(crate) async fn summarise_async(
             context: context.clone(),
             route,
             chain: walk.chain,
-            key: usage::DIGEST_KEY.to_string(),
-            usage_job: usage::DIGEST,
+            key: key.to_string(),
+            usage_job,
             timeout: timeout(cfg),
             max_tokens: MAX_TOKENS,
             unit: Duration::from_secs(1),

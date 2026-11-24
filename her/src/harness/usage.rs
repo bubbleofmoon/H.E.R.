@@ -17,6 +17,8 @@ pub(crate) const ENGINE: &str = "harness";
 pub(crate) const TURN: &str = "turn";
 /// The `job` of the digest's samples.
 pub(crate) const DIGEST: &str = "digest";
+/// The `job` of a harness handover summary's samples.
+pub(crate) const SUMMARY: &str = "summary";
 /// The `job` of the slang learner's samples.
 pub(crate) const SLANG: &str = "slang";
 /// The ledger key the digest's samples are filed under.
@@ -91,11 +93,21 @@ pub(crate) fn buckets(usage: &Usage) -> Option<Value> {
     }))
 }
 
-/// The ledger record of one request on route `route` (model `model`) of job `job`, at `at` ms. Its `seq` is 0, so the
-/// ledger keeps the first record of a place and ignores a repeat (`Ledger::apply`). A response without reported prompt
-/// or completion tokens is recorded as evidence without billing (`b: null`).
-pub(crate) fn row(place: &Place, route: &str, model: &str, job: &str, usage: Option<&Usage>, at: i64) -> Value {
-    json!({
+/// The ledger record of one request on route `route` (model `model`) of job `job`, at `at` ms.
+/// Its `seq` is 0, so the ledger keeps the first record of a place and ignores a repeat
+/// (`Ledger::apply`). A response without reported prompt or completion tokens is recorded as
+/// evidence without billing (`b: null`). When `attempt_id` is `Some`, `"attemptId"` links the
+/// row to `conversations.db`'s `model_attempts.id` for startup crash reconciliation.
+pub(crate) fn row_for_attempt(
+    place: &Place,
+    route: &str,
+    model: &str,
+    job: &str,
+    usage: Option<&Usage>,
+    at: i64,
+    attempt_id: Option<&str>,
+) -> Value {
+    let mut record = json!({
         "k": "turn",
         "t": at,
         "sid": session(&place.key),
@@ -110,27 +122,144 @@ pub(crate) fn row(place: &Place, route: &str, model: &str, job: &str, usage: Opt
         "route": route,
         "job": job,
         "b": usage.and_then(buckets).unwrap_or(Value::Null),
-    })
+    });
+    if let (Some(id), Some(obj)) = (attempt_id, record.as_object_mut()) {
+        obj.insert("attemptId".into(), json!(id));
+    }
+    record
 }
 
-/// Records one usage fact (`row`) in the selected runtime's token ledger. A runtime that is not selected records
-/// nothing; a failed write goes to the run record (component `model-chain`, event `usage-unrecorded`) and never fails
-/// the request.
-pub(crate) fn record(context: &RuntimeContext, place: &Place, route: &str, model: &str, job: &str, usage: Option<&Usage>) {
+/// Redact any configured secrets in `route` or `model` before persisting a usage fact or failure.
+fn redact_field(context: &RuntimeContext, text: &str) -> String {
+    let Ok(mut keys) = crate::settings::stored_secrets(context) else {
+        return "[REDACTED]".to_string();
+    };
+    keys.extend(crate::settings::harness_credential(context));
+    keys.sort_unstable_by_key(|key| std::cmp::Reverse(key.len()));
+    super::routes::redact_credentials(text, &keys)
+}
+
+/// Records one usage fact (`row_for_attempt`) in the selected runtime's token ledger. A runtime
+/// that is not selected records nothing; a failed write goes to the run record (component
+/// `model-chain`, event `usage-unrecorded`, tagged with `Trigger::Digest` for digest jobs and
+/// `Trigger::Turn` otherwise) and never fails the request.
+pub(crate) fn record_attempt(
+    context: &RuntimeContext,
+    place: &Place,
+    route: &str,
+    model: &str,
+    job: &str,
+    usage: Option<&Usage>,
+    attempt_id: Option<&str>,
+) {
     if !context.is_isolated() {
         return;
     }
-    let row = row(place, route, model, job, usage, crate::parity_clock::now_ms());
+    let safe_route = redact_field(context, route);
+    let safe_model = redact_field(context, model);
+    let row = row_for_attempt(
+        place,
+        &safe_route,
+        &safe_model,
+        job,
+        usage,
+        crate::parity_clock::now_ms(),
+        attempt_id,
+    );
     if let Err(error) = crate::ledger::append_record_for_runtime(context, &row) {
+        let trigger = if job == DIGEST { Trigger::Digest } else { Trigger::Turn };
         crate::recovery_log::record(
             context,
-            Trigger::Turn,
+            trigger,
             Component::ModelChain,
             "usage-unrecorded",
             Outcome::Failed,
-            &format!("{}: route {route} step {}: a usage fact was not written ({error})", place.key, place.step),
+            &format!(
+                "{}: route {safe_route} step {}: a usage fact was not written ({error})",
+                place.key, place.step
+            ),
         );
     }
+}
+
+/// Reconcile completed model attempts from `conversations.db` into `token-usage-rust.jsonl`
+/// at startup so usage from a response that ended just before a crash is captured once without
+/// double-counting already-recorded facts (even across ledger compaction or reset).
+pub(crate) fn reconcile_startup(context: &RuntimeContext) -> Result<usize, String> {
+    if !context.is_isolated() {
+        return Ok(0);
+    }
+    let after_seq = crate::ledger::LedgerStorage::read_reconcile_seq(context)?;
+    let completed = super::store::completed_attempts_after(context, after_seq)?;
+    if completed.is_empty() {
+        return Ok(0);
+    }
+    let existing = crate::ledger::Ledger::load_all_for_runtime(context)?;
+    let candidates: Vec<crate::ledger::ReconcileCandidate> = completed
+        .iter()
+        .map(|attempt| crate::ledger::ReconcileCandidate {
+            attempt_id: attempt.attempt_id.clone(),
+            key: attempt.conversation.clone(),
+            model: redact_field(context, &attempt.model),
+            ended_ms: attempt.ended_ms,
+            buckets: attempt
+                .usage
+                .as_ref()
+                .and_then(buckets)
+                .as_ref()
+                .map(crate::pricing::normalize_usage),
+        })
+        .collect();
+    let missing = crate::ledger::plan_harness_reconciliation(&existing, &candidates);
+    for idx in &missing {
+        let attempt = &completed[*idx];
+        let safe_route = redact_field(context, &attempt.route);
+        let safe_model = redact_field(context, &attempt.model);
+        let place = Place {
+            key: attempt.conversation.clone(),
+            turn: next_number(),
+            step: 0,
+            retry: 0,
+        };
+        let row = row_for_attempt(
+            &place,
+            &safe_route,
+            &safe_model,
+            TURN,
+            attempt.usage.as_ref(),
+            attempt.ended_ms,
+            Some(&attempt.attempt_id),
+        );
+        crate::ledger::append_record_for_runtime(context, &row)?;
+    }
+    if let Some(max_seq) = completed.iter().map(|c| c.seq).max() {
+        crate::ledger::LedgerStorage::advance_reconcile_seq(context, max_seq)?;
+    }
+    Ok(missing.len())
+}
+
+#[cfg(test)]
+pub(crate) fn row(
+    place: &Place,
+    route: &str,
+    model: &str,
+    job: &str,
+    usage: Option<&Usage>,
+    at: i64,
+) -> Value {
+    row_for_attempt(place, route, model, job, usage, at, None)
+}
+
+#[cfg(test)]
+pub(crate) fn record(
+    context: &RuntimeContext,
+    place: &Place,
+    route: &str,
+    model: &str,
+    job: &str,
+    usage: Option<&Usage>,
+) {
+    record_attempt(context, place, route, model, job, usage, None);
 }
 
 #[cfg(test)]
@@ -442,5 +571,194 @@ mod tests {
             (Some("internal:digest"), Some("first"), Some("digest-173"), Some("digest"))
         );
         assert_eq!(rows[0]["b"], json!({"cacheMiss": 40, "cacheHit": 0, "cacheWrite": 0, "output": 2, "reasoning": 0}));
+    }
+
+    #[test]
+    fn harness_usage_digest_failure_uses_digest_trigger_and_redacts_route() {
+        let fixture = Fixture::new("digest-trigger", json!({"model": "digest-173"}), 1);
+        std::fs::create_dir(fixture.root.join("data/token-usage-rust.jsonl")).unwrap();
+        record_attempt(
+            &fixture.context,
+            &place(DIGEST_KEY, 1000, 0, 0),
+            "route-synthetic-model-key-173",
+            "model-synthetic-model-key-173",
+            DIGEST,
+            Some(&usage(json!({"prompt_tokens": 5, "completion_tokens": 1}))),
+            None,
+        );
+        let page = crate::recovery_log::page(&fixture.context, &crate::run_record::Query::default())
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].trigger, Trigger::Digest);
+        assert_eq!(page.records[0].event, "usage-unrecorded");
+        assert!(page.records[0].reason.contains("route-[REDACTED]"));
+        assert!(!page.records[0].reason.contains("synthetic-model-key-173"));
+    }
+
+    #[test]
+    fn harness_usage_handover_summary_attributes_usage_to_conversation() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&mut socket);
+            let body = json!({
+                "id": "sum-259",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "sum-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "简短摘要"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 25, "completion_tokens": 5, "total_tokens": 30}
+            })
+            .to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let chain = json!({"routes": [{"id": "sum-route", "model": "sum-model"}]});
+        let fixture = Fixture::new("handover-attr", chain, port);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let deadline = tokio::time::Instant::now()
+            + crate::harness::handover::SUMMARY_RESERVE
+            + std::time::Duration::from_secs(10);
+        let res = rt
+            .block_on(crate::harness::handover::summarise_text_for(
+                &fixture.context,
+                &fixture.cfg,
+                "group:101",
+                SUMMARY,
+                "transcript",
+                &mut rx,
+                deadline,
+            ))
+            .unwrap();
+        assert_eq!(res, Ok("简短摘要".to_string()));
+        server.join().unwrap();
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "group:101");
+        assert_eq!(rows[0]["job"], "summary");
+        assert_eq!(rows[0]["route"], "sum-route");
+    }
+
+    #[test]
+    fn harness_usage_reconcile_startup_captures_missing_attempts_without_double_counting() {
+        let fixture = Fixture::new("reconcile", json!({"model": "rec-model"}), 1);
+        let db_path = fixture.root.join("data/conversations.db");
+        let _store = crate::harness::store::Store::open(&fixture.context).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,conversation,generation) VALUES('s1','group:200','g1')",
+            [],
+        )
+        .unwrap();
+        for (turn_id, state) in [
+            ("t-recorded", "completed"),
+            ("t-crashed", "completed"),
+            ("t-legacy", "completed"),
+            ("t-cancelled", "cancelled"),
+        ] {
+            conn.execute(
+                "INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) \
+                 VALUES(?1,'s1','group:200','chat',?2,1000)",
+                rusqlite::params![turn_id, state],
+            )
+            .unwrap();
+        }
+        let resp_rec =
+            json!({"captured_usage": {"prompt_tokens": 10, "completion_tokens": 2}}).to_string();
+        let resp_crash =
+            json!({"captured_usage": {"prompt_tokens": 40, "completion_tokens": 8}}).to_string();
+        let resp_legacy =
+            json!({"captured_usage": {"prompt_tokens": 15, "completion_tokens": 3}}).to_string();
+        for (aid, tid, state, ended, resp) in [
+            ("att-recorded", "t-recorded", "completed", Some(2000i64), Some(resp_rec)),
+            ("att-crashed", "t-crashed", "completed", Some(3000i64), Some(resp_crash)),
+            ("att-legacy", "t-legacy", "completed", Some(4000i64), Some(resp_legacy)),
+            ("att-cancelled", "t-cancelled", "cancelled", Some(5000i64), None),
+        ] {
+            conn.execute(
+                "INSERT INTO model_attempts(\
+                 id,turn_id,model,endpoint,state,begun_ms,ended_ms,response) \
+                 VALUES(?1,?2,'rec-model','http://127.0.0.1:1',?3,1000,?4,?5)",
+                rusqlite::params![aid, tid, state, ended, resp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(session_id,turn_id,attempt_id,kind,payload,created_ms) \
+                 VALUES('s1',?1,?2,'model_attempt_started',?3,1000)",
+                rusqlite::params![
+                    tid,
+                    aid,
+                    json!({"model": "rec-model", "route": "route-rec"}).to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(session_id,turn_id,attempt_id,kind,payload,created_ms) \
+                 VALUES('s1',?1,?2,'model_attempt_ended',?3,?4)",
+                rusqlite::params![
+                    tid,
+                    aid,
+                    json!({"state": state}).to_string(),
+                    ended.unwrap_or(1000)
+                ],
+            )
+            .unwrap();
+        }
+        // Pre-record att-recorded by attemptId and att-legacy as pre-upgrade untagged row.
+        record_attempt(
+            &fixture.context,
+            &place("group:200", 1, 0, 0),
+            "route-rec",
+            "rec-model",
+            TURN,
+            Some(&usage(json!({"prompt_tokens": 10, "completion_tokens": 2}))),
+            Some("att-recorded"),
+        );
+        let legacy_row = row_for_attempt(
+            &place("group:200", 2, 0, 0),
+            "route-rec",
+            "rec-model",
+            TURN,
+            Some(&usage(json!({"prompt_tokens": 15, "completion_tokens": 3}))),
+            4000,
+            None,
+        );
+        crate::ledger::append_record_for_runtime(&fixture.context, &legacy_row).unwrap();
+
+        assert_eq!(reconcile_startup(&fixture.context).unwrap(), 1, "only att-crashed added");
+        assert_eq!(reconcile_startup(&fixture.context).unwrap(), 0, "second startup adds nothing");
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 3);
+        let crashed = rows.iter().find(|r| r["attemptId"] == "att-crashed").unwrap();
+        assert_eq!(
+            (crashed["key"].as_str(), crashed["route"].as_str()),
+            (Some("group:200"), Some("route-rec"))
+        );
+        assert_eq!(crashed["b"]["cacheMiss"], 40);
+        assert_eq!(crashed["b"]["output"], 8);
+
+        // Compaction evicting older rows and reset keep watermark so old attempts stay omitted.
+        let table = crate::pricing::PriceTable::default();
+        assert!(crate::ledger::LedgerStorage::compact_for_runtime(&fixture.context, &table, 3, 1)
+            .unwrap());
+        assert_eq!(reconcile_startup(&fixture.context).unwrap(), 0);
+        crate::ledger::LedgerStorage::reset(&fixture.context).unwrap();
+        assert_eq!(reconcile_startup(&fixture.context).unwrap(), 0);
+        assert_eq!(fixture.rows().len(), 0);
     }
 }

@@ -241,3 +241,99 @@ async fn revoked_authority_settles_a_submitted_send_without_starting_the_next_ca
         "model continued after revocation"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_stream_after_response_end_still_records_usage_and_revokes_generation() {
+    let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+        "her-259-cancel-usage-{}",
+        crate::turn_ledger::mint_id("")
+    )));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    for dir in ["config", "data", "resources"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let model = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let endpoint = format!("http://{}", model.local_addr().unwrap());
+    let cfg = json!({
+        "ownerQQ": 8808,
+        "consoleToken": "synthetic-console-token-259",
+        "harness": {"model": "fake-chat"}
+    });
+    std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+    std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-259").unwrap();
+    std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+    std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+    std::fs::write(
+        root.join("dependencies.json"),
+        json!({"dsh": endpoint, "model": endpoint, "onebot": endpoint}).to_string(),
+    )
+    .unwrap();
+    let context = RuntimeContext::from_root(&root).unwrap();
+    let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
+    let generation = crate::send_outbox::token_epoch(&token);
+    let chunk = json!({
+        "id": "fake-259",
+        "object": "chat.completion.chunk",
+        "model": "fake-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": "partial"},
+            "finish_reason": null
+        }]
+    });
+    let end = json!({
+        "id": "fake-259",
+        "object": "chat.completion.chunk",
+        "model": "fake-chat",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+    });
+    let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let revoke_context = context.clone();
+    let revoke_token = token.clone();
+    let model_task = tokio::spawn(respond_once(model, response, move || {
+        crate::social_state::revoke(&revoke_context, "private:8808", &revoke_token).unwrap();
+    }));
+    let harness = Harness::open(&context).unwrap();
+    let mut turn = harness
+        .admit(TurnRequest {
+            id: "cancel-after-end".into(),
+            conversation: "private:8808".into(),
+            generation: generation.clone(),
+            prompt: "reply".into(),
+            media: Vec::new(),
+            profile: "closed-agent".into(),
+            route: ModelRoute::from_runtime(&context, &cfg).unwrap(),
+            deadline: Duration::from_secs(10),
+            tools: Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation)
+                .unwrap(),
+            limits: Limits::from_config(&cfg),
+        })
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), turn.wait())
+        .await
+        .expect("cancelled turn did not settle");
+    assert_eq!(model_task.await.unwrap()["stream"], true);
+    assert!(result.is_err());
+    assert!(matches!(turn.status(), Status::Cancelled));
+    let ledger = std::fs::read_to_string(root.join("data/token-usage-rust.jsonl")).unwrap();
+    let rows: Vec<Value> = ledger
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "response end before cancel must bill once: {rows:?}");
+    assert_eq!(rows[0]["b"]["cacheMiss"], 30);
+    assert_eq!(rows[0]["b"]["output"], 7);
+    assert!(rows[0]["attemptId"].as_str().is_some_and(|s| s.starts_with("model-attempt-")));
+}

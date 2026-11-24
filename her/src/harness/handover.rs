@@ -79,10 +79,7 @@ pub(super) async fn prepare(
     let first_round = history.rounds.first().map(|round| round.through);
     let cfg = context.load_config()?;
     let route = request.route.routes[request.route.start].spec.id.clone();
-    let summaries = cfg
-        .pointer("/harness/summaries")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let summaries = crate::settings::HARNESS_SUMMARIES.switch(&cfg);
     let current = current(request, &instruction);
     let mut summarise = summaries;
     if let Some(idle_from) = history.idle_from {
@@ -210,7 +207,17 @@ async fn checkpoint(
     if summarise {
         check_bound(request, cancelled, deadline)?;
         let transcript = transcript(context, history.summary.as_deref(), &history.rounds[..split])?;
-        match summarise_text(context, cfg, &transcript, cancelled, deadline).await? {
+        match summarise_text_for(
+            context,
+            cfg,
+            &request.conversation,
+            crate::harness::usage::SUMMARY,
+            &transcript,
+            cancelled,
+            deadline,
+        )
+        .await?
+        {
             Ok(text) => summary = Some(text),
             Err(class) => failed = Some(class),
         }
@@ -335,13 +342,13 @@ impl Drop for AbandonOnExit {
     }
 }
 
-/// One summary of `transcript` from the digest's model port (`digest::summarise_async`: a route walk over
-/// `memory.digest.model` alone, else over the harness chain), bounded by `memory.digest.timeoutSecs` and by the turn's
-/// `deadline` less `SUMMARY_RESERVE`; the walk stops at once on cancellation. The outer error ends the turn
-/// (cancellation); the inner one is the summary's content-free failure class, `timeout` when the deadline bound passes.
-pub(crate) async fn summarise_text(
+/// One summary of `transcript` attributed to `usage_key` and `usage_job`, bounded by
+/// `memory.digest.timeoutSecs` and `deadline - SUMMARY_RESERVE`.
+pub(crate) async fn summarise_text_for(
     context: &RuntimeContext,
     cfg: &Value,
+    usage_key: &str,
+    usage_job: &'static str,
     transcript: &str,
     cancelled: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
@@ -356,11 +363,16 @@ pub(crate) async fn summarise_text(
         let abandoned = Arc::new(AtomicBool::new(false));
         let _abandon = AbandonOnExit(abandoned.clone());
         let within = bound.saturating_duration_since(tokio::time::Instant::now());
-        let task = tokio::task::spawn_blocking(move || model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned));
+        let task = tokio::task::spawn_blocking(move || {
+            model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned)
+        });
         let joined = tokio::select! { biased;
-            _ = cancelled.changed() => return Err(Failure::Cancelled),
             joined = tokio::time::timeout_at(bound, task) => joined,
+            _ = cancelled.changed() => return Err(Failure::Cancelled),
         };
+        if *cancelled.borrow() {
+            return Err(Failure::Cancelled);
+        }
         return Ok(match joined {
             Err(_elapsed) => Err("timeout"),
             Ok(Err(_join)) => Err("worker"),
@@ -369,7 +381,8 @@ pub(crate) async fn summarise_text(
         });
     }
     if tokio::time::Instant::now() >= bound {
-        // Still check configuration before returning timeout so unconfigured runtimes report `unconfigured`.
+        // Still check configuration before returning timeout so unconfigured runtimes report
+        // `unconfigured`.
         if let Err(error) = crate::digest::model_for(context, cfg) {
             return Ok(Err(error.0));
         }
@@ -378,15 +391,52 @@ pub(crate) async fn summarise_text(
     let within = bound.saturating_duration_since(tokio::time::Instant::now());
     let mut cancel = super::routes::Cancellation::from_watch(cancelled.clone());
     let result = tokio::select! { biased;
+        result = tokio::time::timeout_at(
+            bound,
+            crate::digest::summarise_async(
+                context,
+                cfg,
+                usage_key,
+                usage_job,
+                SUMMARY_PROMPT,
+                transcript,
+                within,
+                &mut cancel,
+            ),
+        ) => result,
         _ = cancelled.changed() => return Err(Failure::Cancelled),
-        result = tokio::time::timeout_at(bound, crate::digest::summarise_async(context, cfg, SUMMARY_PROMPT, transcript, within, &mut cancel)) => result,
     };
+    if *cancelled.borrow() {
+        return Err(Failure::Cancelled);
+    }
     match result {
         Err(_elapsed) => Ok(Err("timeout")),
         Ok(Err(crate::digest::ModelError("cancelled"))) => Err(Failure::Cancelled),
         Ok(Err(error)) => Ok(Err(error.0)),
         Ok(Ok(text)) => Ok(accept(transcript, &text)),
     }
+}
+
+/// One summary of `transcript` from the digest's model port (defaulting attribution to
+/// `internal:digest` / `digest` for direct tests without a conversation key).
+#[cfg(test)]
+pub(crate) async fn summarise_text(
+    context: &RuntimeContext,
+    cfg: &Value,
+    transcript: &str,
+    cancelled: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<Result<String, &'static str>, Failure> {
+    summarise_text_for(
+        context,
+        cfg,
+        crate::harness::usage::DIGEST_KEY,
+        crate::harness::usage::DIGEST,
+        transcript,
+        cancelled,
+        deadline,
+    )
+    .await
 }
 
 /// A summary the history may carry: trimmed and not empty (`empty-response`), naming no #142 denied term

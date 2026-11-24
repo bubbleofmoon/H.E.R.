@@ -78,6 +78,9 @@ struct Episode {
     /// The offer that is sending this episode's alert right now (`claim_owed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim: Option<Claim>,
+    /// The conversation key that last offered this episode, for startup alert recovery.
+    #[serde(rename = "lastKey", default, skip_serializing_if = "Option::is_none")]
+    last_key: Option<String>,
 }
 
 /// A turn's offer of the owner's alert, made at `at` ms. A claim older than `CLAIM_TTL_MS` (the claim lease), or from
@@ -157,6 +160,7 @@ fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64
                     class,
                     alerted: false,
                     claim: None,
+                    last_key: None,
                 })
             }
         }
@@ -239,18 +243,132 @@ pub(crate) fn alert_text(key: &str, routes: usize, class: &str) -> String {
     )
 }
 
-/// After a harness turn of conversation `key` with a route failure: sends the all-routes-failed alert when an episode of
-/// the configured chain is owed, and marks it alerted once the notice queue accepted it (`admin_alert::notify_notice`).
-/// An offer claims the owed episode under the gate (`claim_owed`) before it calls the notice queue, so concurrent turns
-/// offer one alert. A refused notice (no `ownerQQ`, the per-minute key window, the hourly cap or a full queue) releases
-/// the claim and stays owed for the next failed turn; an episode is alerted once, until an answer ends it. Returns
-/// whether the alert was accepted now.
+/// After a harness turn of conversation `key` with a route failure: sends the all-routes-failed
+/// alert when an episode of the configured chain is owed. An offer claims the owed episode under
+/// the gate (`claim_owed_for`) before queuing it in `admin_alert::notify_route_alert`; `alerted`
+/// is marked only once the delivery worker reaches the network boundary (`begin_alert_delivery`)
+/// and is released on `NotCommitted` pre-send or crash before delivery (`reconcile_startup`).
 pub(crate) fn alert_if_owed(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
-    offer(context, cfg, key, |text| crate::admin_alert::notify_notice(context, cfg, text, ALERT_KEY))
+    if !context.is_isolated() {
+        return false;
+    }
+    let Ok(chain) = routes::chain(cfg) else {
+        return false;
+    };
+    let hash = chain_hash(&chain);
+    let now = crate::parity_clock::now_ms();
+    let claimed = with_state(context, |state| claim_owed_for(state, &hash, key, now));
+    let (episode, class) = match claimed {
+        Ok(Some(claimed)) => claimed,
+        Ok(None) => return false,
+        Err(error) => {
+            unrecorded(context, "the all-routes-failed alert state", &error);
+            return false;
+        }
+    };
+    let queued = crate::admin_alert::notify_route_alert(
+        context,
+        cfg,
+        &alert_text(key, chain.len(), &class),
+        ALERT_KEY,
+        hash.clone(),
+        episode,
+    );
+    if !queued {
+        if let Err(error) = with_state(context, |state| settle(state, &hash, episode, false)) {
+            unrecorded(context, "the all-routes-failed alert state", &error);
+        }
+    }
+    let (outcome, reason) = if queued {
+        (Outcome::Ok, "every route failed; the owner's alert was queued")
+    } else {
+        (Outcome::Skipped, "every route failed; the owner's alert was refused and stays owed")
+    };
+    crate::recovery_log::record(
+        context,
+        Trigger::Turn,
+        Component::ModelChain,
+        "routes-all-failed",
+        outcome,
+        &format!("{key}: {reason}"),
+    );
+    queued
 }
 
-/// `alert_if_owed` with `notify` as the notice queue: it is offered the alert text and answers whether it accepted it
-/// (tests pass their own).
+/// Checkpoint delivery uncertainty before touching OneBot (`deliver_private`): returns `Ok(true)`
+/// and marks `alerted = true` only when `episode_n` of `hash` is still active and un-alerted.
+/// Returns `Ok(false)` if an answer ended the episode or another delivery already settled it.
+pub(crate) fn begin_alert_delivery(
+    context: &RuntimeContext,
+    hash: &str,
+    episode_n: u64,
+) -> Result<bool, String> {
+    if !context.is_isolated() {
+        return Ok(false);
+    }
+    with_state(context, |state| {
+        if state.v != 1 || state.chain != hash {
+            return false;
+        }
+        let Some(ep) = state.all_failed.as_mut().filter(|e| e.n == episode_n && !e.alerted) else {
+            return false;
+        };
+        ep.alerted = true;
+        ep.claim = None;
+        true
+    })
+}
+
+/// Release an episode alert back to owed after a pre-send (`SendError::NotCommitted`) failure.
+pub(crate) fn release_alert_delivery(
+    context: &RuntimeContext,
+    hash: &str,
+    episode_n: u64,
+) -> Result<(), String> {
+    if !context.is_isolated() {
+        return Ok(());
+    }
+    with_state(context, |state| {
+        if state.v != 1 || state.chain != hash {
+            return;
+        }
+        if let Some(ep) = state.all_failed.as_mut().filter(|e| e.n == episode_n) {
+            ep.alerted = false;
+            ep.claim = None;
+        }
+    })
+}
+
+/// Clear any stale in-flight alert claim left by a crashed process (its memory queue no longer
+/// exists) and re-queue the owed all-routes-failed alert when the episode is still un-alerted.
+pub(crate) fn reconcile_startup(context: &RuntimeContext, cfg: &Value) -> bool {
+    if !context.is_isolated() {
+        return false;
+    }
+    let Ok(chain) = routes::chain(cfg) else {
+        return false;
+    };
+    let hash = chain_hash(&chain);
+    let pending_key = match with_state(context, |state| {
+        if state.v != 1 || state.chain != hash {
+            return None;
+        }
+        let ep = state.all_failed.as_mut()?;
+        ep.claim = None;
+        (!ep.alerted).then(|| ep.last_key.clone().unwrap_or_else(|| "system".to_string()))
+    }) {
+        Ok(key) => key,
+        Err(error) => {
+            unrecorded(context, "the all-routes-failed alert state", &error);
+            return false;
+        }
+    };
+    pending_key.is_some_and(|key| alert_if_owed(context, cfg, &key))
+}
+
+/// Synchronous `alert_if_owed` seam for unit tests: `notify` decides immediately whether the alert
+/// succeeded.
+#[cfg(test)]
 fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&str) -> bool) -> bool {
     if !context.is_isolated() {
         return false;
@@ -259,8 +377,6 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
         return false;
     };
     let hash = chain_hash(&chain);
-    // Under the gate the owed episode is claimed and nothing else happens; the notice queue is offered the alert with the
-    // gate released. An episode that another offer holds is left to it.
     let now = crate::parity_clock::now_ms();
     let (episode, class) = match with_state(context, |state| claim_owed(state, &hash, now)) {
         Ok(Some(claimed)) => claimed,
@@ -271,8 +387,6 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
         }
     };
     let sent = notify(&alert_text(key, chain.len(), &class));
-    // Settled only for the very episode that was claimed: an answer meanwhile ended it, a later failure started a new one
-    // that is owed itself. An accepted alert marks it alerted; a refused one releases the claim and stays owed.
     if let Err(error) = with_state(context, |state| settle(state, &hash, episode, sent)) {
         unrecorded(context, "the all-routes-failed alert state", &error);
     }
@@ -283,6 +397,14 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
     };
     crate::recovery_log::record(context, Trigger::Turn, Component::ModelChain, "routes-all-failed", outcome, &format!("{key}: {reason}"));
     sent
+}
+
+fn claim_owed_for(state: &mut State, hash: &str, key: &str, now: i64) -> Option<(u64, String)> {
+    let claimed = claim_owed(state, hash, now)?;
+    if let Some(ep) = state.all_failed.as_mut() {
+        ep.last_key = Some(key.to_string());
+    }
+    Some(claimed)
 }
 
 /// Claims the episode of chain `hash` that is owed an alert and that no offer holds, at `now`: its number and last class.
@@ -780,5 +902,58 @@ mod tests {
         assert_eq!(report(&fixture.context, &fixture.cfg).unwrap()["error"], "route health is unreadable", "an oversized state is never parsed");
         observe(&fixture.context, &chain, 2, Seen::Answered);
         assert_eq!(states(&report(&fixture.context, &fixture.cfg).unwrap())[2], "spare-route=ok", "a damaged state starts over");
+    }
+
+    #[test]
+    fn route_health_durable_alert_survives_crash_after_queueing_and_releases_on_not_committed() {
+        let ids = ["primary-route", "backup-route"];
+        let chain = chain_of(&ids);
+        let mut cfg = routes_cfg(&ids, true);
+        // Set closed OneBot port so background delivery fails NotCommitted.
+        cfg["ownerQQ"] = json!(8808);
+        let fixture = Fixture::new("durable-alert", cfg);
+        let hash = chain_hash(&chain);
+        observe(&fixture.context, &chain, 0, failed("quota"));
+        observe(&fixture.context, &chain, 1, failed("quota"));
+
+        // Simulate an offer queued before crash: claim present, alerted=false, last_key stored.
+        let ep = with_state(&fixture.context, |state| {
+            claim_owed_for(state, &hash, "group:505", crate::parity_clock::now_ms()).unwrap().0
+        })
+        .unwrap();
+        let stored_before = fixture.stored().all_failed.unwrap();
+        assert!(!stored_before.alerted);
+        assert!(stored_before.claim.is_some());
+        assert_eq!(stored_before.last_key.as_deref(), Some("group:505"));
+
+        // Checkpoint marks alerted=true before I/O; NotCommitted releases back to owed.
+        assert!(begin_alert_delivery(&fixture.context, &hash, ep).unwrap());
+        assert!(fixture.stored().all_failed.unwrap().alerted);
+        release_alert_delivery(&fixture.context, &hash, ep).unwrap();
+        let released = fixture.stored().all_failed.unwrap();
+        assert!(!released.alerted);
+        assert!(released.claim.is_none());
+
+        // An answer ending the episode while queued makes begin_alert_delivery skip sending.
+        assert!(with_state(&fixture.context, |s| claim_owed_for(
+            s,
+            &hash,
+            "group:505",
+            crate::parity_clock::now_ms()
+        ))
+        .unwrap()
+        .is_some());
+        observe(&fixture.context, &chain, 0, Seen::Answered);
+        assert!(!begin_alert_delivery(&fixture.context, &hash, ep).unwrap());
+
+        // New episode left claimed with alerted=false: startup clears stale claim and re-queues.
+        observe(&fixture.context, &chain, 0, failed("timeout"));
+        let crashed_ep = with_state(&fixture.context, |state| {
+            claim_owed_for(state, &hash, "group:506", crate::parity_clock::now_ms()).unwrap().0
+        })
+        .unwrap();
+        assert!(!fixture.stored().all_failed.unwrap().alerted);
+        assert!(reconcile_startup(&fixture.context, &fixture.cfg));
+        assert_eq!(fixture.stored().all_failed.map(|e| e.n), Some(crashed_ep));
     }
 }
