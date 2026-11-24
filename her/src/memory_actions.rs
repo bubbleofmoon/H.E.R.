@@ -28,7 +28,7 @@ pub(crate) fn tool_action(context: &RuntimeContext, action: &str, args: &Value) 
     }
     let headers = HashMap::from([("x-agent-token".to_string(), args["token"].as_str().unwrap_or("").to_string())]);
     handle_inner(action, &headers, &HashMap::new(), &body.to_string(), &cfg, context,
-        ConsoleCapability::Conversation, None).map_err(|(_, error)| error)
+        ConsoleCapability::Conversation, None, &mut None).map_err(|(_, error)| error)
 }
 
 #[derive(Default)]
@@ -46,16 +46,36 @@ pub(crate) enum BrowserAcl {
     Write(AclAction, Value),
 }
 
-pub(crate) fn handle_http(
-    action: &str, req: &Request, cfg: &Value, context: &RuntimeContext,
-    capability: ConsoleCapability, browser_acl: Option<BrowserAcl>,
-) -> Result<Value, (u16, String)> {
+pub(crate) fn handle_http_tx(
+    action: &str,
+    req: &Request,
+    cfg: &Value,
+    context: &RuntimeContext,
+    capability: ConsoleCapability,
+    browser_acl: Option<BrowserAcl>,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let capability = if context.is_isolated() {
         capability
     } else {
         configured_header(&req.headers, cfg)
     };
-    handle_inner(action, &req.headers, &req.query, &req.body, cfg, context, capability, browser_acl)
+    let mut config_diff = None;
+    match handle_inner(
+        action,
+        &req.headers,
+        &req.query,
+        &req.body,
+        cfg,
+        context,
+        capability,
+        browser_acl,
+        &mut config_diff,
+    ) {
+        Ok(value) => Ok(crate::config_tx::CommitOutcome { value, config_diff }),
+        Err((status, message)) => {
+            Err(crate::config_tx::CommitError::with_diff(status, message, config_diff))
+        }
+    }
 }
 
 fn configured_header(headers: &HashMap<String, String>, cfg: &Value) -> ConsoleCapability {
@@ -74,7 +94,17 @@ pub(crate) fn handle(
     action: &str, headers: &HashMap<String, String>, query: &HashMap<String, String>,
     body: &str, cfg: &Value, context: &RuntimeContext,
 ) -> Result<Value, (u16, String)> {
-    handle_inner(action, headers, query, body, cfg, context, configured_header(headers, cfg), None)
+    handle_inner(
+        action,
+        headers,
+        query,
+        body,
+        cfg,
+        context,
+        configured_header(headers, cfg),
+        None,
+        &mut None,
+    )
 }
 
 /// One memory or settings action; native query parameters and JSON still merge, body first.
@@ -87,6 +117,7 @@ fn handle_inner(
     context: &RuntimeContext,
     capability: ConsoleCapability,
     browser_acl: Option<BrowserAcl>,
+    config_diff: &mut Option<crate::config_tx::ConfigDiff>,
 ) -> Result<Value, (u16, String)> {
     // Block/defer unstopped memory.db and chat-tool settings.db/config.json writers during an
     // active restore before acquiring the social/configuration gate.
@@ -179,17 +210,22 @@ fn handle_inner(
         {
             return Err((403, "配置读写只允许管理员私聊".to_string()));
         }
-        let mut reply = crate::console::settings_action(action, &b, cfg, context)?;
-        drop(_gate);
-        if action == "settings-set"
-            && reply["changed"] == true
-            && reply["key"].as_str().and_then(crate::settings::chat_setting)
-                .is_some_and(|setting| crate::settings::wake_timing::refreshes_default_plan(setting.key))
-            && authority::refresh_default_wake_configs(context).is_err()
-        {
-            reply["note"] = json!(format!("{}；设置已保存，这次未能同步默认唤醒计划", reply["note"].as_str().unwrap_or("")));
+        match crate::config_tx::commit_chat_settings(
+            action,
+            &b,
+            cfg,
+            context,
+            _gate.as_ref(),
+        ) {
+            Ok(outcome) => {
+                *config_diff = outcome.config_diff;
+                return Ok(outcome.value);
+            }
+            Err(err) => {
+                *config_diff = err.config_diff;
+                return Err((err.status, err.message));
+            }
         }
-        return Ok(reply);
     }
     if action == "archive" {
         let key = b.get("key").and_then(Value::as_str).unwrap_or("");

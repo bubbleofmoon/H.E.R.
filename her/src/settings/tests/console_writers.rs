@@ -73,9 +73,11 @@ fn settings_config_writers_keep_the_stored_values_in_config_json() {
     let mut edited = stored_config(&root);
     edited["socialV2"] = json!({"enabled": true});
     edited["dsh"]["model"] = json!("fixture-model-edited");
-    let written = write_selected_config_text(&context, &serde_json::to_string_pretty(&edited).unwrap());
-    let _ = take_config_writes();
-    written.unwrap();
+    let written = crate::config_tx::write_selected_config_text(
+        &context,
+        &serde_json::to_string_pretty(&edited).unwrap(),
+    );
+    assert!(written.is_ok(), "{written:?}");
     let file = stored_config(&root);
     assert_eq!(
         file["socialV2"],
@@ -86,8 +88,10 @@ fn settings_config_writers_keep_the_stored_values_in_config_json() {
     // #177: a writer that changes the member in the file itself is refused and writes nothing.
     edited["socialV2"] = json!({"enabled": true, "reply": {"wakeQuietMs": 9000}});
     edited["dsh"]["model"] = json!("fixture-model-other");
-    let written = write_selected_config_text(&context, &serde_json::to_string_pretty(&edited).unwrap());
-    let _ = take_config_writes();
+    let written = crate::config_tx::write_selected_config_text(
+        &context,
+        &serde_json::to_string_pretty(&edited).unwrap(),
+    );
     assert_eq!(written, Err("reply.wakeQuietMs changes only through the settings store".to_string()));
     assert_eq!(stored_config(&root), file, "nothing is written");
 }
@@ -104,7 +108,7 @@ fn settings_console_writer_keeps_the_copy_before_it_mirrors() {
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let text = json!({"socialV2": {"reply": {}}}).to_string();
     assert_eq!(
-        write_selected_config_text(&context, &text),
+        crate::config_tx::write_selected_config_text(&context, &text),
         Err("config.json.pre-settings cannot be written".to_string()),
         "a console write that would mirror a stored value is refused without its copy"
     );
@@ -434,31 +438,39 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
             slot = &mut slot[name];
         }
         *slot = value;
-        let written = write_selected_config_text(&context, &serde_json::to_string_pretty(&edited).unwrap());
-        let _ = take_config_writes();
+        let written = crate::config_tx::write_selected_config_text(
+            &context,
+            &serde_json::to_string_pretty(&edited).unwrap(),
+        );
         assert_eq!(written, Err(format!("{} changes only through the settings store", setting.key)));
         assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "{}: untouched", setting.key);
         assert!(!settings_db(&root).exists(), "{}", setting.key);
         let mut unchanged = stored_config(&root);
         unchanged["notes"] = json!("console writer");
-        let written = write_selected_config_text(&context, &serde_json::to_string_pretty(&unchanged).unwrap());
-        let _ = take_config_writes();
-        assert_eq!(written, Ok(()), "{}", setting.key);
+        let written = crate::config_tx::write_selected_config_text(
+            &context,
+            &serde_json::to_string_pretty(&unchanged).unwrap(),
+        );
+        assert!(written.is_ok(), "{}: {written:?}", setting.key);
     }
-    // That write path is the only product write of config.json in social_state and the console modules.
-    let social_state = include_str!("../../social_state.rs");
-    // Split on the test module's header only (no line ending in the pattern, so a CRLF checkout splits the same).
-    let product = social_state.split("mod tests {").next().unwrap();
+    // `config_tx.rs` is the sole product writer of `config.json` across social_state & console.
+    let config_tx = include_str!("../../config_tx.rs");
+    let config_tx_product = config_tx.split("mod tests {").next().unwrap();
     assert_eq!(
-        product.matches("write_atomic(RuntimeArea::Config").count(),
+        config_tx_product.matches("write_atomic(RuntimeArea::Config").count(),
         1,
-        "social_state.rs writes config.json once"
+        "config_tx.rs writes config.json once"
     );
+    let social_state = include_str!("../../social_state.rs")
+        .split("mod tests {")
+        .next()
+        .unwrap();
     let console = include_str!("../../console.rs")
         .split("mod tests {")
         .next()
         .unwrap();
     for (name, source) in [
+        ("social_state.rs", social_state),
         ("console.rs", console),
         ("console_access.rs", include_str!("../../console_access.rs")),
         ("console_agent.rs", include_str!("../../console_agent.rs")),
@@ -487,8 +499,10 @@ fn settings_console_writer_leaves_endpoint_keys_in_the_store() {
     }
     let mut edited = stored_config(&root);
     edited["webSearch"]["apiKey"] = json!("fixture-legacy-console-probe");
-    let written = write_selected_config_text(&context, &serde_json::to_string(&edited).unwrap());
-    let _ = take_config_writes();
+    let written = crate::config_tx::write_selected_config_text(
+        &context,
+        &serde_json::to_string(&edited).unwrap(),
+    );
     written.unwrap();
     let file = stored_config(&root);
     assert_eq!(file["webSearch"]["apiKey"], "fixture-legacy-console-probe");

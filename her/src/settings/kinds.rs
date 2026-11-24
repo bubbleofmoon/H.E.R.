@@ -95,7 +95,7 @@ pub(crate) trait SettingKind: Sync {
     }
 
     /// Whether a change of this kind is an access change, revoked like a whitelist write (an allow or deny list, the
-    /// owner: `social_state::access_setting_change`).
+    /// owner: `config_tx::commit_access_setting_change`).
     fn access(&self) -> bool {
         false
     }

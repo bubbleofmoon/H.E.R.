@@ -317,7 +317,7 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     let (root, context) = settings_fixture("settings revoked");
     let body = json!({"setting": QUIET_KEY, "value": 4500}).to_string();
     let revoked = crate::console_front::revoked_admin_context(&context);
-    let (status, _, reply) = crate::console_settings::route(
+    let (status, _, reply, _) = crate::console_settings::route(
         crate::console_front::AdminCaller::new(&revoked),
         "POST",
         "/api/settings/set",
@@ -328,7 +328,7 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     assert!(!settings_db(&root).exists(), "a revoked credential never writes");
     assert!(!pre_settings_copy(&root).exists(), "nor copies config.json");
     assert_eq!(next_use_quiet(&context), Some(3000));
-    let (status, _, reply) = crate::console_settings::route(
+    let (status, _, reply, _) = crate::console_settings::route(
         crate::console_front::AdminCaller::new(&context),
         "POST",
         "/api/settings/set",

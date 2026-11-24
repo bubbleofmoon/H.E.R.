@@ -410,7 +410,7 @@ fn live_wake_save_with_unreadable_store_writes_nothing() {
     let error = handle_social_config_post(&context, r#"{"wake":{"recommendedPoke":false}}"#).unwrap_err();
     assert_eq!(error.0, 503);
     assert_eq!(
-        crate::social_state::refresh_default_wake_configs(&context)
+        crate::config_tx::refresh_default_wake_configs(&context)
             .unwrap_err()
             .into_http()
             .0,
