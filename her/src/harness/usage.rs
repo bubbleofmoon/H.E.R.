@@ -207,7 +207,7 @@ pub(crate) fn reconcile_startup(context: &RuntimeContext) -> Result<usize, Strin
                 .as_ref()
                 .and_then(buckets)
                 .as_ref()
-                .map(crate::pricing::normalize_usage),
+                .map(|u| crate::pricing::normalize_usage(Some(u))),
         })
         .collect();
     let missing = crate::ledger::plan_harness_reconciliation(&existing, &candidates);
@@ -644,7 +644,8 @@ mod tests {
                 &mut rx,
                 deadline,
             ))
-            .unwrap();
+            .ok()
+            .expect("summary call should not fail or cancel");
         assert_eq!(res, Ok("简短摘要".to_string()));
         server.join().unwrap();
         let rows = fixture.rows();

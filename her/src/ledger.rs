@@ -24,9 +24,9 @@
 
 mod storage;
 
-pub use storage::{
-    LedgerStorage, DEFAULT_MAX_LINES, LEDGER_FILE, LEDGER_FILES, RUST_LEDGER_FILE,
-};
+pub use storage::{LedgerStorage, DEFAULT_MAX_LINES};
+#[cfg(test)]
+pub use storage::{LEDGER_FILE, LEDGER_FILES, RUST_LEDGER_FILE};
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2224,7 +2224,7 @@ pub fn plan_harness_reconciliation(
     existing: &Ledger,
     candidates: &[ReconcileCandidate],
 ) -> Vec<usize> {
-    let mut legacy_pool: Vec<&Sample> = existing
+    let legacy_pool: Vec<&Sample> = existing
         .sample_order
         .iter()
         .filter_map(|sk| existing.samples.get(sk))
@@ -2276,7 +2276,7 @@ impl Ledger {
                 continue;
             };
             let at = if s.t != 0 { s.t } else { now };
-            if crate::pricing::beijing_parts(at).2 < start_day {
+            if crate::pricing::beijing_parts(at).2.as_str() < start_day {
                 continue;
             }
             let (_, cost) = price_usage(&s.buckets, &s.model, at, table);
