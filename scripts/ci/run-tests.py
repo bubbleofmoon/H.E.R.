@@ -78,6 +78,8 @@ for path in sorted((root / 'her/tests').glob('*.rs')):
 run_scripts = sys.platform == 'linux' and not args.slot_ticket
 if run_scripts:
     commands.append(('scripts', 'scripts/ci/run-script-tests.py'))
+if run_scripts and args.only is not None:
+    commands.append(('dsh_contract', 'scripts/ci/dsh-contract.py'))
 if args.only is not None:
     valid = [name for name, _ in commands]
     wanted = [name for name in args.only.split(',') if name]
@@ -88,7 +90,7 @@ if args.only is not None:
 if args.filter is not None:
     if any(name == 'scripts' for name, _ in commands):
         ap.error('--filter applies to cargo test targets only; select them with --only')
-    commands = [(name, command if name == 'build' else command.replace(' -- ', f' {args.filter} -- ', 1))
+    commands = [(name, command if name in ('build', 'dsh_contract') else command.replace(' -- ', f' {args.filter} -- ', 1))
                 for name, command in commands]
 script_bins = ev / 'script-bins'
 # Only binaries copied by this invocation's build count; an earlier run's copy must never be used.
@@ -102,7 +104,8 @@ scripts_selected = any(name == 'scripts' for name, _ in commands)
 results = []
 passed_by_target = {}
 for name, command in commands:
-    print(f'RUN {name}: ' + ('python ' if name == 'scripts' else 'cargo ') + command, flush=True)
+    python_target = name in ('scripts', 'dsh_contract')
+    print(f'RUN {name}: ' + ('python ' if python_target else 'cargo ') + command, flush=True)
     crate = 'her-memory' if name == 'memory_library' else 'her'
     if args.slot_ticket:
         slot_command = command
@@ -120,6 +123,10 @@ for name, command in commands:
         cmd = ['cargo', *command.split()]
         if name == 'scripts':
             cmd = [sys.executable, '-I', str(root / command), '--exe', str(script_bins / 'her'), '--evidence', str(ev)]
+        if name == 'dsh_contract':
+            cmd = [sys.executable, '-I', str(root / command)]
+            if args.filter is not None:
+                cmd += ['--filter', args.filter]
         with logs[0].open('wb') as out, logs[1].open('wb') as err:
             if name == 'scripts' and not snapshot_ok:
                 err.write(b'scripts: unavailable: no snapshot from this run\n')
@@ -154,7 +161,9 @@ for name, command in commands:
             lines = log.read_text(encoding='utf-8', errors='replace').splitlines()
             all_lines.extend(lines)
             for line in lines:
-                if line.startswith('test result:') or (name == 'scripts' and line.startswith(('PASS ', 'FAIL ', 'Ran '))):
+                if (line.startswith('test result:')
+                        or (name == 'scripts' and line.startswith(('PASS ', 'FAIL ', 'Ran ')))
+                        or (name == 'dsh_contract' and line.startswith('dsh_contract '))):
                     print(name + ': ' + line, flush=True)
             if code:
                 fallback_lines.extend([f'--- {log.name} ---', *lines])
