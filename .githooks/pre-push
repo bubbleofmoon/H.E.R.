@@ -10,11 +10,15 @@
 # and a tracked blob under a folder the working copy ignores is still scanned, because a
 # committed blob is published. A branch that moves forward from a commit the remote already
 # has (the remote sha is a commit present here and an ancestor of the new commit, and both the
-# local and the remote ref are branches) publishes only what its new commits add: their blobs
-# that differ from their parents are scanned (scan-public.py --added-from-stdin), and a new
-# commit without a parent, or with a parent this repository cannot read, is scanned whole.
-# Every other ref (a new ref, a remote sha this repository lacks, a force push, a tag or a
-# branch pushed to a tag) has the whole tree of every new commit scanned (--revs-from-stdin).
+# local and the remote ref are branches) or a new branch (all-zero remote sha, both refs under
+# refs/heads/, local sha is a commit) descending from a trusted remote-tracking main
+# (validated remote name matching configured pushurl/url, refs/remotes/<remote>/main is a
+# commit and an ancestor of the new commit) publishes only what its new commits add: their
+# blobs that differ from their parents are scanned (scan-public.py --added-from-stdin), and a
+# new commit without a parent, or with a parent this repository cannot read, is scanned whole.
+# Every other ref (a new ref without a trusted remote-tracking main, a remote sha this
+# repository lacks, a force push, a tag or a branch pushed to a tag) has the whole tree of
+# every new commit scanned (--revs-from-stdin).
 # Replace refs are ignored, because a push sends the real objects. The published text is not
 # only blobs: the message of every outgoing commit, and of an annotated tag object whose ref
 # leaves with this push, is scanned in a second pass, so a clean tree with a sensitive commit or
@@ -23,6 +27,8 @@
 # cannot inspect is a refusal too: an unreadable outgoing commit, a message object that cannot
 # be read, a list that cannot be sorted or a scan that could not run fails closed.
 set -u
+remote_name=${1:-}
+remote_url=${2:-}
 export GIT_NO_REPLACE_OBJECTS=1          # scan the objects a push sends, never their local replacements
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'pre-push: not inside a git repository' >&2; exit 1; }
 py=python; command -v python >/dev/null 2>&1 || py=python3
@@ -57,6 +63,43 @@ trap 'rm -f "$revs" "$added" "$objects"' EXIT
 record() { # <list file> <line>: one line of an outgoing list; a failed write refuses the push
   printf '%s\n' "$2" >>"$1" || { echo 'pre-push: cannot write the outgoing list; nothing is published' >&2; exit 1; }
 }
+is_all_zeros() {
+  [ -n "${1:-}" ] || return 1
+  case "$1" in
+    *[!0]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+is_valid_remote_name() {
+  local LC_ALL=C
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+remote_url_matches() {
+  local name=$1 url=$2 urls line
+  [ -n "$url" ] || return 1
+  urls=$(git -C "$root" config --get-all "remote.${name}.pushurl" 2>/dev/null || true)
+  if [ -z "$urls" ]; then
+    urls=$(git -C "$root" config --get-all "remote.${name}.url" 2>/dev/null || true)
+  fi
+  [ -n "$urls" ] || return 1
+  while IFS= read -r line; do
+    [ "$line" = "$url" ] && return 0
+  done <<EOF
+$urls
+EOF
+  return 1
+}
+trusted_remote_main_base() {
+  local name=$1 url=$2 base
+  is_valid_remote_name "$name" || return 1
+  remote_url_matches "$name" "$url" || return 1
+  base=$(git -C "$root" rev-parse --verify --quiet "refs/remotes/${name}/main^{commit}" 2>/dev/null) || return 1
+  [ -n "$base" ] || return 1
+  printf '%s\n' "$base"
+}
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref// /}" ] || continue          # nothing being pushed on this line
   if [ -z "${local_sha:-}" ]; then
@@ -84,6 +127,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
        && git -C "$root" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
       forward=1
     fi
+  elif is_all_zeros "${remote_sha:-}" \
+       && [ "${local_ref#refs/heads/}" != "$local_ref" ] && [ "${remote_ref#refs/heads/}" != "$remote_ref" ] \
+       && [ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = commit ] \
+       && base_sha=$(trusted_remote_main_base "$remote_name" "$remote_url") \
+       && git -C "$root" merge-base --is-ancestor "$base_sha" "$local_sha" 2>/dev/null; then
+    if ! listed=$(git -C "$root" rev-list "$local_sha" --not "$base_sha" 2>/dev/null); then
+      echo "pre-push: the new commits of $local_ref cannot be listed" >&2
+      exit 1
+    fi
+    forward=1
   elif ! listed=$(git -C "$root" rev-list "$local_sha" 2>/dev/null); then
     echo "pre-push: the commits of $local_ref cannot be listed" >&2
     exit 1

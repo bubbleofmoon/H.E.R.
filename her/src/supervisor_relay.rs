@@ -295,7 +295,9 @@ mod probe_tests {
     }
 }
 
-use crate::guarded_fs::{sanitized_path as shown, vanished, AclError, AclPolicy};
+use crate::guarded_fs::{
+    ensure_entry_private, sanitized_path as shown, vanished, AclError, AclPolicy, RestrictOutcome,
+};
 
 /// Whether `path` itself is now reported missing.
 fn gone(path: &Path) -> bool {
@@ -417,34 +419,47 @@ fn inspect_with(
     Ok(Some(meta))
 }
 
-/// Makes one entry private with `private`. `Ok(false)` when a listed entry vanished: the OS
+/// Makes one entry private with `private`. `Ok(None)` when a listed entry vanished: the OS
 /// reported it missing and a fresh inspection finds it gone. A missing report for an entry that
 /// still exists (a child that vanished while a directory's ACL propagated) is retried once, with
 /// the fresh inspection, so a replacement link is refused. Any other failure refuses, even for an
 /// entry that is gone by then; the version folder (`listed == false`) is never skipped.
+fn protect_entry(
+    path: &Path,
+    expected_dir: bool,
+    listed: bool,
+    mut private: impl FnMut(&Path, bool) -> Result<RestrictOutcome, AclError>,
+) -> Result<Option<RestrictOutcome>, String> {
+    let mut expected_dir = expected_dir;
+    let mut retried = false;
+    loop {
+        let reason = match private(path, expected_dir) {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(AclError::Refused(reason)) => return Err(reason),
+            Err(AclError::Missing(reason)) => reason,
+        };
+        match inspect(path, listed)? {
+            None => return Ok(None),
+            Some(_) if retried => return Err(reason),
+            Some(fresh) => {
+                expected_dir = fresh.is_dir();
+                retried = true;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 fn protect(
     path: &Path,
     meta: std::fs::Metadata,
     listed: bool,
     mut private: impl FnMut(&Path, &std::fs::Metadata) -> Result<(), AclError>,
 ) -> Result<bool, String> {
-    let mut meta = meta;
-    let mut retried = false;
-    loop {
-        let reason = match private(path, &meta) {
-            Ok(()) => return Ok(true),
-            Err(AclError::Refused(reason)) => return Err(reason),
-            Err(AclError::Missing(reason)) => reason,
-        };
-        match inspect(path, listed)? {
-            None => return Ok(false),
-            Some(_) if retried => return Err(reason),
-            Some(fresh) => {
-                meta = fresh;
-                retried = true;
-            }
-        }
-    }
+    protect_entry(path, meta.is_dir(), listed, |p, _| {
+        private(p, &meta).map(|()| RestrictOutcome::Hardened)
+    })
+    .map(|outcome| outcome.is_some())
 }
 
 /// Restrict the entire version tree, so config and future login files are protected too.
@@ -468,12 +483,38 @@ enum Seam {
     Hardening,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct SweepStats {
+    skipped: usize,
+    hardened: usize,
+    already_private: usize,
+}
+
 /// `restrict` with its test seams.
 fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, String> {
+    let (skipped, _, _) = sweep_inner(folder, seam)?;
+    Ok(skipped)
+}
+
+#[cfg(test)]
+fn sweep_stats(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<SweepStats, String> {
+    let (skipped, hardened, already_private) = sweep_inner(folder, seam)?;
+    Ok(SweepStats {
+        skipped,
+        hardened,
+        already_private,
+    })
+}
+
+fn sweep_inner(
+    folder: &Path,
+    seam: &mut dyn FnMut(Seam, &Path),
+) -> Result<(usize, usize, usize), String> {
     fn collect(
         path: &Path,
         listed: bool,
-        entries: &mut Vec<(PathBuf, std::fs::Metadata, bool)>,
+        entries: &mut Vec<(PathBuf, bool, bool)>,
         skipped: &mut usize,
         seam: &mut dyn FnMut(Seam, &Path),
     ) -> Result<(), String> {
@@ -501,7 +542,7 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
             for child in children {
                 let child = match child {
                     Ok(child) => child.path(),
-                    // The directory went away while it was listed; `protect` counts it below.
+                    // The directory went away while it was listed; `protect_entry` counts it below.
                     Err(error) if listed && vanished(&error) => break,
                     Err(error) => {
                         return Err(failure(
@@ -516,22 +557,26 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
                 collect(&child, true, entries, skipped, seam)?;
             }
         }
-        entries.push((path.to_path_buf(), meta, listed));
+        entries.push((path.to_path_buf(), meta.is_dir(), listed));
         Ok(())
     }
     let mut entries = Vec::new();
     let mut skipped = 0;
+    let mut hardened = 0;
+    let mut already_private = 0;
     collect(folder, false, &mut entries, &mut skipped, seam)?;
     seam(Seam::Hardening, folder);
     // Parent first closes external access before processing its children.
-    for (path, meta, listed) in entries.into_iter().rev() {
-        if !protect(&path, meta, listed, |p, m| {
-            crate::guarded_fs::restrict_entry(p, m, AclPolicy::OwnerOnly)
+    for (path, is_dir, listed) in entries.into_iter().rev() {
+        match protect_entry(&path, is_dir, listed, |p, dir| {
+            ensure_entry_private(p, Some(dir), AclPolicy::OwnerOnly)
         })? {
-            skipped += 1;
+            None => skipped += 1,
+            Some(RestrictOutcome::Hardened) => hardened += 1,
+            Some(RestrictOutcome::AlreadyPrivate) => already_private += 1,
         }
     }
-    Ok(skipped)
+    Ok((skipped, hardened, already_private))
 }
 
 #[cfg(all(test, windows))]
@@ -748,20 +793,33 @@ mod native_tests {
 
     #[test]
     fn relay_acl_verification_refuses_a_protected_foreign_sid_grant() {
+        let fixture = Fixture::new();
+        restrict(&fixture.0).unwrap();
+        let file = fixture.0.join("synthetic.key");
+        std::fs::write(&file, b"synthetic fixture").unwrap();
+        // A protected DACL alone is insufficient: this grants Everyone access to fake data.
+        apply_everyone_dacl(&file);
+        let Err(AclError::Refused(error)) =
+            crate::guarded_fs::verify_path_exact_acl(&file, false, AclPolicy::OwnerOnly)
+        else {
+            panic!("a foreign SID grant must be refused");
+        };
+        assert!(error.contains("SID"), "{error}");
+        assert!(error.contains("verify failed"), "{error}");
+        // Restore the ordinary preparation contract, and prove that it is accepted again.
+        restrict(&fixture.0).unwrap();
+        assert_dacl(&file, true, 0);
+    }
+
+    fn apply_everyone_dacl(path: &Path) {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
         };
         use windows_sys::Win32::Security::{
             GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
         };
-
-        let fixture = Fixture::new();
-        restrict(&fixture.0).unwrap();
-        let file = fixture.0.join("synthetic.key");
-        std::fs::write(&file, b"synthetic fixture").unwrap();
-        // A protected DACL alone is insufficient: this grants Everyone access to fake data.
         let sddl: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
-        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut descriptor = Descriptor(std::ptr::null_mut());
         // SAFETY: terminated SDDL/path, valid output pointers, retained descriptor owns ACL.
         unsafe {
@@ -795,16 +853,198 @@ mod native_tests {
                 0
             );
         }
-        let Err(AclError::Refused(error)) =
-            crate::guarded_fs::verify_path_exact_acl(&file, false, AclPolicy::OwnerOnly)
-        else {
-            panic!("a foreign SID grant must be refused");
+    }
+
+    #[test]
+    fn steady_state_second_sweep_skips_already_private_entries() {
+        let fixture = Fixture::new();
+        let logs = fixture.0.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let config = fixture.0.join("config.yaml");
+        let key = fixture.0.join("client.key");
+        std::fs::write(&config, b"synthetic config").unwrap();
+        std::fs::write(&key, b"synthetic key").unwrap();
+
+        let first = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            first,
+            SweepStats {
+                skipped: 0,
+                hardened: 4,
+                already_private: 0,
+            }
+        );
+
+        let second = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            second,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 4,
+            }
+        );
+
+        let part = logs.join("request-log-parts-request-body-9");
+        std::fs::write(&part, b"synthetic body").unwrap();
+        apply_everyone_dacl(&config);
+
+        let third = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            third,
+            SweepStats {
+                skipped: 0,
+                hardened: 2,
+                already_private: 3,
+            }
+        );
+        assert_dacl(&part, true, 0);
+        assert_dacl(&config, true, 0);
+
+        let fourth = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            fourth,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn junction_replacing_entry_between_seams_refuses_without_touching_target() {
+        for target_seam in [Seam::Hardening, Seam::Listed] {
+            let fixture = Fixture::new();
+            let logs = fixture.0.join("logs");
+            let session = logs.join("session");
+            std::fs::create_dir_all(&session).unwrap();
+            let outside = Fixture::new();
+            std::fs::write(outside.0.join("secret.txt"), b"outside").unwrap();
+            apply_everyone_dacl(&outside.0);
+            assert!(!crate::guarded_fs::is_directory_hardened(
+                &outside.0,
+                AclPolicy::OwnerOnly
+            ));
+
+            let result = sweep(&fixture.0, &mut |seam, path| {
+                let hit = match target_seam {
+                    Seam::Hardening => seam == Seam::Hardening,
+                    Seam::Listed => seam == Seam::Listed && path == session.as_path(),
+                    Seam::Inspected => false,
+                };
+                if hit {
+                    std::fs::remove_dir(&session).unwrap();
+                    let output = crate::subprocess::command_without_console("cmd.exe")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(&session)
+                        .arg(&outside.0)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                }
+            });
+            assert!(result.is_err(), "{target_seam:?}: {result:?}");
+            assert!(
+                !crate::guarded_fs::is_directory_hardened(&outside.0, AclPolicy::OwnerOnly),
+                "{target_seam:?}: outside target DACL was modified"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_native_part_creation_inherits_her_ace_and_open_handles_race_cleanly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        assert!(error.contains("SID"), "{error}");
-        assert!(error.contains("verify failed"), "{error}");
-        // Restore the ordinary preparation contract, and prove that it is accepted again.
+
+        let fixture = Fixture::new();
+        let requests = fixture.0.join("requests");
+        std::fs::create_dir(&requests).unwrap();
         restrict(&fixture.0).unwrap();
-        assert_dacl(&file, true, 0);
+        assert_dacl(&fixture.0, true, 3);
+        assert_dacl(&requests, true, 3);
+
+        // A part created in place immediately inherits ONLY the HER-only ACE without waiting for
+        // a sweep, and remains sweepable while open writer and reader handles are held.
+        let part0 = requests.join("request-log-parts-request-body-0");
+        let mut writer = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&part0)
+            .unwrap();
+        writer.write_all(b"synthetic request body").unwrap();
+        assert_dacl(&part0, false, 16);
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&part0)
+            .unwrap();
+        restrict(&fixture.0).unwrap();
+        assert_dacl(&part0, true, 0);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(&part0).unwrap();
+
+        // Race active read/write/delete-shared part handles and rotation/deletion against sweeps.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = {
+            let requests = requests.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut previous: Option<PathBuf> = None;
+                for i in 1..=120usize {
+                    let part = requests.join(format!("request-log-parts-request-body-{i}"));
+                    let share = if i % 2 == 0 {
+                        FILE_SHARE_READ | FILE_SHARE_WRITE
+                    } else {
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                    };
+                    let mut w = std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .read(true)
+                        .write(true)
+                        .share_mode(share)
+                        .open(&part)
+                        .unwrap();
+                    w.write_all(b"synthetic request body").unwrap();
+                    let r = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(share)
+                        .open(&part)
+                        .unwrap();
+                    if i % 2 == 1 {
+                        // Delete while read/write/delete-shared handles remain open.
+                        std::fs::remove_file(&part).unwrap();
+                        drop(r);
+                        drop(w);
+                    } else {
+                        drop(r);
+                        drop(w);
+                        if let Some(old) = previous.take() {
+                            std::fs::remove_file(&old).unwrap();
+                        }
+                        previous = Some(part);
+                    }
+                }
+                if let Some(old) = previous.take() {
+                    std::fs::remove_file(&old).unwrap();
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let mut sweeps = 0usize;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) || sweeps < 40 {
+            restrict(&fixture.0).unwrap();
+            sweeps += 1;
+        }
+        worker.join().unwrap();
+        restrict(&fixture.0).unwrap();
     }
 }
 
@@ -1324,5 +1564,95 @@ mod unix_tests {
         assert!(other <= 300, "{other}");
         assert_eq!(restrict(&fixture.0), Ok(0));
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn steady_state_second_sweep_skips_already_private_entries() {
+        let fixture = Fixture::new();
+        let logs = fixture.0.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let config = fixture.0.join("config.yaml");
+        let key = fixture.0.join("client.key");
+        let bin = fixture.0.join("relay-bin");
+        std::fs::write(&config, b"synthetic config").unwrap();
+        std::fs::write(&key, b"synthetic key").unwrap();
+        std::fs::write(&bin, b"synthetic bin").unwrap();
+        set_mode(&config, 0o644);
+        set_mode(&key, 0o644);
+        set_mode(&bin, 0o755);
+
+        let first = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            first,
+            SweepStats {
+                skipped: 0,
+                hardened: 5,
+                already_private: 0,
+            }
+        );
+        assert_eq!(mode(&bin), 0o700);
+
+        let second = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            second,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 5,
+            }
+        );
+
+        set_mode(&config, 0o644);
+        let part = logs.join("request-log-parts-request-body-9");
+        std::fs::write(&part, b"synthetic body").unwrap();
+        set_mode(&part, 0o644);
+
+        let third = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            third,
+            SweepStats {
+                skipped: 0,
+                hardened: 2,
+                already_private: 4,
+            }
+        );
+        assert_eq!(mode(&config), 0o600);
+        assert_eq!(mode(&part), 0o600);
+
+        let fourth = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            fourth,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn symlink_replacing_entry_between_seams_refuses_without_touching_target() {
+        for target_seam in [Seam::Hardening, Seam::Listed] {
+            let fixture = Fixture::new();
+            let (_, part, _) = request_log_parts(&fixture);
+            let outside = Fixture::new();
+            let target = outside.0.join("foreign");
+            std::fs::write(&target, b"synthetic").unwrap();
+            set_mode(&target, 0o644);
+
+            let result = sweep(&fixture.0, &mut |seam, path| {
+                let hit = match target_seam {
+                    Seam::Hardening => seam == Seam::Hardening,
+                    Seam::Listed => seam == Seam::Listed && path == part.as_path(),
+                    Seam::Inspected => false,
+                };
+                if hit {
+                    std::fs::remove_file(&part).unwrap();
+                    std::os::unix::fs::symlink(&target, &part).unwrap();
+                }
+            });
+            assert!(result.is_err(), "{target_seam:?}: {result:?}");
+            assert_eq!(mode(&target), 0o644, "{target_seam:?}");
+        }
     }
 }
