@@ -678,7 +678,11 @@ mod native_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            if std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            } else {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
         }
     }
 
@@ -1060,51 +1064,74 @@ mod native_tests {
         std::fs::remove_file(&part0).unwrap();
 
         // Race active read/write/delete-shared part handles and rotation/deletion against sweeps.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = {
-            let requests = requests.clone();
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let mut previous: Option<PathBuf> = None;
-                for i in 1..=120usize {
-                    let part = requests.join(format!("request-log-parts-request-body-{i}"));
-                    let share = if i % 2 == 0 {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE
+        struct WorkerGuard {
+            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = self.handle.take() {
+                    if std::thread::panicking() {
+                        let _ = handle.join();
                     } else {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                    };
-                    let mut w = std::fs::OpenOptions::new()
-                        .create_new(true)
-                        .read(true)
-                        .write(true)
-                        .share_mode(share)
-                        .open(&part)
-                        .unwrap();
-                    w.write_all(b"synthetic request body").unwrap();
-                    let r = std::fs::OpenOptions::new()
-                        .read(true)
-                        .share_mode(share)
-                        .open(&part)
-                        .unwrap();
-                    if i % 2 == 1 {
-                        // Delete while read/write/delete-shared handles remain open.
-                        std::fs::remove_file(&part).unwrap();
-                        drop(r);
-                        drop(w);
-                    } else {
-                        drop(r);
-                        drop(w);
-                        if let Some(old) = previous.take() {
-                            std::fs::remove_file(&old).unwrap();
-                        }
-                        previous = Some(part);
+                        handle.join().unwrap();
                     }
                 }
-                if let Some(old) = previous.take() {
-                    std::fs::remove_file(&old).unwrap();
-                }
-                done.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
+            }
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker = WorkerGuard {
+            done: done.clone(),
+            handle: Some({
+                let requests = requests.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut previous: Option<PathBuf> = None;
+                    for i in 1..=120usize {
+                        if done.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let part = requests.join(format!("request-log-parts-request-body-{i}"));
+                        let share = if i % 2 == 0 {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE
+                        } else {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                        };
+                        let mut w = std::fs::OpenOptions::new()
+                            .create_new(true)
+                            .read(true)
+                            .write(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        w.write_all(b"synthetic request body").unwrap();
+                        let r = std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        if i % 2 == 1 {
+                            // Delete while read/write/delete-shared handles remain open.
+                            std::fs::remove_file(&part).unwrap();
+                            drop(r);
+                            drop(w);
+                        } else {
+                            drop(r);
+                            drop(w);
+                            if let Some(old) = previous.take() {
+                                std::fs::remove_file(&old).unwrap();
+                            }
+                            previous = Some(part);
+                        }
+                    }
+                    if let Some(old) = previous.take() {
+                        std::fs::remove_file(&old).unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            }),
         };
 
         let mut sweeps = 0usize;
@@ -1112,7 +1139,9 @@ mod native_tests {
             restrict(&fixture.0).unwrap();
             sweeps += 1;
         }
-        worker.join().unwrap();
+        if let Some(handle) = worker.handle.take() {
+            handle.join().unwrap();
+        }
         restrict(&fixture.0).unwrap();
     }
 
