@@ -292,7 +292,7 @@ pub fn operation_gate(context: &RuntimeContext) -> Result<File, String> {
 /// 3. `locks/console-credential.lock` (full restore & offline password CLI)
 /// 4. `quiesce` (`tasks/locks/*.lock` -> `lifecycle/lifecycle.lock` -> `rbridge-live.lock`, `rbridge-console.lock`)
 /// 5. `locks/restore-writers.lock` (this gate: exclusive during restore pre-snapshot/replacement; shared for unstopped `memory.db` and chat-tool writers)
-/// 6. `locks/social-v2.lock` (`console::config_gate` / `conversation_state::acquire`)
+/// 6. `locks/social-v2.lock` (`social_state::acquire_config_gate` / `conversation_state::acquire`)
 /// 7. `locks/authority.lock`
 /// 8. `locks/settings-store.lock` (`settings::restore_gate` / `store_gate`)
 ///
@@ -751,7 +751,7 @@ fn clear_finished_recovery(context: &RuntimeContext) -> Result<(), String> {
 
 // A terminal outcome survives namespace cleanup and lets recovery retry just the cleanup.
 fn finish_recovery(context: &RuntimeContext, phase: RestorePhase) -> Result<(), String> {
-    let _gate = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+    let _gate = crate::social_state::acquire_config_gate(context)?;
     let mut intent = read_recovery_intent(context, RECOVERY_INTENT)?.ok_or_else(recovery_error)?;
     intent.phase = phase;
     publish_recovery_intent(context, &intent)?;
@@ -896,7 +896,8 @@ fn stop_and_replace(
         ReplaceMode::Rollback { pair } => pair.map(FullPublication::Rollback),
     };
     if let Some(publication) = rollback_pair {
-        let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
+        let _config = crate::social_state::acquire_config_gate(context)
+            .map_err(|error| Step::Refused(error.to_string()))?;
         let authority = context.authority_gate().map_err(Step::Refused)?;
         let _store = crate::settings::restore_gate(context).map_err(Step::Refused)?;
         let staged;
@@ -1061,7 +1062,7 @@ fn reconcile_conversations(context: &RuntimeContext) -> Result<(), String> {
             _ => ("harness-interrupted", "Harness turn interrupted; administrator resolution required".into()),
         };
         // Revocation must succeed before recording a pause, just as in startup recovery.
-        crate::console::ensure_or_rotate_agent_token(context, &key, true)?;
+        crate::social_state::ensure_or_rotate(context, &key, true)?;
         Recorder::attach(context, &id, &key).without_retry().unknown(reason, &detail)?;
     }
     Ok(())
@@ -1134,7 +1135,7 @@ fn execute_with(
         }
         let _credential = if memory_only { None } else { Some(console_auth::credential_mutation_gate(context)?) };
         if !memory_only {
-            let _config = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+            let _config = crate::social_state::acquire_config_gate(context)?;
             console_auth::reconcile_token_rotation(context)?;
         }
         let prepared = Prepared::open(context, archive, memory_only)?;
@@ -1182,7 +1183,8 @@ fn execute_with(
                 .clone()
                 .ok_or_else(|| Step::Refused("pre-restore backup unavailable".into()))?;
             if !memory_only {
-                let _config = crate::console::config_gate(context).map_err(|(_, e)| Step::Failed(e))?;
+                let _config = crate::social_state::acquire_config_gate(context)
+                    .map_err(|e| Step::Failed(e.to_string()))?;
                 set_restore_phase(context, RestorePhase::Verifying)?;
             }
             resume(context, by)?;
@@ -1369,7 +1371,7 @@ fn recover_with(context: &RuntimeContext, control: &mut dyn Control) -> Result<V
     let _credential = console_auth::credential_mutation_gate(context)?;
     let by = "her-cli:restore-recovery";
     let phase = {
-        let _config = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+        let _config = crate::social_state::acquire_config_gate(context)?;
         match read_recovery_intent(context, RECOVERY_INTENT)? {
             Some(intent) => intent.phase,
             None => {
@@ -1805,7 +1807,7 @@ mod tests {
         fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String> {
             assert_eq!(budget, Duration::from_secs(120));
             if self.observe_generation {
-                let _config = crate::console::config_gate(context).map_err(|(_, error)| error)?;
+                let _config = crate::social_state::acquire_config_gate(context)?;
                 self.generation_at_health = console_auth::restore_generation(context)?;
             }
             self.health_finished = Some(crate::parity_clock::now_ms());

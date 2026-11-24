@@ -103,7 +103,7 @@ pub fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, 
     let restore_gate = crate::restore::writer_gate_shared(context)?;
     let store = MemoryStore::open_prepared(
         open_for_runtime_unlocked(context)?,
-        crate::conversation_authority::owner_conversation(cfg),
+        crate::social_state::owner_conversation(cfg),
     )?;
     Ok(match restore_gate {
         Some(guard) => store.with_guard(guard),

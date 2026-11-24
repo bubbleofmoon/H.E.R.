@@ -796,7 +796,7 @@ fn ticket55_forget_visibility_check_failure_answers_search_failed() {
 }
 
 #[test]
-fn conversation_authority_owner_config_is_store_owner() {
+fn social_state_owner_config_is_store_owner() {
     let (_root, context) = fixture_runtime("ticket55 owner config", "fixture-console-token-17");
     let cfg = json!({"ownerQQ": 2});
     let store = crate::memory::open_store(&context, &cfg).unwrap();

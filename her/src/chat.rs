@@ -492,7 +492,8 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
             }
             "/active" | "/speak" => return Decision::SetRoleMode { mode: "active", say: "已退出静默模式，恢复正常回复。" },
             other if other == "/role" || other.starts_with("/role ") => {
-                let name = crate::console::sanitize_role_name(crate::role::js_trim(&f.plain.chars().skip(5).collect::<String>()));
+                let raw = f.plain.chars().skip(5).collect::<String>();
+                let name = crate::role::sanitize_name(crate::role::js_trim(&raw));
                 if name.is_empty() || name == "off" || name == "clear" {
                     return Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".to_string() };
                 }
@@ -932,9 +933,11 @@ impl Hub {
         let context = self.context.clone();
         let guard_cfg = cfg.clone();
         let guard_key = key.to_string();
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let guard = move || -> Result<(), String> {
-            if crate::console::runtime_mode(&context) != mode || !matches!(mode.as_str(), "chat" | "closed-agent") {
+            if crate::social_state::mode(&context) != mode
+                || !matches!(mode.as_str(), "chat" | "closed-agent")
+            {
                 return Err("模式已变化".to_string());
             }
             if !allowed_in_mode(&guard_cfg, &mode, &guard_key) {
@@ -976,7 +979,10 @@ impl Hub {
         }
         let owner = owner_qq(cfg);
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
-        if is_owner && !plain.is_empty() && crate::console::runtime_mode(&self.context) == "closed-agent" {
+        if is_owner
+            && !plain.is_empty()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             if let Some(interactions) = &self.interactions {
                 let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
                 use crate::harness::interactions::Answer;
@@ -1009,7 +1015,7 @@ impl Hub {
                 }
             }
         }
-        let role_state = crate::console::chat_role_state(&self.context)?;
+        let role_state = crate::social_state::role_state(&self.context)?;
         let role = role_state.get("role").and_then(Value::as_str).map(str::to_string);
         let role_mode = role_state.get("mode").and_then(Value::as_str).unwrap_or("active").to_string();
         let session = crate::session_map::lookup(&self.context, &key)?;
@@ -1045,23 +1051,27 @@ impl Hub {
                 if crate::persona::applies(&self.context) {
                     self.say(cfg, &key, crate::persona_command::ROLE_RETIRED);
                 } else {
-                    crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    crate::social_state::write_role_state(
+                        &self.context,
+                        name.as_deref(),
+                        &role_mode,
+                    )?;
                     self.say(cfg, &key, &say);
                 }
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }
             Decision::SetRoleMode { mode, say } => {
-                crate::console::chat_write_role_state(&self.context, role.as_deref(), mode)?;
+                crate::social_state::write_role_state(&self.context, role.as_deref(), mode)?;
                 self.say(cfg, &key, say);
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }
             Decision::Reset => {
-                match crate::console::chat_reset_conversation(&self.context, &key) {
-                    Ok(()) => self.say(cfg, &key, "已重置会话，下次消息将开新上下文"),
-                    Err((404, _)) => {}
-                    Err((_, error)) => {
+                match crate::social_state::reset_conversation(&self.context, &key) {
+                    Ok(_) => self.say(cfg, &key, "已重置会话，下次消息将开新上下文"),
+                    Err(crate::social_state::SocialError::NotFound(_)) => {}
+                    Err(error) => {
                         println!("[chat] {key} 重置失败：{error}");
                         self.say(cfg, &key, &format!("重置失败：{error}"));
                     }
@@ -1095,7 +1105,7 @@ impl Hub {
                     &text,
                     &media_hint(&message_ref, media_count(&inb.message)),
                 );
-                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::console::runtime_mode(&self.context), owner: is_owner, resets: None, mode_stamp: None, admission_retries: 0 });
+                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::social_state::mode(&self.context), owner: is_owner, resets: None, mode_stamp: None, admission_retries: 0 });
                 Ok(Outcome::Dispatched { plain, sender })
             }
         }
@@ -1123,7 +1133,7 @@ impl Hub {
 
 /// Why a queued job must not run any more (its epoch ended), or `None` when it is still current.
 fn stale_job(context: &RuntimeContext, cfg: &Value, key: &str, job: &Job) -> Option<&'static str> {
-    if crate::console::runtime_mode(context) != job.mode || !allowed_in_mode(cfg, &job.mode, key) {
+    if crate::social_state::mode(context) != job.mode || !allowed_in_mode(cfg, &job.mode, key) {
         return Some("");
     }
     // Fail closed: a job whose epoch cannot be proven current (not read at dispatch, or not

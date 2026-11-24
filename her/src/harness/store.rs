@@ -905,7 +905,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-128").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
             id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),
@@ -958,7 +958,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-165").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), None, "no database: no request");
         assert!(!root.join("data").join(DB).exists(), "reading never creates the database");
@@ -1006,7 +1006,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-7").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let request = TurnRequest {
             id:"last-route".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),

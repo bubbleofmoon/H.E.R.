@@ -126,7 +126,8 @@ pub(super) fn is_canonical(conversation: &str) -> bool {
 /// Whether the bridge answers `conversation` under `cfg`, a configuration as `load_config` returns it: the inbound gate
 /// admits it (its allow list, not denied), or it is the owner's private chat (closed-agent answers only that one).
 pub(crate) fn conversation_admitted(cfg: &Value, conversation: &str) -> bool {
-    crate::console::inbound_admitted(cfg, conversation) || crate::chat::is_owner_key(cfg, conversation)
+    crate::social_state::inbound_admitted(cfg, conversation)
+        || crate::chat::is_owner_key(cfg, conversation)
 }
 
 /// The stored conversation values on an open connection, ordered by conversation and key; none on a store of version 1.

@@ -17,7 +17,7 @@ mod model_text_policy;
 mod model_failure;
 mod mcp_validate;
 mod memory;
-mod conversation_authority;
+mod social_state;
 mod conversation_state;
 mod memory_actions;
 mod pipeline;
@@ -360,7 +360,7 @@ fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Ve
     let mut replay = Vec::new();
     let mut settle = Vec::new();
     for item in items {
-        if console::inbound_admitted(cfg, &item.conversation) {
+        if social_state::inbound_admitted(cfg, &item.conversation) {
             replay.push(item);
         } else {
             settle.push(item.event_key);
@@ -373,7 +373,10 @@ fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Ve
 /// configuration read now admits or, when it cannot be read, those of the last readable configuration.
 fn gap_lists(read: Result<Value, &'static str>, last: &(Vec<String>, Vec<String>)) -> (Vec<String>, Vec<String>) {
     match read {
-        Ok(cfg) => (console::admitted_ids(&cfg, "group"), console::admitted_ids(&cfg, "private")),
+        Ok(cfg) => (
+            social_state::admitted_ids(&cfg, "group"),
+            social_state::admitted_ids(&cfg, "private"),
+        ),
         Err(error) => {
             println!("[her] ❌ 读取配置失败，本次连接按上次读到的允许列表记录断线缺口：{error}");
             last.clone()
@@ -512,7 +515,7 @@ fn sync_wake_configs(
     if let Some(cfg) = current_cfg.as_ref().filter(|cfg| {
         cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) != Some(false)
             && state.get("paused").and_then(Value::as_bool) != Some(true)
-            && console::runtime_mode(context) == "reserved2"
+            && social_state::mode(context) == "reserved2"
     }) {
         if let Some(conversations) = state.get("conversations").and_then(Value::as_object) {
             for (key, conversation) in conversations {
@@ -520,7 +523,7 @@ fn sync_wake_configs(
                     wc.get("infinite").and_then(Value::as_bool) == Some(false)
                         && wc.get("sleepUntil").and_then(Value::as_str).and_then(wake::parse_iso_ms).is_some()
                 });
-                if finite && console::inbound_admitted(cfg, key) {
+                if finite && social_state::inbound_admitted(cfg, key) {
                     drivers.entry(key.clone()).or_insert_with(|| {
                         session::Driver::new(session::scheduler_from_state(wake_cfg_of(cfg), conversation), text_seed(key, None))
                     });
@@ -1480,7 +1483,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         };
         if runtime_context.is_isolated() {
             let cfg = {
-                let _config = console::config_gate(&runtime_context).map_err(|(_, e)| e)?;
+                let _config = social_state::acquire_config_gate(&runtime_context)?;
                 if restore::recovery_pending(&runtime_context) {
                     json!({})
                 } else {
@@ -1849,7 +1852,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let mut ws = ws;
     let mut token = token;
     // #186: the gap lists of the last readable configuration, for a reconnect that cannot read it.
-    let mut gap_admitted = (console::admitted_ids(&cfg_raw, "group"), console::admitted_ids(&cfg_raw, "private"));
+    let mut gap_admitted = (
+        social_state::admitted_ids(&cfg_raw, "group"),
+        social_state::admitted_ids(&cfg_raw, "private"),
+    );
     // #192 (F3): saved events held while the configuration cannot be read (journal keys, arrival order), kept across
     // reconnects, and the refusals not recorded yet.
     let mut held: Vec<String> = Vec::new();
@@ -2321,7 +2327,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 // #46: QQ's whole-group mute notice has user_id 0, which `Event` refuses.
                 if !replayed && self_id > 0 {
                     if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
-                        if runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
+                        if runtime_context.load_config().is_ok_and(|now_cfg| {
+                            social_state::inbound_admitted(&now_cfg, &format!("group:{gid}"))
+                        }) {
                             // Older refreshes predate this notice: drop them before the new one starts.
                             let (context, key) = (runtime_context.clone(), format!("group:{gid}"));
                             if let Err(error) = tokio::task::spawn_blocking(move || group_mute::note_whole_group_notice(&context, &key)).await {
@@ -2348,7 +2356,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             if me > 0 {
                 mute_refresh_armed = true;
                 // #186: the groups admitted at this connection.
-                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                let admitted = runtime_context
+                    .load_config()
+                    .map(|now_cfg| social_state::admitted_ids(&now_cfg, "group"))
+                    .unwrap_or_default();
                 let groups: Vec<(i64, Option<i64>)> = admitted.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
                 group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), me, groups);
             }
@@ -2390,7 +2401,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         {
             if !http_token.is_empty() && self_id != 0 {
                 // #186: the groups admitted when the login answer arrives.
-                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                let admitted = runtime_context
+                    .load_config()
+                    .map(|now_cfg| social_state::admitted_ids(&now_cfg, "group"))
+                    .unwrap_or_default();
                 for g in &admitted {
                     if let Ok(gid) = g.parse::<i64>() {
                         match fetch_group_card(&http_ob, gid, self_id) {
@@ -2449,7 +2463,12 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         if is_notice && ev.notice_type.as_ref().and_then(Value::as_str) == Some("group_ban") {
             let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
             if let (false, Some(gid)) = (replayed, ev.group_id) {
-                if me > 0 && ev.user_id == Some(me) && runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
+                if me > 0
+                    && ev.user_id == Some(me)
+                    && runtime_context.load_config().is_ok_and(|now_cfg| {
+                        social_state::inbound_admitted(&now_cfg, &format!("group:{gid}"))
+                    })
+                {
                     let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
                     let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
                     // Settled before the next frame: a message right after the ban never wakes her.
@@ -2478,7 +2497,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // dropped silently.
         let event_cfg = if runtime_context.is_isolated() {
             let read = runtime_context.load_config();
-            let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
+            let reserved2_now = reserved2_hub.is_some() && social_state::mode(&runtime_context) == "reserved2";
             let key = held_conversation(&ev).unwrap_or_default();
             let served = reserved2_serves(live_all, &live_groups, &key);
             let listed = !key.is_empty() && live_groups.iter().any(|g| g == &key);
@@ -2579,7 +2598,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // Chat mode (ticket 12): the runtime's stored mode picks the pipeline. Everything below this
         // block is the reserved2 wake machinery, which chat never touches (pokes are not chat input).
         if let Some(hub) = chat_hub.as_mut() {
-            if matches!(console::runtime_mode(&runtime_context).as_str(), "chat" | "reserved" | "closed-agent") {
+            if matches!(
+                social_state::mode(&runtime_context).as_str(),
+                "chat" | "reserved" | "closed-agent"
+            ) {
                 if !is_message {
                     continue;
                 }
@@ -2601,7 +2623,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         continue;
                     }
                 };
-                if !chat::allowed_in_mode(&chat_cfg, &console::runtime_mode(&runtime_context), &key) {
+                if !chat::allowed_in_mode(&chat_cfg, &social_state::mode(&runtime_context), &key) {
                     continue;
                 }
                 let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
@@ -2629,7 +2651,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     message_id: event_message_id(&ev),
                     message: ev.message.clone(),
                 };
-                if console::runtime_mode(&runtime_context)=="reserved" {
+                if social_state::mode(&runtime_context) == "reserved" {
                     if let Some(reserved)=reserved_hub.as_mut(){if let Err(error)=reserved.handle(&inb,&inbound_key,&self_nick).await{println!("[reserved] ingress error: {error}");}}
                     continue;
                 }
@@ -2650,7 +2672,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         if let Some(hub) = reserved2_hub.as_mut() {
-            if console::runtime_mode(&runtime_context) == "reserved2" {
+            if social_state::mode(&runtime_context) == "reserved2" {
                 // #192 (F3): the hub decides with the configuration read above, so a file that becomes unreadable in
                 // between cannot drop the event.
                 let handled = match event_cfg {
@@ -2674,7 +2696,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
         // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
         let allowed = match runtime_context.load_config() {
-            Ok(gate_cfg) => console::inbound_admitted(&gate_cfg, &key),
+            Ok(gate_cfg) => social_state::inbound_admitted(&gate_cfg, &key),
             Err(error) => {
                 println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
                 false
@@ -2728,7 +2750,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             && (live_groups.is_empty() || live_groups.iter().any(|g| g == &key))
             && (is_message || ev.sub_type == "poke")
         {
-            match console::claim_first_wake(&runtime_context, &cfg_raw, &key) {
+            match social_state::claim_first_wake(&runtime_context, &cfg_raw, &key) {
                 Ok(true) => {
                     println!("[her] {key} 首次唤醒：升级为 bootstrap");
                     wake = true;

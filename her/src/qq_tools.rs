@@ -113,7 +113,7 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
                         tool["description"] = json!(format!("{description} {} 重复消息或本轮发送上限会拒绝整个批次，请遵循返回的停止指令。", crate::outbound_message::GUIDANCE));
                     }
                     if tool["name"] == "qq_wait_for_messages" {
-                        let policy = crate::console::wait_policy(cfg);
+                        let policy = crate::social_state::wait_policy(cfg);
                         tool["inputSchema"]["properties"]["purpose"]["description"] = json!("messages：等待对方下文/回复或沉睡前观察；reply：可选的短静默观察。发送工具自动控制回复节奏，首答无需先调用等待工具");
                         tool["description"] = json!(format!("发送工具自动控制回复节奏，首答无需先等待；本工具留给确实要等对方下文或沉睡观察时。等待分两种用途：reply 按最后来信补足 quietMs 静默，已安静足够就返回，不能代替沉睡观察；messages 等到新消息后合批，每条来信重置 {}ms 窗口，从首条起最多 {}ms；你成功发送后的互动窗口（preSleepWaitMs，只有你自己的发送重新计时）内则只在有给你的消息（forYou=true）时立即返回、不合批，只有闲聊时等到互动窗口结束再一起返回。@你或管理员来信立即返回。每条 newMessages 带桥接提示 forYou（true/false）和 forYouReason；它只是提示，是否回复由你决定。返回了给你的消息的等待不占本轮次数（每轮最多与发送上限 send.maxPerTurn 相同的次数）。互动窗口结束时返回 engagementEnded=true 和退出指令，桥接让你干净地沉睡并保留唤醒配置。直接读取 newMessages 和 readThroughSeq，无需重复查询。本轮两种用途合计最多 {} 次，最后一次在需要时自动转为完整沉睡观察。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发送消息。若仍调用 mark_read/set_wake_config 收尾，观察不足时桥接强制 30 秒后再唤醒。未达上限且需要沉睡观察时使用 messages 和完整观察 timeoutMs；preSleepWaitSatisfied/Observed 表示观察资格，短 reply 不授予。", policy.window_ms, policy.max_ms, policy.max_per_turn));
                         tool["inputSchema"]["properties"]["quietMs"]["description"] = json!("reply 用途的静默窗口；messages 的合批窗口由后台 batchWindowMs/batchMaxMs 决定");
@@ -807,7 +807,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             let cfg = match config(context) { Ok(cfg) => cfg, Err(e) => return fail("等待失败：", e) };
             let mut call = with_token(ApiCall::post("/api/socialV2/wait", Value::Object(body)));
             call.long_poll = true;
-            call.timeout_ms = crate::console::wait_client_timeout_ms(&cfg, args);
+            call.timeout_ms = crate::social_state::wait_client_timeout_ms(&cfg, args);
             result(&api, call, "等待失败：")
         }
         "qq_report_feedback" => {

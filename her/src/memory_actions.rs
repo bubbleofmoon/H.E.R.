@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::console::Request;
 use crate::console_auth::{credential_digest, digests_equal, ConsoleAuthority};
-use crate::conversation_authority as authority;
+use crate::social_state as authority;
 use crate::memory::{ForgetError, MemoryStore, NewMemory, VerifiedMessage};
 use crate::runtime::RuntimeContext;
 
@@ -158,7 +158,8 @@ fn handle_inner(
     // `acl` 在 key 校验**之前**处理：控制台调用可以不带 key（JS 同序）
     if action == "acl" {
         let key0 = b.get("key").and_then(Value::as_str).unwrap_or("").trim();
-        let owner_ok = authority::owner_holds_token(context, cfg, key0, &agent_token).map_err(unavailable)?;
+        let owner_ok = authority::owner_holds_token(context, cfg, key0, &agent_token)
+            .map_err(|e| unavailable(e.to_string()))?;
         if !console_ok && !owner_ok {
             return Err((403, "ACL 操作只允许管理员私聊或控制台".to_string()));
         }
@@ -173,7 +174,9 @@ fn handle_inner(
     // 它等于管理端全权，而"对话式配置"的整个设计前提是**只有管理员能改**。
     if action == "settings-get" || action == "settings-set" {
         let key0 = b.get("key").and_then(Value::as_str).unwrap_or("").trim();
-        if !authority::owner_holds_token(context, cfg, key0, &agent_token).map_err(unavailable)? {
+        if !authority::owner_holds_token(context, cfg, key0, &agent_token)
+            .map_err(|e| unavailable(e.to_string()))?
+        {
             return Err((403, "配置读写只允许管理员私聊".to_string()));
         }
         let mut reply = crate::console::settings_action(action, &b, cfg, context)?;
@@ -182,7 +185,7 @@ fn handle_inner(
             && reply["changed"] == true
             && reply["key"].as_str().and_then(crate::settings::chat_setting)
                 .is_some_and(|setting| crate::settings::wake_timing::refreshes_default_plan(setting.key))
-            && crate::console::refresh_default_wake_configs(context).is_err()
+            && authority::refresh_default_wake_configs(context).is_err()
         {
             reply["note"] = json!(format!("{}；设置已保存，这次未能同步默认唤醒计划", reply["note"].as_str().unwrap_or("")));
         }
@@ -190,7 +193,8 @@ fn handle_inner(
     }
     if action == "archive" {
         let key = b.get("key").and_then(Value::as_str).unwrap_or("");
-        let owner_ok = authority::owner_holds_token(context, cfg, key, &agent_token).map_err(unavailable)?;
+        let owner_ok = authority::owner_holds_token(context, cfg, key, &agent_token)
+            .map_err(|e| unavailable(e.to_string()))?;
         if !console_ok && !owner_ok {
             return Err((403, "归档操作只允许管理员私聊或控制台".to_string()));
         }
@@ -206,7 +210,9 @@ fn handle_inner(
     }
     // 其余动作必须带该会话自己的 agent token；控制台令牌在 MCP 进程里也有，
     // 若 search/write 也认它，任何会话都能借 MCP 读到别的会话语料。
-    if !authority::holds_token(context, &key, &agent_token).map_err(unavailable)? {
+    if !authority::holds_token(context, &key, &agent_token)
+        .map_err(|e| unavailable(e.to_string()))?
+    {
         return Err((403, "agent token 无效（必须是该会话自己的令牌）".to_string()));
     }
     let store = open_store(context, cfg)?;

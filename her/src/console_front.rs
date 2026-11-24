@@ -590,9 +590,9 @@ pub(crate) fn enforce_key_preflight(
         if let Some(key) = request_session_key(req) {
             let closed_owner_reset = preflight == KeyPreflight::SessionKeyOrClosedOwnerReset
                 && context.is_isolated()
-                && runtime_mode(context) == "closed-agent"
+                && crate::social_state::mode(context) == "closed-agent"
                 && crate::chat::is_owner_key(cfg, &key);
-            if !key_in_allowlist(cfg, &key) && !closed_owner_reset {
+            if !crate::social_state::key_in_allowlist(cfg, &key) && !closed_owner_reset {
                 return Some((
                     403,
                     "application/json; charset=utf-8".to_string(),

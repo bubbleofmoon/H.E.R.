@@ -41,7 +41,7 @@ impl Pipeline {
             if crate::dsh_health::is_down(&self.context) {
                 return Err("DSH is unavailable for the wake".into());
             }
-            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, cfg)?;
         }
         // A pinned CLI backend was the caller's to run: the DSH adapter's configuration
         // copy drops `backends.sessions`, so its failover never runs that CLI again.
@@ -53,11 +53,18 @@ impl Pipeline {
     }
 
     fn preset_for(&self, key: &str) -> String {
-        if self.context.is_isolated() && crate::console::runtime_mode(&self.context) == "closed-agent" {
+        if self.context.is_isolated()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             return self.preset_closed.clone();
         }
         // Chat mode has one preset for every conversation (JS `modePreset`).
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             return self.preset_chat.clone();
         }
         let owner_key = format!("private:{}", self.owner_qq);
@@ -145,7 +152,12 @@ impl Pipeline {
         let preset = self.preset_for(key);
         // A conversation of a QQ group must never fall back to DSH's default preset (it carries local
         // tools): chat refuses to create a session unless DSH offers the configured preset.
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             self.require_preset(&preset)?;
         }
         let create = |rpc: &crate::dsh::Rpc| {
@@ -173,7 +185,12 @@ impl Pipeline {
             .ok_or_else(|| format!("session/create 没返回 sessionId：{created}"))?
             .to_string();
 
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             // Chat: the JS title (`renameSessionForUi`) is resolved after the model is selected and
             // set once the first prompt is in DSH's hands.
             self.title_for = Some((sid.clone(), key.to_string()));
@@ -217,12 +234,16 @@ impl Pipeline {
     /// What a session's authority depends on: mode file, current allowance, the ledger's reset
     /// count, the conversation token and the session policy.
     fn access_epoch(&self, key: &str) -> AccessEpoch {
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         AccessEpoch {
             mode_stamp: crate::reserved::mode_stamp(&self.context),
-            allowed: self.context.load_config().map(|cfg| crate::console::access_allowed(&cfg, &mode, key)).map_err(str::to_string),
+            allowed: self
+                .context
+                .load_config()
+                .map(|cfg| crate::social_state::access_allowed(&cfg, &mode, key))
+                .map_err(str::to_string),
             resets: crate::turn_ledger::reset_count(&self.context, key),
-            token: crate::console::conversation_token(&self.context, key),
+            token: crate::social_state::token(&self.context, key).map_err(String::from),
             policy: self.session_policy(key),
         }
     }
@@ -319,7 +340,7 @@ impl Pipeline {
     pub fn cancel_session(&mut self, key: &str, sid: &str) -> Result<(), String> {
         let stopped = crate::dsh::stop_session_work(&self.rpc, sid);
         if crate::session_map::lookup(&self.context, key)?.as_deref() == Some(sid) {
-            crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+            crate::social_state::ensure_or_rotate(&self.context, key, true)?;
         }
         let current = crate::session_map::lookup(&self.context, key)?;
         if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
@@ -372,7 +393,7 @@ impl Pipeline {
                 // An unmapped first wake can still be waiting for the turn gate.
                 let mut minted = publication.lock().unwrap_or_else(|p| p.into_inner());
                 let current = minted.as_deref().unwrap_or(expected);
-                let token = crate::conversation_authority::revoke_if_current(&self.context, key, current)?;
+                let token = crate::social_state::revoke_if_current(&self.context, key, current)?;
                 if let Some(replacement) = &token {
                     *minted = Some(replacement.clone());
                 }
@@ -382,7 +403,7 @@ impl Pipeline {
         };
         if reason == "turnTimeout" && self.context.is_isolated() && !self.has_dsh() {
             let cfg = self.context.load_config().map_err(str::to_string)?;
-            self.rpc = crate::console::dsh_rpc_for(&self.context, &cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, &cfg)?;
         }
         if self.context.is_isolated() {
             // 被取消/被替代的回合不能再有迟到的结果：先清 inbox（DSH 的 cancel 保留队列）并取消，
@@ -391,7 +412,8 @@ impl Pipeline {
             // It does not finalize the turn: crash recovery must still reconcile live work.
             let open = crate::turn_ledger::read_records(&self.context).ok()
                 .map(|records| crate::turn_ledger::fold(&records).0).unwrap_or_default();
-            let pending_wait = crate::console::observation_wait_turn(&self.context, key).unwrap_or(None);
+            let pending_wait = crate::social_state::observation_wait_turn(&self.context, key)
+                .unwrap_or(None);
             let sleeping = reason == "turnTimeout" && open.iter().any(|t|t.key == key && t.state.is_open()
                 && pending_wait.as_deref() == Some(t.id.as_str()));
             let terminal_reason = if sleeping { "observationSleep" } else { reason };
@@ -402,7 +424,7 @@ impl Pipeline {
                 }
             }
             let stopped = crate::dsh::stop_session_work(&self.rpc, &sid);
-            let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+            let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
             for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
                 let recorder = crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry();
                 let result = if sleeping && stopped.is_ok() {
@@ -462,7 +484,7 @@ impl Pipeline {
             return Ok(false);
         }
         if !self.has_dsh() {
-            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, cfg)?;
         }
         let _ = self.rpc.relogin();
         if mode == "closed-agent" { self.preset_closed = self.closed_preset()?; }
@@ -508,7 +530,7 @@ impl Pipeline {
     /// JS 的会话策略串：`JSON.stringify([mode, preset, closed-agent ? ownerQQ : null])`。
     /// 一并写入映射，回滚到 JS 后它认得这些会话而不是整体退役。未解析的 preset 与 JS 一样序列化为 `""`。
     fn session_policy(&self, key: &str) -> String {
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let owner = if mode == "closed-agent" {
             match self.owner_qq.parse::<i64>() {
                 Ok(n) => serde_json::json!(n),
@@ -530,7 +552,7 @@ impl Pipeline {
         let Some(stored) = doc.get("sessionPolicies").and_then(|p| p.get(key)).and_then(|p| p.as_str()) else {
             return Ok(None);
         };
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let stored_mode = serde_json::from_str::<serde_json::Value>(stored)
             .ok()
             .and_then(|v| v.get(0).and_then(|m| m.as_str()).map(str::to_string));
@@ -549,7 +571,7 @@ impl Pipeline {
         let _ = crate::dsh::stop_session_work(&self.rpc, old);
         let _ = crate::dsh::archive_session(&self.rpc, old);
         self.rotate_turn_token(key)?;
-        let _ = crate::console::mark_conversation_unbootstrapped(&self.context, key);
+        let _ = crate::social_state::mark_unbootstrapped(&self.context, key);
         self.store.sessions.remove(key);
         self.failover_state().forget_session(old);
         let new = self.ensure_session(key)?;
@@ -733,7 +755,8 @@ impl Pipeline {
 
     /// JS `shouldAuditKey`: every conversation is audited except the owner's private chat in closed-agent mode.
     fn should_audit_key(&self, cfg: &serde_json::Value, key: &str) -> bool {
-        !(crate::console::runtime_mode(&self.context) == "closed-agent" && crate::chat::is_owner_key(cfg, key))
+        !(crate::social_state::mode(&self.context) == "closed-agent"
+            && crate::chat::is_owner_key(cfg, key))
     }
 
     /// JS `shouldAuditKey(key) && SENSITIVE_RE.test(text) ? '（含敏感信息，已隐藏）' : text`.

@@ -68,7 +68,7 @@ pub fn live_target_from_config(cfg: &Value) -> Result<LiveTarget, String> {
 }
 
 /// #186: where `rollout.rustGroups` (the conversations a live owner is started to serve, `--live-groups`) and the
-/// inbound gate (`console::inbound_admitted`: listed in an allow list and not denied) disagree.
+/// inbound gate (`social_state::inbound_admitted`: listed in an allow list and not denied) disagree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeGaps {
     /// Served but refused by the inbound gate: their events are dropped before the journal.
@@ -111,14 +111,14 @@ pub fn rollout_scope_gaps(cfg: &Value) -> ScopeGaps {
         .collect();
     let mut not_allowed: Vec<String> = Vec::new();
     for key in &served {
-        if !crate::console::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
+        if !crate::social_state::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
             not_allowed.push(key.clone());
         }
     }
     let mut not_served: Vec<String> = Vec::new();
     if cfg.pointer("/rollout/enabled").and_then(Value::as_bool) != Some(false) {
         for kind in ["group", "private"] {
-            for id in crate::console::admitted_ids(cfg, kind) {
+            for id in crate::social_state::admitted_ids(cfg, kind) {
                 let key = format!("{kind}:{id}");
                 if !served.contains(&key) && !not_served.contains(&key) {
                     not_served.push(key);

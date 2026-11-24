@@ -107,7 +107,7 @@ pub fn resolve(
         return Err((409, "该回合有发送结果未知的消息，重试可能重复发送；确认可以接受后请带 confirm:true 再次提交".to_string()));
     }
     if action == "abandon" && turn.pause_reason == "send-unresolved" {
-        crate::console::ensure_or_rotate_agent_token(context, &turn.key, true)
+        crate::social_state::ensure_or_rotate(context, &turn.key, true)
             .map_err(|e| (500, format!("会话令牌未能撤销，未放弃回合：{e}")))?;
     }
     Recorder::attach(context, id, &turn.key)
@@ -526,7 +526,7 @@ fn wait_secs(cfg: &Value) -> u64 {
 
 /// Same session mapping, same token epoch, conversation still allowed.
 fn validity(context: &RuntimeContext, cfg: &Value, turn: &Turn) -> Result<(), String> {
-    if !crate::console::inbound_admitted(cfg, &turn.key) {
+    if !crate::social_state::inbound_admitted(cfg, &turn.key) {
         return Err("会话已不在允许范围内".to_string());
     }
     if !turn.session_id.is_empty() {
@@ -535,7 +535,7 @@ fn validity(context: &RuntimeContext, cfg: &Value, turn: &Turn) -> Result<(), St
             _ => return Err("会话映射已变化（重置或替换）".to_string()),
         }
     }
-    match crate::console::conversation_token(context, &turn.key)? {
+    match crate::social_state::token(context, &turn.key)? {
         Some(token) if turn.epochs.iter().any(|e| *e == crate::send_outbox::token_epoch(&token)) => Ok(()),
         _ => Err("会话令牌已变化（重置、取消或被替代）".to_string()),
     }
@@ -600,7 +600,7 @@ fn hand_back(journal: &Journal, keys: &[String]) {
 }
 
 fn allowed(cfg: &Value, event: &Replayable) -> bool {
-    crate::console::inbound_admitted(cfg, &event.conversation)
+    crate::social_state::inbound_admitted(cfg, &event.conversation)
 }
 
 /// Apply one verdict. The ledger record comes first and is the commit point: if it cannot be
@@ -642,7 +642,11 @@ fn apply(context: &RuntimeContext, journal: &Journal, turn: &Turn, verdict: &Ver
     // Only a proven terminal verdict can take over; unknown work/sends stay held.
     if matches!(verdict, Verdict::Resume(_) | Verdict::Abandon(_) | Verdict::Complete(_) | Verdict::Fail(_) | Verdict::Cancel(_)) {
         if let Some(("cancel-requested", reason)) = turn.finalization_claim() {
-            if !commit(crate::console::ensure_or_rotate_agent_token(context, &turn.key, true).map(|_| ())) {
+            if !commit(
+                crate::social_state::ensure_or_rotate(context, &turn.key, true)
+                    .map(|_| ())
+                    .map_err(String::from),
+            ) {
                 return;
             }
             // A clean observation sleep is completed work owned by the cancellation claim.
@@ -659,7 +663,15 @@ fn apply(context: &RuntimeContext, journal: &Journal, turn: &Turn, verdict: &Ver
             // A timer-only turn has no inbound event to hand back. Restore its durable deadline
             // before closing recovery, so another crash at either boundary remains recoverable.
             if let Some(claim) = &turn.wake_claim {
-                if !commit(crate::console::rollback_reserved2_wake(context, &turn.key, claim["at"].as_i64().unwrap_or(0), &claim["previous"])) {
+                if !commit(
+                    crate::social_state::rollback_reserved2_wake(
+                        context,
+                        &turn.key,
+                        claim["at"].as_i64().unwrap_or(0),
+                        &claim["previous"],
+                    )
+                    .map_err(String::from),
+                ) {
                     return;
                 }
             }
@@ -701,7 +713,8 @@ fn apply(context: &RuntimeContext, journal: &Journal, turn: &Turn, verdict: &Ver
         Verdict::Reattach | Verdict::Defer(_) => {}
         Verdict::Pause { reason, detail, rotate } => {
             if *rotate {
-                if let Err(error) = crate::console::ensure_or_rotate_agent_token(context, &turn.key, true) {
+                if let Err(error) = crate::social_state::ensure_or_rotate(context, &turn.key, true)
+                {
                     println!("[recovery] ⚠️ 暂停时换令牌失败 {}：{error}", turn.key);
                 }
             }
@@ -731,9 +744,9 @@ impl Pass<'_> {
         // Intent can survive a crash before the cancelling handler revokes authority.
         // Revoke before any probe/wait, without claiming that the work has ended.
         if turn.notes.iter().any(|note| note["verdict"] == "cancel-requested") {
-            let revoke = crate::console::conversation_token(self.context, &turn.key).and_then(|token| {
+            let revoke = crate::social_state::token(self.context, &turn.key).and_then(|token| {
                 if token.is_some_and(|token| turn.epochs.contains(&crate::send_outbox::token_epoch(&token))) {
-                    crate::console::ensure_or_rotate_agent_token(self.context, &turn.key, true).map(|_| ())
+                    crate::social_state::ensure_or_rotate(self.context, &turn.key, true).map(|_| ())
                 } else { Ok(()) }
             });
             if let Err(error) = revoke {
@@ -993,7 +1006,7 @@ impl Pass<'_> {
                 if keys.is_empty() {
                     continue;
                 }
-                if crate::console::runtime_mode(self.context) == "reserved"
+                if crate::social_state::mode(self.context) == "reserved"
                     && validity(self.context, self.cfg, turn).is_ok()
                 {
                     if Recorder::attach(self.context, &turn.id, &turn.key)
@@ -1246,7 +1259,12 @@ mod tests {
             assert_eq!(ended.state, State::Cancelled, "{verdict:?}: {records:?}");
             assert_eq!(ended.outcome_reason, "turnTimeout");
             assert_eq!(records.iter().filter(|row| row["k"] == "ended").count(), 1);
-            assert_ne!(crate::console::conversation_token(&context, "group:1").unwrap().as_deref(), Some("old-token"));
+            assert_ne!(
+                crate::social_state::token(&context, "group:1")
+                    .unwrap()
+                    .as_deref(),
+                Some("old-token")
+            );
             assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"));
             drop(journal);
             std::fs::remove_dir_all(root).unwrap();

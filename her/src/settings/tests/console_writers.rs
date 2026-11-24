@@ -114,7 +114,7 @@ fn settings_console_writer_keeps_the_copy_before_it_mirrors() {
 
 #[test]
 fn settings_writers_take_the_configuration_gate_before_the_store_gate() {
-    // Gate order: every writer of the store holds the configuration gate (`console::config_gate`: the routes'
+    // Gate order: every writer of the store holds the configuration gate (`social_state::acquire_config_gate`: the
     // authority, the chat tools' `memory_actions::handle`) and takes the store gate inside it. The settings module
     // never takes the configuration gate, so no writer holds the store gate while it waits for the configuration gate.
     for (file, source) in SETTINGS_SOURCES {
@@ -445,12 +445,21 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         let _ = take_config_writes();
         assert_eq!(written, Ok(()), "{}", setting.key);
     }
-    // That write path is the only product write of config.json in the console and the modules it calls.
-    let console = include_str!("../../console.rs");
+    // That write path is the only product write of config.json in social_state and the console modules.
+    let social_state = include_str!("../../social_state.rs");
     // Split on the test module's header only (no line ending in the pattern, so a CRLF checkout splits the same).
-    let product = console.split("mod tests {").next().unwrap();
-    assert_eq!(product.matches("write_atomic(RuntimeArea::Config").count(), 1, "console.rs writes config.json once");
+    let product = social_state.split("mod tests {").next().unwrap();
+    assert_eq!(
+        product.matches("write_atomic(RuntimeArea::Config").count(),
+        1,
+        "social_state.rs writes config.json once"
+    );
+    let console = include_str!("../../console.rs")
+        .split("mod tests {")
+        .next()
+        .unwrap();
     for (name, source) in [
+        ("console.rs", console),
         ("console_access.rs", include_str!("../../console_access.rs")),
         ("console_agent.rs", include_str!("../../console_agent.rs")),
         ("console_feedback.rs", include_str!("../../console_feedback.rs")),

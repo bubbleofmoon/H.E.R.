@@ -298,6 +298,20 @@ pub(crate) fn mint_request_id() -> String {
     )
 }
 
+pub(crate) fn rpc_for(context: &RuntimeContext, cfg: &serde_json::Value) -> Result<Rpc, String> {
+    let base = if context.is_isolated() {
+        context
+            .dependency_url("dsh")
+            .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?
+    } else {
+        cfg.get("dsh")
+            .and_then(|d| d.get("baseUrl"))
+            .and_then(|b| b.as_str())
+            .unwrap_or("http://127.0.0.1:3080")
+    };
+    Rpc::connect_with_runtime(context, base)
+}
+
 pub struct Rpc {
     pub base: String,
     /// The login in force. A request refused with 401 refreshes it (`dsh_credential`), so it is shared state behind
@@ -1283,9 +1297,9 @@ impl FollowStream {
 
     fn track_mapped_briefing(&mut self, rpc: &Rpc, sid: &str) -> Result<(), String> {
         let context = rpc.credential().context();
-        if context.is_isolated() && crate::console::runtime_mode(context) == "reserved2" {
+        if context.is_isolated() && crate::social_state::mode(context) == "reserved2" {
             if let Some((key, _)) = crate::session_map::all(context)?.into_iter().find(|(_, mapped)| mapped == sid) {
-                if let Some(epoch) = crate::console::conversation_token(context, &key)? {
+                if let Some(epoch) = crate::social_state::token(context, &key)? {
                     self.track_briefing(context, &key, sid, &epoch)?;
                 }
             }

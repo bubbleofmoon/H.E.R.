@@ -1,7 +1,7 @@
 //! First-generation simulation. State is shared with the companion console under one OS gate;
 //! only the live hub schedules turns. Timers and jobs never survive a process generation.
 use crate::{
-    chat, console,
+    chat,
     conversation_state::{
         read_reserved_document as read, reserved_document_exists,
         update_reserved_document as mutate, ReservedConversation as Conversation,
@@ -37,12 +37,12 @@ pub fn config(cfg: &Value) -> Value {
     v
 }
 fn n(cfg: &Value, name: &str) -> i64 {
-    console::social_v1_number(&cfg[name])
+    crate::social_state::social_v1_number(&cfg[name])
         .max(0.0)
         .min(i64::MAX as f64) as i64
 }
 fn probability(cfg: &Value, name: &str) -> f64 {
-    console::social_v1_number(&cfg[name]).clamp(0.0, 1.0)
+    crate::social_state::social_v1_number(&cfg[name]).clamp(0.0, 1.0)
 }
 // The stream belongs to the shared driver state, so admin and scheduler draws stay serialized.
 fn initial_seed() -> u32 {
@@ -205,8 +205,8 @@ pub fn refresh_console_config(context: &RuntimeContext, cfg: &Value) -> Result<(
 }
 
 pub fn posted_console_config(context: &RuntimeContext, prior: Value, merged: &Value) -> Result<Value, String> {
-    let mut next = console::social_v1_spread(Some(&prior));
-    next.extend(console::social_v1_spread(Some(merged)));
+    let mut next = crate::social_state::social_v1_spread(Some(&prior));
+    next.extend(crate::social_state::social_v1_spread(Some(merged)));
     let next = Value::Object(next);
     mutate(context, |s| {
         s.console_social_config = Some(next.clone());
@@ -358,7 +358,7 @@ impl Authority {
     }
     pub fn check_generation(&self, context: &RuntimeContext, key: &str) -> Result<(), String> {
         let cfg = context.load_config().map_err(|e| e.to_string())?;
-        if console::runtime_mode(context) != "reserved"
+        if crate::social_state::mode(context) != "reserved"
             || mode_stamp(context)? != self.mode
             || (config(&cfg)["enabled"] != false) != self.social
             || !chat::allowed_key(&cfg, key)
@@ -375,7 +375,7 @@ impl Authority {
     }
     pub fn check(&self, context: &RuntimeContext, key: &str) -> Result<(), String> {
         self.check_generation(context, key)?;
-        if console::conversation_token(context, key)?.as_deref() != Some(self.token.as_str()) {
+        if crate::social_state::token(context, key)?.as_deref() != Some(self.token.as_str()) {
             return Err("reserved token changed".into());
         }
         Ok(())
@@ -385,7 +385,7 @@ impl Authority {
 #[cfg(test)]
 pub(crate) fn authority_for_test(context: &RuntimeContext, key: &str) -> Result<Authority, String> {
     let cfg = context.load_config().map_err(|e| e.to_string())?;
-    let token = console::ensure_or_rotate_agent_token(context, key, false)?;
+    let token = crate::social_state::ensure_or_rotate(context, key, false)?;
     let (owner, generation) = mutate(context, |s| {
         if s.owner.is_empty() {
             s.owner = crate::turn_ledger::mint_id("process-");
@@ -509,7 +509,7 @@ impl Hub {
         delay: i64,
         inbound: Vec<String>,
     ) -> Result<(), String> {
-        let token = console::ensure_or_rotate_agent_token(&self.context, key, false)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, false)?;
         let job = Job {
             key: key.into(),
             prompt,
@@ -577,7 +577,7 @@ impl Hub {
             return Ok(());
         }
         self.sync_mode().await?;
-        if console::runtime_mode(&self.context) != "reserved" {
+        if crate::social_state::mode(&self.context) != "reserved" {
             return Ok(());
         }
         let mut res = chat::GroupResolver {
@@ -590,7 +590,7 @@ impl Hub {
         let text = chat::segments_to_text(&inb.message, &mut res, true);
         let plain = chat::segments_to_text(&inb.message, &mut res, false);
         let owner = inb.user_id.to_string() == chat::owner_qq(&cfg);
-        let role = console::chat_role_state(&self.context)?;
+        let role = crate::social_state::role_state(&self.context)?;
         if plain.is_empty() && text.is_empty() || role["mode"] == "silent" && !owner {
             if !(plain.is_empty() && text.is_empty()) {
                 crate::activity::append(
@@ -648,16 +648,24 @@ impl Hub {
                 if crate::persona::applies(&self.context) {
                     Some(crate::persona_command::ROLE_RETIRED.to_string())
                 } else {
-                    console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    crate::social_state::write_role_state(
+                        &self.context,
+                        name.as_deref(),
+                        &role_mode,
+                    )?;
                     Some(say)
                 }
             }
             chat::Decision::SetRoleMode { mode, say } => {
-                console::chat_write_role_state(&self.context, current_role.as_deref(), mode)?;
+                crate::social_state::write_role_state(
+                    &self.context,
+                    current_role.as_deref(),
+                    mode,
+                )?;
                 Some(say.into())
             }
             chat::Decision::Reset => {
-                let reset = console::chat_reset_conversation(&self.context, &key);
+                let reset = crate::social_state::reset_conversation(&self.context, &key);
                 if reset.is_ok() {
                     mutate(&self.context, |s| {
                         s.conversations.remove(&key);
@@ -696,7 +704,7 @@ impl Hub {
                 chat::send_delay_ms(&cfg),
                 &|| {
                     let current = self.context.load_config().map_err(|e| e.to_string())?;
-                    if console::runtime_mode(&self.context) != "reserved"
+                    if crate::social_state::mode(&self.context) != "reserved"
                         || mode_stamp(&self.context)? != self.stamp
                         || !self.allowed(&current, &key)
                     {
@@ -969,7 +977,7 @@ impl Hub {
         }
         let cfg = self.context.load_config().map_err(|e| e.to_string())?;
         let sc = config(&cfg);
-        if console::runtime_mode(&self.context) != "reserved" {
+        if crate::social_state::mode(&self.context) != "reserved" {
             return Ok(());
         }
         let scan = sc["enabled"] != false && now() - self.last_tick >= 5000;
@@ -1341,9 +1349,9 @@ pub fn reply_delay(context: &RuntimeContext, cfg: &Value) -> Result<u64, String>
         };
         // JS applies Number(value) || fallback before clamping, and clamps max
         // to min rather than swapping the bounds.
-        let min = console::social_v1_number(&cfg[lo]);
+        let min = crate::social_state::social_v1_number(&cfg[lo]);
         let min = if min == 0.0 { fallback } else { min.max(0.0) } as u64;
-        let max = console::social_v1_number(&cfg[hi]);
+        let max = crate::social_state::social_v1_number(&cfg[hi]);
         let max = if max == 0.0 {
             min
         } else {
@@ -1422,7 +1430,7 @@ mod tests {
         let authority = authority_for_test(&context, key).unwrap();
         authority.check(&context, key).unwrap();
 
-        let token = console::ensure_or_rotate_agent_token(&context, key, true).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
         authority.check_generation(&context, key).unwrap();
         assert_eq!(
             authority.check(&context, key).unwrap_err(),
@@ -1440,7 +1448,7 @@ mod tests {
             "retiring the reserved generation must invalidate its captured authority"
         );
         assert_eq!(
-            console::conversation_token(&context, key).unwrap(),
+            crate::social_state::token(&context, key).unwrap(),
             Some(token)
         );
     }
@@ -1501,7 +1509,7 @@ mod tests {
         context
             .write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"chat"}"#)
             .unwrap();
-        let chat_token = console::ensure_or_rotate_agent_token(&context, key, true).unwrap();
+        let chat_token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
         crate::session_map::bind(&context, key, "replacement-chat-session", None).unwrap();
         let chat = Recorder::begin(
             &context,
@@ -1517,7 +1525,7 @@ mod tests {
         hub.tick("bot").await.unwrap();
 
         assert_eq!(
-            console::conversation_token(&context, key).unwrap(),
+            crate::social_state::token(&context, key).unwrap(),
             Some(chat_token),
             "stale cleanup must preserve the replacement chat token"
         );

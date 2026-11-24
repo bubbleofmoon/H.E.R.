@@ -213,7 +213,11 @@ pub fn is_reset_of(record: &Value, key: &str) -> bool {
         Some(k) if k == key || k == "*" => true,
         Some(POLICY_RESET) => {
             let mode = record.get("mode").and_then(Value::as_str).unwrap_or("");
-            !crate::console::access_allowed(record.get("policy").unwrap_or(&Value::Null), mode, key)
+            !crate::social_state::access_allowed(
+                record.get("policy").unwrap_or(&Value::Null),
+                mode,
+                key,
+            )
         }
         _ => false,
     }

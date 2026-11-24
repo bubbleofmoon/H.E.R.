@@ -45,9 +45,9 @@ impl From<CheckError> for String {
 impl Tools {
     /// Match console authority, including its reserved2 default for an absent mode.
     pub(crate) fn current_mode(context: &RuntimeContext) -> &'static str {
-        crate::console::current_mode_for(context)
+        crate::social_state::mode_checked(context)
             .ok()
-            .and_then(|mode| crate::config::normalize_mode(&mode))
+            .and_then(|mode| crate::social_state::normalize_mode(&mode))
             .unwrap_or_default()
     }
 
@@ -66,7 +66,7 @@ impl Tools {
         }
         let profile = Profile::of_conversation(cfg, mode, conversation)
             .ok_or("harness has no tool menu for this conversation in this mode")?;
-        let token = crate::conversation_authority::token(context, conversation)?
+        let token = crate::social_state::token(context, conversation)?
             .ok_or("harness tool authority is unavailable")?;
         let authority = Authority {
             context: context.clone(),
@@ -124,7 +124,8 @@ impl Tools {
 
     pub(super) fn revoke(&self) -> Result<Option<String>, String> {
         match &self.authority {
-            Some(a) => crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token),
+            Some(a) => crate::social_state::revoke(&a.context, &a.conversation, &a.token)
+                .map_err(String::from),
             None => Ok(None),
         }
     }
@@ -266,7 +267,7 @@ impl Tools {
         // Use the same gate as mode, token and settings writers. Wait first, then recheck the turn.
         let reminder = super::reminders::NAMES.contains(&call.fn_name.as_str());
         let _gate = if reminder {
-            match crate::console::config_gate(&authority.context) {
+            match crate::social_state::acquire_config_gate(&authority.context) {
                 Ok(gate) => gate,
                 Err(_) => return error("暂时无法处理提醒，请稍后再试"),
             }
@@ -313,7 +314,7 @@ impl Authority {
             .map_err(|reason| CheckError::Unavailable(reason.into()))?;
         let mode = Tools::current_mode(&self.context);
         let allowed = if mode == "reserved2" {
-            crate::console::inbound_admitted(&cfg, &self.conversation)
+            crate::social_state::inbound_admitted(&cfg, &self.conversation)
                 && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
                 && self.context.read_social_state().map_err(CheckError::Unavailable)?["paused"] != true
         } else {
@@ -327,10 +328,10 @@ impl Authority {
                 "harness conversation authority changed",
             ));
         }
-        let token = crate::conversation_authority::token(&self.context, &self.conversation)
-            .map_err(CheckError::Unavailable)?;
+        let token = crate::social_state::token(&self.context, &self.conversation)
+            .map_err(|e| CheckError::Unavailable(e.to_string()))?;
         if token.as_deref() != Some(&self.token)
-            || crate::conversation_authority::generation(&self.token) != self.generation
+            || crate::social_state::generation(&self.token) != self.generation
         {
             return Err(CheckError::Revoked(
                 "harness conversation generation changed",
@@ -357,7 +358,7 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
             d["name"].as_str().is_some_and(|name| {
                 menu.contains(&name)
                     && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
-                        || crate::console::reserved2_menu_tool(cfg, conversation, name))
+                        || crate::social_state::reserved2_menu_tool(cfg, conversation, name))
                     && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
             })
         })
@@ -466,9 +467,9 @@ mod tests {
         /// The conversation's generation, minting its agent token when it has none.
         fn generation(&self, conversation: &str) -> String {
             let token =
-                crate::conversation_authority::ensure_or_rotate(&self.context, conversation, false)
+                crate::social_state::ensure_or_rotate(&self.context, conversation, false)
                     .unwrap();
-            crate::conversation_authority::generation(&token)
+            crate::social_state::generation(&token)
         }
 
         fn capture(&self, mode: &str, conversation: &str) -> Result<Tools, String> {

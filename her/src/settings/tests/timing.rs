@@ -409,7 +409,14 @@ fn live_wake_save_with_unreadable_store_writes_nothing() {
     let file_before = std::fs::read(&config_path).unwrap();
     let error = handle_social_config_post(&context, r#"{"wake":{"recommendedPoke":false}}"#).unwrap_err();
     assert_eq!(error.0, 503);
-    assert_eq!(refresh_default_wake_configs(&context).unwrap_err().0, 503, "a post-commit refresh requires the store too");
+    assert_eq!(
+        crate::social_state::refresh_default_wake_configs(&context)
+            .unwrap_err()
+            .into_http()
+            .0,
+        503,
+        "a post-commit refresh requires the store too"
+    );
     assert_eq!(std::fs::read(path).unwrap(), before, "file-only defaults must never reach the plan");
     assert_eq!(std::fs::read(config_path).unwrap(), file_before, "the refused save keeps the configuration");
 }
@@ -449,7 +456,16 @@ fn restart_preserves_no_action_reset_keywords() {
         plan["noActionCount"] = json!(2);
         plan["triggers"]["keywords"] = json!(["local"]);
         store_group_plan(&context, plan);
-        complete_reserved2_turn(&context, &cfg, "group:101", GROUP_CHAT_TOKEN, Some(1), &json!(0), 0).unwrap();
+        crate::social_state::complete_reserved2_turn(
+            &context,
+            &cfg,
+            "group:101",
+            GROUP_CHAT_TOKEN,
+            Some(1),
+            &json!(0),
+            0,
+        )
+        .unwrap();
         let reset = group_plan(&context);
         assert_eq!(reset["confirmedBy"], "default");
         assert_eq!(reset["triggers"]["keywords"], json!(["local"]));

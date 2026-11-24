@@ -148,9 +148,12 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
         .transpose()?
         .flatten();
     let doc = ConversationState::for_runtime(context).read_document()?;
-    if current_mode_for(context)? != "reserved2" || doc.paused()
-        || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(cfg, &key)
-        || !agent_token_matches_doc(&doc, &key, &token) {
+    if current_mode_for(context)? != "reserved2"
+        || doc.paused()
+        || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
+        || !crate::social_state::inbound_admitted(cfg, &key)
+        || !agent_token_matches_doc(&doc, &key, &token)
+    {
         return Err((403, "wake snapshot invalidated".into()));
     }
     let conv_typed = doc.conversation(&key).unwrap_or_default();
@@ -429,26 +432,9 @@ pub(super) fn error_value(error: (u16, String)) -> (u16, Value) {
     (status, json!({ "ok": false, "error": message }))
 }
 
-/// bridge.js `/^(group|private):(\d+)$/` then `Number(id)`: (kind, id text, id) when valid and positive.
-pub(super) fn parse_key(key: &str) -> Option<(&str, &str, i64)> {
-    let (kind, id_s) = key.split_once(':')?;
-    if (kind != "group" && kind != "private") || id_s.is_empty() || !id_s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let id = id_s.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0)? as i64;
-    Some((kind, id_s, id))
-}
-
-pub(super) const KEY_FORMAT_ERROR: &str = "key 格式应为 group:群号 或 private:QQ号";
-
-/// JS `modeAllowed`: closed-agent serves only the owner's private chat, the other modes the allow-lists.
-pub(super) fn mode_allowed(cfg: &Value, mode: &str, key: &str) -> bool {
-    if mode == "closed-agent" {
-        let owner = cfg.get("ownerQQ").map(social_policy_js_string).unwrap_or_default();
-        return key == format!("private:{owner}");
-    }
-    social_v2_session_allowed(cfg, key)
-}
+pub(super) use crate::social_state::{
+    access_allowed as mode_allowed, parse_key, KEY_FORMAT_ERROR,
+};
 
 // ----- group poke -----------------------------------------------------------------------------------------
 

@@ -34,19 +34,32 @@ fn t186_inbound_gate_admits_listed_and_not_denied_conversations_only() {
         "deny": {"groups": ["420043"]},
         "allowAllWhenEmpty": true
     });
-    assert!(inbound_admitted(&cfg, "group:420042"));
-    assert!(!inbound_admitted(&cfg, "group:420043"), "a denied conversation must be refused even when it is listed");
-    assert!(!inbound_admitted(&cfg, "group:420044"), "an unlisted conversation is refused");
-    assert!(inbound_admitted(&cfg, "private:7001"));
-    assert!(!inbound_admitted(&cfg, "private:7002"));
-    assert!(!inbound_admitted(&cfg, "channel:420042") && !inbound_admitted(&cfg, "group:"), "malformed keys are refused");
+    assert!(crate::social_state::inbound_admitted(&cfg, "group:420042"));
     assert!(
-        !inbound_admitted(&json!({"allow": {"groups": []}, "allowAllWhenEmpty": true}), "group:420042"),
+        !crate::social_state::inbound_admitted(&cfg, "group:420043"),
+        "a denied conversation must be refused even when it is listed"
+    );
+    assert!(
+        !crate::social_state::inbound_admitted(&cfg, "group:420044"),
+        "an unlisted conversation is refused"
+    );
+    assert!(crate::social_state::inbound_admitted(&cfg, "private:7001"));
+    assert!(!crate::social_state::inbound_admitted(&cfg, "private:7002"));
+    assert!(
+        !crate::social_state::inbound_admitted(&cfg, "channel:420042")
+            && !crate::social_state::inbound_admitted(&cfg, "group:"),
+        "malformed keys are refused"
+    );
+    assert!(
+        !crate::social_state::inbound_admitted(
+            &json!({"allow": {"groups": []}, "allowAllWhenEmpty": true}),
+            "group:420042"
+        ),
         "allowAllWhenEmpty never widens the inbound gate"
     );
-    assert_eq!(admitted_ids(&cfg, "group"), ["420042"]);
-    assert_eq!(admitted_ids(&cfg, "private"), ["7001"]);
-    assert!(admitted_ids(&json!({}), "group").is_empty());
+    assert_eq!(crate::social_state::admitted_ids(&cfg, "group"), ["420042"]);
+    assert_eq!(crate::social_state::admitted_ids(&cfg, "private"), ["7001"]);
+    assert!(crate::social_state::admitted_ids(&json!({}), "group").is_empty());
 }
 
 #[test]
@@ -73,7 +86,10 @@ fn t186_admit_writes_both_keys_once_and_reports_the_live_restart() {
     assert_eq!(reply["liveRestart"]["state"], "required", "{reply}");
     assert_eq!(reply["liveRestart"]["serving"], json!([GROUP]));
     assert_eq!(reply["scope"], json!({"notAllowed": [], "notServed": []}), "both keys agree after the action");
-    assert!(inbound_admitted(&context.load_config().unwrap(), "group:420043"), "admitted for the next event");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), "group:420043"),
+        "admitted for the next event"
+    );
     // The change is in the console change history, so it can be undone there.
     let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
     assert_eq!(status, 200, "{recent}");
@@ -126,7 +142,7 @@ fn scope_commits_both_keys_for_the_watchdog_even_if_the_mirror_fails() {
     );
     assert_eq!(file(&root)["rollout"], before["rollout"], "the forced mirror failure leaves the old target on disk");
     let effective = context.load_config().unwrap();
-    assert!(inbound_admitted(&effective, "group:420043"));
+    assert!(crate::social_state::inbound_admitted(&effective, "group:420043"));
     let target = crate::watchdog::live_target_from_config(&effective).unwrap();
     assert_eq!(target.groups, [GROUP, "group:420043"], "the watchdog uses the committed launch order");
 }
@@ -172,7 +188,10 @@ fn t186_remove_revokes_at_once_and_refused_requests_change_nothing() {
         Some("old-scope-token-abcdefghij"),
         "the conversation token is rotated"
     );
-    assert!(!inbound_admitted(&context.load_config().unwrap(), GROUP), "refused for the next event");
+    assert!(
+        !crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "refused for the next event"
+    );
     // A runtime with no rollout in the file or store refuses the scope request.
     let (root, context) = scoped("t186 missing rollout", json!({}));
     let unchanged = std::fs::read(root.0.join("config/config.json")).unwrap();
@@ -212,24 +231,40 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
         "t186 cli wait",
         json!({"allow": {"groups": [420042], "private": []}, "rollout": {"enabled": true, "rustGroups": [GROUP]}}),
     );
+    let tracker = std::sync::Arc::new(crate::social_state::StopTracker::new());
     // A background stop that ends after 300 ms: the CLI entry returns only after it.
-    let stop = access::BackgroundStopForTest::start();
+    let stop = tracker.start_for_test();
     let release = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
         drop(stop);
     });
     let started = std::time::Instant::now();
-    let reply = conversation_scope_change(&context, "group:420043", "admit").expect("the admit applies");
+    let reply = crate::social_state::change_conversation_scope_waiting_with(
+        &context,
+        "group:420043",
+        "admit",
+        std::time::Duration::from_secs(10),
+        &tracker,
+        crate::social_state::default_stopper(),
+    )
+    .expect("the admit applies");
     assert!(started.elapsed() >= std::time::Duration::from_millis(300), "returned before the background stop finished");
     assert!(reply.get("sessionStops").is_none(), "{reply}");
     release.join().unwrap();
     // A stop that outlives the wait is reported, never waited for without end.
-    let stuck = access::BackgroundStopForTest::start();
-    let reply = conversation_scope_change_waiting(&context, "group:420043", "admit", std::time::Duration::from_millis(100))
-        .expect("the admit applies again");
+    let stuck = tracker.start_for_test();
+    let reply = crate::social_state::change_conversation_scope_waiting_with(
+        &context,
+        "group:420043",
+        "admit",
+        std::time::Duration::from_millis(100),
+        &tracker,
+        crate::social_state::default_stopper(),
+    )
+    .expect("the admit applies again");
     assert_eq!(reply["sessionStops"], "unfinished: check the retired sessions' tasks in DSH", "{reply}");
     drop(stuck);
-    assert!(access::wait_background_stops(std::time::Duration::from_secs(10)));
+    assert!(tracker.wait(std::time::Duration::from_secs(10)));
 }
 
 #[test]
@@ -254,13 +289,16 @@ fn t186_concurrent_admits_lose_no_update() {
     let (release_tx, release) = std::sync::mpsc::channel::<()>();
     let release = std::sync::Mutex::new(release);
     let reached = signal_tx.clone();
-    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| {
+    let hook = std::sync::Arc::new(move |key: &str| {
         if key == "group:420051" {
             let _ = reached.send(Signal::Reached);
             // Returns when released, or when the test drops the sender while unwinding.
             let _ = release.lock().unwrap_or_else(|p| p.into_inner()).recv();
         }
-    }));
+    });
+    *crate::social_state::SCOPE_AFTER_READ
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(hook);
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let (first, second, during) = std::thread::scope(|threads| {
         // Owned by this closure, so a panic here drops it and frees the held admit.
@@ -278,7 +316,7 @@ fn t186_concurrent_admits_lose_no_update() {
         let _ = release_tx.send(());
         (first.join().unwrap(), second, during)
     });
-    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *crate::social_state::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let second = second.expect("the first admit ended before it reached the point between its read and its write");
     assert!(second.is_err(), "the second admit must be refused while the first holds the gates: {second:?}");
     assert_eq!(second.unwrap_err().0, 503, "a busy gate refuses with 503");
@@ -292,7 +330,7 @@ fn t186_concurrent_admits_lose_no_update() {
     let config = file(&root);
     assert_eq!(config["allow"]["groups"], json!([420051, 420052]), "no update was lost");
     assert_eq!(config["rollout"]["rustGroups"], json!(["group:420051", "group:420052"]));
-    assert!(inbound_admitted(&context.load_config().unwrap(), "group:420052"));
+    assert!(crate::social_state::inbound_admitted(&context.load_config().unwrap(), "group:420052"));
 }
 
 #[test]
@@ -367,7 +405,10 @@ fn t186_old_spellings_and_large_lists_keep_their_meaning() {
     assert_eq!(config["allow"]["privates"], json!(["7001"]), "the other kind keeps its spelling");
     assert_eq!(config["rollout"]["rustGroups"], json!(["group:100000", GROUP]));
     let effective = context.load_config().unwrap();
-    assert!(inbound_admitted(&effective, "group:100999") && inbound_admitted(&effective, GROUP));
+    assert!(
+        crate::social_state::inbound_admitted(&effective, "group:100999")
+            && crate::social_state::inbound_admitted(&effective, GROUP)
+    );
 }
 
 #[test]

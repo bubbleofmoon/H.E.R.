@@ -29,7 +29,7 @@ pub(super) fn admitted_conversations(cfg: &Value) -> Vec<String> {
     let mut keys: Vec<String> = ["group", "private"]
         .into_iter()
         .flat_map(|kind| {
-            crate::console::admitted_ids(cfg, kind)
+            crate::social_state::admitted_ids(cfg, kind)
                 .into_iter()
                 .filter_map(move |id| crate::settings::canonical_conversation(&format!("{kind}:{id}")))
         })
@@ -63,7 +63,7 @@ fn conversation_reply(conversation: &str, setting: &str, applied: crate::setting
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     legacy_refused(context)?;
     let cfg = loaded_config(context)?;
-    let mode = crate::console::runtime_mode(context);
+    let mode = crate::social_state::mode(context);
     let mut reply = crate::settings::conversation_view(context, &admitted_conversations(&cfg))?;
     if let Some(rows) = reply["conversations"].as_array_mut() {
         for row in rows {
@@ -123,11 +123,13 @@ pub(super) fn switch(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16,
     let (mode, applied, rollback) = {
         let _config = caller.gate()?;
         let cfg = loaded_config(context)?;
-        let mode = crate::console::runtime_mode(context);
-        if !crate::settings::conversation_admitted(&cfg, &key) || !crate::console::access_allowed(&cfg, &mode, &key) {
+        let mode = crate::social_state::mode(context);
+        if !crate::settings::conversation_admitted(&cfg, &key)
+            || !crate::social_state::access_allowed(&cfg, &mode, &key)
+        {
             return Err((409, NOT_ADMITTED_ERROR.into()));
         }
-        if mode == "reserved2" && !crate::console::inbound_admitted(&cfg, &key) {
+        if mode == "reserved2" && !crate::social_state::inbound_admitted(&cfg, &key) {
             return Err((409, NOT_ADMITTED_ERROR.into()));
         }
         if !matches!(mode.as_str(), "chat" | "closed-agent" | "reserved2") {

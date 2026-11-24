@@ -965,7 +965,7 @@ mod tests {
         let endpoint = format!("http://{}", model.local_addr().unwrap());
         let (_root, context) = runtime("harness", &endpoint);
         let cfg = super::test_support::config();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         // An earlier completed turn of this conversation replays a tool result with an image. Before
         // delivery, `model_messages` moves tool images into a user message of their own ("Images from
