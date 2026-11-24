@@ -3740,7 +3740,7 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
     #[test]
     fn crash_between_slang_store_write_and_window_consume_reconciles_idempotently() {
         // Case A: crash after writing slang.json, before consuming slang-windows.json.
-        let (root, context, cfg) = route_fixture("crash-after-store");
+        let (root, context, _cfg) = route_fixture("crash-after-store");
         let state = Mutex::new(WindowState::default());
         let batch = fed_batch(&context, &state);
         let sig = batch_signature("group:retry", &batch);

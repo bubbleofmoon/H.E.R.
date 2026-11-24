@@ -428,24 +428,23 @@ async fn run_walk_failure_async(
     mut request: WalkRequest,
     cancel: &mut Cancellation,
 ) -> Result<String, JobFailure> {
-    let fallback_model = || {
-        request
-            .route
+    let fallback_model = |route: &ModelRoute| {
+        route
             .routes
-            .get(request.route.start)
-            .or_else(|| request.route.routes.first())
+            .get(route.start)
+            .or_else(|| route.routes.first())
             .map_or_else(|| "unspecified".to_string(), |r| r.model.clone())
     };
     if cancel.is_cancelled() {
         return Err(JobFailure {
             failure: Failure::new("cancelled", "cancelled"),
-            model: fallback_model(),
+            model: fallback_model(&request.route),
         });
     }
     if request.policy.use_failover_memory {
         routes::select_start(&request.context, &mut request.route, &request.key, "");
     }
-    let default_model = fallback_model();
+    let default_model = fallback_model(&request.route);
     let max_steps = if request.policy.allow_retries {
         usize::MAX
     } else {
