@@ -7,9 +7,10 @@ use super::{
 use crate::runtime::RuntimeContext;
 use crate::settings::{
     check_store_schema, has_endpoint_credentials, has_stored_setting, inspect_store,
-    migrate_store_v2, open_store_for_write, record_setting_change, restore_gate,
-    store_schema_version, stored_setting_row, StoreInspection, ADMINISTRATOR_PASSWORD,
-    LEGACY_ERROR, STORAGE_ERROR, STORE_SIDECARS,
+    migrate_store_v2, open_store_for_write, read_store, record_setting_change, restore_gate,
+    schema_version_checked, store_schema_version, stored_setting_row, stored_setting_row_checked,
+    InspectError, StoreInspection, ADMINISTRATOR_PASSWORD, LEGACY_ERROR, STORAGE_ERROR,
+    STORE_SIDECARS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -75,35 +76,40 @@ fn storage_error(_: rusqlite::Error) -> String {
     STORAGE_ERROR.to_string()
 }
 
+fn administrator_password_checked(
+    conn: &Connection,
+) -> Result<Option<AdministratorPasswordHash>, InspectError> {
+    let Some((text, _)) = stored_setting_row_checked(conn, ADMINISTRATOR_PASSWORD.key)? else {
+        return Ok(None);
+    };
+    let phc: String = serde_json::from_str(&text)
+        .map_err(|_| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))?;
+    AdministratorPasswordHash::parse(&phc)
+        .map(Some)
+        .ok_or_else(|| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))
+}
+
 pub(super) fn administrator_password_in(
     conn: &Connection,
 ) -> Result<Option<AdministratorPasswordHash>, String> {
-    let Some((text, _)) =
-        stored_setting_row(conn, ADMINISTRATOR_PASSWORD.key).map_err(|(_, error)| error)?
-    else {
-        return Ok(None);
-    };
-    let phc: String = serde_json::from_str(&text).map_err(|_| PASSWORD_UNAVAILABLE.to_string())?;
-    AdministratorPasswordHash::parse(&phc)
-        .map(Some)
-        .ok_or_else(|| PASSWORD_UNAVAILABLE.to_string())
+    administrator_password_checked(conn).map_err(InspectError::into_message)
 }
 
 pub(crate) fn administrator_password_is_set(context: &RuntimeContext) -> Result<bool, String> {
-    let StoreInspection::Ready(conn) = inspect_store(context)? else {
-        return Ok(false);
-    };
-    administrator_password_in(&conn).map(|hash| hash.is_some())
+    read_store(context, |conn| match conn {
+        None => Ok(false),
+        Some(conn) => Ok(administrator_password_checked(conn)?.is_some()),
+    })
 }
 
 #[cfg(test)]
 fn administrator_password(
     context: &RuntimeContext,
 ) -> Result<Option<AdministratorPasswordHash>, String> {
-    let StoreInspection::Ready(conn) = inspect_store(context)? else {
-        return Ok(None);
-    };
-    administrator_password_in(&conn)
+    read_store(context, |conn| match conn {
+        None => Ok(None),
+        Some(conn) => administrator_password_checked(conn),
+    })
 }
 
 /// Run within the credential writer's immediate transaction, including any required v2 migration.
@@ -413,7 +419,7 @@ pub(crate) fn revoke_browser_sessions(context: &RuntimeContext) -> Result<(), (u
     Ok(())
 }
 
-fn browser_clock_state(conn: &Connection) -> Result<(Generation, i64), String> {
+fn browser_clock_state_checked(conn: &Connection) -> Result<(Generation, i64), InspectError> {
     let (generation, failures, deadline, mark): (Vec<u8>, i64, i64, i64) = conn
         .query_row(
             "SELECT auth_generation,consecutive_failures,deadline_ms,clock_high_water_ms
@@ -421,14 +427,18 @@ fn browser_clock_state(conn: &Connection) -> Result<(Generation, i64), String> {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .map_err(storage_error)?;
+        .map_err(InspectError::from_sqlite)?;
     let generation: Generation = generation
         .try_into()
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
     if failures < 0 || deadline < 0 || mark < 0 {
-        return Err(STORAGE_ERROR.to_string());
+        return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
     }
     Ok((generation, mark))
+}
+
+fn browser_clock_state(conn: &Connection) -> Result<(Generation, i64), String> {
+    browser_clock_state_checked(conn).map_err(InspectError::into_message)
 }
 
 /// The clock transition commits even if there is no valid authority in the request.
@@ -707,8 +717,8 @@ fn ensure_restore_generation(context: &RuntimeContext) -> Result<Generation, (u1
     }
 }
 
-fn read_throttle_state(conn: &Connection) -> Result<(i64, i64), String> {
-    if store_schema_version(conn)? != 3 || !auth_rows_exist(conn, "console_auth_state")? {
+fn read_throttle_state_checked(conn: &Connection) -> Result<(i64, i64), InspectError> {
+    if schema_version_checked(conn)? != 3 || !auth_rows_exist_checked(conn, "console_auth_state")? {
         return Ok((0, 0));
     }
     let (failures, deadline, mark): (i64, i64, i64) = conn
@@ -718,11 +728,15 @@ fn read_throttle_state(conn: &Connection) -> Result<(i64, i64), String> {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(storage_error)?;
+        .map_err(InspectError::from_sqlite)?;
     if failures < 0 || deadline < 0 || mark < 0 {
-        return Err(STORAGE_ERROR.to_string());
+        return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
     }
     Ok((failures, deadline))
+}
+
+fn read_throttle_state(conn: &Connection) -> Result<(i64, i64), String> {
+    read_throttle_state_checked(conn).map_err(InspectError::into_message)
 }
 
 fn remaining_wait_ms(deadline: i64, now: i64) -> i64 {
@@ -756,17 +770,15 @@ pub(crate) fn auth_status(context: &RuntimeContext) -> Result<AuthStatusSnapshot
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let StoreInspection::Ready(conn) = inspect_store(context).map_err(unavailable)? else {
-        return Ok(AuthStatusSnapshot {
-            password_set: false,
-            retry_after_ms: 0,
-            consecutive_failures: 0,
-        });
-    };
-    let password_set = administrator_password_in(&conn)
-        .map_err(unavailable)?
-        .is_some();
-    let (consecutive_failures, deadline) = read_throttle_state(&conn).map_err(unavailable)?;
+    let (password_set, consecutive_failures, deadline) = read_store(context, |conn| {
+        let Some(conn) = conn else {
+            return Ok((false, 0, 0));
+        };
+        let password_set = administrator_password_checked(conn)?.is_some();
+        let (consecutive_failures, deadline) = read_throttle_state_checked(conn)?;
+        Ok((password_set, consecutive_failures, deadline))
+    })
+    .map_err(unavailable)?;
     let retry_after_ms = remaining_wait_ms(deadline, crate::parity_clock::now_ms());
     Ok(AuthStatusSnapshot {
         password_set,
@@ -782,15 +794,27 @@ pub(super) fn load_login_challenge(
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let StoreInspection::Ready(conn) = inspect_store(context).map_err(unavailable)? else {
-        return Ok(LoginChallenge::NotSet);
-    };
-    let Some(hash) = administrator_password_in(&conn).map_err(unavailable)? else {
+    let (hash, throttle) = read_store(context, |conn| {
+        let Some(conn) = conn else {
+            return Ok((None, (0, 0)));
+        };
+        let Some(hash) = administrator_password_checked(conn)? else {
+            return Ok((None, (0, 0)));
+        };
+        let throttle = if honor_throttle {
+            read_throttle_state_checked(conn)?
+        } else {
+            (0, 0)
+        };
+        Ok((Some(hash), throttle))
+    })
+    .map_err(unavailable)?;
+    let Some(hash) = hash else {
         return Ok(LoginChallenge::NotSet);
     };
     if honor_throttle {
         let now = crate::parity_clock::now_ms();
-        let (consecutive_failures, deadline) = read_throttle_state(&conn).map_err(unavailable)?;
+        let (consecutive_failures, deadline) = throttle;
         let retry_after_ms = remaining_wait_ms(deadline, now);
         if retry_after_ms > 0 {
             return Ok(LoginChallenge::Throttled {
@@ -1054,52 +1078,56 @@ pub(super) fn list_browser_sessions_raw(
     let Some(restore) = restore_generation(context).map_err(unavailable)? else {
         return Ok(Vec::new());
     };
-    let StoreInspection::Ready(conn) = inspect_store(context).map_err(unavailable)? else {
-        return Ok(Vec::new());
-    };
-    if store_schema_version(&conn).map_err(unavailable)? != 3
-        || !auth_rows_exist(&conn, "console_auth_state").map_err(unavailable)?
-    {
-        return Ok(Vec::new());
-    }
-    let (auth, mark) = browser_clock_state(&conn).map_err(unavailable)?;
     let now = crate::parity_clock::now_ms();
     if now < 0 {
         return Err(unavailable(STORAGE_ERROR.to_string()));
     }
-    if now < mark.saturating_sub(60_000) {
-        return Ok(Vec::new());
-    }
-    let expiry_clock = now.max(mark);
-    let mut stmt = conn
-        .prepare(
-            "SELECT id_digest, origin, token_digest, auth_generation, restore_generation,
-                    created_ms, last_used_ms, expires_ms
-             FROM console_browser_sessions
-             ORDER BY last_used_ms DESC, issued_seq DESC",
-        )
-        .map_err(storage_error)
-        .map_err(unavailable)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        })
-        .map_err(storage_error)
-        .map_err(unavailable)?;
-    let mut views = Vec::new();
-    for entry in rows {
-        let Ok((id_raw, origin, tok_raw, auth_raw, res_raw, created, last, expires)) = entry else {
-            continue;
+    let Some((auth, mark, rows)) = read_store(context, |conn| {
+        let Some(conn) = conn else {
+            return Ok(None);
         };
+        if schema_version_checked(conn)? != 3
+            || !auth_rows_exist_checked(conn, "console_auth_state")?
+        {
+            return Ok(None);
+        }
+        let (auth, mark) = browser_clock_state_checked(conn)?;
+        if now < mark.saturating_sub(60_000) {
+            return Ok(None);
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id_digest, origin, token_digest, auth_generation, restore_generation,
+                        created_ms, last_used_ms, expires_ms
+                 FROM console_browser_sessions
+                 ORDER BY last_used_ms DESC, issued_seq DESC",
+            )
+            .map_err(InspectError::from_sqlite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(InspectError::from_sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(InspectError::from_sqlite)?;
+        Ok(Some((auth, mark, rows)))
+    })
+    .map_err(unavailable)?
+    else {
+        return Ok(Vec::new());
+    };
+    let expiry_clock = now.max(mark);
+    let mut views = Vec::new();
+    for (id_raw, origin, tok_raw, auth_raw, res_raw, created, last, expires) in rows {
         let (Ok(id_digest), Ok(tok), Ok(row_auth), Ok(row_restore)) = (
             Generation::try_from(id_raw),
             Generation::try_from(tok_raw),
@@ -1233,11 +1261,17 @@ fn archive_schema(conn: &Connection) -> Result<i64, String> {
     store_schema_version(conn)
 }
 
+fn auth_rows_exist_checked(conn: &Connection, table: &str) -> Result<bool, InspectError> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(InspectError::from_sqlite)
+}
+
 fn auth_rows_exist(conn: &Connection, table: &str) -> Result<bool, String> {
-    conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |row| {
-        row.get(0)
-    })
-    .map_err(storage_error)
+    auth_rows_exist_checked(conn, table).map_err(InspectError::into_message)
 }
 
 pub(crate) fn archive_credentials(conn: &Connection) -> Result<ArchivedCredentials, String> {

@@ -95,11 +95,12 @@ pub(crate) use store::{
     history, holds_any, import_engine_choices, inspect_store, keep_file_members,
     keep_registry_values, last_good_text, migrate_store_v2, mirror_into, open_store_for_write,
     overlay, overlay_checked, overlay_values, place_changes, preview, read_archive_values,
-    record_setting_change, registry_free, reset, reset_conversation, resolve_config,
-    resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value,
-    security_restore, store_mark, store_path, store_schema_version, stored_secrets,
-    stored_setting_row, undo, view, write_back, Applied, Change, StoreInspection,
-    CONVERSATION_ERROR, LEGACY_ERROR, STORAGE_ERROR, STORE_SIDECARS,
+    read_store, record_setting_change, registry_free, reset, reset_conversation, resolve_config,
+    resolve_live_batch, restore_gate, restore_switch_choice, schema_version_checked,
+    secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
+    stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
+    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, LEGACY_ERROR,
+    STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

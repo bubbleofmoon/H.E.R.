@@ -1184,3 +1184,66 @@ fn console_auth_backup_cancellation_within_scrub_publishes_nothing() {
     assert_eq!(fs::read(store.path()).unwrap(), before);
     assert!(fs::read_dir(backups).unwrap().next().is_none(), "cancelled staging is removed");
 }
+
+#[test]
+fn restore_settings_preview_retries_sidecars_during_concurrent_writes_without_blocking_on_gate() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let f = Fixture::new();
+    set_quiet(&f, 1000);
+    let archive = f.backup();
+
+    // Holding the store gate never blocks restore preview.
+    let gate = f
+        .context()
+        .open_locked_file(RuntimeArea::Data, "locks/settings-store.lock")
+        .unwrap();
+    let started = Instant::now();
+    let gated_plan = preview(&f.context(), &archive, false).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "restore preview blocked on held store gate ({:?})",
+        started.elapsed()
+    );
+    assert!(gated_plan["replaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "data/settings.db"));
+    drop(gate);
+
+    let barrier = std::sync::Barrier::new(2);
+    let stop = AtomicBool::new(false);
+    let mut previews = 0usize;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            let context = f.context();
+            for value in 1001..=1030 {
+                crate::settings::apply(
+                    &context,
+                    "reply.wakeQuietMs",
+                    &json!(value),
+                    "administrator",
+                    "console",
+                )
+                .unwrap();
+            }
+            stop.store(true, SeqCst);
+        });
+        barrier.wait();
+        let context = f.context();
+        while !stop.load(SeqCst) || previews < 5 {
+            let plan = preview(&context, &archive, false).unwrap();
+            assert!(
+                plan["replaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "data/settings.db"),
+                "full preview missed settings.db: {plan}"
+            );
+            previews += 1;
+        }
+    });
+    assert!(previews >= 5);
+}

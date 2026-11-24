@@ -547,16 +547,79 @@ impl RuntimeContext {
         resolve_contained_path(root, base, relative, intent)
     }
 
-    pub fn read_file(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, &'static str> {
-        let path = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+    fn resolve_read_path_once(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        intent: PathIntent,
+    ) -> Result<PathBuf, ReadAttemptError> {
+        let map_err = |error: String| {
+            if transient_read_resolve(cfg!(windows), &error) {
+                ReadAttemptError::Retry
+            } else {
+                ReadAttemptError::Fatal("runtime path is unavailable")
+            }
+        };
+        let path = self.resolve_path_detailed(area, relative, intent).map_err(map_err)?;
         // Re-resolve immediately before opening to catch a replaced parent/leaf between a prior
         // authorization check and this read. The std filesystem API cannot pin every ancestor
         // handle across Windows junction replacement, so callers still need a trusted runtime root.
-        let checked = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+        let checked = self.resolve_path_detailed(area, relative, intent).map_err(map_err)?;
         if checked != path {
-            return Err("runtime path is unavailable");
+            return Err(ReadAttemptError::Fatal("runtime path is unavailable"));
         }
-        fs::read(path).map_err(|_| "runtime path is unavailable")
+        Ok(path)
+    }
+
+    fn read_bytes_once(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        optional: bool,
+    ) -> Result<Option<Vec<u8>>, ReadAttemptError> {
+        let intent = if optional { PathIntent::ReadOptionalFile } else { PathIntent::ReadFile };
+        let path = self.resolve_read_path_once(area, relative, intent)?;
+        if optional {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if transient_read_io(cfg!(windows), &error) => {
+                    return Err(ReadAttemptError::Retry);
+                }
+                Err(_) => return Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+                Ok(metadata) if !is_link(&metadata) && metadata.is_file() => {}
+                Ok(_) => return Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+            }
+        }
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if transient_read_io(cfg!(windows), &error) => Err(ReadAttemptError::Retry),
+            Err(_) => Err(ReadAttemptError::Fatal("runtime path is unavailable")),
+        }
+    }
+
+    fn read_bytes_retrying(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        optional: bool,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let deadline = std::time::Instant::now() + READ_CONFLICT_WAIT;
+        loop {
+            match self.read_bytes_once(area, relative, optional) {
+                Ok(bytes) => return Ok(bytes),
+                Err(ReadAttemptError::Retry) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(ReadAttemptError::Retry) => return Err("runtime path is unavailable"),
+                Err(ReadAttemptError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    pub fn read_file(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, &'static str> {
+        self.read_bytes_retrying(area, relative, false)?
+            .ok_or("runtime path is unavailable")
     }
 
     pub fn read_text(&self, area: RuntimeArea, relative: &str) -> Result<String, &'static str> {
@@ -574,18 +637,9 @@ impl RuntimeContext {
         if !self.is_isolated() {
             return Err("optional runtime reads require an isolated context");
         }
-        let path = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
-        let checked = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
-        if checked != path {
-            return Err("runtime path is unavailable");
-        }
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => self
-                .read_text(area, relative)
-                .map(Some),
-            _ => Err("runtime path is unavailable"),
-        }
+        self.read_bytes_retrying(area, relative, true)?
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid"))
+            .transpose()
     }
 
     /// `read_optional_text` for a caller that holds no lock, gate or chain and can afford to wait: on
@@ -3125,6 +3179,63 @@ pub(crate) mod tests {
         assert_eq!(error, "runtime destination already exists");
         cleanup(&root);
     }
+
+    #[test]
+    fn windows_read_conflict_policy_never_retries_missing_or_policy_failures() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let sharing = std::io::Error::from_raw_os_error(32);
+        assert!(transient_read_io(true, &denied));
+        assert!(transient_read_io(true, &sharing));
+        assert!(!transient_read_io(true, &missing));
+        assert!(!transient_read_io(false, &denied));
+        assert!(!transient_read_io(false, &sharing));
+
+        assert!(transient_read_resolve(
+            true,
+            "class=leaf/metadata kind=PermissionDenied os=Some(5)"
+        ));
+        assert!(transient_read_resolve(
+            true,
+            "class=path/canonicalize kind=Uncategorized os=Some(32)"
+        ));
+        assert!(!transient_read_resolve(
+            true,
+            "class=leaf/metadata kind=NotFound os=Some(2)"
+        ));
+        assert!(!transient_read_resolve(true, "runtime path policy rejected class=path"));
+        assert!(!transient_read_resolve(
+            true,
+            "runtime path has non-file leaf or non-directory parent"
+        ));
+        assert!(!transient_read_resolve(
+            false,
+            "class=leaf/metadata kind=PermissionDenied os=Some(5)"
+        ));
+    }
+}
+
+enum ReadAttemptError {
+    Retry,
+    Fatal(&'static str),
+}
+
+const READ_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn transient_read_io(windows: bool, error: &std::io::Error) -> bool {
+    windows
+        && (error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33)))
+}
+
+fn transient_read_resolve(windows: bool, error: &str) -> bool {
+    windows
+        && (error.starts_with("class=leaf/metadata ")
+            || error.starts_with("class=path/canonicalize "))
+        && (error.contains("kind=PermissionDenied")
+            || error.contains("os=Some(5)")
+            || error.contains("os=Some(32)")
+            || error.contains("os=Some(33)"))
 }
 
 fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {
