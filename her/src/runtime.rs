@@ -1012,7 +1012,7 @@ impl RuntimeContext {
         self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
         let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db"
             | crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
-            | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE))
+            | crate::console_auth::ROTATION_FILE | crate::console_auth::DESKTOP_GRANTS_FILE))
             || (area == RuntimeArea::Data && relative.starts_with("console-restore-recovery/"))
         {
             crate::guarded_fs::stage_protected_file(

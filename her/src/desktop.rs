@@ -722,7 +722,7 @@ mod windows {
                     }
                     let epoch = format!("{:x}", Sha256::digest(credential.as_bytes()));
                     if restart {
-                        let result = crate::console::generate_console_token().and_then(|id| {
+                        let result = crate::console_auth::generate_console_token().and_then(|id| {
                             request(
                                 port,
                                 &credential,

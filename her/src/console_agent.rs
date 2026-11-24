@@ -393,24 +393,6 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
     None
 }
 
-/// Routes that follow the standard social-v2 policy for agent tokens (handlers do the per-key checks).
-pub(super) fn is_agent_policy_route(req: &Request) -> bool {
-    matches!(
-        (req.method.as_str(), req.path.as_str()),
-        ("POST", "/api/socialV2/mark-read")
-            | ("POST", "/api/socialV2/wake-config")
-            | ("POST", "/api/socialV2/wait")
-            | ("POST", "/api/socialV2/send-burst")
-            | ("POST", "/api/socialV2/send-poke")
-            | ("POST", "/api/socialV2/feedback")
-            | ("GET", "/api/socialV2/message-detail")
-    )
-}
-
-pub(super) fn is_send_route(req: &Request) -> bool {
-    req.method == "POST" && matches!(req.path.as_str(), "/api/send/group" | "/api/send/private" | "/api/send/reply")
-}
-
 // ----- JS helpers ------------------------------------------------------------------------------------------
 
 /// `String(value ?? '').trim()` for an optional body member.

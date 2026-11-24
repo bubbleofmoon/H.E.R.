@@ -1,5 +1,5 @@
-//! Unified HTTP console front: canonical route table, host/cross-site validation, credential admission,
-//! desktop sign-in and verified caller authority (`AdminCaller`, `VerifiedCaller`).
+//! Unified HTTP console front: declarative route-policy table, host/cross-site validation,
+//! credential admission, desktop sign-in, auth HTTP adapters, and verified caller authority.
 
 use super::*;
 
@@ -7,85 +7,843 @@ use super::*;
 pub(crate) enum AgentPolicy {
     AgentAllowed,
     AdminOnly(&'static str),
+    PendingAdminOnly,
+    V1StickerAdmin,
+    V2AdminOnly,
+    V2AgentAllowed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyPreflight {
     None,
     SessionKey,
+    SessionKeyDeferAgentHeader,
+    SessionKeyDeferMemoryAgent,
+    SessionKeyDeferAlways,
+    SessionKeyDeferIsolated,
     SessionKeyOrClosedOwnerReset,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyLimit {
+    None,
+    Max1Mb,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionCookiePolicy {
+    Renew,
+    NoRenew,
+    DeleteOnSuccess,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoutePolicy {
+    pub(crate) isolated_supported: bool,
     pub(crate) public_probe: bool,
     pub(crate) agent: AgentPolicy,
     pub(crate) key_preflight: KeyPreflight,
+    pub(crate) body_limit: BodyLimit,
+    pub(crate) session_cookie: SessionCookiePolicy,
 }
 
 impl RoutePolicy {
-    const fn admin(error: &'static str) -> Self {
+    const fn public_probe() -> Self {
         Self {
-            public_probe: false,
-            agent: AgentPolicy::AdminOnly(error),
+            isolated_supported: true,
+            public_probe: true,
+            agent: AgentPolicy::AgentAllowed,
             key_preflight: KeyPreflight::None,
+            body_limit: BodyLimit::None,
+            session_cookie: SessionCookiePolicy::NoRenew,
         }
     }
 
-    const fn auth() -> Self {
+    const fn admin(error: &'static str) -> Self {
         Self {
+            isolated_supported: true,
             public_probe: false,
-            agent: AgentPolicy::AdminOnly("agent credential cannot access console authentication"),
+            agent: AgentPolicy::AdminOnly(error),
             key_preflight: KeyPreflight::None,
+            body_limit: BodyLimit::None,
+            session_cookie: SessionCookiePolicy::Renew,
+        }
+    }
+
+    const fn admin_bounded(error: &'static str) -> Self {
+        Self {
+            body_limit: BodyLimit::Max1Mb,
+            ..Self::admin(error)
+        }
+    }
+
+    const fn auth(method: &str, session_cookie: SessionCookiePolicy) -> Self {
+        let body_limit = if matches!(method, "POST") {
+            BodyLimit::Max1Mb
+        } else {
+            BodyLimit::None
+        };
+        Self {
+            body_limit,
+            session_cookie,
+            ..Self::admin("agent credential cannot access console authentication")
         }
     }
 
     const fn console_or_agent(key_preflight: KeyPreflight) -> Self {
         Self {
+            isolated_supported: true,
             public_probe: false,
             agent: AgentPolicy::AgentAllowed,
             key_preflight,
+            body_limit: BodyLimit::None,
+            session_cookie: SessionCookiePolicy::Renew,
+        }
+    }
+
+    const fn v2_agent(key_preflight: KeyPreflight) -> Self {
+        Self {
+            agent: AgentPolicy::V2AgentAllowed,
+            ..Self::console_or_agent(key_preflight)
+        }
+    }
+
+    const fn with_body(self, body_limit: BodyLimit) -> Self {
+        Self { body_limit, ..self }
+    }
+
+    const fn with_cookie(self, session_cookie: SessionCookiePolicy) -> Self {
+        Self {
+            session_cookie,
+            ..self
+        }
+    }
+
+    const fn with_agent(self, agent: AgentPolicy) -> Self {
+        Self { agent, ..self }
+    }
+
+    const fn isolated_only(self, isolated_supported: bool) -> Self {
+        Self {
+            isolated_supported,
+            ..self
         }
     }
 }
 
+const DESKTOP_ERR: &str = "desktop sign-in requires the installing user";
+const QQ_LOGIN_ERR: &str = "QQ login state is restricted to administrators";
+const RESTART_ERR: &str = "restart is restricted to administrators";
+const DEPS_ERR: &str = "dependency upgrades are restricted to administrators";
+const RELEASES_ERR: &str = "release settings are restricted to administrators";
+const BACKUPS_ERR: &str = "backup settings are restricted to administrators";
+const SCOPE_ERR: &str = "该接口仅控制台可用";
+
+const EXACT_ROUTES: &[(&str, &str, RoutePolicy)] = &[
+    // Public probes (unauthenticated health & icons per ADR 0003).
+    ("GET", "/api/health", RoutePolicy::public_probe()),
+    ("GET", "/favicon.ico", RoutePolicy::public_probe()),
+    ("GET", "/apple-touch-icon.png", RoutePolicy::public_probe()),
+    // Desktop sign-in & console authentication.
+    (
+        "POST",
+        "/api/desktop/sign-in",
+        RoutePolicy::admin(DESKTOP_ERR).with_cookie(SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "GET",
+        "/api/auth/status",
+        RoutePolicy::auth("GET", SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "GET",
+        "/api/auth/sessions",
+        RoutePolicy::auth("GET", SessionCookiePolicy::Renew),
+    ),
+    (
+        "POST",
+        "/api/auth/first-run",
+        RoutePolicy::auth("POST", SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "POST",
+        "/api/auth/login",
+        RoutePolicy::auth("POST", SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "POST",
+        "/api/auth/logout",
+        RoutePolicy::auth("POST", SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "POST",
+        "/api/auth/change-password",
+        RoutePolicy::auth("POST", SessionCookiePolicy::NoRenew),
+    ),
+    (
+        "POST",
+        "/api/auth/sessions/revoke",
+        RoutePolicy::auth("POST", SessionCookiePolicy::NoRenew),
+    ),
+    // Administrator-only system routes.
+    ("GET", "/api/qq/login", RoutePolicy::admin(QQ_LOGIN_ERR)),
+    ("POST", "/api/restart", RoutePolicy::admin_bounded(RESTART_ERR)),
+    ("GET", "/api/dependencies", RoutePolicy::admin(DEPS_ERR)),
+    (
+        "POST",
+        "/api/dependencies/check",
+        RoutePolicy::admin_bounded(DEPS_ERR),
+    ),
+    (
+        "POST",
+        "/api/dependencies/approve",
+        RoutePolicy::admin_bounded(DEPS_ERR),
+    ),
+    ("GET", "/api/releases", RoutePolicy::admin(RELEASES_ERR)),
+    (
+        "GET",
+        "/api/releases/settings",
+        RoutePolicy::admin(RELEASES_ERR),
+    ),
+    (
+        "POST",
+        "/api/releases/settings",
+        RoutePolicy::admin_bounded(RELEASES_ERR),
+    ),
+    (
+        "POST",
+        "/api/releases/approve",
+        RoutePolicy::admin_bounded(RELEASES_ERR),
+    ),
+    ("GET", "/api/backups/settings", RoutePolicy::admin(BACKUPS_ERR)),
+    ("GET", "/api/backups", RoutePolicy::admin(BACKUPS_ERR)),
+    (
+        "POST",
+        "/api/backups/settings",
+        RoutePolicy::admin_bounded(BACKUPS_ERR),
+    ),
+    (
+        "POST",
+        "/api/backups/restore/preview",
+        RoutePolicy::admin_bounded(BACKUPS_ERR),
+    ),
+    (
+        "POST",
+        "/api/backups/restore",
+        RoutePolicy::admin_bounded(BACKUPS_ERR),
+    ),
+    ("POST", "/api/conversations/scope", RoutePolicy::admin(SCOPE_ERR)),
+    // Memory archive/history.
+    (
+        "POST",
+        "/api/memory/archive",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferMemoryAgent),
+    ),
+    (
+        "POST",
+        "/api/memory/history",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferMemoryAgent),
+    ),
+    // Session reset & machine token rotation.
+    (
+        "POST",
+        "/api/session/reset",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyOrClosedOwnerReset),
+    ),
+    (
+        "POST",
+        "/api/console/token",
+        RoutePolicy::console_or_agent(KeyPreflight::None)
+            .with_cookie(SessionCookiePolicy::DeleteOnSuccess),
+    ),
+    // Pending & tool-log admin-only surfaces with agent-token semantics.
+    (
+        "GET",
+        "/api/pending",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::PendingAdminOnly),
+    ),
+    (
+        "GET",
+        "/api/socialV2/tool-log",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    (
+        "POST",
+        "/api/socialV2/tool-log/clear",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    // V2 admin-only social routes (defer query key preflight when x-agent-token is present).
+    (
+        "GET",
+        "/api/socialV2/config",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    (
+        "POST",
+        "/api/socialV2/config",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    (
+        "GET",
+        "/api/socialV2/activity",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    (
+        "POST",
+        "/api/socialV2/activity",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    (
+        "GET",
+        "/api/socialV2/states",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_agent(AgentPolicy::V2AdminOnly),
+    ),
+    // V1 sticker administration.
+    (
+        "GET",
+        "/api/stickers",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V1StickerAdmin),
+    ),
+    (
+        "POST",
+        "/api/stickers/note",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V1StickerAdmin),
+    ),
+    (
+        "POST",
+        "/api/stickers/sync",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V1StickerAdmin),
+    ),
+    (
+        "POST",
+        "/api/stickers/remark",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_agent(AgentPolicy::V1StickerAdmin),
+    ),
+    // Social V2 agent-allowed routes (global V2 gates + agent-header key deferral).
+    (
+        "POST",
+        "/api/socialV2/send-message",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+            .with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/socialV2/mark-read",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/wake-config",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/wait",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/send-burst",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/send-poke",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/feedback",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/message-detail",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/memory",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/memory-append",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/memory-update",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/memory-remove",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/memory-clear",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/state",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/unread",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/prompt",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/slang/query",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/slang/submit",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/recent",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/my-recent",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/active-members",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/self-image",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/images/message",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/forward-message",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/forward-media",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/sticker-list",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/sticker-list",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "GET",
+        "/api/socialV2/sticker-image",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/sticker-note",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/sticker-remark",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/send-sticker",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    (
+        "POST",
+        "/api/socialV2/collect-sticker",
+        RoutePolicy::v2_agent(KeyPreflight::SessionKeyDeferAgentHeader),
+    ),
+    // Handler-deferred key preflight routes.
+    (
+        "POST",
+        "/api/send/group",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAlways),
+    ),
+    (
+        "POST",
+        "/api/send/private",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAlways),
+    ),
+    (
+        "POST",
+        "/api/send/reply",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAlways),
+    ),
+    (
+        "POST",
+        "/api/socialV2/wake",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferIsolated),
+    ),
+    (
+        "POST",
+        "/api/authorize/read",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferIsolated),
+    ),
+    // Remaining SessionKey routes.
+    (
+        "GET",
+        "/api/social",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/social",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/social/state",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/social/flush",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/socialV2/send-voice",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/voice/send",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/send/voice",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/socialV2/reset",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/socialV2/wake-snapshot",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/socialV2/initial-prompt",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/socialV2/initial-prompt",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/socialV2/feedback",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/socialV2/feedback-clear",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/inbound/gaps",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/inbound/gaps/retry",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/socialV2/send-outbox",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/sessions",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/turns",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/turns/resolve",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/model-chain",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/voice/list",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/socialV2/voices",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "GET",
+        "/api/tokens/turns",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/session-models",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    (
+        "POST",
+        "/api/slang/extract",
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKey),
+    ),
+    // Role management POST routes (1 MB bounded JSON).
+    (
+        "POST",
+        "/api/roles/create",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/roles/update",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/roles/rename",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/roles/delete",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/roles/limit",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/role",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    (
+        "POST",
+        "/api/role-mode",
+        RoutePolicy::console_or_agent(KeyPreflight::None).with_body(BodyLimit::Max1Mb),
+    ),
+    // Remaining KeyPreflight::None console-or-agent routes.
+    (
+        "POST",
+        "/api/mode",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/status",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/whitelist",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/security",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/audit/recent",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/whitelist",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/security",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/audit/undo",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/session-models",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/roles",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/roles/content",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/presets",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/preset/sim-prompt",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/preset/sim-prompt/backups",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/preset/sim-prompt",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/preset/sim-prompt/restore",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/tokens/by-provider",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/usage/attribution",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/tokens/summary",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/tokens/series",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/tokens/recent",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/slang",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "GET",
+        "/api/recovery-record",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/clear",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/config",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/batch-delete",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/batch-confirm",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/batch-reject",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+    (
+        "POST",
+        "/api/slang/research",
+        RoutePolicy::console_or_agent(KeyPreflight::None),
+    ),
+];
+
 pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
-    if matches!(
-        (method, path),
-        (
-            "GET",
-            "/api/health" | "/favicon.ico" | "/apple-touch-icon.png"
-        )
-    ) {
-        return Some(RoutePolicy {
-            public_probe: true,
-            agent: AgentPolicy::AgentAllowed,
-            key_preflight: KeyPreflight::None,
-        });
-    }
-    if (method, path) == ("POST", "/api/desktop/sign-in") {
-        return Some(RoutePolicy::admin(
-            "desktop sign-in requires the installing user",
-        ));
-    }
-    if matches!(
-        (method, path),
-        ("GET", "/api/auth/status" | "/api/auth/sessions")
-            | (
-                "POST",
-                "/api/auth/first-run"
-                    | "/api/auth/login"
-                    | "/api/auth/logout"
-                    | "/api/auth/change-password"
-                    | "/api/auth/sessions/revoke"
-            )
-    ) {
-        return Some(RoutePolicy::auth());
+    if let Some((_, _, policy)) = EXACT_ROUTES
+        .iter()
+        .find(|(m, p, _)| *m == method && *p == path)
+    {
+        return Some(*policy);
     }
     if matches!(method, "GET" | "POST") && crate::console_settings::is_route(path) {
-        return Some(RoutePolicy::admin(
-            "settings routes are restricted to administrators",
-        ));
+        let body_limit = if method == "POST" && path.starts_with("/api/settings/") {
+            BodyLimit::Max1Mb
+        } else {
+            BodyLimit::None
+        };
+        return Some(
+            RoutePolicy::admin("settings routes are restricted to administrators")
+                .with_body(body_limit),
+        );
     }
     if matches!(method, "GET" | "POST")
         && (path == "/api/personas" || path.starts_with("/api/personas/"))
@@ -97,16 +855,28 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
     if matches!(method, "GET" | "POST")
         && (path == "/api/schedule" || path.starts_with("/api/schedule/"))
     {
-        return Some(RoutePolicy::admin(
-            "日程接口仅限管理员控制台，不接受 agent 凭据",
-        ));
+        let body_limit = if method == "POST" {
+            BodyLimit::Max1Mb
+        } else {
+            BodyLimit::None
+        };
+        return Some(
+            RoutePolicy::admin("日程接口仅限管理员控制台，不接受 agent 凭据")
+                .with_body(body_limit),
+        );
     }
     if (method == "GET" && path == "/api/tasks")
         || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
     {
-        return Some(RoutePolicy::admin(
-            "任务接口仅限管理员控制台，不接受 agent 凭据",
-        ));
+        let body_limit = if method == "POST" {
+            BodyLimit::Max1Mb
+        } else {
+            BodyLimit::None
+        };
+        return Some(
+            RoutePolicy::admin("任务接口仅限管理员控制台，不接受 agent 凭据")
+                .with_body(body_limit),
+        );
     }
     if matches!(method, "GET" | "POST")
         && matches!(
@@ -123,7 +893,15 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
             )
         )
     {
-        return Some(RoutePolicy::console_or_agent(KeyPreflight::SessionKey));
+        let body_limit = if path == "/api/memory/acl" {
+            BodyLimit::Max1Mb
+        } else {
+            BodyLimit::None
+        };
+        return Some(
+            RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferMemoryAgent)
+                .with_body(body_limit),
+        );
     }
     if path.strip_prefix("/api/slang/").is_some_and(|tail| {
         let parts: Vec<&str> = tail.split('/').collect();
@@ -135,182 +913,70 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
     }) {
         return Some(RoutePolicy::console_or_agent(KeyPreflight::None));
     }
-
-    match (method, path) {
-        ("GET", "/api/qq/login") => Some(RoutePolicy::admin(
-            "QQ login state is restricted to administrators",
-        )),
-        ("POST", "/api/restart") => Some(RoutePolicy::admin(
-            "restart is restricted to administrators",
-        )),
-        ("GET", "/api/dependencies")
-        | ("POST", "/api/dependencies/check" | "/api/dependencies/approve") => Some(
-            RoutePolicy::admin("dependency upgrades are restricted to administrators"),
-        ),
-        ("GET", "/api/releases" | "/api/releases/settings")
-        | ("POST", "/api/releases/settings" | "/api/releases/approve") => Some(RoutePolicy::admin(
-            "release settings are restricted to administrators",
-        )),
-        ("GET", "/api/backups/settings" | "/api/backups")
-        | (
-            "POST",
-            "/api/backups/settings" | "/api/backups/restore/preview" | "/api/backups/restore",
-        ) => Some(RoutePolicy::admin(
-            "backup settings are restricted to administrators",
-        )),
-        ("POST", "/api/conversations/scope") => Some(RoutePolicy::admin("该接口仅控制台可用")),
-
-        ("POST", "/api/session/reset") => Some(RoutePolicy::console_or_agent(
-            KeyPreflight::SessionKeyOrClosedOwnerReset,
-        )),
-        ("POST", "/api/memory/archive" | "/api/memory/history") => {
-            Some(RoutePolicy::console_or_agent(KeyPreflight::SessionKey))
-        }
-
-        ("GET", "/api/social")
-        | ("POST", "/api/social" | "/api/social/state" | "/api/social/flush")
-        | (
-            "POST",
-            "/api/socialV2/send-message"
-            | "/api/socialV2/send-burst"
-            | "/api/socialV2/send-poke"
-            | "/api/socialV2/send-voice",
-        )
-        | (
-            "POST",
-            "/api/voice/send"
-            | "/api/send/voice"
-            | "/api/socialV2/mark-read"
-            | "/api/socialV2/wake-config"
-            | "/api/socialV2/wait",
-        )
-        | (
-            "GET",
-            "/api/socialV2/message-detail"
-            | "/api/images/message"
-            | "/api/socialV2/forward-message",
-        )
-        | ("POST", "/api/socialV2/forward-media")
-        | (
-            "GET",
-            "/api/socialV2/sticker-image"
-            | "/api/socialV2/self-image"
-            | "/api/socialV2/sticker-list",
-        )
-        | (
-            "POST",
-            "/api/socialV2/sticker-list"
-            | "/api/socialV2/sticker-note"
-            | "/api/socialV2/sticker-remark",
-        )
-        | ("POST", "/api/socialV2/send-sticker" | "/api/socialV2/collect-sticker")
-        | (
-            "POST",
-            "/api/send/group" | "/api/send/private" | "/api/send/reply" | "/api/authorize/read",
-        )
-        | ("POST", "/api/socialV2/reset" | "/api/socialV2/wake" | "/api/socialV2/wake-snapshot")
-        | ("GET", "/api/socialV2/memory")
-        | (
-            "POST",
-            "/api/socialV2/memory-append"
-            | "/api/socialV2/memory-update"
-            | "/api/socialV2/memory-remove"
-            | "/api/socialV2/memory-clear",
-        )
-        | (
-            "GET" | "POST",
-            "/api/socialV2/config"
-            | "/api/socialV2/activity"
-            | "/api/socialV2/feedback"
-            | "/api/socialV2/initial-prompt",
-        )
-        | (
-            "GET",
-            "/api/socialV2/state"
-            | "/api/socialV2/prompt"
-            | "/api/socialV2/slang/query"
-            | "/api/socialV2/states",
-        )
-        | ("POST", "/api/socialV2/slang/submit" | "/api/socialV2/feedback-clear")
-        | (
-            "GET",
-            "/api/socialV2/unread"
-            | "/api/socialV2/recent"
-            | "/api/socialV2/my-recent"
-            | "/api/socialV2/active-members",
-        )
-        | (
-            "GET",
-            "/api/inbound/gaps" | "/api/socialV2/send-outbox" | "/api/sessions" | "/api/turns",
-        )
-        | ("POST", "/api/inbound/gaps/retry" | "/api/turns/resolve")
-        | (
-            "GET",
-            "/api/model-chain" | "/api/voice/list" | "/api/socialV2/voices" | "/api/tokens/turns",
-        )
-        | ("POST", "/api/session-models" | "/api/slang/extract") => {
-            Some(RoutePolicy::console_or_agent(KeyPreflight::SessionKey))
-        }
-
-        (
-            "GET",
-            "/api/status" | "/api/pending" | "/api/whitelist" | "/api/security"
-            | "/api/audit/recent",
-        )
-        | ("POST", "/api/whitelist" | "/api/security" | "/api/console/token" | "/api/audit/undo")
-        | ("GET", "/api/session-models" | "/api/socialV2/tool-log")
-        | ("POST", "/api/socialV2/tool-log/clear")
-        | (
-            "GET",
-            "/api/roles"
-            | "/api/roles/content"
-            | "/api/presets"
-            | "/api/preset/sim-prompt"
-            | "/api/preset/sim-prompt/backups",
-        )
-        | (
-            "POST",
-            "/api/roles/create" | "/api/roles/update" | "/api/roles/rename" | "/api/roles/delete"
-            | "/api/roles/limit" | "/api/role" | "/api/role-mode" | "/api/mode",
-        )
-        | ("POST", "/api/preset/sim-prompt" | "/api/preset/sim-prompt/restore")
-        | ("GET", "/api/stickers")
-        | ("POST", "/api/stickers/note" | "/api/stickers/sync" | "/api/stickers/remark")
-        | (
-            "GET",
-            "/api/tokens/by-provider"
-            | "/api/usage/attribution"
-            | "/api/tokens/summary"
-            | "/api/tokens/series"
-            | "/api/tokens/recent",
-        )
-        | ("GET", "/api/slang" | "/api/recovery-record")
-        | (
-            "POST",
-            "/api/slang"
-            | "/api/slang/clear"
-            | "/api/slang/config"
-            | "/api/slang/batch-delete"
-            | "/api/slang/batch-confirm"
-            | "/api/slang/batch-reject"
-            | "/api/slang/research",
-        ) => Some(RoutePolicy::console_or_agent(KeyPreflight::None)),
-        _ if method == "GET"
-            && !path.starts_with("/api/")
-            && path != "/api"
-            && (crate::console_ui::legacy_redirect(path).is_some()
-                || crate::console_ui::resolve_asset(path).is_some()) =>
-        {
-            Some(RoutePolicy::admin(
-                "console UI routes are restricted to administrators",
-            ))
-        }
-        _ => None,
+    // Method-agnostic legacy/isolated agent-denial surfaces (closed in isolated HTTP allowlist).
+    if path == "/api/stickers" || path.starts_with("/api/stickers/") {
+        return Some(
+            RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+                .with_agent(AgentPolicy::V1StickerAdmin)
+                .isolated_only(false),
+        );
     }
+    if path == "/api/socialV2/config" || path == "/api/socialV2/activity" {
+        return Some(
+            RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
+                .with_agent(AgentPolicy::V2AdminOnly)
+                .isolated_only(false),
+        );
+    }
+    if method == "POST"
+        && (path.starts_with("/api/auth/")
+            || path.starts_with("/api/backups/")
+            || path.starts_with("/api/releases/")
+            || path.starts_with("/api/dependencies/"))
+    {
+        return Some(
+            RoutePolicy::admin("route requires an explicit endpoint")
+                .with_body(BodyLimit::Max1Mb)
+                .isolated_only(false),
+        );
+    }
+    if method == "GET"
+        && !path.starts_with("/api/")
+        && path != "/api"
+        && (crate::console_ui::legacy_redirect(path).is_some()
+            || crate::console_ui::resolve_asset(path).is_some())
+    {
+        let cookie = if path.starts_with("/assets/") {
+            SessionCookiePolicy::NoRenew
+        } else {
+            SessionCookiePolicy::Renew
+        };
+        return Some(
+            RoutePolicy::admin("console UI routes are restricted to administrators")
+                .with_cookie(cookie),
+        );
+    }
+    None
 }
 
 pub(crate) fn supports_request(context: &RuntimeContext, method: &str, path: &str) -> bool {
-    !context.is_isolated() || route_policy(method, path).is_some()
+    !context.is_isolated()
+        || route_policy(method, path).is_some_and(|policy| policy.isolated_supported)
+}
+
+pub(crate) fn is_bounded_json_request(method: &str, path: &str) -> bool {
+    route_policy(method, path).is_some_and(|policy| policy.body_limit == BodyLimit::Max1Mb)
+}
+
+pub(super) fn bounded_post_body_too_large(req: &Request) -> bool {
+    is_bounded_json_request(&req.method, &req.path)
+        && (req.body_too_large
+            || req
+                .headers
+                .get("content-length")
+                .map(|value| decimal_exceeds_limit(value, BOUNDED_POST_MAX_BODY_BYTES))
+                .unwrap_or(false)
+            || req.body.as_bytes().len() > BOUNDED_POST_MAX_BODY_BYTES)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -360,6 +1026,7 @@ impl VerifiedCaller {
     pub(crate) fn record_config_diff(&mut self, diff: Option<crate::config_tx::ConfigDiff>) {
         self.config_diff = crate::config_tx::merge_diffs(self.config_diff.take(), diff);
     }
+
     pub(crate) fn is_admitted(&self) -> bool {
         matches!(
             self.kind,
@@ -420,6 +1087,108 @@ pub(crate) fn memory_agent_call(req: &Request) -> bool {
             .headers
             .get("x-agent-token")
             .is_some_and(|token| !token.is_empty())
+}
+
+pub(super) fn presented_console_token(req: &Request) -> Option<&str> {
+    req.query
+        .get("token")
+        .or_else(|| req.headers.get("x-console-token"))
+        .map(String::as_str)
+}
+
+pub(super) fn token_supplied(req: &Request, expected: &str) -> bool {
+    presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
+}
+
+pub(super) fn authorized(req: &Request, cfg: &Value) -> bool {
+    token_supplied(req, &console_token(cfg))
+}
+
+fn has_fetch_metadata(req: &Request) -> bool {
+    req.headers.keys().any(|name| name.starts_with("sec-fetch-"))
+}
+
+fn has_agent_marker(req: &Request) -> bool {
+    req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call")
+}
+
+fn canonical_request(req: &Request, port: u16) -> bool {
+    req.headers
+        .get("host")
+        .is_some_and(|host| host == &crate::console_auth::canonical_host(port))
+}
+
+pub(super) enum BrowserCookie {
+    Renew {
+        port: u16,
+        digest: [u8; 32],
+        id: [u8; 32],
+    },
+    Delete {
+        port: u16,
+        digest: [u8; 32],
+    },
+    LegacyPage {
+        port: u16,
+        mac: [u8; 32],
+    },
+    LegacyPageDelete {
+        port: u16,
+    },
+}
+
+impl BrowserCookie {
+    pub(super) fn header(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        match self {
+            Self::Renew { port, digest, id } => format!(
+                "her_browser_{port}_{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                URL_SAFE_NO_PAD.encode(digest),
+                URL_SAFE_NO_PAD.encode(id),
+                7 * 24 * 60 * 60
+            ),
+            Self::Delete { port, digest } => format!(
+                "her_browser_{port}_{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                URL_SAFE_NO_PAD.encode(digest)
+            ),
+            Self::LegacyPage { port, mac } => format!(
+                "her_legacy_{port}={}; HttpOnly; SameSite=Strict; Path=/",
+                URL_SAFE_NO_PAD.encode(mac)
+            ),
+            Self::LegacyPageDelete { port } => {
+                format!("her_legacy_{port}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+            }
+        }
+    }
+}
+
+pub(super) enum ConsoleRedirect {
+    CanonicalOrigin(u16, String),
+    Path(String),
+}
+
+pub(super) struct ConsoleResponse {
+    pub(super) status: u16,
+    pub(super) content_type: String,
+    pub(super) body: String,
+    pub(super) redirect: Option<ConsoleRedirect>,
+    pub(super) cookies: Vec<BrowserCookie>,
+    pub(super) raw_body: Option<&'static [u8]>,
+    pub(super) csp: Option<&'static str>,
+}
+
+impl From<(u16, String, String)> for ConsoleResponse {
+    fn from((status, content_type, body): (u16, String, String)) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
+            redirect: None,
+            cookies: Vec::new(),
+            raw_body: None,
+            csp: None,
+        }
+    }
 }
 
 /// Host header must name the loopback console with its bound port (DNS rebinding guard).
@@ -503,6 +1272,724 @@ pub(super) fn cross_site_denial(req: &Request, port: u16) -> Option<(u16, Value)
     None
 }
 
+fn browser_candidates(
+    req: &Request,
+    port: u16,
+) -> Result<Vec<([u8; 32], [u8; 32])>, (u16, String)> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest as _, Sha256};
+
+    let invalid = || (401, "browser credential is invalid".into());
+    let prefix = format!("her_browser_{port}_");
+    let Some(line) = req.headers.get("cookie") else {
+        return Ok(Vec::new());
+    };
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for pair in line.split(';').map(str::trim) {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let Some(tag) = name.trim().strip_prefix(&prefix) else {
+            continue;
+        };
+        let (exact_name, value) = pair.split_once('=').ok_or_else(invalid)?;
+        if name.trim() != exact_name
+            || tag.len() != 43
+            || value.len() != 43
+            || candidates.len() >= crate::console_auth::MAX_BROWSER_SESSIONS
+            || !seen.insert(name)
+        {
+            return Err(invalid());
+        }
+        let id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(value)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid)?;
+        let digest: [u8; 32] = Sha256::digest(id).into();
+        if URL_SAFE_NO_PAD.encode(digest) != tag || URL_SAFE_NO_PAD.encode(id) != value {
+            return Err(invalid());
+        }
+        candidates.push((digest, id));
+    }
+    Ok(candidates)
+}
+
+fn browser_denial(req: &Request, port: u16) -> Result<(), (u16, String)> {
+    let origin = crate::console_auth::canonical_origin(port);
+    let claimed_origin = req.headers.get("origin");
+    let origin_matches = claimed_origin == Some(&origin);
+    if !canonical_request(req, port)
+        || req
+            .headers
+            .get("sec-fetch-site")
+            .is_some_and(|site| !matches!(site.as_str(), "same-origin" | "none"))
+        || ((claimed_origin.is_some() || req.method != "GET") && !origin_matches)
+    {
+        return Err((403, "browser request requires the console origin".into()));
+    }
+    if req.method != "GET"
+        && !req.headers.get("content-type").is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        })
+    {
+        return Err((415, "browser request requires application/json".into()));
+    }
+    Ok(())
+}
+
+fn validate_browser_acl(
+    req: &Request,
+) -> Result<Option<crate::memory_actions::BrowserAcl>, (u16, String)> {
+    use crate::memory_actions::BrowserAcl;
+    if req.path != "/api/memory/acl" {
+        return Ok(None);
+    }
+    if bounded_post_body_too_large(req) {
+        return Err((413, BODY_TOO_LARGE_ERROR.into()));
+    }
+    if !req.query.is_empty() {
+        return Err((400, "browser ACL requests do not accept query fields".into()));
+    }
+    match req.method.as_str() {
+        "GET" if req.body.is_empty() && !req.headers.contains_key("transfer-encoding") => {
+            Ok(Some(BrowserAcl::List))
+        }
+        "POST" => {
+            let fields: Value = serde_json::from_str(&req.body)
+                .map_err(|_| (400, "body must be a JSON object".into()))?;
+            let action = match fields.get("action").and_then(Value::as_str) {
+                Some("grant") => crate::memory_actions::AclAction::Grant,
+                Some("revoke") => crate::memory_actions::AclAction::Revoke,
+                _ => return Err((400, "ACL action must be grant or revoke".into())),
+            };
+            Ok(Some(BrowserAcl::Write(action, fields)))
+        }
+        _ => Err((405, "browser ACL changes require POST".into())),
+    }
+}
+
+fn select_browser(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    expected: &str,
+    renew: bool,
+) -> Result<(Option<crate::console_auth::ConsoleAuthority>, Option<BrowserCookie>), (u16, String)> {
+    use crate::console_auth::ConsoleAuthority;
+    let candidates = browser_candidates(req, port)?;
+    if candidates.is_empty() {
+        return Ok((None, None));
+    }
+    let ids: Vec<_> = candidates.iter().map(|(digest, _)| *digest).collect();
+    let token = credential_digest(expected);
+    let Some(admission) = crate::console_auth::admit_browser(
+        context,
+        &crate::console_auth::canonical_origin(port),
+        (!expected.is_empty()).then_some(token),
+        &ids,
+        renew,
+    )?
+    else {
+        return Ok((None, None));
+    };
+    let digest = admission.proof.id_digest;
+    let cookie = if admission.renewed {
+        candidates
+            .into_iter()
+            .find(|(id_digest, _)| *id_digest == digest)
+            .map(|(_, id)| BrowserCookie::Renew { port, digest, id })
+    } else {
+        None
+    };
+    Ok((
+        Some(ConsoleAuthority::Browser {
+            token_digest: token,
+            grant: admission.proof,
+        }),
+        cookie,
+    ))
+}
+
+fn selected_memory_capability(
+    req: &Request,
+    context: &RuntimeContext,
+    cfg: &Value,
+    effective: &str,
+) -> Result<crate::memory_actions::ConsoleCapability, (u16, String)> {
+    use crate::memory_actions::ConsoleCapability;
+    let Some(header) = req.headers.get("x-console-token").map(|token| token.trim()) else {
+        return Ok(ConsoleCapability::Conversation);
+    };
+    let configured = console_token(cfg);
+    if !has_fetch_metadata(req) && credential_eq(&configured, header) {
+        return Ok(ConsoleCapability::Configured(credential_digest(header)));
+    }
+    if let Some(proof) =
+        crate::console_auth::admit_explicit_authority(context, header, effective, false)?
+    {
+        return Ok(ConsoleCapability::Desktop(proof));
+    }
+    Ok(ConsoleCapability::Conversation)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FRONT_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn load_front_config(context: &RuntimeContext) -> Result<Value, &'static str> {
+    #[cfg(test)]
+    if FRONT_READ_HOOK.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook())) {
+        return Err("runtime config is unavailable");
+    }
+    context.load_config()
+}
+
+struct FrontAdmission {
+    config: Value,
+    proof: Option<crate::console_auth::ConsoleAuthority>,
+    renewal: Option<BrowserCookie>,
+    memory: crate::memory_actions::ConsoleCapability,
+    browser_acl: Option<crate::memory_actions::BrowserAcl>,
+}
+
+fn admit_selected_request(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+) -> Result<FrontAdmission, (u16, String)> {
+    use crate::memory_actions::ConsoleCapability;
+    let config = load_front_config(context)
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    crate::console_auth::ensure_credentials_ready(context)?;
+    let agent_call = has_agent_marker(req);
+    let explicit = presented_console_token(req);
+    let candidates = browser_candidates(req, port)?;
+    let browser_auth = explicit.is_none()
+        && !agent_call
+        && !candidates.is_empty()
+        && (canonical_request(req, port)
+            || !crate::console_ui::is_ui_page_request(&req.method, &req.path));
+    let _gate = if browser_auth {
+        Some(acquire_social_state_gate(context)?)
+    } else {
+        None
+    };
+    let config = if browser_auth {
+        crate::console_auth::ensure_credentials_ready(context)?;
+        load_front_config(context)
+            .map_err(|_| (503, "runtime config is unavailable".to_string()))?
+    } else {
+        config
+    };
+    let expected = context.effective_console_token(&config);
+    let memory_route = req.path.starts_with("/api/memory/");
+    let (proof, renewal, browser_acl) = if let Some(presented) = explicit {
+        (
+            crate::console_auth::admit_explicit_authority(
+                context,
+                presented,
+                &expected,
+                !has_fetch_metadata(req),
+            )?,
+            None,
+            None,
+        )
+    } else if browser_auth {
+        browser_denial(req, port)?;
+        if bounded_post_body_too_large(req) {
+            return Err((413, BODY_TOO_LARGE_ERROR.into()));
+        }
+        let acl = validate_browser_acl(req)?;
+        let renew = route_policy(&req.method, &req.path)
+            .is_none_or(|policy| policy.session_cookie == SessionCookiePolicy::Renew);
+        let (proof, renewal) = select_browser(req, context, port, &expected, renew)?;
+        let acl = proof.as_ref().and(acl);
+        (proof, renewal, acl)
+    } else {
+        (None, None, None)
+    };
+    if (proof.is_some()
+        || (memory_route
+            && req
+                .headers
+                .get("x-agent-token")
+                .is_some_and(|t| !t.is_empty())))
+        && !matches!(proof, Some(crate::console_auth::ConsoleAuthority::Browser { .. }))
+    {
+        if let Some((status, value)) = cross_site_denial(req, port) {
+            return Err((
+                status,
+                value["error"].as_str().unwrap_or("request refused").to_string(),
+            ));
+        }
+    }
+    let memory = if memory_route {
+        selected_memory_capability(req, context, &config, &expected)?
+    } else {
+        ConsoleCapability::Conversation
+    };
+    Ok(FrontAdmission {
+        config,
+        proof,
+        renewal,
+        memory,
+        browser_acl,
+    })
+}
+
+fn parse_auth_json_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, String)> {
+    let Value::Object(map) = serde_json::from_str::<Value>(body)
+        .map_err(|_| (400, "请求体必须是合法 JSON 对象".to_string()))?
+    else {
+        return Err((400, "请求体必须是 JSON 对象".to_string()));
+    };
+    Ok(map)
+}
+
+fn parse_auth_digest(raw: &str) -> Option<[u8; 32]> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    if raw.len() != 43 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(raw).ok()?;
+    let digest: [u8; 32] = bytes.try_into().ok()?;
+    if URL_SAFE_NO_PAD.encode(digest) != raw {
+        return None;
+    }
+    Some(digest)
+}
+
+fn auth_retry_seconds(retry_after_ms: i64) -> i64 {
+    if retry_after_ms <= 0 {
+        0
+    } else {
+        retry_after_ms.saturating_add(999) / 1000
+    }
+}
+
+fn issue_session_cookie_response(
+    port: u16,
+    issued: crate::console_auth::IssuedSession,
+) -> ConsoleResponse {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({
+            "ok": true,
+            "authenticated": true,
+            "sessionId": URL_SAFE_NO_PAD.encode(issued.id_digest),
+        })
+        .to_string(),
+    ));
+    response.cookies.push(BrowserCookie::Renew {
+        port,
+        digest: issued.id_digest,
+        id: issued.id,
+    });
+    response
+}
+
+fn auth_status_route(
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::ConsoleAuthority;
+    let json_reply = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    let snapshot = match crate::console_auth::auth_status(context) {
+        Ok(snapshot) => snapshot,
+        Err((code, msg)) => return json_reply(code, json!({ "ok": false, "error": msg })),
+    };
+    let auth_kind = match &admission.proof {
+        Some(ConsoleAuthority::Browser { .. }) => json!("browser"),
+        Some(ConsoleAuthority::Desktop { .. }) => json!("desktop"),
+        Some(ConsoleAuthority::Machine { .. }) => json!("machine"),
+        None => Value::Null,
+    };
+    let configured_token = admission
+        .config
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+    let token_file = if configured_token || !context.is_isolated() {
+        "config/config.json"
+    } else {
+        "data/console-token"
+    };
+    json_reply(
+        200,
+        json!({
+            "ok": true,
+            "passwordSet": snapshot.password_set,
+            "authenticated": admission.proof.is_some(),
+            "authKind": auth_kind,
+            "canonicalOrigin": crate::console_auth::canonical_origin(port),
+            "tokenFile": token_file,
+            "consecutiveFailures": snapshot.consecutive_failures,
+            "retryAfterMs": snapshot.retry_after_ms,
+            "retryAfterSeconds": auth_retry_seconds(snapshot.retry_after_ms),
+            "requirePasswordLocally":
+                crate::console_auth::require_password_locally(&admission.config),
+            "localAutoSignInAvailable": cfg!(windows),
+        }),
+    )
+}
+
+fn auth_first_run_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+    use crate::console_auth::PasswordError;
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, &msg);
+    }
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let Some(token) = fields
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return err(400, "缺少 consoleToken");
+    };
+    let Some(password) = fields.get("password").and_then(Value::as_str) else {
+        return err(400, "缺少 password");
+    };
+    match crate::console_auth::auth_first_run_browser(context, port, token, password) {
+        Ok(issued) => issue_session_cookie_response(port, issued),
+        Err(PasswordError::Input) => {
+            err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符")
+        }
+        Err(PasswordError::Proof) => err(401, "控制台令牌校验失败"),
+        Err(PasswordError::AlreadySet) => err(409, "管理员密码已设置"),
+        Err(PasswordError::Busy | PasswordError::Unavailable) => {
+            err(503, "administrator password storage is unavailable")
+        }
+    }
+}
+
+fn auth_login_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+    use crate::console_auth::LoginError;
+    let err = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, json!({ "ok": false, "error": msg }));
+    }
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, json!({ "ok": false, "error": msg })),
+    };
+    let Some(password) = fields.get("password").and_then(Value::as_str) else {
+        return err(400, json!({ "ok": false, "error": "缺少 password" }));
+    };
+    match crate::console_auth::auth_login(context, port, password) {
+        Ok(issued) => issue_session_cookie_response(port, issued),
+        Err(LoginError::Input) => err(400, json!({ "ok": false, "error": "密码长度超出限制" })),
+        Err(LoginError::NotSet) => err(
+            409,
+            json!({ "ok": false, "passwordSet": false, "error": "尚未设置管理员密码" }),
+        ),
+        Err(LoginError::WrongPassword {
+            retry_after_ms,
+            consecutive_failures,
+        }) => err(
+            401,
+            json!({
+                "ok": false,
+                "error": "管理员密码错误",
+                "consecutiveFailures": consecutive_failures,
+                "retryAfterMs": retry_after_ms,
+                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
+            }),
+        ),
+        Err(LoginError::Throttled {
+            retry_after_ms,
+            consecutive_failures,
+        }) => err(
+            429,
+            json!({
+                "ok": false,
+                "error": "尝试次数过多，请稍后再试",
+                "consecutiveFailures": consecutive_failures,
+                "retryAfterMs": retry_after_ms,
+                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
+            }),
+        ),
+        Err(LoginError::Busy | LoginError::Unavailable) => err(
+            503,
+            json!({ "ok": false, "error": "administrator authentication is unavailable" }),
+        ),
+    }
+}
+
+fn auth_logout_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, &msg);
+    }
+    let mut digests = Vec::new();
+    match crate::console_auth::auth_logout(context, admission.proof.as_ref()) {
+        Ok(Some(digest)) => digests.push(digest),
+        Ok(None) => {}
+        Err((code, msg)) => return err(code, &msg),
+    }
+    if let Ok(candidates) = browser_candidates(req, port) {
+        for (digest, _) in candidates {
+            if !digests
+                .iter()
+                .any(|existing| crate::console_auth::digests_equal(existing, &digest))
+            {
+                digests.push(digest);
+            }
+        }
+    }
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({ "ok": true }).to_string(),
+    ));
+    for digest in digests {
+        response.cookies.push(BrowserCookie::Delete { port, digest });
+    }
+    response
+}
+
+fn auth_change_password_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::{ChangePasswordError, ConsoleAuthority};
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return err(401, "console credential is required");
+    };
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let Some(current_password) = fields.get("currentPassword").and_then(Value::as_str) else {
+        return err(400, "缺少 currentPassword");
+    };
+    let Some(new_password) = fields.get("newPassword").and_then(Value::as_str) else {
+        return err(400, "缺少 newPassword");
+    };
+    match crate::console_auth::auth_change_password(
+        context,
+        port,
+        authority,
+        current_password,
+        new_password,
+    ) {
+        Ok(rotated) => {
+            let mut response = ConsoleResponse::from((
+                200,
+                "application/json; charset=utf-8".to_string(),
+                json!({ "ok": true, "sessionRotated": rotated.is_some() }).to_string(),
+            ));
+            if let (ConsoleAuthority::Browser { grant, .. }, Some(issued)) = (authority, rotated) {
+                response.cookies.push(BrowserCookie::Delete {
+                    port,
+                    digest: grant.id_digest,
+                });
+                response.cookies.push(BrowserCookie::Renew {
+                    port,
+                    digest: issued.id_digest,
+                    id: issued.id,
+                });
+            }
+            response
+        }
+        Err(ChangePasswordError::Input) => {
+            err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符")
+        }
+        Err(ChangePasswordError::WrongCurrent) => err(401, "当前密码错误"),
+        Err(ChangePasswordError::Revoked) => err(401, "console credential was revoked"),
+        Err(ChangePasswordError::NotSet) => err(409, "尚未设置管理员密码"),
+        Err(ChangePasswordError::Busy | ChangePasswordError::Unavailable) => {
+            err(503, "administrator password storage is unavailable")
+        }
+    }
+}
+
+fn auth_sessions_list_route(
+    context: &RuntimeContext,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    let json_reply = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return json_reply(
+            401,
+            json!({ "ok": false, "error": "console credential is required" }),
+        );
+    };
+    match crate::console_auth::list_browser_sessions(context, authority) {
+        Ok(sessions) => json_reply(200, json!({ "ok": true, "sessions": sessions })),
+        Err((code, msg)) => json_reply(code, json!({ "ok": false, "error": msg })),
+    }
+}
+
+fn auth_sessions_revoke_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::RevokeTarget;
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return err(401, "console credential is required");
+    };
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let id_field = fields.get("id").filter(|v| !v.is_null());
+    let others_field = match fields.get("others") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return err(400, "others 必须是布尔值"),
+    };
+    let all_field = match fields.get("all") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return err(400, "all 必须是布尔值"),
+    };
+    let target = match (id_field, others_field, all_field) {
+        (Some(Value::String(raw)), false, false) => {
+            let Some(digest) = parse_auth_digest(raw) else {
+                return err(400, "无效的会话 id");
+            };
+            RevokeTarget::One(digest)
+        }
+        (None, true, false) => RevokeTarget::Others,
+        (None, false, true) => RevokeTarget::All,
+        _ => return err(400, "请明确指定 id、others: true 或 all: true"),
+    };
+
+    let outcome =
+        match crate::console_auth::revoke_browser_sessions_authorized(context, authority, target) {
+            Ok(outcome) => outcome,
+            Err((code, msg)) => return err(code, &msg),
+        };
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({ "ok": true, "revoked": outcome.revoked_count }).to_string(),
+    ));
+    if let Some(digest) = outcome.delete_own {
+        response.cookies.push(BrowserCookie::Delete { port, digest });
+    }
+    response
+}
+
+fn handle_auth_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> Option<ConsoleResponse> {
+    if !context.is_isolated() || !req.path.starts_with("/api/auth/") {
+        return None;
+    }
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if has_agent_marker(req) {
+        return Some(err(
+            403,
+            "agent credential cannot access console authentication",
+        ));
+    }
+    if bounded_post_body_too_large(req) {
+        return Some(err(413, BODY_TOO_LARGE_ERROR));
+    }
+    let response = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/auth/status") => auth_status_route(context, port, admission),
+        ("POST", "/api/auth/first-run") => auth_first_run_route(req, context, port),
+        ("POST", "/api/auth/login") => auth_login_route(req, context, port),
+        ("POST", "/api/auth/logout") => auth_logout_route(req, context, port, admission),
+        ("POST", "/api/auth/change-password") => {
+            auth_change_password_route(req, context, port, admission)
+        }
+        ("GET", "/api/auth/sessions") => auth_sessions_list_route(context, admission),
+        ("POST", "/api/auth/sessions/revoke") => {
+            auth_sessions_revoke_route(req, context, port, admission)
+        }
+        (
+            _,
+            "/api/auth/status"
+            | "/api/auth/first-run"
+            | "/api/auth/login"
+            | "/api/auth/logout"
+            | "/api/auth/change-password"
+            | "/api/auth/sessions"
+            | "/api/auth/sessions/revoke",
+        ) => err(405, "method not allowed"),
+        _ => err(404, "not found"),
+    };
+    Some(response)
+}
+
 fn desktop_sign_in(
     stream: Option<&TcpStream>,
     req: &Request,
@@ -552,9 +2039,32 @@ fn desktop_sign_in(
         )
     }
     #[cfg(windows)]
-    match super::desktop_sign_in_selected(stream, req, context, port) {
-        Ok(session) => reply(200, json!({"ok":true,"session":session})),
-        Err((status, error)) => reply(status, json!({"ok":false,"error":error})),
+    {
+        let is_browser = has_fetch_metadata(req)
+            || ["origin", "referer", "cookie"]
+                .iter()
+                .any(|key| req.headers.contains_key(*key));
+        let proof_input = if is_browser {
+            if let Err((status, error)) = browser_denial(req, port) {
+                return reply(status, json!({"ok":false,"error":error}));
+            }
+            match browser_candidates(req, port) {
+                Ok(candidates) => crate::console_auth::DesktopSignInProof::Browser {
+                    id_digests: candidates.into_iter().map(|(digest, _)| digest).collect(),
+                },
+                Err((status, error)) => {
+                    return reply(status, json!({"ok":false,"error":error}));
+                }
+            }
+        } else {
+            crate::console_auth::DesktopSignInProof::Native {
+                presented_token: presented_console_token(req),
+            }
+        };
+        match crate::console_auth::desktop_sign_in(stream, context, port, proof_input) {
+            Ok(session) => reply(200, json!({"ok":true,"session":session})),
+            Err((status, error)) => reply(status, json!({"ok":false,"error":error})),
+        }
     }
 }
 
@@ -564,33 +2074,27 @@ pub(crate) fn enforce_key_preflight(
     context: &RuntimeContext,
     caller: &VerifiedCaller,
 ) -> Option<(u16, String, String)> {
-    let policy = route_policy(&req.method, &req.path);
-    let preflight = policy
+    let preflight = route_policy(&req.method, &req.path)
         .map(|p| p.key_preflight)
         .unwrap_or(KeyPreflight::SessionKey);
-    if preflight == KeyPreflight::None {
+    let has_agent_header = req.headers.contains_key("x-agent-token");
+    let defer = match preflight {
+        KeyPreflight::None => return None,
+        KeyPreflight::SessionKey | KeyPreflight::SessionKeyOrClosedOwnerReset => false,
+        KeyPreflight::SessionKeyDeferAgentHeader => has_agent_header,
+        KeyPreflight::SessionKeyDeferMemoryAgent => memory_agent_call(req),
+        KeyPreflight::SessionKeyDeferAlways => true,
+        KeyPreflight::SessionKeyDeferIsolated => context.is_isolated(),
+    };
+    if defer {
         return None;
     }
-    let memory_agent_call = memory_agent_call(req);
     let has_credential = caller.is_admitted()
         || req
             .headers
             .get("x-agent-token")
             .is_some_and(|t| !t.trim().is_empty());
-    let has_agent_header = req.headers.contains_key("x-agent-token");
-    let defer_agent_allowlist = memory_agent_call
-        || (has_agent_header
-            && (social_agent_policy_route(req) || pending_admin_agent_gate_route(req)));
-    let defer_send_message_agent_allowlist =
-        (req.method == "POST" && req.path == "/api/socialV2/send-message" && has_agent_header)
-            || agent::is_send_route(req)
-            || (context.is_isolated()
-                && req.method == "POST"
-                && matches!(
-                    req.path.as_str(),
-                    "/api/socialV2/wake" | "/api/authorize/read"
-                ));
-    if has_credential && !defer_agent_allowlist && !defer_send_message_agent_allowlist {
+    if has_credential {
         if let Some(key) = request_session_key(req) {
             let closed_owner_reset = preflight == KeyPreflight::SessionKeyOrClosedOwnerReset
                 && context.is_isolated()
@@ -600,12 +2104,67 @@ pub(crate) fn enforce_key_preflight(
                 return Some((
                     403,
                     "application/json; charset=utf-8".to_string(),
-                    json!({"ok": false, "error": format!("会话不在允许范围内：{key}")}).to_string(),
+                    json!({"ok": false, "error": format!("会话不在允许范围内：{key}")})
+                        .to_string(),
                 ));
             }
         }
     }
     None
+}
+
+fn v2_agent_global_gates(
+    req: &Request,
+    cfg: &Value,
+    context: &RuntimeContext,
+) -> Option<(u16, String)> {
+    let token = req.headers.get("x-agent-token")?;
+    if token.is_empty() {
+        return Some((403, "agent token 不能为空".to_string()));
+    }
+    let doc = match ConversationState::for_runtime(context).read_document() {
+        Ok(doc) => doc,
+        Err((status, message)) => return Some((status, message)),
+    };
+    if doc.paused() {
+        return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
+    }
+    if cfg
+        .get("socialV2")
+        .and_then(|social| social.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+    }
+    match current_mode_for(context) {
+        Ok(mode) if mode == "reserved2" => None,
+        Ok(_) => Some((403, "该接口仅 reserved2 模式可用".to_string())),
+        Err((status, message)) => Some((status, message)),
+    }
+}
+
+pub(super) fn policy_agent_denial(
+    policy: Option<RoutePolicy>,
+    req: &Request,
+    cfg: &Value,
+    context: &RuntimeContext,
+) -> Option<(u16, String)> {
+    let policy = policy?;
+    match policy.agent {
+        AgentPolicy::AgentAllowed | AgentPolicy::AdminOnly(_) => None,
+        AgentPolicy::PendingAdminOnly | AgentPolicy::V1StickerAdmin => {
+            let token = req.headers.get("x-agent-token")?;
+            if token.is_empty() {
+                Some((403, "agent token 不能为空".to_string()))
+            } else {
+                Some((403, "该接口仅控制台可用".to_string()))
+            }
+        }
+        AgentPolicy::V2AdminOnly => v2_agent_global_gates(req, cfg, context)
+            .or_else(|| Some((403, "该接口仅控制台可用".to_string()))),
+        AgentPolicy::V2AgentAllowed => v2_agent_global_gates(req, cfg, context),
+    }
 }
 
 pub(crate) fn enforce_agent_denials(
@@ -621,26 +2180,20 @@ pub(crate) fn enforce_agent_denials(
             json!({"ok": false, "error": message}).to_string(),
         )
     };
-    if let Some(policy) = route_policy(&req.method, &req.path) {
-        if let AgentPolicy::AdminOnly(message) = policy.agent {
-            if caller.is_agent() {
-                return Some(reply(403, message.to_string()));
-            }
+    let policy = route_policy(&req.method, &req.path);
+    if let Some(RoutePolicy {
+        agent: AgentPolicy::AdminOnly(message),
+        ..
+    }) = policy
+    {
+        if caller.is_agent() {
+            return Some(reply(403, message.to_string()));
         }
     }
     if let Some((status, message)) = agent::agent_global_denial(req, cfg, context) {
         return Some(reply(status, message));
     }
-    if let Some((status, message)) = tool_log_agent_denial(req, cfg, context) {
-        return Some(reply(status, message));
-    }
-    if let Some((status, message)) = pending_agent_denial(req) {
-        return Some(reply(status, message));
-    }
-    if let Some((status, message)) = send_message_global_agent_denial(req, cfg, context) {
-        return Some(reply(status, message));
-    }
-    if let Some((status, message)) = social_agent_policy_denial(req, cfg, context) {
+    if let Some((status, message)) = policy_agent_denial(policy, req, cfg, context) {
         return Some(reply(status, message));
     }
     None
@@ -734,7 +2287,8 @@ fn ui_page_response(
 
 #[cfg(test)]
 thread_local! {
-    static TEST_PEER_SAME_USER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_PEER_SAME_USER: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn peer_is_installing_user(stream: Option<&TcpStream>) -> bool {
@@ -742,7 +2296,7 @@ fn peer_is_installing_user(stream: Option<&TcpStream>) -> bool {
     if let Some(override_same) = TEST_PEER_SAME_USER.with(|cell| cell.get()) {
         return override_same;
     }
-    stream.is_some_and(super::same_installing_user)
+    stream.is_some_and(crate::console_auth::same_installing_user)
 }
 
 fn eligible_for_local_auto_sign_in(req: &Request, port: u16, admission: &FrontAdmission) -> bool {
@@ -814,7 +2368,10 @@ pub(crate) fn handle_http_request(
         if has_agent_marker(req) {
             return json_reply(
                 403,
-                json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                json!({
+                    "ok": false,
+                    "error": "console UI routes are restricted to administrators",
+                }),
             );
         }
         return match crate::console_ui::resolve_asset(&req.path) {
@@ -918,7 +2475,10 @@ pub(crate) fn handle_http_request(
         if agent_marker {
             return json_reply(
                 403,
-                json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                json!({
+                    "ok": false,
+                    "error": "console UI routes are restricted to administrators",
+                }),
             );
         }
         let expected = console_token(cfg);
@@ -944,7 +2504,10 @@ pub(crate) fn handle_http_request(
         if agent_marker {
             return json_reply(
                 403,
-                json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                json!({
+                    "ok": false,
+                    "error": "console UI routes are restricted to administrators",
+                }),
             );
         }
         if let Some((status, err)) = cross_site_denial(req, port) {
@@ -1033,7 +2596,15 @@ pub(crate) fn handle_http_request(
             };
             let (status, ctype, body) = route_with_caller(&mut caller, req);
             let config_diff = caller.config_diff.take();
-            (caller.context, status, ctype, body, Vec::new(), None, config_diff)
+            (
+                caller.context,
+                status,
+                ctype,
+                body,
+                Vec::new(),
+                None,
+                config_diff,
+            )
         };
     let record_admin = audit && administrator;
     if audit && ((200..300).contains(&status) || record_admin) {
@@ -1053,19 +2624,21 @@ pub(crate) fn handle_http_request(
             );
             if audit_context.is_isolated() {
                 if let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&body) {
-                    reply.insert("audit".into(), json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}));
+                    reply.insert(
+                        "audit".into(),
+                        json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}),
+                    );
                     body = Value::Object(reply).to_string();
                 }
             }
         }
     }
+    let delete_on_ok = route_policy(&req.method, &req.path)
+        .is_some_and(|policy| policy.session_cookie == SessionCookiePolicy::DeleteOnSuccess);
     let mut response = ConsoleResponse::from((status, ctype, body));
     if !auth_cookies.is_empty() {
         response.cookies = auth_cookies;
-    } else if (200..300).contains(&status)
-        && req.method == "POST"
-        && req.path == "/api/console/token"
-    {
+    } else if (200..300).contains(&status) && delete_on_ok {
         if let Some(crate::console_auth::ConsoleAuthority::Browser { grant, .. }) =
             &audit_context.console_authority
         {
@@ -1083,6 +2656,71 @@ pub(crate) fn handle_http_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declarative_route_policy_table_invariants_hold() {
+        let mut seen = HashSet::new();
+        for (method, path, policy) in EXACT_ROUTES {
+            assert!(seen.insert((*method, *path)), "duplicate route {method} {path}");
+            if matches!(policy.agent, AgentPolicy::AdminOnly(_)) {
+                assert_eq!(
+                    policy.key_preflight,
+                    KeyPreflight::None,
+                    "admin-only route must skip session key preflight: {method} {path}"
+                );
+            }
+            if policy.public_probe {
+                assert!(policy.isolated_supported);
+                assert_eq!(policy.key_preflight, KeyPreflight::None);
+                assert_eq!(policy.body_limit, BodyLimit::None);
+                assert_eq!(policy.session_cookie, SessionCookiePolicy::NoRenew);
+            }
+        }
+        assert_eq!(
+            route_policy("POST", "/api/console/token").unwrap().session_cookie,
+            SessionCookiePolicy::DeleteOnSuccess
+        );
+        for (method, path) in [
+            ("GET", "/api/auth/status"),
+            ("POST", "/api/auth/first-run"),
+            ("POST", "/api/auth/login"),
+            ("POST", "/api/auth/logout"),
+            ("POST", "/api/auth/change-password"),
+            ("POST", "/api/auth/sessions/revoke"),
+            ("POST", "/api/desktop/sign-in"),
+        ] {
+            assert_eq!(
+                route_policy(method, path).unwrap().session_cookie,
+                SessionCookiePolicy::NoRenew,
+                "{method} {path} must not renew browser cookie"
+            );
+        }
+        assert_eq!(
+            route_policy("GET", "/api/auth/sessions").unwrap().session_cookie,
+            SessionCookiePolicy::Renew
+        );
+        for (method, path) in [
+            ("POST", "/api/settings/set"),
+            ("POST", "/api/tasks/backup/run"),
+            ("POST", "/api/schedule"),
+            ("POST", "/api/backups/restore"),
+            ("POST", "/api/releases/approve"),
+            ("POST", "/api/dependencies/approve"),
+            ("GET", "/api/memory/acl"),
+            ("POST", "/api/memory/acl"),
+            ("POST", "/api/restart"),
+            ("POST", "/api/auth/login"),
+            ("POST", "/api/roles/create"),
+            ("POST", "/api/socialV2/send-message"),
+        ] {
+            assert!(
+                is_bounded_json_request(method, path),
+                "{method} {path} must be 1MB bounded"
+            );
+        }
+        assert!(!is_bounded_json_request("GET", "/api/settings"));
+        assert!(!is_bounded_json_request("POST", "/api/session-models"));
+    }
 
     #[test]
     fn isolated_send_message_route_allowlist_is_exact() {
@@ -1803,7 +3441,6 @@ mod tests {
         let canonical = crate::console_auth::canonical_host(port);
         let cfg = context.load_config().unwrap();
 
-        // Unavailable peer (`stream = None`, no test override) -> serves public SPA shell, issues no cookie.
         TEST_PEER_SAME_USER.with(|cell| cell.set(None));
         let unavailable = handle_http_request(
             None,
@@ -1815,7 +3452,6 @@ mod tests {
         assert_eq!(unavailable.status, 200);
         assert!(unavailable.cookies.is_empty());
 
-        // Different user (`Some(false)`) -> serves public SPA shell, issues no cookie.
         TEST_PEER_SAME_USER.with(|cell| cell.set(Some(false)));
         let other_user = handle_http_request(
             None,
@@ -1827,7 +3463,6 @@ mod tests {
         assert_eq!(other_user.status, 200);
         assert!(other_user.cookies.is_empty());
 
-        // Same user (`Some(true)`), cross-site / bad Host / agent / explicit token / /login / /setup / API path -> no cookie issued.
         TEST_PEER_SAME_USER.with(|cell| cell.set(Some(true)));
         for (req, expected_status) in [
             (
@@ -1885,7 +3520,6 @@ mod tests {
             );
         }
 
-        // Same-user canonical page GET -> issues browser cookie & serves page (200).
         let signed_in = handle_http_request(
             None,
             &make_page_req(&canonical, "/settings", &[("sec-fetch-site", "none")]),
@@ -1902,7 +3536,6 @@ mod tests {
             .0
             .to_string();
 
-        // Issued cookie authenticates /api/auth/status and /api/settings as a browser session.
         let status_res = handle_http_request(
             None,
             &make_page_req(
@@ -1933,7 +3566,6 @@ mod tests {
         );
         assert_eq!(api_settings.status, 200, "{}", api_settings.body);
 
-        // Enabling `security.requirePasswordLocally` turns off auto sign-in even for same user.
         crate::settings::apply(
             &context,
             "security.requirePasswordLocally",
