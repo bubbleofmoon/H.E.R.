@@ -1507,25 +1507,25 @@ pub(crate) fn turn_wait_limit_reached(
         .flatten()
         .is_some_and(|conv| {
             let budget = conv.field("waitBudget");
+            let stored_max = budget.and_then(|b| b.get("max")).and_then(Value::as_u64);
+            let live_max = context
+                .load_config()
+                .ok()
+                .map(|cfg| wait_policy(&cfg).max_per_turn);
+            let effective_max = match (stored_max, live_max) {
+                (Some(s), Some(l)) => Some(s.min(l)),
+                (a, b) => a.or(b),
+            };
             conv.token() == Some(token)
                 && budget.and_then(|b| b.get("scope")).and_then(Value::as_str)
                     == Some(scope.as_str())
-                && budget
-                    .and_then(|b| b.get("max"))
-                    .and_then(Value::as_u64)
-                    .or_else(|| {
-                        context
-                            .load_config()
-                            .ok()
-                            .map(|cfg| wait_policy(&cfg).max_per_turn)
-                    })
-                    .is_some_and(|max| {
-                        budget
-                            .and_then(|b| b.get("used"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0)
-                            >= max
-                    })
+                && effective_max.is_some_and(|max| {
+                    budget
+                        .and_then(|b| b.get("used"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        >= max
+                })
         })
 }
 
@@ -3657,5 +3657,48 @@ mod tests {
         write_role_state(&context, Some("alice"), "silent").unwrap();
         assert!(silent_blocks_send(&context, &cfg, "group:42").unwrap());
         assert!(!silent_blocks_send(&context, &cfg, "private:7001").unwrap());
+    }
+
+    #[test]
+    fn turn_wait_limit_reached_honors_lowered_max_per_turn() {
+        let root = TestDir::new("wait-limit-lowered");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": { "wait": { "maxPerTurn": 4 } }
+        });
+        let context = test_context(&root, cfg);
+        let token = ensure_or_rotate(&context, "group:42", false).unwrap();
+        let turn = "turn-42";
+        let scope = format!("{}:{turn}", token_epoch(&token));
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["waitBudget"] =
+                json!({ "scope": scope, "used": 2, "max": 4 });
+            Ok(())
+        })
+        .unwrap();
+        assert!(!turn_wait_limit_reached(&context, "group:42", turn, &token));
+
+        let mut lowered = context.load_config().unwrap();
+        lowered["socialV2"]["wait"]["maxPerTurn"] = json!(2);
+        context
+            .write_atomic(
+                RuntimeArea::Config,
+                "config.json",
+                lowered.to_string().as_bytes(),
+            )
+            .unwrap();
+        assert!(turn_wait_limit_reached(&context, "group:42", turn, &token));
+        assert!(!turn_wait_limit_reached(
+            &context,
+            "group:42",
+            "other-turn",
+            &token
+        ));
+        assert!(!turn_wait_limit_reached(
+            &context,
+            "group:42",
+            turn,
+            "wrong-token"
+        ));
     }
 }
