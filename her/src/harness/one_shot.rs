@@ -245,10 +245,13 @@ impl Drop for AbandonOnExit {
 }
 
 /// Async digest route walk (or installed test fake) bounded by `within` and
-/// `memory.digest.timeoutSecs`.
+/// `memory.digest.timeoutSecs`, attributing usage under `key` and `usage_job`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn digest_summarise_async(
     context: &RuntimeContext,
     cfg: &Value,
+    key: &str,
+    usage_job: &'static str,
     system: &str,
     input: &str,
     within: Duration,
@@ -256,6 +259,9 @@ pub(crate) async fn digest_summarise_async(
 ) -> Result<String, ModelError> {
     #[cfg(test)]
     if let Some(model) = context.test_one_shot(Job::Digest) {
+        if cancel.is_cancelled() {
+            return Err(ModelError("cancelled"));
+        }
         if within.is_zero() {
             return Err(ModelError("timeout"));
         }
@@ -268,9 +274,12 @@ pub(crate) async fn digest_summarise_async(
             model.complete_within(&system, &input, within, &flag)
         });
         let joined = tokio::select! { biased;
-            _ = cancel.cancelled() => return Err(ModelError("cancelled")),
             joined = tokio::time::timeout(within, task) => joined,
+            _ = cancel.cancelled() => return Err(ModelError("cancelled")),
         };
+        if cancel.is_cancelled() {
+            return Err(ModelError("cancelled"));
+        }
         return match joined {
             Err(_elapsed) => Err(ModelError("timeout")),
             Ok(Err(_join)) => Err(ModelError("worker")),
@@ -288,8 +297,8 @@ pub(crate) async fn digest_summarise_async(
             context: context.clone(),
             route,
             chain: walk.chain,
-            key: usage::DIGEST_KEY.to_string(),
-            usage_job: usage::DIGEST,
+            key: key.to_string(),
+            usage_job,
             timeout: digest_timeout(cfg),
             max_tokens: DIGEST_MAX_TOKENS,
             unit: Duration::from_secs(1),

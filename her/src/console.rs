@@ -11,7 +11,7 @@ use crate::conversation_state::{Conversation, ConversationState, SocialDocument}
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -2730,7 +2730,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
     let limit = limit.clamp(1, 500) as usize;
     let mut out = ledger.summary(&table, limit);
     if let Some(obj) = out.as_object_mut() {
-        obj.insert("ledger".into(), ledger.stats(&table, 20_000));
+        obj.insert("ledger".into(), ledger.stats(&table, crate::ledger::DEFAULT_MAX_LINES));
     }
     Ok(out)
 }
@@ -2750,30 +2750,6 @@ fn handle_tokens_by_provider(context: &RuntimeContext, cfg: &Value) -> Result<Va
     let mut out = ledger.by_provider(&table);
     out["ok"] = json!(true);
     Ok(out)
-}
-
-/// 一个归属分组的累计（轮次用 `(sid, turn)` 去重，避免多 step 把轮数放大）。
-#[derive(Default)]
-struct UsageAgg {
-    turns: HashSet<(String, i64)>,
-    tokens: f64,
-    cost: f64,
-}
-
-impl UsageAgg {
-    fn add(&mut self, sid: &str, turn: i64, tokens: f64, cost: f64) {
-        self.turns.insert((sid.to_string(), turn));
-        self.tokens += tokens;
-        self.cost += cost;
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "turns": self.turns.len() as i64,
-            "tokens": self.tokens,
-            "cost": self.cost,
-        })
-    }
 }
 
 /// `.dshw-usage.json` 的按天合计。`day` 缺失时用 `ts` 推北京时间日期，不因为缺字段漏账。
@@ -2841,113 +2817,16 @@ fn handle_usage_attribution(context: &RuntimeContext, cfg: &Value, days: i64) ->
     let today = crate::pricing::beijing_parts(now).2;
     let start_day = crate::pricing::beijing_parts(now - (days - 1) * 86_400_000).2;
 
-    // 复用 ledger 的载入 + 幂等折叠（同 (turn,step,retry) 只留 seq 最大的一条），
-    // 不直接扫 JSONL —— 原始文件里会有被覆盖的旧采样，直接加会重复计费。
     let ledger = ledger_for_runtime(context)?;
-    let mut our = UsageAgg::default();
-    let mut by_key: BTreeMap<String, UsageAgg> = BTreeMap::new();
-    let mut by_provider: BTreeMap<String, UsageAgg> = BTreeMap::new();
-    let mut samples = 0i64;
-    // Harness samples (`harness::usage`) never went through DSH, so they are never subtracted from its total.
-    for s in ledger.dsh_comparable_samples() {
-        // 只统计有归属的记录；没有 key 的历史采样不属于「我们」，差额会体现出来。
-        let Some(key) = s
-            .key
-            .clone()
-            .or_else(|| ledger.key_of(&s.session_id))
-            .filter(|k| !k.is_empty())
-        else {
-            continue;
-        };
-        let at = if s.t != 0 { s.t } else { now };
-        if crate::pricing::beijing_parts(at).2 < start_day {
-            continue;
-        }
-        let (_, cost) = crate::pricing::price_usage(&s.buckets, &s.model, at, &table);
-        let tokens = s.buckets.total();
-        our.add(&s.session_id, s.turn, tokens, cost.total);
-        let provider = if s.provider.is_empty() {
-            "unknown".to_string()
-        } else {
-            s.provider.clone()
-        };
-        by_key
-            .entry(key)
-            .or_default()
-            .add(&s.session_id, s.turn, tokens, cost.total);
-        by_provider
-            .entry(provider)
-            .or_default()
-            .add(&s.session_id, s.turn, tokens, cost.total);
-        samples += 1;
-    }
-
-    let (dsh_turns, dsh_tokens, dsh_cost) = dsh_usage_total(context, &start_day)?;
-
-    let token_sort_key = |v: &Value| v.get("tokens").and_then(|t| t.as_f64()).unwrap_or(0.0);
-    let mut by_key_rows: Vec<Value> = by_key
-        .iter()
-        .map(|(k, a)| {
-            let mut row = a.to_json();
-            row["key"] = json!(k);
-            row
-        })
-        .collect();
-    by_key_rows.sort_by(|a, b| {
-        token_sort_key(b)
-            .partial_cmp(&token_sort_key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut by_provider_rows: Vec<Value> = by_provider
-        .iter()
-        .map(|(p, a)| {
-            let mut row = a.to_json();
-            row["provider"] = json!(p);
-            row
-        })
-        .collect();
-    by_provider_rows.sort_by(|a, b| {
-        token_sort_key(b)
-            .partial_cmp(&token_sort_key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // 差额不隐藏，负数也照实回：负数 = 账本领先于总账（回合刚跑完、总账还没落盘）。
-    // 同口径相减：总账事件与账本采样都是 LLM 请求（一条 usage 一次）；our.turns 是对话轮数，不能直接相减。
-    let unattributed_turns = dsh_turns - samples;
-    let unattributed_tokens = dsh_tokens - our.tokens;
-    let unattributed_cost = dsh_cost - our.cost;
-    let note = "DSH 总账（.dshw-usage.json）减去桥接账本（token-usage.jsonl 里带 key 的记录）。\
-差额没有被吞掉：可能是 Web GUI / CLI 探针等没有 QQ 会话归属的调用，也可能是回合刚跑完、\
-总账尚未落盘（此时为负）。dshTotal.turns 与 unattributed.turns 都按 LLM 请求计（总账事件\
-条数减去账本里带 key 的 usage 采样数 our.samples）；our.turns 是账本里的对话轮数，不参与相减。";
-
-    Ok(json!({
-        "ok": true,
-        "days": days,
-        "symbol": table.symbol,
-        "window": { "fromDay": start_day, "toDay": today },
-        "our": {
-            "turns": our.turns.len() as i64,
-            "tokens": our.tokens,
-            "cost": our.cost,
-            "samples": samples,
-        },
-        "dshTotal": {
-            "turns": dsh_turns,
-            "tokens": dsh_tokens,
-            "cost": dsh_cost,
-            "events": dsh_turns,
-        },
-        "unattributed": {
-            "turns": unattributed_turns,
-            "tokens": unattributed_tokens,
-            "cost": unattributed_cost,
-            "note": note,
-        },
-        "byKey": by_key_rows,
-        "byProvider": by_provider_rows,
-    }))
+    let attr = ledger.dsh_attribution(&table, &start_day, now);
+    let (turns, tokens, cost) = dsh_usage_total(context, &start_day)?;
+    Ok(attr.to_response(
+        days,
+        &today,
+        &start_day,
+        &table,
+        crate::ledger::DshTotals { turns, tokens, cost },
+    ))
 }
 /// `/api/tokens/recent?limit=`：最近 N 条按轮计费的采样（带金额与峰谷标记）。
 ///
@@ -9645,62 +9524,7 @@ pub(crate) fn reply_text_of(ob: crate::onebot::OneBot, kind: &str, conv_id: &str
 /// TD-1 之后账本是两份（JS + Rust），**两份都要清** —— 只清一份同样会表现为
 /// "点了重置还是老数字"（另一份的记录还在）。
 fn handle_tokens_reset(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        // Resolve both destinations before opening either. This catches an invalid second path
-        // before open_locked_file's create=true behavior can leave a new first ledger behind.
-        let js_path = context
-            .resolve_path(RuntimeArea::Data, "token-usage.jsonl", PathIntent::WriteFile)
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        let rust_path = context
-            .resolve_path(RuntimeArea::Data, "token-usage-rust.jsonl", PathIntent::WriteFile)
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        let exists = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err((500, "重置失败：所选用量账本不可用".to_string())),
-        };
-        let js_exists = exists(&js_path)?;
-        let rust_exists = exists(&rust_path)?;
-
-        // If one ledger is missing, lock the existing one first. A busy existing file then
-        // cannot cause the missing sibling to be created as a side effect of a failed reset.
-        // When both are missing, the first successful open may create an empty file before the
-        // second open fails; this helper is intentionally create-capable for JS reset parity.
-        let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
-            let rust = context
-                .open_locked_file(RuntimeArea::Data, "token-usage-rust.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            let js = context
-                .open_locked_file(RuntimeArea::Data, "token-usage.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            (js, rust)
-        } else {
-            let js = context
-                .open_locked_file(RuntimeArea::Data, "token-usage.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            let rust = context
-                .open_locked_file(RuntimeArea::Data, "token-usage-rust.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            (js, rust)
-        };
-        js_ledger
-            .set_len(0)
-            .and_then(|_| js_ledger.sync_all())
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        rust_ledger
-            .set_len(0)
-            .and_then(|_| rust_ledger.sync_all())
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-    } else {
-        for path in crate::ledger::LEDGER_FILES {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-                .map_err(|e| (500, format!("重置失败 {path}：{e}")))?;
-        }
-    }
+    crate::ledger::LedgerStorage::reset(context).map_err(|error| (500, error))?;
     crate::safe_println!("[console] token 账本已重置（JS + Rust 两份）");
     Ok(json!({ "ok": true }))
 }

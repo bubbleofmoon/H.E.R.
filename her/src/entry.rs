@@ -1829,6 +1829,29 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         dependency_watch::report_last_crash(&runtime_context, &cfg_raw);
         // #179: write the guarded DSH profile rows back and check the whole profile once at start.
         dsh_profile::startup(&runtime_context);
+        harness::route_health::reconcile_startup(&runtime_context, &cfg_raw);
+        if let Err(error) = harness::usage::reconcile_startup(&runtime_context) {
+            recovery_log::record(
+                &runtime_context,
+                run_record::Trigger::Recovery,
+                run_record::Component::ModelChain,
+                "usage-reconcile-failed",
+                run_record::Outcome::Failed,
+                &error,
+            );
+        }
+        let price_table = crate::pricing::resolve(cfg_raw.get("pricing"));
+        if let Err(error) = ledger::LedgerStorage::compact_if_needed(&runtime_context, &price_table)
+        {
+            recovery_log::record(
+                &runtime_context,
+                run_record::Trigger::Recovery,
+                run_record::Component::ModelChain,
+                "usage-compact-failed",
+                run_record::Outcome::Failed,
+                &error,
+            );
+        }
     }
     let mut reserved2_hub = if runtime_context.is_isolated() && live_mode {
         let args: Vec<String> = std::env::args().collect();

@@ -30,19 +30,19 @@ pub(crate) const MESSAGE_TOKENS: u64 = 4;
 /// The context window of the route `route` names: `harness.contextTokens.<route id>`, an integer from
 /// `CONTEXT_TOKENS_MIN` to `CONTEXT_TOKENS_MAX`, else `DEFAULT_CONTEXT_TOKENS`.
 pub(crate) fn window(cfg: &Value, route: &str) -> u64 {
-    cfg.pointer("/harness/contextTokens")
-        .and_then(|table| table.get(route))
+    crate::settings::HARNESS_CONTEXT_TOKENS
+        .read(cfg)
+        .get(route)
         .and_then(Value::as_u64)
-        .filter(|tokens| (CONTEXT_TOKENS_MIN..=CONTEXT_TOKENS_MAX).contains(tokens))
         .unwrap_or(DEFAULT_CONTEXT_TOKENS)
 }
 
 /// The share of the window one request may fill: `harness.historyShare`, a number from `HISTORY_SHARE_MIN` to
 /// `HISTORY_SHARE_MAX`, else `DEFAULT_HISTORY_SHARE`.
 pub(crate) fn share(cfg: &Value) -> f64 {
-    cfg.pointer("/harness/historyShare")
-        .and_then(Value::as_f64)
-        .filter(|share| (HISTORY_SHARE_MIN..=HISTORY_SHARE_MAX).contains(share))
+    crate::settings::HARNESS_HISTORY_SHARE
+        .read(cfg)
+        .as_f64()
         .unwrap_or(DEFAULT_HISTORY_SHARE)
 }
 

@@ -441,8 +441,29 @@ fn digest_walk_records_name_routes_without_the_credential() {
     assert_eq!(fixture.walk(Duration::from_secs(10)).complete("system", "input"), Ok("[]".to_string()));
     let failovers = fixture.records("failover-step");
     assert!(failovers.len() == 1 && failovers[0].contains("route r-[REDACTED] (backend)"), "{failovers:?}");
-    let ledger = std::fs::read_to_string(fixture.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let page =
+        crate::recovery_log::page(&fixture.context, &crate::run_record::Query::default()).unwrap();
+    assert_eq!(page.records[0].trigger, crate::run_record::Trigger::Digest);
+    let ledger = std::fs::read_to_string(fixture.root.join("data/token-usage-rust.jsonl"))
+        .unwrap_or_default();
     assert!(!ledger.is_empty() && !ledger.contains(SECRET), "the ledger never keeps the credential");
+
+    // Also verify answering digest route itself redacts route id & model in the ledger row.
+    let model_c = format!("c-{SECRET}");
+    let relay_ans = Relay::start(vec![(model_c.as_str(), at_once(Kind::Answer("[]")))]);
+    let extra_ans = json!({
+        "harness": {"routes": [{"id": format!("id-{SECRET}"), "model": model_c}]}
+    });
+    let fixture_ans = Fixture::new("credential-ans", &relay_ans, extra_ans);
+    assert_eq!(
+        fixture_ans.walk(Duration::from_secs(10)).complete("system", "input"),
+        Ok("[]".to_string())
+    );
+    let ans_ledger =
+        std::fs::read_to_string(fixture_ans.root.join("data/token-usage-rust.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(ans_ledger.lines().next().unwrap()).unwrap();
+    assert_eq!(row["route"], "id-[REDACTED]");
+    assert_eq!(row["model"], "c-[REDACTED]");
 }
 
 #[test]

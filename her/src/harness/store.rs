@@ -22,6 +22,8 @@ pub(crate) struct Round {
 #[derive(Clone, Debug)]
 pub(crate) struct History {
     pub session: String,
+    /// The initial `model_attempts.id` opened for this turn admission.
+    pub attempt: String,
     /// The summary the session's newest checkpoint carries (`None`: no checkpoint, or one without a summary).
     pub summary: Option<String>,
     /// The completed turns after that checkpoint, oldest first.
@@ -249,6 +251,7 @@ impl Store {
         let idle_from: Option<i64> = tx
             .query_row("SELECT MAX(ended_ms) FROM turns WHERE session_id=?1", [&session], |r| r.get(0))
             .map_err(|_| STORAGE_ERROR)?;
+        let attempt = crate::turn_ledger::mint_id("model-attempt-");
         let history = {
             let mut stmt = tx.prepare("SELECT e.seq,e.turn_id,e.kind,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
                 WHERE e.session_id=?1 AND e.seq>?2 AND t.state='completed' AND e.kind IN ('user','assistant','tool_result') ORDER BY e.seq").map_err(|_| STORAGE_ERROR)?;
@@ -294,6 +297,7 @@ impl Store {
             }
             History {
                 session: session.clone(),
+                attempt: attempt.clone(),
                 summary,
                 rounds: rounds.into_iter().map(|(_, round)| round).collect(),
                 idle_from,
@@ -304,7 +308,6 @@ impl Store {
             params![request.id, session, request.conversation, request.profile, now]).map_err(|_| STORAGE_ERROR)?;
         // The first attempt goes to the turn's start route (`ModelRoute::start`).
         let route = request.route.routes.get(request.route.start).ok_or(STORAGE_ERROR)?;
-        let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
             params![attempt, request.id, safe_text(&known, &route.model), safe_text(&known, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
         append(
@@ -376,7 +379,7 @@ impl Store {
     }
 
     /// A new attempt of the running turn on route `route` of its chain (a step, a retry or a failover).
-    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<(), String> {
+    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<String, String> {
         let route = request.route.routes.get(route).ok_or(STORAGE_ERROR)?;
         let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
@@ -397,7 +400,7 @@ impl Store {
             json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
-        Ok(())
+        Ok(attempt)
     }
 
     /// Intent commits before the blocking handler may be scheduled, including refused calls.
@@ -838,6 +841,118 @@ fn attempt_route(model: String, started: &str) -> String {
         .ok()
         .and_then(|payload| payload["route"].as_str().map(str::to_string))
         .unwrap_or(model)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedAttemptRecord {
+    pub seq: i64,
+    pub attempt_id: String,
+    pub conversation: String,
+    pub model: String,
+    pub route: String,
+    pub ended_ms: i64,
+    pub usage: Option<genai::chat::Usage>,
+}
+
+/// Completed model attempts committed after `after_seq` (`events.seq` of `model_attempt_ended`)
+/// that carry a saved response, for startup usage-ledger crash reconciliation. Never creates or
+/// migrates `conversations.db`.
+pub(crate) fn completed_attempts_after(
+    context: &RuntimeContext,
+    after_seq: i64,
+) -> Result<Vec<CompletedAttemptRecord>, String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.seq, a.id, s.conversation, a.model, a.ended_ms, a.begun_ms, a.response,
+                (SELECT es.payload FROM events es
+                 WHERE es.attempt_id = a.id AND es.kind = 'model_attempt_started'
+                 ORDER BY es.seq DESC LIMIT 1) AS started_payload
+             FROM events e
+             JOIN model_attempts a ON a.id = e.attempt_id
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.kind = 'model_attempt_ended'
+               AND a.state = 'completed'
+               AND a.response IS NOT NULL
+               AND e.seq > ?1
+             ORDER BY e.seq ASC",
+        )
+        .map_err(|_| STORAGE_ERROR)?;
+    let rows = stmt
+        .query_map(params![after_seq], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(|_| STORAGE_ERROR)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (seq, attempt_id, conversation, model, ended_ms, begun_ms, response_raw, started) in rows {
+        let Ok(response) = serde_json::from_str::<Value>(&response_raw) else {
+            continue;
+        };
+        let usage = response
+            .get("captured_usage")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value::<genai::chat::Usage>(v.clone()).ok());
+        let route = attempt_route(model.clone(), started.as_deref().unwrap_or(""));
+        out.push(CompletedAttemptRecord {
+            seq,
+            attempt_id,
+            conversation,
+            model,
+            route,
+            ended_ms: ended_ms.unwrap_or(begun_ms),
+            usage,
+        });
+    }
+    Ok(out)
+}
+
+/// Highest `events.seq` among `model_attempt_ended` events (all events when `attempt_ids` is
+/// `None`, or those matching `attempt_ids` when `Some`). Returns `0` when no database exists.
+pub(crate) fn max_attempt_event_seq(
+    context: &RuntimeContext,
+    attempt_ids: Option<&[String]>,
+) -> Result<i64, String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok(0);
+    };
+    match attempt_ids {
+        None => conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE kind = 'model_attempt_ended'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| STORAGE_ERROR.to_string()),
+        Some(ids) if ids.is_empty() => Ok(0),
+        Some(ids) => {
+            let mut max_seq = 0i64;
+            for chunk in ids.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT COALESCE(MAX(seq), 0) FROM events
+                     WHERE kind = 'model_attempt_ended' AND attempt_id IN ({placeholders})"
+                );
+                let seq: i64 = conn
+                    .query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |r| r.get(0))
+                    .map_err(|_| STORAGE_ERROR.to_string())?;
+                max_seq = max_seq.max(seq);
+            }
+            Ok(max_seq)
+        }
+    }
 }
 
 #[cfg(test)]

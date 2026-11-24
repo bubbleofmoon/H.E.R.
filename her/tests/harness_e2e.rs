@@ -4702,13 +4702,24 @@ fn ticket159_reserved2_thinking_begins_after_checkpoint_preparation() {
     rig.start();
     reserved2_push_mention(&rig, 15941, "first turn to create history");
     assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1));
-    let path = rig.root.join("config/config.json");
-    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    config["harness"]["contextTokens"] = json!({"fake-chat":1000});
-    config["harness"]["summaries"] = json!(true);
-    let staged = path.with_extension("tmp");
-    fs::write(&staged, config.to_string()).unwrap();
-    fs::rename(staged, path).unwrap();
+    assert_eq!(
+        rig.console(
+            "POST",
+            "/api/settings/set",
+            Some(&json!({"setting": "harness.contextTokens", "value": {"fake-chat": 1000}})),
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        rig.console(
+            "POST",
+            "/api/settings/set",
+            Some(&json!({"setting": "harness.summaries", "value": true})),
+        )
+        .0,
+        200
+    );
 
     reserved2_push_mention(&rig, 15942, "second turn after a budget change");
     assert!(wait_for(LONG, || lock(&model.requests).len() == 2), "the second turn must request a checkpoint summary");

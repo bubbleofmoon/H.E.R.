@@ -76,3 +76,63 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(quiet_view(&context)["value"], 4500, "the next list shows the new value");
 }
+
+#[test]
+fn harness_history_budget_settings_overlay_live_reads_and_reset_defaults() {
+    let (_root, context) = settings_fixture("harness history budget");
+    let cfg = context.load_config().unwrap();
+    assert_eq!(crate::harness::budget::window(&cfg, "primary"), 64_000);
+    assert_eq!(crate::harness::budget::share(&cfg), 0.82);
+    assert!(crate::settings::HARNESS_SUMMARIES.switch(&cfg));
+
+    let (status, body) = admin_request(
+        &context,
+        "POST",
+        "/api/settings/set",
+        Some(&json!({"setting": "harness.contextTokens", "value": {"primary": 32_000}})),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = admin_request(
+        &context,
+        "POST",
+        "/api/settings/set",
+        Some(&json!({"setting": "harness.historyShare", "value": 0.5})),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = admin_request(
+        &context,
+        "POST",
+        "/api/settings/set",
+        Some(&json!({"setting": "harness.summaries", "value": false})),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    let overlaid = context.load_config().unwrap();
+    assert_eq!(crate::harness::budget::window(&overlaid, "primary"), 32_000);
+    assert_eq!(crate::harness::budget::window(&overlaid, "other"), 64_000);
+    assert_eq!(crate::harness::budget::share(&overlaid), 0.5);
+    assert_eq!(crate::harness::budget::limit(&overlaid, "primary"), 16_000);
+    assert!(!crate::settings::HARNESS_SUMMARIES.switch(&overlaid));
+
+    let (status, _) = admin_request(
+        &context,
+        "POST",
+        "/api/settings/set",
+        Some(&json!({"setting": "harness.historyShare", "value": 0.99})),
+    );
+    assert_eq!(status, 400);
+
+    for key in ["harness.contextTokens", "harness.historyShare", "harness.summaries"] {
+        let (status, body) = admin_request(
+            &context,
+            "POST",
+            "/api/settings/reset",
+            Some(&json!({"setting": key})),
+        );
+        assert_eq!(status, 200, "{key}: {body}");
+    }
+    let reset_cfg = context.load_config().unwrap();
+    assert_eq!(crate::harness::budget::window(&reset_cfg, "primary"), 64_000);
+    assert_eq!(crate::harness::budget::share(&reset_cfg), 0.82);
+    assert!(crate::settings::HARNESS_SUMMARIES.switch(&reset_cfg));
+}

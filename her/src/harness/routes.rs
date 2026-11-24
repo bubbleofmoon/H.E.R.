@@ -907,6 +907,12 @@ pub(crate) trait RouteStep: Send {
         ctx: StepContext<'a>,
     ) -> Pin<Box<dyn Future<Output = StepResult<Self::Output>> + Send + 'a>>;
 
+    /// The active `conversations.db` `model_attempts.id` for this step, when backed by durable
+    /// turn storage.
+    fn attempt_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Invoked after `decide` selects `Next::Retry` or `Next::FailOver` (before any backoff sleep) so stateful turn
     /// adapters can check bounds and close the failed attempt in storage.
     fn on_miss_transition(&mut self, _next: Next) -> Result<(), StepAbort> {
@@ -1158,7 +1164,7 @@ impl ChainExecutor {
         }
     }
 
-    fn record_usage(&self, route: &Route, usage: Option<&Usage>) {
+    fn record_usage(&self, route: &Route, usage: Option<&Usage>, attempt_id: Option<&str>) {
         if !self.cfg.record_usage {
             return;
         }
@@ -1168,13 +1174,14 @@ impl ChainExecutor {
             step: if self.cfg.track_steps { self.step as i64 } else { 0 },
             retry: self.repeats,
         };
-        usage::record(
+        usage::record_attempt(
             &self.cfg.context,
             &place,
             &route.id,
             &route.model,
             self.cfg.usage_job,
             usage,
+            attempt_id,
         );
     }
 
@@ -1182,11 +1189,23 @@ impl ChainExecutor {
         if !self.cfg.record_events {
             return;
         }
+        let trigger = if self.cfg.usage_job == usage::DIGEST {
+            Trigger::Digest
+        } else {
+            Trigger::Turn
+        };
         let reason = format!(
             "{}: route {} ({summary}) on a request of {bytes} bytes; {action}",
             self.cfg.key, route.id
         );
-        crate::recovery_log::record(&self.cfg.context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
+        crate::recovery_log::record(
+            &self.cfg.context,
+            trigger,
+            Component::ModelChain,
+            event,
+            outcome,
+            &reason,
+        );
     }
 
     fn record_route_miss<S: RouteStep>(
@@ -1243,9 +1262,10 @@ impl ChainExecutor {
                 max_tokens,
             };
             let step_result = tokio::select! { biased;
-                _ = cancel.cancelled() => return Err(ChainError::Cancelled),
                 result = adapter.step(ctx) => result,
+                _ = cancel.cancelled() => return Err(ChainError::Cancelled),
             };
+            let attempt_id = adapter.attempt_id().map(str::to_string);
             let route = &self.cfg.route.routes[self.route_idx];
             match step_result {
                 StepResult::Abort {
@@ -1254,7 +1274,7 @@ impl ChainExecutor {
                     tokens_charged,
                 } => {
                     if let Some(usage) = response_usage {
-                        self.record_usage(route, usage.as_ref());
+                        self.record_usage(route, usage.as_ref(), attempt_id.as_deref());
                         self.spent_tokens = self.spent_tokens.saturating_add(tokens_charged);
                     }
                     return Err(abort.into());
@@ -1266,8 +1286,11 @@ impl ChainExecutor {
                     ..
                 } => {
                     if let Some(usage) = response_usage {
-                        self.record_usage(route, usage.as_ref());
+                        self.record_usage(route, usage.as_ref(), attempt_id.as_deref());
                         self.spent_tokens = self.spent_tokens.saturating_add(tokens_charged);
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(ChainError::Cancelled);
                     }
                     self.step += 1;
                     if self.cfg.observe_health {
@@ -1291,7 +1314,7 @@ impl ChainExecutor {
                     observe_health,
                 } => {
                     if let Some(usage) = response_usage {
-                        self.record_usage(route, usage.as_ref());
+                        self.record_usage(route, usage.as_ref(), attempt_id.as_deref());
                         self.spent_tokens = self.spent_tokens.saturating_add(tokens_charged);
                     }
                     let now = Instant::now();
@@ -2476,5 +2499,69 @@ mod tests {
             summary_rows,
             [("turn", 2, 2, "b"), ("turn", 3, 0, "b"), ("digest", 0, 0, "a"), ("digest", 0, 1, "a")]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chain_executor_records_ready_usage_when_cancel_races_step_completion() {
+        use tokio::sync::oneshot;
+
+        struct CancelRaceStep {
+            entered: Option<oneshot::Sender<()>>,
+            ready: Option<oneshot::Receiver<()>>,
+        }
+
+        impl RouteStep for CancelRaceStep {
+            type Output = String;
+
+            fn step<'a>(
+                &'a mut self,
+                _ctx: StepContext<'a>,
+            ) -> Pin<Box<dyn Future<Output = StepResult<String>> + Send + 'a>> {
+                let entered = self.entered.take();
+                let ready = self.ready.take();
+                Box::pin(async move {
+                    if let Some(tx) = entered {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = ready {
+                        let _ = rx.await;
+                    }
+                    StepResult::Answered {
+                        value: "late-answer".into(),
+                        response_usage: Some(Some(sample_usage())),
+                        tokens_charged: 15,
+                    }
+                })
+            }
+        }
+
+        let cfg_routes = json!({"routes": [route("a")]});
+        let fixture = TestFixture::new("cancel-race", cfg_routes, "secret-259-cancel-race");
+        let model = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        let mut exec = ChainExecutor::new(turn_chain_cfg(&fixture.context, model, "group:9"));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let mut step = CancelRaceStep {
+            entered: Some(entered_tx),
+            ready: Some(ready_rx),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut cancel = Cancellation::from_watch(cancel_rx);
+        let racer = tokio::spawn(async move {
+            let _ = entered_rx.await;
+            let _ = cancel_tx.send(true);
+            let _ = ready_tx.send(());
+        });
+        let err = exec.next_answer(&mut step, &mut cancel).await.unwrap_err();
+        racer.await.unwrap();
+        assert_eq!(err, ChainError::Cancelled);
+        let rows = fixture.usage_rows();
+        assert_eq!(
+            rows.len(),
+            1,
+            "ready usage must still be recorded before returning Cancelled"
+        );
+        assert_eq!(rows[0]["b"]["cacheMiss"], 10);
+        assert_eq!(rows[0]["b"]["output"], 5);
     }
 }
