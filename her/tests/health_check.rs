@@ -593,7 +593,9 @@ impl Rig {
                 .unwrap();
             last_status = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
             last_status["owners"]["console"]["state"] == "held"
+                && last_status["owners"]["console"]["owner"].is_object()
                 && last_status["owners"]["supervisor"]["state"] == "held"
+                && last_status["owners"]["supervisor"]["owner"].is_object()
         }) {
             panic!("owners not ready: {last_status}");
         }
