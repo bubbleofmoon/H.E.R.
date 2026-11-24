@@ -326,7 +326,7 @@ fn model_and_cost_settings_have_no_reader_default() {
     let readers = [
         ("harness.rs", include_str!("../../harness.rs")),
         ("harness/routes.rs", include_str!("../../harness/routes.rs")),
-        ("digest/model.rs", include_str!("../../digest/model.rs")),
+        ("harness/one_shot.rs", include_str!("../../harness/one_shot.rs")),
         ("aux_search.rs", include_str!("../../aux_search.rs")),
     ];
     let owned = [

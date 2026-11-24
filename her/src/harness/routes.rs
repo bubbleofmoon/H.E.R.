@@ -1530,13 +1530,13 @@ mod tests {
     #[test]
     fn harness_routes_digest_model_falls_back_to_the_first_route() {
         let cfg = routes(vec![route("a"), route("b")]);
-        assert_eq!(super::one_shot::digest_model_id(&cfg).as_deref(), Some("model-a"));
+        assert_eq!(crate::harness::one_shot::digest_model_id(&cfg).as_deref(), Some("model-a"));
         let mut own = cfg.clone();
         own["memory"] = json!({"digest": {"model": "d"}});
-        assert_eq!(super::one_shot::digest_model_id(&own).as_deref(), Some("d"));
+        assert_eq!(crate::harness::one_shot::digest_model_id(&own).as_deref(), Some("d"));
         let invalid = json!({"harness": {"model": "h", "routes": [{"id": "a"}]}});
         assert_eq!(
-            super::one_shot::digest_model_id(&invalid),
+            crate::harness::one_shot::digest_model_id(&invalid),
             None,
             "an invalid chain is not configured"
         );
