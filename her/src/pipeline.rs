@@ -942,7 +942,7 @@ impl Pipeline {
         match crate::social_state::token(&self.context, key) {
             Ok(Some(token)) if crate::send_outbox::token_epoch(&token) == self.turn_epoch => Ok(()),
             Ok(_) => Err("会话令牌已变化（重置、取消或被替代）".to_string()),
-            Err(error) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -1203,7 +1203,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             let message = format!("{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）", blocking.id);
             return Err(LedgerAdmissionError::Held { message, record });
         }
-        let token = crate::social_state::ensure_or_rotate(&self.context, key, false)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, false)
+            .map_err(String::from)?;
         if self.dispatch_token.take().is_some_and(|expected| expected != token) {
             return Err("queued wake token invalidated".to_string().into());
         }

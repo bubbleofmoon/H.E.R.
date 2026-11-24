@@ -3162,7 +3162,7 @@ pub(crate) fn finish_access_change(
 #[allow(clippy::too_many_arguments)]
 fn finish_access_change_with(
     context: &RuntimeContext,
-    interaction_gate: &std::fs::File,
+    _interaction_gate: &std::fs::File,
     before: &Value,
     after: &Value,
     why: &str,
@@ -3180,16 +3180,25 @@ fn finish_access_change_with(
             hook(context.config_file());
         }
     }
-    let (revoked, mut failures) = reconcile_access_change_with(
-        context,
-        interaction_gate,
-        before,
-        after,
-        why,
-        pending.as_deref(),
-        tracker,
-        stopper,
-    );
+    let (revoked, mut failures) = if !context.is_isolated() {
+        (Vec::new(), Vec::new())
+    } else {
+        let current_mode = mode(context);
+        reconcile_policies(
+            context,
+            &ReconcileRequest {
+                before,
+                after,
+                mode: &current_mode,
+                why,
+                dsh_cfg: after,
+                entry: pending.as_deref(),
+                targets: &[],
+            },
+            tracker,
+            stopper,
+        )
+    };
     if failures.is_empty() {
         if let Err(error) = forget_access_change(context, &pending) {
             failures.push(format!(
@@ -3892,16 +3901,15 @@ mod tests {
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
                 .collect();
-            let dir = std::env::temp_dir().join(format!(
+            let dir = crate::install_root::development_root(std::env::temp_dir().join(format!(
                 "her-social-state-{}-{}-{safe}",
                 std::process::id(),
                 crate::parity_clock::now_ms()
-            ));
+            )));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("config")).unwrap();
-            std::fs::create_dir_all(dir.join("data")).unwrap();
-            std::fs::create_dir_all(dir.join("resources")).unwrap();
-            std::fs::create_dir_all(dir.join("logs")).unwrap();
+            for sub in ["config", "data", "resources", "logs", "user/dsh"] {
+                std::fs::create_dir_all(dir.join(sub)).unwrap();
+            }
             Self(dir)
         }
     }
@@ -3912,7 +3920,15 @@ mod tests {
         }
     }
 
-    fn test_context(root: &TestDir, cfg: Value) -> RuntimeContext {
+    fn test_context(root: &TestDir, mut cfg: Value) -> RuntimeContext {
+        if cfg
+            .get("consoleToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            cfg["consoleToken"] = json!("synthetic-social-state-test-token");
+        }
         std::fs::write(
             root.0.join("config/config.json"),
             serde_json::to_string_pretty(&cfg).unwrap(),
@@ -3923,7 +3939,17 @@ mod tests {
             r#"{"paused":false,"conversations":{}}"#,
         )
         .unwrap();
-        RuntimeContext::for_runtime_root(&root.0).unwrap()
+        std::fs::write(
+            root.0.join("dependencies.json"),
+            json!({
+                "dsh": "http://127.0.0.1:1",
+                "model": "http://127.0.0.1:1",
+                "onebot": "http://127.0.0.1:1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        RuntimeContext::from_root(&root.0).unwrap()
     }
 
     struct FakeStopper {

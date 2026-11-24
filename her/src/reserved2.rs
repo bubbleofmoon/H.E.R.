@@ -1,8 +1,8 @@
 //! Live selected-runtime owner of the existing wake driver. Turns run independently of ingress.
 use crate::{
-    chat, console, inbound, inbound_text, pipeline, prompt,
+    chat, inbound, inbound_text, pipeline, prompt,
     runtime::{RuntimeArea, RuntimeContext},
-    session,
+    session, social_state,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -109,6 +109,7 @@ const STALE_WAKE: &str = "queued wake token invalidated";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{console, conversation_state};
 
     async fn queued_hub(label: &str) -> (std::path::PathBuf, Hub) {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-{label}-{}", crate::turn_ledger::mint_id(""))));

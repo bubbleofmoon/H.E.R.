@@ -1,7 +1,7 @@
 //! First-generation simulation. State is shared with the companion console under one OS gate;
 //! only the live hub schedules turns. Timers and jobs never survive a process generation.
 use crate::{
-    chat, console,
+    chat,
     conversation_state::{
         read_reserved_document as read, reserved_document_exists,
         update_reserved_document as mutate, ReservedConversation as Conversation,

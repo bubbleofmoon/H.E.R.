@@ -9,6 +9,7 @@ pub struct MemoryStore {
     conn: Connection,
     owner: Option<String>,
     has_provenance: bool,
+    _guard: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// One conversation's view: search, write, forget and index see only what it may read.
@@ -77,12 +78,24 @@ impl MemoryStore {
             conn: super::prepare_connection(conn)?,
             owner,
             has_provenance: true,
+            _guard: None,
         })
     }
 
     /// Bind an initialized connection and the optional owner conversation (probes and tests; no migration runs).
     pub fn from_connection(conn: Connection, owner: Option<String>) -> Self {
-        Self { conn, owner, has_provenance: false }
+        Self {
+            conn,
+            owner,
+            has_provenance: false,
+            _guard: None,
+        }
+    }
+
+    /// Attach an opaque lock/resource guard kept alive for the lifetime of this store handle.
+    pub fn with_guard<G: std::any::Any + Send + 'static>(mut self, guard: G) -> Self {
+        self._guard = Some(Box::new(guard));
+        self
     }
 
     pub fn for_reader(&self, conversation: &str) -> Reader<'_> {

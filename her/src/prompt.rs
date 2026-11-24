@@ -682,8 +682,9 @@ pub(crate) fn record_recall_hits(context: &RuntimeContext, ids: &[i64]) {
     if ids.is_empty() {
         return;
     }
-    let counted = crate::memory::open_ready_for_runtime(context).and_then(|conn| {
-        crate::memory::record_hits(&conn, ids).map_err(|error| crate::memory::search_error_message(&error))
+    let counted = crate::memory::open_ready_guarded_for_runtime(context).and_then(|(conn, _gate)| {
+        crate::memory::record_hits(&conn, ids)
+            .map_err(|error| crate::memory::search_error_message(&error))
     });
     if counted.is_err() {
         eprintln!("memory recall hit count failed (database unavailable or update refused)");

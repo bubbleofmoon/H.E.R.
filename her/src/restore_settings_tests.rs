@@ -134,9 +134,10 @@ fn restore_settings_full_restore_brings_the_store_back_and_memory_only_leaves_it
             "a full restore brings the archived history back"
         );
         let pre = Path::new(result["preRestoreBackup"].as_str().unwrap());
-        assert!(
+        assert_eq!(
             crate::backup::verify_archive(pre, &|| Ok(())).unwrap().files.contains_key("settings.db"),
-            "the pre-restore backup holds the current settings.db"
+            !memory_only,
+            "the pre-restore backup is scoped to the restore"
         );
     }
 }
@@ -201,9 +202,10 @@ fn restore_settings_archive_without_the_store_restores_and_only_a_full_restore_r
         }
         assert_eq!(memory(&f), "old memory");
         let pre = Path::new(result["preRestoreBackup"].as_str().unwrap());
-        assert!(
+        assert_eq!(
             crate::backup::verify_archive(pre, &|| Ok(())).unwrap().files.contains_key("settings.db"),
-            "the pre-restore backup keeps the current store"
+            !memory_only,
+            "the pre-restore backup keeps the current store only for full restore"
         );
     }
 }
@@ -371,24 +373,50 @@ fn restore_settings_unusable_store_fails_the_backup_and_refuses_a_restore_before
         let error = crate::backup::create(&f.context(), &|| Ok(())).expect_err(case);
         assert!(error.contains("settings"), "{case}: {error}");
         assert_eq!(archives(&f), published, "{case}: a failed backup publishes nothing");
-        let plan = preview(&f.context(), &archive, true).unwrap();
-        let mut control = FakeControl::default();
-        let error = execute_with(
+
+        let full_plan = preview(&f.context(), &archive, false);
+        let full_confirmation = full_plan
+            .as_ref()
+            .map(|p| p["confirmation"].as_str().unwrap().to_string())
+            .unwrap_or_default();
+        let mut full_control = FakeControl::default();
+        let full_error = execute_with(
+            &f.context(),
+            &archive,
+            false,
+            &full_confirmation,
+            "fixture-admin",
+            &mut full_control,
+        )
+        .expect_err(case);
+        assert!(full_error.contains("settings"), "{case}: {full_error}");
+        if case == "symlink" {
+            assert_eq!(full_control.stops, 0, "{case}: symlink refused before stopping");
+        } else {
+            assert_eq!(full_control.stops, 1, "{case}: full pre-restore backup runs after quiesce");
+            assert_eq!(full_control.writes, 0, "{case}: nothing replaced");
+            assert_eq!(full_control.restarts, 1, "{case}: owners restarted after refusal");
+            assert!(
+                full_control
+                    .alerts
+                    .iter()
+                    .any(|alert| alert.contains("Restore refused after stopping")),
+                "{case}: {:?}",
+                full_control.alerts
+            );
+        }
+
+        let mem_plan = preview(&f.context(), &archive, true).unwrap();
+        let mut mem_control = FakeControl::default();
+        execute_with(
             &f.context(),
             &archive,
             true,
-            plan["confirmation"].as_str().unwrap(),
+            mem_plan["confirmation"].as_str().unwrap(),
             "fixture-admin",
-            &mut control,
+            &mut mem_control,
         )
-        .expect_err(case);
-        assert!(error.contains("settings"), "{case}: {error}");
-        assert_eq!(control.stops, 0, "{case}: refused before anything stops");
-        assert!(
-            control.alerts.iter().any(|alert| alert.contains("Restore refused before stopping")),
-            "{case}: {:?}",
-            control.alerts
-        );
+        .unwrap();
         assert_eq!(memory(&f), "old memory");
     }
 }
