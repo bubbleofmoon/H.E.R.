@@ -14,8 +14,9 @@
 //! it (`write_store_with`), as every settings writer does.
 
 use super::{
-    inspect, now_ms, raw_config, read_stored_values, request_id, schema_version, write_store_with, Applied, Inspection,
-    Undone, CHANGED_SINCE_ERROR, CONFIG_ERROR, LEGACY_ERROR, NOT_UNDOABLE_ERROR, OLD_VALUE_REFUSED_ERROR, SEED_ACTOR,
+    now_ms, raw_config, read_store, read_stored_values_checked, request_id, schema_version,
+    schema_version_checked, write_store_with, Applied, InspectError, Undone, CHANGED_SINCE_ERROR,
+    CONFIG_ERROR, LEGACY_ERROR, NOT_UNDOABLE_ERROR, OLD_VALUE_REFUSED_ERROR, SEED_ACTOR,
     STORAGE_ERROR,
 };
 use crate::runtime::RuntimeContext;
@@ -75,22 +76,37 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<Option<V
 
 /// The scoped choice and global default from one settings snapshot. The caller supplies
 /// the loader's document for the registry's ordinary config and default fallback.
-pub(crate) fn engine_choice(context: &RuntimeContext, cfg: &Value, key: &str, inherit_default: bool) -> Result<Value, String> {
+pub(crate) fn engine_choice(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    inherit_default: bool,
+) -> Result<Value, String> {
     use crate::settings::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
-    let fallback = || if inherit_default { ENGINE_DEFAULT.read(cfg) } else { Value::String("dsh".into()) };
-    let Inspection::Ready(conn) = inspect(context)? else { return Ok(fallback()) };
-    let scoped = if schema_version(&conn)? >= 2 {
-        stored_row(&conn, key, CONVERSATION_ENGINE.key).map_err(|(_, error)| error)?
-    } else {
-        None
-    };
-    if let Some((text, _)) = scoped {
-        return serde_json::from_str::<Value>(&text).ok().and_then(|value| CONVERSATION_ENGINE.normalize(&value))
-            .ok_or_else(|| "stored conversation engine is invalid".into());
-    }
-    if !inherit_default { return Ok(fallback()); }
-    Ok(read_stored_values(&conn)?.into_iter().find(|(setting, _)| setting.key == ENGINE_DEFAULT.key)
-        .map_or_else(fallback, |(_, value)| value))
+    let fallback =
+        || if inherit_default { ENGINE_DEFAULT.read(cfg) } else { Value::String("dsh".into()) };
+    read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(fallback()) };
+        let scoped = if schema_version_checked(conn)? >= 2 {
+            stored_row_sqlite(conn, key, CONVERSATION_ENGINE.key)
+                .map_err(InspectError::from_sqlite)?
+        } else {
+            None
+        };
+        if let Some((text, _)) = scoped {
+            return serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| CONVERSATION_ENGINE.normalize(&value))
+                .ok_or_else(|| InspectError::Fatal("stored conversation engine is invalid".into()));
+        }
+        if !inherit_default {
+            return Ok(fallback());
+        }
+        Ok(read_stored_values_checked(conn)?
+            .into_iter()
+            .find(|(setting, _)| setting.key == ENGINE_DEFAULT.key)
+            .map_or_else(fallback, |(_, value)| value))
+    })
 }
 
 /// The refusal of a conversation that is not `group:<id>` or `private:<id>`.
@@ -134,20 +150,20 @@ pub(crate) fn conversation_admitted(cfg: &Value, conversation: &str) -> bool {
 /// A row whose key the conversation registry does not have, whose conversation is not canonical, or whose value its
 /// setting does not keep (`Setting::storable` of its global setting: a valid value, or none where the default is none,
 /// which a reset stores) is skipped.
-fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
-    if schema_version(conn)? < 2 {
+fn read_values_checked(conn: &Connection) -> Result<Vec<Stored>, InspectError> {
+    if schema_version_checked(conn)? < 2 {
         return Ok(Vec::new());
     }
     let mut statement = conn
         .prepare("SELECT conversation, key, value, revision FROM conversation_settings ORDER BY conversation, key")
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(InspectError::from_sqlite)?;
     let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
         })
-        .map_err(|_| STORAGE_ERROR.to_string())?
+        .map_err(InspectError::from_sqlite)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(InspectError::from_sqlite)?;
     let mut values = Vec::new();
     for (conversation, key, text, revision) in rows {
         let Some(setting) = find_conversation(&key) else { continue };
@@ -162,6 +178,10 @@ fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
     Ok(values)
 }
 
+fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
+    read_values_checked(conn).map_err(InspectError::into_message)
+}
+
 /// #162: the stored value of the conversation setting `key` for `conversation` (canonicalized), read through the store's
 /// read-only connection, for a reader that runs when a turn starts: `Some` with the value its global setting keeps
 /// (`Setting::storable`: `null` for none, which a reset stores where the default is none), else `None`: a legacy context,
@@ -174,23 +194,39 @@ pub(crate) fn conversation_value(context: &RuntimeContext, conversation: &str, k
     }
     let setting = find_conversation(key)?;
     let conversation = canonical_conversation(conversation)?;
-    let Ok(Inspection::Ready(conn)) = inspect(context) else { return None };
-    if schema_version(&conn).ok()? < 2 {
-        return None;
-    }
-    let (text, _) = stored_row(&conn, &conversation, setting.key).ok()??;
+    let text = read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(None) };
+        if schema_version_checked(conn)? < 2 {
+            return Ok(None);
+        }
+        Ok(stored_row_sqlite(conn, &conversation, setting.key)
+            .map_err(InspectError::from_sqlite)?
+            .map(|(text, _)| text))
+    })
+    .ok()??;
     serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.global.storable(&value))
 }
 
-/// The stored text and revision of `key` for `conversation`, read in the caller's transaction.
-fn stored_row(conn: &Connection, conversation: &str, key: &str) -> Result<Option<(String, i64)>, (u16, String)> {
+fn stored_row_sqlite(
+    conn: &Connection,
+    conversation: &str,
+    key: &str,
+) -> Result<Option<(String, i64)>, rusqlite::Error> {
     conn.query_row(
         "SELECT value, revision FROM conversation_settings WHERE conversation=?1 AND key=?2",
         params![conversation, key],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
-    .map_err(|_| (503, STORAGE_ERROR.to_string()))
+}
+
+/// The stored text and revision of `key` for `conversation`, read in the caller's transaction.
+fn stored_row(
+    conn: &Connection,
+    conversation: &str,
+    key: &str,
+) -> Result<Option<(String, i64)>, (u16, String)> {
+    stored_row_sqlite(conn, conversation, key).map_err(|_| (503, STORAGE_ERROR.to_string()))
 }
 
 /// Writes one change of `conversation`'s value of `setting` and its audit row (scope: the conversation) in the caller's
@@ -494,10 +530,10 @@ pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -
     }
     let document = context.load_config_document().map_err(|_| (503, CONFIG_ERROR.to_string()))?;
     let read = || -> Result<Vec<Stored>, String> {
-        match inspect(context)? {
-            Inspection::Missing | Inspection::Fresh => Ok(Vec::new()),
-            Inspection::Ready(conn) => read_values(&conn),
-        }
+        read_store(context, |conn| match conn {
+            None => Ok(Vec::new()),
+            Some(conn) => read_values_checked(conn),
+        })
     };
     let (values, store_error) = match read() {
         Ok(values) => (values, None),

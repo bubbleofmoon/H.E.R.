@@ -263,12 +263,16 @@ fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path
     context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
 }
 
-/// The store's path for a restore's file set: the store and its sidecars pass the runtime's containment checks (no
-/// link; a plain file or missing), and so does the gate file, whether or not the store exists. A missing store is a
-/// path that does not exist.
+/// The store's path for a restore's file set: the gate and store pass containment (no link; a
+/// plain file or missing), and the sidecar checks retry transient concurrent-writer transitions up
+/// to `WAL_SWITCH_WAIT`, without taking the store gate. A missing store is a path that does not
+/// exist.
 pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    let path = check_paths(context, PathIntent::ReadOptionalFile)?;
     check_gate_file(context)?;
+    let path = context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    retry_sidecars(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
     Ok(path)
 }
 
@@ -301,33 +305,120 @@ pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connectio
         return Ok(None);
     }
     refuse_hard_links(&path)?;
-    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
-    while let Err(error) = check_sidecars(context) {
-        if std::time::Instant::now() >= deadline {
-            return Err(error);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    retry_sidecars(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
         .map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
     Ok(Some(conn))
 }
 
-/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or missing.
-fn check_sidecars(context: &RuntimeContext) -> Result<(), String> {
-    for name in SIDECARS {
-        let sidecar = context
-            .resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
-            .map_err(|_| STORAGE_ERROR.to_string())?;
-        file_len(&sidecar)?;
-        refuse_hard_links(&sidecar)?;
+pub(super) enum InspectError {
+    Retry(String),
+    Fatal(String),
+}
+
+impl InspectError {
+    pub(super) fn into_message(self) -> String {
+        match self {
+            Self::Retry(error) | Self::Fatal(error) => error,
+        }
     }
-    Ok(())
+
+    pub(super) fn from_sqlite(error: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(ffi, _) = &error {
+            if ffi.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK {
+                return Self::Fatal(LEFTOVER_JOURNAL_ERROR.to_string());
+            }
+            if is_transient_sqlite(ffi) {
+                return Self::Retry(STORAGE_ERROR.to_string());
+            }
+        }
+        Self::Fatal(STORAGE_ERROR.to_string())
+    }
+}
+
+fn is_transient_sqlite(error: &rusqlite::ffi::Error) -> bool {
+    matches!(
+        error.code,
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::SystemIoFailure
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::SchemaChanged
+    )
+}
+
+fn is_transient_io(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.kind() == std::io::ErrorKind::Interrupted
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+fn is_transient_resolve_error(error: &str) -> bool {
+    (error.starts_with("class=leaf/metadata ") || error.starts_with("class=path/canonicalize "))
+        && (error.contains("kind=PermissionDenied")
+            || error.contains("kind=NotFound")
+            || error.contains("os=Some(5)")
+            || error.contains("os=Some(32)")
+            || error.contains("os=Some(33)"))
+}
+
+fn resolve_optional_store_file(
+    context: &RuntimeContext,
+    name: &str,
+) -> Result<std::path::PathBuf, InspectError> {
+    context
+        .resolve_path_detailed(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
+        .map_err(|error| {
+            if is_transient_resolve_error(&error) {
+                InspectError::Retry(STORAGE_ERROR.to_string())
+            } else {
+                InspectError::Fatal(STORAGE_ERROR.to_string())
+            }
+        })
+}
+
+/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or missing.
+fn check_sidecars(
+    context: &RuntimeContext,
+) -> Result<[(std::path::PathBuf, Option<u64>); 3], InspectError> {
+    let mut checked = Vec::with_capacity(SIDECARS.len());
+    for name in SIDECARS {
+        let sidecar = resolve_optional_store_file(context, name)?;
+        let len = file_len_checked(&sidecar)?;
+        refuse_hard_links_checked(&sidecar)?;
+        checked.push((sidecar, len));
+    }
+    Ok(checked.try_into().expect("three settings sidecars"))
+}
+
+fn retry_sidecars(
+    context: &RuntimeContext,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    loop {
+        match check_sidecars(context) {
+            Ok(_) => return Ok(()),
+            Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into_message()),
+        }
+    }
+}
+
+fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(InspectError::from_sqlite)
 }
 
 fn schema_version(conn: &Connection) -> Result<i64, String> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(|_| STORAGE_ERROR.to_string())
+    schema_version_checked(conn).map_err(InspectError::into_message)
 }
 
 fn refuse_version(version: i64) -> String {
@@ -359,23 +450,37 @@ const LEFTOVER_JOURNAL_ERROR: &str =
 /// WAL when its last connection closes.
 const SIDECAR_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// The length of a store file, `None` when it is missing; anything but a plain file is refused.
-fn file_len(path: &std::path::Path) -> Result<Option<u64>, String> {
+fn file_len_checked(path: &std::path::Path) -> Result<Option<u64>, InspectError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_transient_io(&error) => {
+            Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+        }
         Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
-        _ => Err(STORAGE_ERROR.to_string()),
+        _ => Err(InspectError::Fatal(STORAGE_ERROR.to_string())),
     }
 }
 
-/// Refuses a store file with another hard link: the containment checks see paths, not files, so a second name for
-/// another database would pass them. A missing file passes.
-fn refuse_hard_links(path: &std::path::Path) -> Result<(), String> {
+/// The length of a store file, `None` when it is missing; anything but a plain file is refused.
+fn file_len(path: &std::path::Path) -> Result<Option<u64>, String> {
+    file_len_checked(path).map_err(InspectError::into_message)
+}
+
+fn refuse_hard_links_checked(path: &std::path::Path) -> Result<(), InspectError> {
     match link_count(path) {
         Ok(1) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        _ => Err(STORAGE_ERROR.to_string()),
+        Err(error) if is_transient_io(&error) => {
+            Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+        }
+        _ => Err(InspectError::Fatal(STORAGE_ERROR.to_string())),
     }
+}
+
+/// Refuses a store file with another hard link: the containment checks see paths, not files, so
+/// another name for another database would pass them. A missing file passes.
+fn refuse_hard_links(path: &std::path::Path) -> Result<(), String> {
+    refuse_hard_links_checked(path).map_err(InspectError::into_message)
 }
 
 #[cfg(unix)]
@@ -437,96 +542,176 @@ fn normalized_sql(sql: &str) -> String {
 
 /// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for versions 1 through 3
 /// with exactly this release's schema of that version (`has_settings_schema`); anything else is refused.
-fn check_schema(conn: &Connection) -> Result<bool, String> {
-    match schema_version(conn)? {
+fn check_schema_checked(conn: &Connection) -> Result<bool, InspectError> {
+    match schema_version_checked(conn)? {
         0 => {
             let objects: i64 = conn
                 .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-                .map_err(|_| STORAGE_ERROR.to_string())?;
-            if objects == 0 { Ok(false) } else { Err(STORAGE_ERROR.to_string()) }
+                .map_err(InspectError::from_sqlite)?;
+            if objects == 0 {
+                Ok(false)
+            } else {
+                Err(InspectError::Fatal(STORAGE_ERROR.to_string()))
+            }
         }
-        version @ 1..=SCHEMA_VERSION if has_settings_schema(conn, version) => Ok(true),
-        1..=SCHEMA_VERSION => Err(STORAGE_ERROR.to_string()),
-        version => Err(refuse_version(version)),
+        version @ 1..=SCHEMA_VERSION => {
+            if has_settings_schema(conn, version)? {
+                Ok(true)
+            } else {
+                Err(InspectError::Fatal(STORAGE_ERROR.to_string()))
+            }
+        }
+        version => Err(InspectError::Fatal(refuse_version(version))),
     }
 }
 
-/// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and `-journal`,
-/// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A leftover
-/// rollback journal (beside a missing database, or hot: no connection holds the write lock) is refused, and nothing
-/// recovers it; a live writer's journal is waited for. Invalid database bytes, an unsupported version, or a schema
-/// that differs from the declared version are refused too. Otherwise a read-only connection
-/// that never checkpoints on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt
-/// meanwhile.
+fn check_schema(conn: &Connection) -> Result<bool, String> {
+    check_schema_checked(conn).map_err(InspectError::into_message)
+}
+
+/// Looks at the store without opening it for writing. Every store file (the database, its `-wal`,
+/// `-shm` and `-journal`, and the store gate) must be a plain file with one link or missing,
+/// whether or not the database exists. A leftover rollback journal (beside a missing database, or
+/// hot: no connection holds the write lock) is refused, and nothing recovers it; a live writer's
+/// journal is waited for. Invalid database bytes, an unsupported version, or a schema that differs
+/// from the declared version are refused too. Otherwise a read-only connection that never
+/// checkpoints on close reads the schema, retrying transient concurrent-writer sidecar,
+/// initialization, and WAL/SHM close transitions up to `WAL_SWITCH_WAIT`.
 fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
-    inspect_store(context, true)
+    inspect_at(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
 }
 
-fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, String> {
-    let resolve = |name: &str| {
-        context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR.to_string())
-    };
-    let path = resolve(DB)?;
-    let (wal, shm, journal, gate) =
-        (resolve(SIDECARS[0])?, resolve(SIDECARS[1])?, resolve(SIDECARS[2])?, resolve(STORE_GATE)?);
-    // SQLite opens, truncates or removes the sidecars even when it creates the database.
-    for file in [&path, &wal, &shm, &journal, &gate] {
-        file_len(file)?;
-        refuse_hard_links(file)?;
+fn inspect_at(
+    context: &RuntimeContext,
+    deadline: std::time::Instant,
+) -> Result<Inspection, String> {
+    check_gate_file(context)?;
+    let path = context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    loop {
+        match inspect_attempt(context, &path, deadline) {
+            Ok(inspection) => return Ok(inspection),
+            Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into_message()),
+        }
     }
-    let journal_len = file_len(&journal)?.unwrap_or(0);
-    let wal_len = file_len(&wal)?.unwrap_or(0);
-    let Some(len) = file_len(&path)? else {
-        return if journal_len > 0 { Err(LEFTOVER_JOURNAL_ERROR.to_string()) } else { Ok(Inspection::Missing) };
+}
+
+fn inspect_attempt(
+    context: &RuntimeContext,
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<Inspection, InspectError> {
+    // SQLite opens, truncates or removes the sidecars even when it creates the database.
+    let [(wal_path, wal_len), (shm_path, shm_len), (_, journal_len)] = check_sidecars(context)?;
+    let journal_len = journal_len.unwrap_or(0);
+    let wal_len = wal_len.unwrap_or(0);
+    let shm_present = shm_len.is_some();
+    let Some(len) = file_len_checked(path)? else {
+        return if journal_len > 0 {
+            Err(InspectError::Fatal(LEFTOVER_JOURNAL_ERROR.to_string()))
+        } else {
+            Ok(Inspection::Missing)
+        };
     };
+    refuse_hard_links_checked(path)?;
     if len == 0 {
         // An empty database has no page a journal could restore: a journal beside it is a live writer's (`BEGIN
         // IMMEDIATE` on a new store writes one) or one SQLite discards, and the writer's open waits for a live lock.
-        return if wal_len == 0 { Ok(Inspection::Fresh) } else { Err(STORAGE_ERROR.to_string()) };
+        // If a fresh store already has WAL frames while a writer creates its schema, retry until it
+        // checkpoints.
+        return if wal_len == 0 {
+            Ok(Inspection::Fresh)
+        } else {
+            Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+        };
     }
-    let header = header_version(&path)?;
+    let header = header_version_checked(path)?;
     if wal_len == 0 {
         // The header is current while no WAL holds later commits.
         if !(0..=SCHEMA_VERSION).contains(&header) {
-            return Err(refuse_version(header));
+            return Err(InspectError::Fatal(refuse_version(header)));
         }
-    } else {
+    } else if !shm_present {
         // A read-only connection would create a missing index; wait for a closing connection to finish instead.
-        let settled = std::time::Instant::now() + SIDECAR_SETTLE;
-        while file_len(&shm)?.is_none() {
-            if file_len(&wal)?.is_none() {
-                return if again { inspect_store(context, false) } else { Err(STORAGE_ERROR.to_string()) };
+        let settled = deadline.min(std::time::Instant::now() + SIDECAR_SETTLE);
+        loop {
+            if file_len_checked(&wal_path)?.is_none() {
+                return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
+            }
+            if file_len_checked(&shm_path)?.is_some() {
+                let checked = resolve_optional_store_file(context, SIDECARS[1])?;
+                file_len_checked(&checked)?;
+                refuse_hard_links_checked(&checked)?;
+                break;
             }
             if std::time::Instant::now() >= settled {
-                return Err(STORAGE_ERROR.to_string());
+                return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
-    // A journal is hot when no connection holds the store's write lock: a leftover, which this read-only connection
-    // refuses to play back. A live writer's journal is not hot, and its lock is waited for under `busy_timeout`.
-    if let Err(rusqlite::Error::SqliteFailure(error, _)) =
-        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-    {
-        if error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK {
-            return Err(LEFTOVER_JOURNAL_ERROR.to_string());
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(InspectError::from_sqlite)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(InspectError::from_sqlite)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")
+        .map_err(InspectError::from_sqlite)?;
+    // A journal is hot when no connection holds the store's write lock: a leftover
+    // (`SQLITE_READONLY_ROLLBACK`), which this read-only connection refuses to play back. A live
+    // writer's journal is waited for under `busy_timeout`.
+    if check_schema_checked(&conn)? {
+        Ok(Inspection::Ready(conn))
+    } else {
+        Ok(Inspection::Fresh)
+    }
+}
+
+pub(super) fn read_store<T>(
+    context: &RuntimeContext,
+    mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+    loop {
+        let conn = match inspect_at(context, deadline)? {
+            Inspection::Missing | Inspection::Fresh => None,
+            Inspection::Ready(conn) => Some(conn),
+        };
+        match read(conn.as_ref()) {
+            Ok(value) => return Ok(value),
+            Err(InspectError::Retry(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into_message()),
         }
     }
-    if check_schema(&conn)? { Ok(Inspection::Ready(conn)) } else { Ok(Inspection::Fresh) }
 }
 
 /// The schema version in a SQLite file's header (bytes 60-63); a file without the SQLite magic is refused.
-fn header_version(path: &std::path::Path) -> Result<i64, String> {
+fn header_version_checked(path: &std::path::Path) -> Result<i64, InspectError> {
     let mut header = [0u8; 100];
-    std::fs::File::open(path)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound || is_transient_io(&error) {
+            InspectError::Retry(STORAGE_ERROR.to_string())
+        } else {
+            InspectError::Fatal(STORAGE_ERROR.to_string())
+        }
+    })?;
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        if is_transient_io(&error) {
+            InspectError::Retry(STORAGE_ERROR.to_string())
+        } else {
+            InspectError::Fatal(STORAGE_ERROR.to_string())
+        }
+    })?;
     if &header[..16] != b"SQLite format 3\0" {
-        return Err(STORAGE_ERROR.to_string());
+        return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
     }
     Ok(i64::from(i32::from_be_bytes([header[60], header[61], header[62], header[63]])))
 }
@@ -536,11 +721,10 @@ fn header_version(path: &std::path::Path) -> Result<i64, String> {
 /// and so are rows with a value their setting does not keep (`storable`), except for a text setting: its last good
 /// version (`last_good`) stands in, and the refusal is reported once per key and process on stderr.
 fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
-    let conn = match inspect(context)? {
-        Inspection::Missing | Inspection::Fresh => return Ok(Vec::new()),
-        Inspection::Ready(conn) => conn,
-    };
-    read_stored_values(&conn)
+    read_store(context, |conn| match conn {
+        None => Ok(Vec::new()),
+        Some(conn) => read_stored_values_checked(conn),
+    })
 }
 
 /// Reads storable non-secret global settings from an already-verified archive `settings.db`.
@@ -553,12 +737,20 @@ pub(crate) fn read_archive_values(
 /// The stored values of registry settings on an open connection of the store; rows with a key the registry does not
 /// have, or a value its setting does not accept, are skipped.
 fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)>, String> {
-    let mut statement = conn.prepare("SELECT key, value FROM settings").map_err(|_| STORAGE_ERROR.to_string())?;
+    read_stored_values_checked(conn).map_err(InspectError::into_message)
+}
+
+pub(super) fn read_stored_values_checked(
+    conn: &Connection,
+) -> Result<Vec<(&'static Setting, Value)>, InspectError> {
+    let mut statement = conn
+        .prepare("SELECT key, value FROM settings")
+        .map_err(InspectError::from_sqlite)?;
     let rows = statement
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .map_err(|_| STORAGE_ERROR.to_string())?
+        .map_err(InspectError::from_sqlite)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(InspectError::from_sqlite)?;
     let mut values = Vec::new();
     for (key, text) in rows {
         let Some(setting) = find(&key).filter(|setting| !setting.secret) else { continue };
@@ -581,53 +773,93 @@ fn read_secrets(context: &RuntimeContext) -> Result<Vec<(&'static str, String, S
     if !context.is_isolated() {
         return Ok(Vec::new());
     }
-    match inspect(context)? {
-        Inspection::Ready(conn) => secrets_in(&conn),
-        Inspection::Missing | Inspection::Fresh => Ok(Vec::new()),
-    }
+    read_store(context, |conn| match conn {
+        None => Ok(Vec::new()),
+        Some(conn) => secrets_in_checked(conn),
+    })
 }
 
-fn secret_row(conn: &Connection, setting: &Setting) -> Result<Option<(String, String)>, String> {
-    let Some((text, _)) = stored_row(conn, setting.key).map_err(|(_, error)| error)? else { return Ok(None) };
+fn secret_row_checked(
+    conn: &Connection,
+    setting: &Setting,
+) -> Result<Option<(String, String)>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, setting.key).map_err(InspectError::from_sqlite)?
+    else {
+        return Ok(None);
+    };
     if text == "null" {
         return Ok(None);
     }
-    let (endpoint, credential): (String, String) = serde_json::from_str(&text).map_err(|_| STORAGE_ERROR.to_string())?;
+    let (endpoint, credential): (String, String) =
+        serde_json::from_str(&text).map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
     if endpoint.is_empty() || setting.normalize(&json!(credential)).is_none() {
-        return Err(STORAGE_ERROR.to_string());
+        return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
     }
     Ok(Some((endpoint, credential)))
 }
 
-fn secrets_in(conn: &Connection) -> Result<Vec<(&'static str, String, String)>, String> {
+fn secrets_in_checked(
+    conn: &Connection,
+) -> Result<Vec<(&'static str, String, String)>, InspectError> {
     let mut secrets = Vec::new();
     for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY] {
-        if let Some((endpoint, credential)) = secret_row(conn, setting)? {
+        if let Some((endpoint, credential)) = secret_row_checked(conn, setting)? {
             secrets.push((setting.key, endpoint, credential));
         }
     }
     Ok(secrets)
 }
 
-pub(crate) fn secret_value(context: &RuntimeContext, setting: &Setting, endpoint: &str) -> Result<Option<String>, String> {
-    if !context.is_isolated() || (setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key) {
+fn secrets_in(conn: &Connection) -> Result<Vec<(&'static str, String, String)>, String> {
+    secrets_in_checked(conn).map_err(InspectError::into_message)
+}
+
+pub(crate) fn secret_value(
+    context: &RuntimeContext,
+    setting: &Setting,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
+    if !context.is_isolated()
+        || (setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key)
+    {
         return Ok(None);
     }
-    let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
-    Ok(secret_row(&conn, setting)?.filter(|(bound, _)| bound == endpoint).map(|(_, credential)| credential))
+    read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(None) };
+        Ok(secret_row_checked(conn, setting)?
+            .filter(|(bound, _)| bound == endpoint)
+            .map(|(_, credential)| credential))
+    })
 }
 
-fn administrator_password(context: &RuntimeContext) -> Result<Option<AdministratorPasswordHash>, String> {
-    let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
-    administrator_password_in(&conn)
+fn administrator_password(
+    context: &RuntimeContext,
+) -> Result<Option<AdministratorPasswordHash>, String> {
+    read_store(context, |conn| match conn {
+        None => Ok(None),
+        Some(conn) => administrator_password_checked(conn),
+    })
 }
 
-fn administrator_password_in(conn: &Connection) -> Result<Option<AdministratorPasswordHash>, String> {
-    let Some((text, _)) = stored_row(conn, ADMINISTRATOR_PASSWORD.key).map_err(|(_, error)| error)? else {
+fn administrator_password_checked(
+    conn: &Connection,
+) -> Result<Option<AdministratorPasswordHash>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, ADMINISTRATOR_PASSWORD.key)
+        .map_err(InspectError::from_sqlite)?
+    else {
         return Ok(None);
     };
-    let phc: String = serde_json::from_str(&text).map_err(|_| PASSWORD_UNAVAILABLE.to_string())?;
-    AdministratorPasswordHash::parse(&phc).map(Some).ok_or_else(|| PASSWORD_UNAVAILABLE.to_string())
+    let phc: String = serde_json::from_str(&text)
+        .map_err(|_| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))?;
+    AdministratorPasswordHash::parse(&phc)
+        .map(Some)
+        .ok_or_else(|| InspectError::Fatal(PASSWORD_UNAVAILABLE.to_string()))
+}
+
+fn administrator_password_in(
+    conn: &Connection,
+) -> Result<Option<AdministratorPasswordHash>, String> {
+    administrator_password_checked(conn).map_err(InspectError::into_message)
 }
 
 /// The settings row revision partitions the per-process search cache after a credential change.
@@ -635,8 +867,13 @@ pub(crate) fn secret_revision(context: &RuntimeContext, setting: &Setting) -> Op
     if !context.is_isolated() {
         return None;
     }
-    let Inspection::Ready(conn) = inspect(context).ok()? else { return None };
-    stored_row(&conn, setting.key).ok().flatten().map(|(_, revision)| revision)
+    read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(None) };
+        stored_row_sqlite(conn, setting.key).map_err(InspectError::from_sqlite)
+    })
+    .ok()
+    .flatten()
+    .map(|(_, revision)| revision)
 }
 
 pub(crate) fn stored_secrets(context: &RuntimeContext) -> Result<Vec<String>, String> {
@@ -698,10 +935,19 @@ fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> 
 /// The newest audited text of text setting `key` that the registry accepts and that `accepted` takes, read through the
 /// store's read-only connection; `None` when there is no store, no such row, or the search ends (`last_good`). Used when
 /// a text that passed the load check fails a later check, such as the model-view strip.
-pub(crate) fn last_good_text(context: &RuntimeContext, key: &str, accepted: impl Fn(&str) -> bool) -> Option<String> {
+pub(crate) fn last_good_text(
+    context: &RuntimeContext,
+    key: &str,
+    accepted: impl Fn(&str) -> bool,
+) -> Option<String> {
     let setting = find(key)?;
-    let Ok(Inspection::Ready(conn)) = inspect(context) else { return None };
-    last_good(&conn, setting, |value| value.as_str().is_some_and(&accepted))?.as_str().map(str::to_string)
+    read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(None) };
+        Ok(last_good(conn, setting, |value| value.as_str().is_some_and(&accepted))
+            .and_then(|value| value.as_str().map(str::to_string)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// One stderr line per text setting and process when its stored value is refused at load.
@@ -806,17 +1052,22 @@ const SCHEMA_V2_IMPLICIT: [(&str, &str, &str, Option<&str>); 1] =
 /// Whether `sqlite_master` holds exactly the declared schema version: the same objects
 /// (type, name, table) with the same CREATE text after `normalized_sql`, and nothing else. A store that claims the
 /// version without it is refused before it is touched, so the WAL switch never rewrites its header.
-fn has_settings_schema(conn: &Connection, version: i64) -> bool {
+fn has_settings_schema(conn: &Connection, version: i64) -> Result<bool, InspectError> {
     type Object = (String, String, String, Option<String>);
-    let Ok(mut statement) = conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master") else {
-        return false;
-    };
-    let found = statement
+    let mut statement = conn
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")
+        .map_err(InspectError::from_sqlite)?;
+    let mut found = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
         })
-        .and_then(|rows| rows.collect::<Result<Vec<Object>, _>>());
-    let Ok(mut found) = found else { return false };
+        .and_then(|rows| rows.collect::<Result<Vec<Object>, _>>())
+        .map_err(InspectError::from_sqlite)?;
     let v2 = SCHEMA_V2_ADDED.iter().filter(|_| version >= 2);
     let v2_indexes = SCHEMA_V2_IMPLICIT.iter().filter(|_| version >= 2);
     let v3 = console_auth::SCHEMA_V3_ADDED.iter().filter(|_| version >= 3);
@@ -825,13 +1076,22 @@ fn has_settings_schema(conn: &Connection, version: i64) -> bool {
         .iter()
         .chain(v2)
         .chain(v3)
-        .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), Some(sql.to_string())))
+        .map(|(kind, name, table, sql)| {
+            (kind.to_string(), name.to_string(), table.to_string(), Some(sql.to_string()))
+        })
         .chain(
             SCHEMA_V1_IMPLICIT
                 .iter()
                 .chain(v2_indexes)
                 .chain(v3_indexes)
-                .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), sql.map(str::to_string))),
+                .map(|(kind, name, table, sql)| {
+                    (
+                        kind.to_string(),
+                        name.to_string(),
+                        table.to_string(),
+                        sql.map(str::to_string),
+                    )
+                }),
         )
         .collect();
     for objects in [&mut found, &mut expected] {
@@ -840,7 +1100,7 @@ fn has_settings_schema(conn: &Connection, version: i64) -> bool {
         }
         objects.sort();
     }
-    found == expected
+    Ok(found == expected)
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
@@ -1235,11 +1495,19 @@ fn access_rows(conn: &Connection) -> Result<Vec<(String, String)>, (u16, String)
     Ok(rows.into_iter().filter(|(key, _)| find(key).is_some_and(Setting::access)).collect())
 }
 
+fn stored_row_sqlite(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<(String, i64)>, rusqlite::Error> {
+    conn.query_row("SELECT value, revision FROM settings WHERE key=?1", [key], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })
+    .optional()
+}
+
 /// The stored text and revision of a global setting, read in the caller's transaction.
 fn stored_row(conn: &Connection, key: &str) -> Result<Option<(String, i64)>, (u16, String)> {
-    conn.query_row("SELECT value, revision FROM settings WHERE key=?1", [key], |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()
-        .map_err(|_| (503, STORAGE_ERROR.to_string()))
+    stored_row_sqlite(conn, key).map_err(|_| (503, STORAGE_ERROR.to_string()))
 }
 
 const ROLLOUT_ALLOW_LISTS: [(&str, &Setting); 2] = [("group", &ALLOW_GROUPS), ("private", &ALLOW_PRIVATE)];
@@ -1620,43 +1888,49 @@ pub(crate) fn history(
             conversation::is_canonical(conversation).then_some(conversation).ok_or((400, CONVERSATION_ERROR.to_string()))
         })
         .transpose()?;
-    let conn = match inspect(context).map_err(|error| (503, error))? {
-        Inspection::Missing | Inspection::Fresh => return Ok(json!({"ok": true, "entries": [], "next": null})),
-        Inspection::Ready(conn) => conn,
-    };
-    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
-    let shown = |text: Option<String>| {
-        text.map_or(Value::Null, |text| serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
-    };
-    let mut statement = conn
-        .prepare(
-            "SELECT id, at_ms, actor, source, scope, key, old_value, new_value FROM settings_audit
-             WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4) ORDER BY id DESC LIMIT ?3",
-        )
-        .map_err(failed)?;
-    let entries = statement
-        .query_map(params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope], |row| {
-            let id: i64 = row.get(0)?;
-            let at: i64 = row.get(1)?;
-            let actor: String = row.get(2)?;
-            let source: String = row.get(3)?;
-            let scope: String = row.get(4)?;
-            let key: String = row.get(5)?;
-            let old: Option<String> = row.get(6)?;
-            let new: Option<String> = row.get(7)?;
-            let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
-                (json!(SECRET_MARKER), json!(SECRET_MARKER))
-            } else {
-                (shown(old), shown(new))
-            };
-            Ok(json!({
-                "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope, "setting": key,
-                "old": old, "new": new,
-            }))
-        })
-        .map_err(failed)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(failed)?;
+    let entries = read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(Vec::new()) };
+        let shown = |text: Option<String>| {
+            text.map_or(Value::Null, |text| {
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
+            })
+        };
+        let mut statement = conn
+            .prepare(
+                "SELECT id, at_ms, actor, source, scope, key, old_value, new_value
+                 FROM settings_audit
+                 WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4)
+                 ORDER BY id DESC LIMIT ?3",
+            )
+            .map_err(InspectError::from_sqlite)?;
+        statement
+            .query_map(
+                params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
+                |row| {
+                    let id: i64 = row.get(0)?;
+                    let at: i64 = row.get(1)?;
+                    let actor: String = row.get(2)?;
+                    let source: String = row.get(3)?;
+                    let scope: String = row.get(4)?;
+                    let key: String = row.get(5)?;
+                    let old: Option<String> = row.get(6)?;
+                    let new: Option<String> = row.get(7)?;
+                    let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
+                        (json!(SECRET_MARKER), json!(SECRET_MARKER))
+                    } else {
+                        (shown(old), shown(new))
+                    };
+                    Ok(json!({
+                        "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
+                        "setting": key, "old": old, "new": new,
+                    }))
+                },
+            )
+            .map_err(InspectError::from_sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(InspectError::from_sqlite)
+    })
+    .map_err(|error| (503, error))?;
     let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
     Ok(json!({"ok": true, "entries": entries, "next": next}))
 }
@@ -2005,16 +2279,17 @@ pub(crate) fn preview(
             if FAIL_UNDO_LOOK.with(|fail| fail.replace(false)) {
                 return Err((503, STORAGE_ERROR.to_string()));
             }
-            let conn = match inspect(context).map_err(|error| (503, error))? {
-                Inspection::Missing | Inspection::Fresh => return Err((404, UNKNOWN_ENTRY_ERROR.to_string())),
-                Inspection::Ready(conn) => conn,
-            };
-            let row: Option<(String, Option<String>)> = conn
-                .query_row("SELECT key, old_value FROM settings_audit WHERE id=?1", [entry], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
+            let row: Option<(String, Option<String>)> = read_store(context, |conn| {
+                let Some(conn) = conn else { return Ok(None) };
+                conn.query_row(
+                    "SELECT key, old_value FROM settings_audit WHERE id=?1",
+                    [entry],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
                 .optional()
-                .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+                .map_err(InspectError::from_sqlite)
+            })
+            .map_err(|error| (503, error))?;
             let (key, old) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
             let setting = find(&key).ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
             if setting.secret {
@@ -2057,10 +2332,77 @@ pub(crate) fn store_mark(context: &RuntimeContext) -> Option<i64> {
     if !context.is_isolated() {
         return Some(0);
     }
-    match inspect(context).ok()? {
-        Inspection::Missing | Inspection::Fresh => Some(0),
-        Inspection::Ready(conn) => {
-            conn.query_row("SELECT coalesce(max(id), 0) FROM settings_audit", [], |row| row.get(0)).ok()
+    read_store(context, |conn| {
+        let Some(conn) = conn else { return Ok(0) };
+        conn.query_row("SELECT coalesce(max(id), 0) FROM settings_audit", [], |row| row.get(0))
+            .map_err(InspectError::from_sqlite)
+    })
+    .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_transient_resolve_error, InspectError, LEFTOVER_JOURNAL_ERROR, STORAGE_ERROR};
+
+    #[test]
+    fn sqlite_error_classification_keeps_leftover_journal_and_corruption_fatal() {
+        let hot = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ReadOnly,
+                extended_code: rusqlite::ffi::SQLITE_READONLY_ROLLBACK,
+            },
+            None,
+        );
+        assert!(matches!(
+            InspectError::from_sqlite(hot),
+            InspectError::Fatal(message) if message == LEFTOVER_JOURNAL_ERROR
+        ));
+
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+            rusqlite::ErrorCode::CannotOpen,
+            rusqlite::ErrorCode::SystemIoFailure,
+            rusqlite::ErrorCode::ReadOnly,
+            rusqlite::ErrorCode::SchemaChanged,
+        ] {
+            let err = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error { code, extended_code: 0 },
+                None,
+            );
+            assert!(
+                matches!(
+                    InspectError::from_sqlite(err),
+                    InspectError::Retry(m) if m == STORAGE_ERROR
+                ),
+                "{code:?}"
+            );
         }
+
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: 0,
+            },
+            None,
+        );
+        assert!(matches!(
+            InspectError::from_sqlite(corrupt),
+            InspectError::Fatal(message) if message == STORAGE_ERROR
+        ));
+    }
+
+    #[test]
+    fn resolve_error_classification_retries_only_transient_sidecar_io() {
+        assert!(is_transient_resolve_error("class=leaf/metadata kind=PermissionDenied os=Some(5)"));
+        assert!(is_transient_resolve_error("class=path/canonicalize kind=NotFound os=Some(2)"));
+        assert!(is_transient_resolve_error("class=leaf/metadata kind=Uncategorized os=Some(32)"));
+        assert!(!is_transient_resolve_error("runtime path policy rejected class=path"));
+        assert!(!is_transient_resolve_error(
+            "runtime path has non-file leaf or non-directory parent"
+        ));
+        assert!(!is_transient_resolve_error(
+            "class=root/metadata kind=PermissionDenied os=Some(5)"
+        ));
     }
 }

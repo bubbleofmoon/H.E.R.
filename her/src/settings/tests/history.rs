@@ -444,3 +444,43 @@ fn settings_undo_of_a_migration_entry_is_refused_and_revisions_continue_after_th
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["revision"], 4, "the seed, the change and the undo each took a revision");
 }
+
+#[test]
+fn settings_undo_and_preview_never_503_under_concurrent_apply_loop() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let (_root, context) = settings_fixture("settings undo concurrent loop");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let barrier = std::sync::Barrier::new(2);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            for value in 1001..=1030 {
+                let applied = crate::settings::apply(
+                    &context,
+                    QUIET_KEY,
+                    &json!(value),
+                    "administrator",
+                    "console",
+                )
+                .unwrap();
+                assert_eq!(applied.value, json!(value));
+            }
+            stop.store(true, SeqCst);
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            let mut rounds = 0usize;
+            while !stop.load(SeqCst) || rounds < 10 {
+                let (entries, _) = history_page(&context, "");
+                let entry = entries[0]["entry"].clone();
+                let undo = post(&context, "/api/settings/undo", json!({"entry": entry}));
+                assert!(matches!(undo.0, 200 | 409), "unexpected undo status: {undo:?}");
+                rounds += 1;
+            }
+        });
+    });
+    assert!(matches!(next_use_quiet(&context), Some(v) if (1000..=1030).contains(&v)));
+}
