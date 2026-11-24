@@ -939,11 +939,9 @@ fn report_refused_text(key: &'static str) {
     }
 }
 
-/// How long a reader retries transient WAL/sidecar transitions and a writer waits for other
-/// connections to let go while switching a new store to WAL (the same as `busy_timeout`).
+/// How long a writer waits for the store gate and for other connections to let go while it switches a new store to
+/// WAL (the same as `busy_timeout`).
 const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long a store writer waits for `locks/settings-store.lock` (matching `authority_gate`).
-const WRITE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
 /// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. The
@@ -1378,7 +1376,7 @@ fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(),
 /// Runs one write under the store gate. The caller holds the configuration gate (`social_state::acquire_config_gate`: the console's
 /// settings routes take it through their authority, the chat settings tools through `memory_actions::handle`), so the
 /// order is always the configuration gate, then the store gate, never the reverse. The store gate
-/// is taken (waiting up to `WRITE_GATE_WAIT`, else 503) before the inspection and held until the
+/// is taken (waiting up to `WAL_SWITCH_WAIT`, else 503) before the inspection and held until the
 /// connection closes, so no other writer of
 /// this store can stop between this writer's inspection and its read-write open and leave a journal that open would
 /// play back. With `existing_only`, a store that is missing or fresh is 404 under the gate and none is created. Then
@@ -1414,7 +1412,7 @@ fn write_store_with<T>(
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
     let (result, stored) = {
-        let _gate = store_gate(context, std::time::Instant::now() + WRITE_GATE_WAIT)
+        let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
             return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));

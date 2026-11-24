@@ -467,6 +467,7 @@ fn settings_undo_and_preview_never_503_under_concurrent_apply_loop() {
                 )
                 .unwrap();
                 assert_eq!(applied.value, json!(value));
+                std::thread::yield_now();
             }
             stop.store(true, SeqCst);
         });
