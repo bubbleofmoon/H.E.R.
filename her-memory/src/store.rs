@@ -181,7 +181,11 @@ impl Reader<'_> {
                     return Ok(None);
                 };
                 if replacement.is_some() && replacement == existing_id {
-                    return Ok(existing_id.map(|id| UpsertOutcome { id, deduped: true }));
+                    return Ok(existing.map(|(id, archived)| UpsertOutcome {
+                        id,
+                        deduped: true,
+                        archived,
+                    }));
                 }
                 let same_author = author.as_deref() == Some(message.author_id)
                     || (author.is_none() && self.is_owner);
@@ -193,8 +197,8 @@ impl Reader<'_> {
                 }
             }
 
-            let written = if let Some(id) = existing_id {
-                UpsertOutcome { id, deduped: true }
+            let written = if let Some((id, archived)) = existing {
+                UpsertOutcome { id, deduped: true, archived }
             } else {
                 let id = super::write_memory(conn, &MemoryInput {
                     owner_type: "session", owner_id: &self.key, scope,
@@ -209,7 +213,7 @@ impl Reader<'_> {
                         message.position.0, message.position.1],
                 )?;
                 super::audit(conn, &self.key, "write-message", Some(id), None)?;
-                UpsertOutcome { id, deduped: false }
+                UpsertOutcome { id, deduped: false, archived: false }
             };
             if let Some(previous) = supersedes {
                 conn.execute(
@@ -479,5 +483,80 @@ mod tests {
         assert_eq!(store.for_reader(OWNER).correction_history(1).unwrap(), None);
         assert!(store.admin().archive(1, true, "fixture").unwrap());
         assert!(store.admin().archive(1, false, "fixture").unwrap());
+    }
+
+    #[test]
+    fn rewriting_an_archived_message_reports_its_archived_state() {
+        let store =
+            MemoryStore::open_prepared(Connection::open_in_memory().unwrap(), Some(OWNER.into()))
+                .unwrap();
+        let reader = store.for_reader(OWNER);
+        let msg = || VerifiedMessage {
+            id: "msg-1",
+            text: "我喜欢热茶",
+            author_id: "9",
+            position: (10, 0),
+        };
+        let first = reader.write_message(msg(), None).unwrap().unwrap();
+        assert_eq!(first, UpsertOutcome { id: 1, deduped: false, archived: false });
+
+        assert!(store.admin().archive(first.id, true, "console").unwrap());
+        let while_archived = reader.write_message(msg(), None).unwrap().unwrap();
+        assert_eq!(
+            while_archived,
+            UpsertOutcome { id: first.id, deduped: true, archived: true }
+        );
+        assert!(reader.search("热茶", &[], 10).unwrap().is_empty());
+
+        assert!(store.admin().archive(first.id, false, "console").unwrap());
+        let after_unarchive = reader.write_message(msg(), None).unwrap().unwrap();
+        assert_eq!(
+            after_unarchive,
+            UpsertOutcome { id: first.id, deduped: true, archived: false }
+        );
+        assert_eq!(reader.search("热茶", &[], 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retrying_an_archived_correction_reports_archived_and_refuses_new_supersession() {
+        let store =
+            MemoryStore::open_prepared(Connection::open_in_memory().unwrap(), Some(OWNER.into()))
+                .unwrap();
+        let reader = store.for_reader(OWNER);
+        let first = reader
+            .write_message(
+                VerifiedMessage { id: "m1", text: "热茶", author_id: "9", position: (10, 0) },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let second_msg = || VerifiedMessage {
+            id: "m2",
+            text: "冷茶",
+            author_id: "9",
+            position: (11, 0),
+        };
+        let second = reader.write_message(second_msg(), Some(first.id)).unwrap().unwrap();
+        assert_eq!(second, UpsertOutcome { id: 2, deduped: false, archived: false });
+
+        assert!(store.admin().archive(second.id, true, "console").unwrap());
+        let retried = reader.write_message(second_msg(), Some(first.id)).unwrap().unwrap();
+        assert_eq!(
+            retried,
+            UpsertOutcome { id: second.id, deduped: true, archived: true }
+        );
+
+        let third = reader
+            .write_message(
+                VerifiedMessage { id: "m3", text: "乌龙茶", author_id: "9", position: (12, 0) },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.write_message(second_msg(), Some(third.id)).unwrap(),
+            None,
+            "an archived message cannot supersede a fresh memory"
+        );
     }
 }

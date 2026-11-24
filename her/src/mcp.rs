@@ -200,7 +200,14 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
     Ok(match name {
         "memory_write" => {
             if result["deduped"] == true {
-                format!("已存在相同记忆（#{}），已更新使用时间。", result["id"])
+                if result["archived"] == true {
+                    format!(
+                        "已存在相同记忆（#{}，已归档，当前不会参与检索）。",
+                        result["id"]
+                    )
+                } else {
+                    format!("已存在相同记忆（#{}），已更新使用时间。", result["id"])
+                }
             } else {
                 format!("已记住（#{}）。", result["id"])
             }
@@ -218,8 +225,8 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                             "{}. [#{} {}·{}{}] {}",
                             i + 1,
                             m.id,
-                            m.kind,
                             m.provenance_label(),
+                            m.kind,
                             m.subject
                                 .as_ref()
                                 .filter(|s| !s.is_empty())

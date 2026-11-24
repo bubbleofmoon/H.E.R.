@@ -766,8 +766,10 @@ fn recall_block_with_conversation(
     let mut rows = rows;
     let items: Vec<String> = rows.iter().map(|m| {
         let tag = match &m.subject {
-            Some(s) if !s.is_empty() => format!("{}·{}·{}", m.kind, m.provenance_label(), s),
-            _ => format!("{}·{}", m.kind, m.provenance_label()),
+            Some(s) if !s.is_empty() => {
+                format!("{}·{}·{}", m.provenance_label(), m.kind, s)
+            }
+            _ => format!("{}·{}", m.provenance_label(), m.kind),
         };
         let content: String = m.content.chars().take(120).collect();
         format!("- [{tag}] {content}")

@@ -293,3 +293,161 @@ fn ticket24_memory_write_tool_strips_message_and_correction_fields() {
     assert_eq!(row["provenance"], "inference");
     assert!(row["message_id"].is_null());
 }
+
+#[test]
+fn ticket336_provenance_renders_before_kind_in_search_and_recall() {
+    let (_root, context) = ticket24_memory_fixture();
+    let mut state = context.read_social_state().unwrap();
+    state["conversations"]["private:7001"]["unread"] =
+        json!([{"text":"我喜欢热茶，管理员喜欢咖啡，手写笔记测试热茶，饮品偏好"}]);
+    context
+        .write_atomic(
+            RuntimeArea::Data,
+            "social-v2.json",
+            state.to_string().as_bytes(),
+        )
+        .unwrap();
+    let (port, server) = start_http_fixture(context.clone(), 4);
+    let owner = |action, mut body: Value| {
+        body["key"] = json!("private:7001");
+        ticket24_memory_request(port, action, "owner-token", body)
+    };
+    let (fact_status, fact) = owner(
+        "write",
+        json!({"messageId":"owner-note","content":"我喜欢热茶"}),
+    );
+    let (quote_status, quote) = ticket24_memory_request(
+        port,
+        "write",
+        "group-token",
+        json!({
+            "key":"group:101","messageId":"group-note","content":"管理员喜欢咖啡","kind":"fact"
+        }),
+    );
+    let (unverified_status, unverified) = owner(
+        "write",
+        json!({"kind":"fact","subject":"饮品偏好","content":"手写笔记测试热茶"}),
+    );
+    let (preview_status, preview) = owner("preview", json!({}));
+    server.join().unwrap();
+    assert_eq!(fact_status, 200, "{fact}");
+    assert_eq!(quote_status, 200, "{quote}");
+    assert_eq!(unverified_status, 200, "{unverified}");
+    assert_eq!(preview_status, 200, "{preview}");
+
+    let block = preview["block"].as_str().unwrap();
+    assert!(block.contains("- [事实·fact] 我喜欢热茶"), "{block}");
+    assert!(block.contains("- [推断·fact·饮品偏好] 手写笔记测试热茶"), "{block}");
+    assert!(block.contains("- [推断·inference] 202说：管理员喜欢咖啡"), "{block}");
+    assert!(!block.contains("fact·推断"), "{block}");
+
+    let tool_written = crate::mcp::call_tool_with_context(
+        "memory_write",
+        &json!({
+            "key":"private:7001","token":"owner-token","kind":"fact","content":"工具写入乌龙茶"
+        }),
+        &context,
+    )
+    .unwrap();
+    assert!(tool_written.contains("已记住"), "{tool_written}");
+
+    let search_text = crate::mcp::call_tool_with_context(
+        "memory_search",
+        &json!({"key":"private:7001","token":"owner-token","query":"","limit":10}),
+        &context,
+    )
+    .unwrap();
+    assert!(search_text.contains("事实·fact] 我喜欢热茶"), "{search_text}");
+    assert!(
+        search_text.contains("推断·fact · 饮品偏好] 手写笔记测试热茶"),
+        "{search_text}"
+    );
+    assert!(search_text.contains("推断·fact] 工具写入乌龙茶"), "{search_text}");
+    assert!(
+        search_text.contains("推断·inference] 202说：管理员喜欢咖啡"),
+        "{search_text}"
+    );
+    assert!(!search_text.contains("fact·推断"), "{search_text}");
+}
+
+#[test]
+fn ticket336_rewriting_archived_message_returns_archived_state_until_unarchived() {
+    let (_root, context) = ticket24_memory_fixture();
+    let (port, server) = start_http_fixture(context.clone(), 9);
+    let owner = |action, mut body: Value| {
+        body["key"] = json!("private:7001");
+        ticket24_memory_request(port, action, "owner-token", body)
+    };
+    let (s1, first) = owner(
+        "write",
+        json!({"messageId":"owner-note","content":"我喜欢热茶"}),
+    );
+    assert_eq!(s1, 200, "{first}");
+    assert_eq!(first["deduped"], false);
+    assert_eq!(first["archived"], false);
+
+    let (s2, active_dedup) = owner(
+        "write",
+        json!({"messageId":"owner-note","content":"我喜欢热茶"}),
+    );
+    assert_eq!(s2, 200, "{active_dedup}");
+    assert_eq!(active_dedup["id"], first["id"]);
+    assert_eq!(active_dedup["deduped"], true);
+    assert_eq!(active_dedup["archived"], false);
+
+    let (s3, archived) = owner("archive", json!({"id":first["id"],"archived":true}));
+    assert_eq!(s3, 200, "{archived}");
+    assert_eq!(archived["changed"], true);
+
+    let (s4, hidden_search) = owner("search", json!({"query":"热茶"}));
+    assert_eq!(s4, 200, "{hidden_search}");
+    assert_eq!(hidden_search["count"], 0);
+
+    let (s5, archived_dedup) = owner(
+        "write",
+        json!({"messageId":"owner-note","content":"我喜欢热茶"}),
+    );
+    assert_eq!(s5, 200, "{archived_dedup}");
+    assert_eq!(archived_dedup["id"], first["id"]);
+    assert_eq!(archived_dedup["deduped"], true);
+    assert_eq!(archived_dedup["archived"], true);
+
+    let (s6, restored) = owner("archive", json!({"id":first["id"],"archived":false}));
+    assert_eq!(s6, 200, "{restored}");
+    assert_eq!(restored["changed"], true);
+
+    let (s7, restored_dedup) = owner(
+        "write",
+        json!({"messageId":"owner-note","content":"我喜欢热茶"}),
+    );
+    assert_eq!(s7, 200, "{restored_dedup}");
+    assert_eq!(restored_dedup["id"], first["id"]);
+    assert_eq!(restored_dedup["deduped"], true);
+    assert_eq!(restored_dedup["archived"], false);
+
+    let (s8, unlinked) = owner(
+        "write",
+        json!({"content":"未关联归档内容","kind":"thought"}),
+    );
+    assert_eq!(s8, 200, "{unlinked}");
+    assert_eq!(unlinked["archived"], false);
+
+    let (s9, unlinked_arch) = owner("archive", json!({"id":unlinked["id"],"archived":true}));
+    assert_eq!(s9, 200, "{unlinked_arch}");
+    server.join().unwrap();
+
+    let tool_dedup = crate::mcp::call_tool_with_context(
+        "memory_write",
+        &json!({
+            "key":"private:7001","token":"owner-token","content":"未关联归档内容","kind":"thought"
+        }),
+        &context,
+    )
+    .unwrap();
+    let expected_id = unlinked["id"].as_i64().unwrap();
+    assert!(
+        tool_dedup.contains(&format!("#{expected_id}")) && tool_dedup.contains("已归档"),
+        "{tool_dedup}"
+    );
+    assert!(!tool_dedup.contains("已更新使用时间"), "{tool_dedup}");
+}

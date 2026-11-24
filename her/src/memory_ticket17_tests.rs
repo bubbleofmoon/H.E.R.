@@ -13,7 +13,7 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
     }).unwrap();
     let args = json!({"key":"group:101","token":"group-token","query":"deepseek-v4.1-flash"});
     let valid = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap();
-    assert_eq!(valid, "1. [#1 fact·推断] deepseek-v4.1-flash v0.2.1");
+    assert_eq!(valid, "1. [#1 推断·fact] deepseek-v4.1-flash v0.2.1");
     let block = crate::prompt::recall_block_with_runtime(&context, &context.load_config().unwrap(),
         &json!({"unread":[{"text":"deepseek-v4.1-flash v0.2.1"}]}), "group:101");
     assert!(block.contains("deepseek-v4.1-flash v0.2.1"), "dotted recall must inject: {block}");
@@ -566,7 +566,7 @@ fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when
     let st = &state["conversations"][key];
     let preview = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
     assert!(preview.contains("评测记录"), "{preview}");
-    assert_eq!(preview.matches("\n- [fact").count(), 1, "relatedTopK is honoured: {preview}");
+    assert_eq!(preview.matches("\n- [推断·fact").count(), 1, "relatedTopK is honoured: {preview}");
     // Rendering (the preview and the compatibility render that precedes a delivery) counts nothing.
     let _ = crate::prompt::build_with_runtime(&context, key, "atMention", "bot", "9001");
     assert_eq!(recall_hits(&conn), 0, "reading recall for preview or for a later delivery is not a use");
@@ -713,7 +713,7 @@ fn a_message_that_matches_no_memory_renders_no_recalled_memory() {
     let mut st = state["conversations"][key].clone();
     st["unread"][0]["text"] = json!("今天中午吃什么好呢，想不出来");
     let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &st, key);
-    assert!(!block.contains("\n- [fact"), "no pinned or recent padding: {block}");
+    assert!(!block.contains("\n- [推断·fact"), "no pinned or recent padding: {block}");
     assert!(!block.contains("【记忆】你可能需要回顾"), "{block}");
 }
 
