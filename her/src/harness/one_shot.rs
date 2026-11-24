@@ -201,6 +201,7 @@ pub(crate) fn digest_walk_of(cfg: &Value) -> Option<Walk> {
 }
 
 /// The digest's first route model id; `None` when unconfigured or invalid.
+#[cfg(test)]
 pub(crate) fn digest_model_id(cfg: &Value) -> Option<String> {
     digest_walk_of(cfg)
         .and_then(|walk| walk.routes.into_iter().next())

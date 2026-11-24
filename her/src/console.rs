@@ -23078,7 +23078,7 @@ pub(super) mod tests {
         let (_root_a, ctx_a) = fixture_runtime("slang-extract-a", "token-extract-a");
         let (_root_b, ctx_b) = fixture_runtime("slang-extract-b", "token-extract-b");
         let c = cfg();
-        let learner_a = crate::slang_learn::SlangLearner::new(&ctx_a);
+        let learner_a = crate::slang_learn::SlangLearning::new(&ctx_a);
         assert!(learner_a.feed_window("group:7002", "Alice", "yyds"));
         let body = json!({ "key": "group:7002", "dryRun": true }).to_string();
 
