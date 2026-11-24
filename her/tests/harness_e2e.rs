@@ -3160,7 +3160,10 @@ fn hotfix82_harness_memory_filter_preserves_generated_ids() {
     let written=tool_text(1,"write-82");
     assert!(written.contains("#1"),"generated write ID is metadata: {written}");
     let found=tool_text(2,"read-82");
-    assert!(found.contains("1. [#1 fact"),"generated search ordinal and ID are metadata: {found}");
+    assert!(
+        found.contains("1. [#1 推断·fact"),
+        "generated search ordinal and ID are metadata: {found}"
+    );
     assert!(found.contains("WORD82")&&!found.contains('奸'),"chat fields are filtered: {found}");
     let index=tool_text(3,"index-82");
     assert!(index.contains("共 1 条")&&!index.contains('奸'),"generated count is metadata: {index}");
@@ -3172,7 +3175,7 @@ fn hotfix82_harness_memory_filter_preserves_generated_ids() {
     assert_eq!(requests.len(),5);
     let replay=requests[4]["messages"].to_string();
     assert!(!replay.contains("WORD82"),"replayed chat/query/results use the new blacklist: {replay}");
-    assert!(replay.contains("#1 fact"),"replayed generated memory ID remains intact: {replay}");
+    assert!(replay.contains("#1 推断·fact"),"replayed generated memory ID remains intact: {replay}");
 }
 
 #[test]
@@ -3397,7 +3400,7 @@ fn tool_preview_oversized_memory_search_reaches_the_model_as_a_preview_and_stays
         let wire = tool_preview_wire(&requests[1], "preview-search");
         let outcome: Value = serde_json::from_str(&wire).unwrap();
         let shown = outcome["content"][0]["text"].as_str().unwrap();
-        assert!(shown.starts_with("1. [#1 fact·推断] HEAD175 filler"), "{shown}");
+        assert!(shown.starts_with("1. [#1 推断·fact] HEAD175 filler"), "{shown}");
         assert!(!wire.contains("TAIL175"), "omitted text reached the model");
         let written = tool_wire_result(&requests[1], "preview-write");
         assert_eq!(

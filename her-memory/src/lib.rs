@@ -759,10 +759,12 @@ fn write_memory_inner(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Resul
 }
 
 /// 幂等写入：同 (owner, source, content) 视为同一条（对应 upsertMemory）。
-/// 返回 (id, 是否去重命中)。
+/// 返回 (id, 是否去重命中, 命中行是否已归档)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpsertOutcome {
     pub id: i64,
     pub deduped: bool,
+    pub archived: bool,
 }
 
 fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
@@ -770,23 +772,27 @@ fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<Ups
 }
 
 fn upsert_memory_inner(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
-    let existing: Option<i64> = conn
+    let existing: Option<(i64, bool)> = conn
         .query_row(
-            "SELECT id FROM memory WHERE owner_id = ?1 AND source = ?2 AND content = ?3 LIMIT 1",
+            "SELECT id, archived FROM memory
+             WHERE owner_id = ?1 AND source = ?2 AND content = ?3 LIMIT 1",
             params![m.owner_id, m.source, m.content],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if let Some(id) = existing {
-        conn.execute(
-            "UPDATE memory SET last_used_at = ?1, importance = MAX(importance, ?2) WHERE id = ?3",
-            params![now_ms(), m.importance, id],
-        )?;
-        return Ok(UpsertOutcome { id, deduped: true });
+    if let Some((id, archived)) = existing {
+        if !archived {
+            conn.execute(
+                "UPDATE memory SET last_used_at = ?1, importance = MAX(importance, ?2)
+                 WHERE id = ?3",
+                params![now_ms(), m.importance, id],
+            )?;
+        }
+        return Ok(UpsertOutcome { id, deduped: true, archived });
     }
     let id = write_memory(conn, m)?;
     audit(conn, m.source, "write", Some(id), Some(m.kind))?;
-    Ok(UpsertOutcome { id, deduped: false })
+    Ok(UpsertOutcome { id, deduped: false, archived: false })
 }
 
 /// 删除一条记忆（连同 FTS 行），返回是否真的删掉了。
@@ -1335,5 +1341,49 @@ mod tests {
     #[test]
     fn segment_single_han_kept() {
         assert_eq!(segment("鱼").join(" "), "鱼");
+    }
+
+    #[test]
+    fn upsert_reports_archived_state_and_skips_touching_archived_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        let input = |importance| MemoryInput {
+            owner_type: "session",
+            owner_id: "group:101",
+            scope: "group",
+            kind: "thought",
+            subject: None,
+            content: "已归档去重测试",
+            tags: None,
+            source: "agent",
+            importance,
+        };
+        let created = upsert_memory(&conn, &input(0.3)).unwrap();
+        assert_eq!(
+            created,
+            UpsertOutcome { id: 1, deduped: false, archived: false }
+        );
+        archive_memory(&conn, created.id, true, "console").unwrap();
+        let deduped = upsert_memory(&conn, &input(0.9)).unwrap();
+        assert_eq!(
+            deduped,
+            UpsertOutcome { id: created.id, deduped: true, archived: true }
+        );
+        let (last_used_at, importance): (Option<i64>, f64) = conn
+            .query_row(
+                "SELECT last_used_at, importance FROM memory WHERE id = ?1",
+                [created.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_used_at, None);
+        assert!((importance - 0.3).abs() < f64::EPSILON);
+
+        archive_memory(&conn, created.id, false, "console").unwrap();
+        let restored = upsert_memory(&conn, &input(0.9)).unwrap();
+        assert_eq!(
+            restored,
+            UpsertOutcome { id: created.id, deduped: true, archived: false }
+        );
     }
 }

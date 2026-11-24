@@ -1786,7 +1786,7 @@ mod tests {
         .to_string();
         let filtered = filter_tool_text(&original, &json!({}), Some("memory_search")).unwrap();
         let (shown, _, data) = tool_preview_parts(&preview_tool_text(&filtered, 1_000), 1_000);
-        assert!(shown.starts_with("1. [#7 fact·推断] HEAD175 filler"), "{shown}");
+        assert!(shown.starts_with("1. [#7 推断·fact] HEAD175 filler"), "{shown}");
         assert!(!shown.contains("TAIL175"), "{shown}");
         assert!(
             data.get("_meta").is_none(),

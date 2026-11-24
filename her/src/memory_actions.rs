@@ -298,7 +298,13 @@ fn handle_inner(
             };
             use sha1::{Digest, Sha1};
             let hash = format!("{:x}", Sha1::digest(content.as_bytes()));
-            Ok(json!({ "ok": true, "id": out.id, "deduped": out.deduped, "hash": hash }))
+            Ok(json!({
+                "ok": true,
+                "id": out.id,
+                "deduped": out.deduped,
+                "archived": out.archived,
+                "hash": hash
+            }))
         }
         "history" => {
             let id = b.get("id").and_then(Value::as_i64).filter(|id| *id > 0)
