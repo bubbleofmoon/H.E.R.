@@ -233,42 +233,69 @@ class WorkflowContract(unittest.TestCase):
         scans = self.job_block(text, "scans")
         self.assertNotIn("needs:", scans)
         self.assertNotIn("needs.changes", scans)
-        self.assertIn("python -I scripts/tests/test_checks_workflow.py", scans)
+        self.assertIn("python -I scripts/ci/run-scans.py", scans)
+        self.assertIn("python -I scripts/scan-public.py", scans)
+        self.assertIn('"$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner', scans)
+
+        ui_build = self.job_block(text, "ui-build")
+        self.assertIn("name: ui-build (ubuntu-24.04)", ui_build)
+        self.assertIn("needs: changes", ui_build)
+        self.assertIn("if: needs.changes.outputs.code == 'true'", ui_build)
+        self.assertIn("install-node.py", ui_build)
+        self.assertIn("npm ci", ui_build)
+        self.assertIn("npm run typecheck", ui_build)
+        self.assertIn("npm run build", ui_build)
+        self.assertIn("actions/upload-artifact@v4", ui_build)
+        self.assertIn("name: her-ui-dist", ui_build)
+        self.assertIn("path: ${{ env.PUBLIC_TREE }}/her-ui/dist", ui_build)
 
         for job in ("lint", "tests"):
             block = self.job_block(text, job)
-            self.assertIn("needs: changes", block, job)
+            self.assertIn("needs: [changes, ui-build]", block, job)
             self.assertIn("if: needs.changes.outputs.code == 'true'", block, job)
 
         windows = self.job_block(text, "tests-windows")
-        self.assertIn("needs: changes", windows)
+        self.assertIn("needs: [changes, ui-build]", windows)
         self.assertIn("if: github.event_name == 'push' && needs.changes.outputs.code == 'true'", windows)
+
+        lint = self.job_block(text, "lint")
+        self.assertNotIn("install-node.py", lint)
+        self.assertNotIn("npm run build", lint)
+
+        for job in ("tests", "tests-windows"):
+            block = self.job_block(text, job)
+            self.assertIn("install-node.py", block, job)
+            self.assertNotIn("npm run build", block, job)
 
         for job in ("lint", "tests", "tests-windows"):
             block = self.job_block(text, job)
-            self.assertIn("her-ui", block, job)
-            self.assertIn("npm run build", block, job)
-            self.assertIn("HER_REQUIRE_UI_DIST=1", block, job)
+            self.assertIn("actions/download-artifact@v4", block, job)
+            self.assertIn("name: her-ui-dist", block, job)
+            self.assertIn("path: ${{ env.PUBLIC_TREE }}/her-ui/dist", block, job)
+            self.assertRegex(block, r"HER_REQUIRE_UI_DIST:\s*'1'", job)
 
     def test_checks_workflow_defines_always_run_checks_gate(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         gate = self.job_block(text, "gate")
 
         self.assertIn("name: checks-gate", gate)
-        self.assertIn("needs: [changes, scans, lint, tests]", gate)
+        self.assertIn("needs: [changes, scans, ui-build, lint, tests]", gate)
         self.assertIn("if: always()", gate)
         for expr in (
             "needs.changes.result",
             "needs.changes.outputs.code",
             "needs.scans.result",
+            "needs.ui-build.result",
             "needs.lint.result",
             "needs.tests.result",
         ):
             self.assertIn(expr, gate)
 
         self.assertIn('if [ "$CODE_CHANGED" = "false" ]; then', gate)
+        self.assertIn('"$UI_BUILD_RESULT" != "skipped"', gate)
         self.assertIn('"$LINT_RESULT" != "skipped"', gate)
         self.assertIn('"$TESTS_RESULT" != "skipped"', gate)
+        self.assertIn('if [ "$UI_BUILD_RESULT" != "success" ]; then', gate)
         self.assertIn('if [ "$LINT_RESULT" != "success" ]; then', gate)
         self.assertIn('if [ "$TESTS_RESULT" != "success" ]; then', gate)
 
