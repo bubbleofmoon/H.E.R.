@@ -14,7 +14,7 @@
 //! Record format and folding stay in `send_outbox.rs`; reply classification stays in
 //! `onebot::classify_send_reply`.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use serde_json::{json, Map, Value};
 
@@ -34,6 +34,15 @@ pub fn send_chain() -> MutexGuard<'static, ()> {
     SEND_CHAIN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Try to enter the send chain without waiting under another gate.
+pub(crate) fn try_send_chain() -> Option<MutexGuard<'static, ()>> {
+    match SEND_CHAIN.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Run a send that may wait for the chain (and then on the gateway) without holding a tokio

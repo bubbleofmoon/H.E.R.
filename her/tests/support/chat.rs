@@ -153,6 +153,7 @@ struct DshInner {
     accepted_results: Vec<Value>,
     drop_result_response: usize,
     hold_result_response: bool,
+    trickle_next_result: Option<std::sync::mpsc::Sender<()>>,
     hold_settings_update: bool,
 }
 
@@ -172,7 +173,7 @@ fn event(sess: &mut Sess, kind: &str, data: Value) {
 impl Dsh {
     fn new() -> Arc<Self> {
         Arc::new(Self { loop_fixture: Mutex::new(None), loop_results: Mutex::new(Vec::new()), requests: Mutex::default(), inner: Mutex::new(DshInner { sessions: HashMap::new(), next_sid: 0, rpc: Vec::new(), prompts: Vec::new(), refuse_prompt: false, preview_fault: None, interactions: Vec::new(), event_clients: 0, drop_interaction_stream: false, stall_handshakes: false, stalled_handshakes: 0, fail_settings: false,
-            archive_failures: 0, presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, hold_settings_update: false }), trace: Arc::default() })
+            archive_failures: 0, presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, trickle_next_result: None, hold_settings_update: false }), trace: Arc::default() })
     }
 
     fn prompts(&self) -> Vec<PromptRec> {
@@ -565,7 +566,21 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
     if method == "$events/result" && outcome.is_ok() {
         let mut inner = lock(&world.inner);
         if inner.drop_result_response > 0 { inner.drop_result_response -= 1; return; }
+        let trickle = inner.trickle_next_result.take();
         drop(inner);
+        if let Some(closed) = trickle {
+            // Keep the response in progress beyond the bridge's total deadline.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let limit = Instant::now() + Duration::from_secs(45);
+            while Instant::now() < limit {
+                if stream.write_all(b" ").is_err() {
+                    let _ = closed.send(());
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            return;
+        }
         while lock(&world.inner).hold_result_response { thread::sleep(Duration::from_millis(20)); }
     }
     if method == "settings/update" {

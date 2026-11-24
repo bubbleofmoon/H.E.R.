@@ -591,6 +591,9 @@ pub struct SendReport {
     pub parts: usize,
     pub confirmed: usize,
     pub error: Option<String>,
+    /// At least one part may have reached QQ without confirmation.
+    pub delivery_unknown: bool,
+    /// Recovery lacks durable proof of at least one outcome.
     pub unknown: bool,
 }
 
@@ -617,12 +620,13 @@ pub fn send_recorded(
     delay_ms: u64,
     guard: &dyn Fn() -> Result<(), String>,
 ) -> SendReport {
-    crate::recorded_send::off_worker(|| {
-        send_recorded_inline(context, ob, key, epoch, purpose, text, delay_ms, guard)
+    send_recorded_with_chain(context, ob, key, epoch, purpose, text, delay_ms, guard, || {
+        Ok(crate::recorded_send::send_chain())
     })
 }
 
-fn send_recorded_inline(
+/// Enter the send chain with any additional locks the caller needs through delivery.
+pub(crate) fn send_recorded_with_chain<Locks>(
     context: &RuntimeContext,
     ob: &OneBot,
     key: &str,
@@ -631,8 +635,25 @@ fn send_recorded_inline(
     text: &str,
     delay_ms: u64,
     guard: &dyn Fn() -> Result<(), String>,
+    acquire_chain: impl FnOnce() -> Result<Locks, String>,
 ) -> SendReport {
-    use crate::recorded_send::{send_chain, BeginError, History, Proof, Recorded, BATCH_BUSY};
+    crate::recorded_send::off_worker(|| {
+        send_recorded_inline(context, ob, key, epoch, purpose, text, delay_ms, guard, acquire_chain)
+    })
+}
+
+fn send_recorded_inline<Locks>(
+    context: &RuntimeContext,
+    ob: &OneBot,
+    key: &str,
+    epoch: &str,
+    purpose: &str,
+    text: &str,
+    delay_ms: u64,
+    guard: &dyn Fn() -> Result<(), String>,
+    acquire_chain: impl FnOnce() -> Result<Locks, String>,
+) -> SendReport {
+    use crate::recorded_send::{BeginError, History, Proof, Recorded, BATCH_BUSY};
     use crate::send_outbox::ItemState;
     let mut report = SendReport::default();
     let (Some(target), Some((kind, id_s))) = (target_of(key), key.split_once(':')) else {
@@ -650,7 +671,13 @@ fn send_recorded_inline(
     }
     // Owner rule (issue #70): a chat send may wait briefly behind another send in exchange for
     // one runner per batch and no blind duplicate.
-    let _chain = send_chain();
+    let _locks = match acquire_chain() {
+        Ok(locks) => locks,
+        Err(error) => {
+            report.error = Some(error);
+            return report;
+        }
+    };
     let delays: Vec<i64> = vec![delay_ms as i64; parts.len().saturating_sub(1)];
     let fields = json!({
         "key": key, "epoch": epoch, "purpose": purpose, "messages": parts,
@@ -703,7 +730,8 @@ fn send_recorded_inline(
         }
         let outcome = ob.send_one_outcome(&target, part, None, None);
         let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
-        report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
+        report.delivery_unknown |= settled.state.needs_verification();
+        report.unknown |= report.delivery_unknown || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;
             confirmed_ids.extend(message_id);

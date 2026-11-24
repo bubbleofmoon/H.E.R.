@@ -1108,9 +1108,9 @@ impl Pipeline {
                             tokio::select! {
                                 result = &mut completion => break result,
                                 _ = tick.tick() => {
-                                    // Mode/reset handlers hold this gate until retirement completes.
-                                    // On contention keep waiting; do not race their partial state.
-                                    if let Ok(_gate) = crate::closed_agent::lock(&self.context) {
+                                    // A mode write or reset can hold the gate across DSH I/O.
+                                    // Retry on the next tick so the collector yields between checks.
+                                    if let Ok(Some(_gate)) = crate::closed_agent::try_lock(&self.context) {
                                         if let Err(reason) = self.turn_validity(key, &sid) {
                                             let already_ended = self.cur_turn.as_ref().and_then(|turn| {
                                                 crate::turn_ledger::read_records(&self.context).ok().map(|records| {
