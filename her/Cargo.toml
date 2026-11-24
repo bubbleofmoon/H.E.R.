@@ -25,13 +25,14 @@ required-features = ["release-test-keys"]
 [features]
 default = []
 # Synthetic Rust fixtures: advancing epoch via HER_PARITY_EPOCH_MS; off by default.
-parity-clock = []
+parity-clock = ["her-memory/parity-clock"]
 # Private controlled-poll seam for the ticket 13 regression only.
 deadlock-regression = []
 # Synthetic signing pins for fake-feed executables only; rejected in release-profile builds.
 release-test-keys = []
 
 [dependencies]
+her-memory = { path = "../her-memory" }
 genai = "=0.7.3"
 jiff = { version = "=0.2.39", features = ["tzdb-bundle-always"] }
 tokio = { version = "1", features = ["full"] }
@@ -44,6 +45,9 @@ regex = "1"
 roxmltree = "0.21.2"
 base64 = "0.22"
 sha2 = "0.10"
+argon2 = "=0.5.3"
+rpassword = "=7.5.4"
+subtle = "=2.6.1"
 minisign-verify = "=0.3.0"
 getrandom = "0.2"
 sha1 = "0.10"
@@ -83,6 +87,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

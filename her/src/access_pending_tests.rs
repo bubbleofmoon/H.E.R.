@@ -36,7 +36,7 @@ fn file(root: &FixtureRoot) -> Value {
 
 /// The recorded pending revocations (none without the record file).
 fn pending(root: &FixtureRoot) -> Vec<Value> {
-    match std::fs::read(root.0.join("data").join(access::PENDING_REVOCATIONS)) {
+    match std::fs::read(root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS)) {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap()["pending"].as_array().cloned().unwrap(),
         Err(_) => Vec::new(),
     }
@@ -49,7 +49,7 @@ static CRASHING: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::n
 /// a crash there would. True when the change stopped there.
 fn crash_after_write<T>(context: &RuntimeContext, change: impl FnOnce() -> T) -> bool {
     let config = context.config_file().to_path_buf();
-    *access::AFTER_ACCESS_WRITE.lock().unwrap_or_else(|p| p.into_inner()) =
+    *crate::social_state::AFTER_ACCESS_WRITE.lock().unwrap_or_else(|p| p.into_inner()) =
         Some(std::sync::Arc::new(|path: &std::path::Path| {
             if CRASHING.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|crashing| crashing == path) {
                 panic!("t192: simulated crash between the configuration write and the revocation");
@@ -65,7 +65,7 @@ fn crash_after_write<T>(context: &RuntimeContext, change: impl FnOnce() -> T) ->
 fn t192_a_crash_between_the_write_and_the_revocation_is_finished_at_console_start() {
     let (root, context) = admitted("t192 crash scope");
     assert_eq!(
-        access::finish_pending_revocations(&context).unwrap(),
+        crate::social_state::finish_pending_revocations(&context).unwrap(),
         (Vec::new(), Vec::new()),
         "a runtime without the record has nothing pending"
     );
@@ -79,14 +79,17 @@ fn t192_a_crash_between_the_write_and_the_revocation_is_finished_at_console_star
     assert_eq!(recorded[0]["before"]["allow"]["groups"], json!(["420042"]));
     assert_eq!(recorded[0]["after"]["allow"]["groups"], json!([]));
     // Console start finishes it.
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     let rotated = conversation_token(&context, GROUP).unwrap();
     assert_ne!(rotated.as_deref(), Some(OLD_TOKEN), "the conversation token is rotated");
     assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "the DSH mapping is retired");
     assert!(pending(&root).is_empty(), "a finished revocation is no longer pending");
     // Running it again changes nothing.
-    assert_eq!(access::finish_pending_revocations(&context).unwrap(), (Vec::new(), Vec::new()));
+    assert_eq!(
+        crate::social_state::finish_pending_revocations(&context).unwrap(),
+        (Vec::new(), Vec::new())
+    );
     // A re-grant keeps the fresh epoch; the old one never comes back.
     let reply = conversation_scope_change(&context, GROUP, "admit").expect("the re-grant applies");
     assert_eq!(reply["revoked"], json!([]), "{reply}");
@@ -97,6 +100,8 @@ fn t192_a_crash_between_the_write_and_the_revocation_is_finished_at_console_star
 #[test]
 fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finished_the_same_way() {
     let (root, context) = admitted("t192 crash whitelist undo");
+    // This whitelist-only removal needs the live target to exclude the group first.
+    crate::settings::reset(&context, "rollout.rustGroups", "administrator").unwrap();
     let body = json!({"allow": {"groups": [], "private": []}, "confirm": true}).to_string();
     assert!(crash_after_write(&context, || access::whitelist_post(&context, &body)), "the whitelist write stopped after its write");
     assert_eq!(file(&root)["allow"]["groups"], json!([]));
@@ -134,7 +139,7 @@ fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finish
     let recorded = pending(&root);
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(recorded[0]["why"], "audit-undo");
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec!["group:420044".to_string()], Vec::<String>::new()));
     assert_ne!(conversation_token(&context, "group:420044").unwrap().as_deref(), Some("old-undo-token-abcdefghij"));
     assert!(pending(&root).is_empty());
@@ -153,9 +158,12 @@ fn t192_a_crash_before_the_write_revokes_with_a_fresh_epoch_and_keeps_the_access
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "the configuration was not written");
     assert_eq!(pending(&root).len(), 1, "the revocation was recorded before the write");
     // Finished as recorded (fail closed): the conversation keeps its access with a fresh epoch.
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
-    assert!(inbound_admitted(&context.load_config().unwrap(), GROUP), "the configuration still admits it");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "the configuration still admits it"
+    );
     assert_ne!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     assert!(pending(&root).is_empty());
 }
@@ -177,7 +185,7 @@ fn t192_a_change_is_refused_while_an_earlier_revocation_cannot_finish() {
     assert_eq!(status, 503, "{reply}");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a refused change writes nothing");
     assert_eq!(pending(&root).len(), 1, "the unfinished revocation stays recorded");
-    let (_, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (_, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert!(!failures.is_empty(), "console start reports the failure");
     assert_eq!(pending(&root).len(), 1);
     // Repaired, the next change finishes it first and then applies.
@@ -188,11 +196,12 @@ fn t192_a_change_is_refused_while_an_earlier_revocation_cannot_finish() {
     assert_ne!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     assert!(pending(&root).is_empty());
     // A record file that is not a pending-revocation record refuses every access change.
-    std::fs::write(root.0.join("data").join(access::PENDING_REVOCATIONS), "not json").unwrap();
+    let pending_path = root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS);
+    std::fs::write(pending_path, "not json").unwrap();
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let error = conversation_scope_change(&context, GROUP, "remove").unwrap_err();
     assert_eq!(error.0, 503, "{error:?}");
-    assert!(error.1.contains(access::PENDING_REVOCATIONS), "{error:?}");
+    assert!(error.1.contains(crate::social_state::PENDING_REVOCATIONS), "{error:?}");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before);
 }
 
@@ -200,12 +209,12 @@ fn t192_a_change_is_refused_while_an_earlier_revocation_cannot_finish() {
 fn t192_an_entry_without_mode_or_reason_is_finished_in_the_current_mode() {
     let (root, context) = admitted("t192 bare entry");
     std::fs::write(
-        root.0.join("data").join(access::PENDING_REVOCATIONS),
+        root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS),
         json!({"pending": [{"id": "revoke-t192-bare", "before": {"allow": {"groups": [420042]}}, "after": {"allow": {"groups": []}}}]})
             .to_string(),
     )
     .unwrap();
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     assert_ne!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     assert!(pending(&root).is_empty());
@@ -217,12 +226,12 @@ fn t192_console_start_keeps_the_record_while_the_interaction_gate_is_busy() {
     assert!(crash_after_write(&context, || conversation_scope_change(&context, GROUP, "remove")));
     // Another holder keeps the closed-agent interaction gate past the five-second wait.
     let held = crate::closed_agent::lock(&context).unwrap();
-    let error = access::finish_pending_revocations(&context).unwrap_err();
-    assert!(error.contains("closed-agent interaction lock unavailable"), "{error}");
+    let error = crate::social_state::finish_pending_revocations(&context).unwrap_err();
+    assert!(error.to_string().contains("closed-agent interaction lock unavailable"), "{error}");
     assert_eq!(pending(&root).len(), 1, "nothing is finished without the gate");
     assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     drop(held);
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     assert!(pending(&root).is_empty());
 }
@@ -272,7 +281,7 @@ fn t192_a_failed_config_write_keeps_its_revocation_unless_nothing_was_published(
     assert_eq!(file(&root)["allow"]["groups"], json!([]), "the configuration was published");
     assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     assert_eq!(pending(&root).len(), 1, "the published change keeps its pending revocation");
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     assert_ne!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
     assert!(pending(&root).is_empty());
@@ -281,7 +290,7 @@ fn t192_a_failed_config_write_keeps_its_revocation_unless_nothing_was_published(
 #[test]
 fn t192_an_entry_without_usable_policies_refuses_access_changes() {
     let (root, context) = admitted("t192 unusable entry");
-    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let record = root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS);
     let config = root.0.join("config/config.json");
     for entry in [
         json!({}),
@@ -295,7 +304,10 @@ fn t192_an_entry_without_usable_policies_refuses_access_changes() {
         assert_eq!(error.0, 503, "{entry}: {error:?}");
         assert!(error.1.contains("no usable before/after policy"), "{entry}: {error:?}");
         assert_eq!(std::fs::read(&config).unwrap(), before, "{entry}: nothing is written");
-        assert!(access::finish_pending_revocations(&context).is_err(), "{entry}: console start reports it");
+        assert!(
+            crate::social_state::finish_pending_revocations(&context).is_err(),
+            "{entry}: console start reports it"
+        );
         assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "{entry}: the record is kept for repair");
         assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "{entry}: nothing is revoked");
     }
@@ -303,7 +315,7 @@ fn t192_an_entry_without_usable_policies_refuses_access_changes() {
 
 /// The recorded DSH session stops that have not finished.
 fn stops(root: &FixtureRoot) -> Vec<Value> {
-    match std::fs::read(root.0.join("data").join(access::PENDING_REVOCATIONS)) {
+    match std::fs::read(root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS)) {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap()["stops"].as_array().cloned().unwrap_or_default(),
         Err(_) => Vec::new(),
     }
@@ -312,29 +324,58 @@ fn stops(root: &FixtureRoot) -> Vec<Value> {
 #[test]
 fn t192_a_retired_session_stays_recorded_until_its_stop_finished() {
     const SESSION: &str = "dsh-t192-recorded-stop";
-    static STOP_WORKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    struct LocalStopper(std::sync::atomic::AtomicBool);
+    impl crate::social_state::SessionStopper for LocalStopper {
+        fn stop_and_archive(
+            &self,
+            _context: &RuntimeContext,
+            _cfg: &Value,
+            _key: &str,
+            session_id: &str,
+        ) -> Result<(), String> {
+            assert_eq!(session_id, SESSION);
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("t192: DSH unreachable".to_string())
+            }
+        }
+        fn sync_mode(&self, _context: &RuntimeContext, _cfg: &Value, _mode: &str) -> bool {
+            false
+        }
+    }
     let (root, context) = admitted("t192 recorded stop");
     std::fs::write(
         root.0.join("data/sessions.json"),
         json!({"sessions": {GROUP: SESSION}, "sessionPolicies": {GROUP: "[\"reserved2\",\"qq-chat-v2\",null]"}}).to_string(),
     )
     .unwrap();
-    // Only this test's session: its DSH stop fails until the test lets it succeed.
-    *access::STOP_SEAM.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(|session: &str| {
-        (session == SESSION).then(|| {
-            if STOP_WORKS.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) } else { Err("t192: DSH unreachable".to_string()) }
-        })
-    }));
+    let tracker = std::sync::Arc::new(crate::social_state::StopTracker::new());
+    let stopper: std::sync::Arc<LocalStopper> =
+        std::sync::Arc::new(LocalStopper(std::sync::atomic::AtomicBool::new(false)));
+    let stopper_dyn: std::sync::Arc<dyn crate::social_state::SessionStopper> = stopper.clone();
     // The CLI entry waits for its background stops, so the failed stop has ended when it returns.
-    let reply = conversation_scope_change(&context, GROUP, "remove").expect("the remove applies");
+    let reply = crate::config_tx::change_conversation_scope_waiting_with(
+        &context,
+        GROUP,
+        "remove",
+        std::time::Duration::from_secs(10),
+        &tracker,
+        &stopper_dyn,
+    )
+    .expect("the remove applies");
     assert_eq!(reply["revoked"], json!([GROUP]), "{reply}");
     assert!(pending(&root).is_empty(), "the revocation itself finished");
     assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "the mapping is retired");
     assert_eq!(stops(&root), [json!({"key": GROUP, "session": SESSION})], "the failed stop stays recorded");
     // Console start runs it again; once it succeeds, the record is gone.
-    STOP_WORKS.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(access::finish_pending_revocations(&context).unwrap(), (Vec::new(), Vec::new()));
-    assert!(access::wait_background_stops(std::time::Duration::from_secs(15)), "the stop ended");
+    stopper.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        crate::social_state::finish_pending_revocations_with(&context, &tracker, &stopper_dyn)
+            .unwrap(),
+        (Vec::new(), Vec::new())
+    );
+    assert!(tracker.wait(std::time::Duration::from_secs(15)), "the stop ended");
     assert!(stops(&root).is_empty(), "a finished stop is no longer recorded");
 }
 
@@ -344,7 +385,7 @@ fn t192_an_owner_change_retried_after_a_crash_still_selects_a_retired_mapping() 
     // State a crash leaves between `retire_if` and the token rotation: an owner change in closed-agent mode, the other
     // conversation's mapping already retired and its stop recorded, its token still the old one.
     std::fs::write(
-        root.0.join("data").join(access::PENDING_REVOCATIONS),
+        root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS),
         json!({
             "pending": [{"id": "revoke-t192-owner", "why": "access-revoked", "mode": "closed-agent",
                          "before": {"ownerQQ": 8808}, "after": {"ownerQQ": 8809}}],
@@ -358,7 +399,7 @@ fn t192_an_owner_change_retried_after_a_crash_still_selects_a_retired_mapping() 
         Ok(())
     })
     .unwrap();
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert!(failures.is_empty(), "{failures:?}");
     assert!(revoked.contains(&"group:420046".to_string()), "the recorded stop still selects it: {revoked:?}");
     assert_ne!(
@@ -378,11 +419,11 @@ fn t192_revocation_targets_are_recorded_before_the_steps_and_kept_until_all_succ
     let sessions = root.0.join("data/sessions.json");
     let mapping = std::fs::read(&sessions).unwrap();
     std::fs::write(&sessions, "{ damaged").unwrap();
-    let (_, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (_, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert!(!failures.is_empty(), "the attempt failed");
     assert_eq!(pending(&root)[0]["targets"], json!([GROUP]), "its targets were recorded before its steps and stay after the failure");
     std::fs::write(&sessions, &mapping).unwrap();
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     assert!(pending(&root).is_empty(), "every step succeeded: the entry and its targets are gone");
 }
@@ -393,7 +434,7 @@ fn t192_a_retried_owner_change_selects_its_recorded_targets_after_the_stop_clear
     // What the gate review describes: an attempt recorded `group:420046` as a target, retired its mapping, failed to
     // rotate its token, and its DSH stop then finished, so neither a mapping nor a stop names it any more.
     std::fs::write(
-        root.0.join("data").join(access::PENDING_REVOCATIONS),
+        root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS),
         json!({"pending": [{"id": "revoke-t192-targets", "why": "access-revoked", "mode": "closed-agent",
                             "before": {"ownerQQ": 8808}, "after": {"ownerQQ": 8809}, "targets": ["group:420046"]}]})
         .to_string(),
@@ -404,7 +445,7 @@ fn t192_a_retried_owner_change_selects_its_recorded_targets_after_the_stop_clear
         Ok(())
     })
     .unwrap();
-    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    let (revoked, failures) = crate::social_state::finish_pending_revocations(&context).unwrap();
     assert!(failures.is_empty(), "{failures:?}");
     assert!(revoked.contains(&"group:420046".to_string()), "the recorded target is selected again: {revoked:?}");
     assert_ne!(
@@ -418,7 +459,7 @@ fn t192_a_retried_owner_change_selects_its_recorded_targets_after_the_stop_clear
 #[test]
 fn t192_a_malformed_stop_record_refuses_access_changes() {
     let (root, context) = admitted("t192 malformed stops");
-    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let record = root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS);
     let config = root.0.join("config/config.json");
     for stops in [
         json!([{"key": "group:420046"}]),
@@ -432,7 +473,10 @@ fn t192_a_malformed_stop_record_refuses_access_changes() {
         assert_eq!(error.0, 503, "{stops}: {error:?}");
         assert!(error.1.contains("malformed stop record"), "{stops}: {error:?}");
         assert_eq!(std::fs::read(&config).unwrap(), before, "{stops}: nothing is written");
-        assert!(access::finish_pending_revocations(&context).is_err(), "{stops}: console start reports it");
+        assert!(
+            crate::social_state::finish_pending_revocations(&context).is_err(),
+            "{stops}: console start reports it"
+        );
         assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "{stops}: the record is kept for repair");
     }
     // A record without the field (every record written before run 6) stays accepted.
@@ -443,7 +487,7 @@ fn t192_a_malformed_stop_record_refuses_access_changes() {
 #[test]
 fn t192_duplicate_pending_ids_refuse_access_changes() {
     let (root, context) = admitted("t192 duplicate ids");
-    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let record = root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS);
     let config = root.0.join("config/config.json");
     // Two entries share the id "same": the first selects nothing, the second selects `GROUP` for its token rotation.
     let text = json!({"pending": [
@@ -459,13 +503,16 @@ fn t192_duplicate_pending_ids_refuse_access_changes() {
     assert_eq!(std::fs::read(&config).unwrap(), before, "nothing is written");
     assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "the record is kept for repair");
     assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "nothing is revoked");
-    assert!(access::finish_pending_revocations(&context).is_err(), "console start reports it");
+    assert!(
+        crate::social_state::finish_pending_revocations(&context).is_err(),
+        "console start reports it"
+    );
 }
 
 #[test]
 fn t192_a_noncanonical_target_refuses_access_changes() {
     let (root, context) = admitted("t192 noncanonical target");
-    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let record = root.0.join("data").join(crate::social_state::PENDING_REVOCATIONS);
     let config = root.0.join("config/config.json");
     // A hand-edited target with a trailing space names no conversation the token lookup finds.
     let text = json!({"pending": [{

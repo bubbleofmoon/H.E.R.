@@ -1,6 +1,9 @@
 //! Health check through seam 1: real CLI, selected roots and loopback fakes.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::http_mock::{ConcurrentMockServer, MockAction, MockResponse};
+use support::install_root;
+use support::ports::{start_console, OwnedChild};
+use support::wait::{assert_eventually, wait_until};
+mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
 
@@ -8,20 +11,11 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use process_identity::{KillOutcome, Liveness, ProcessIdentity};
-
-struct Child(Option<std::process::Child>);
-impl Drop for Child {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 /// How long the rig's cleanup gives each lifecycle CLI call and the owners' exit.
 const CLEANUP_BOUND: Duration = Duration::from_secs(10);
@@ -84,10 +78,10 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
         .map_err(|e| format!("could not start: {e}"))?;
     let stdout = Drain::new(process.stdout.take());
     let stderr = Drain::new(process.stderr.take());
-    let mut child = Child(Some(process));
+    let mut child = Some(OwnedChild(process));
     let limit = Instant::now() + allow;
     let mut status = loop {
-        let Some(process) = child.0.as_mut() else {
+        let Some(process) = child.as_mut() else {
             break Err("lost its process handle".to_string());
         };
         match process.try_wait() {
@@ -109,20 +103,23 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
         // The reap after the kill is bounded: a child that ignores the kill leaks its handle
         // and is reported, never followed by a blocking `wait` that could stall the fixture.
         let mut leaked = false;
-        if let Some(process) = child.0.as_mut() {
+        if let Some(process) = child.as_mut() {
             let _ = process.kill();
             let reaped = Instant::now() + Duration::from_secs(5);
             loop {
                 match process.try_wait() {
                     Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < reaped => std::thread::sleep(Duration::from_millis(5)),
+                    Ok(None) if Instant::now() < reaped => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
                     Ok(None) => {
                         *reason += "; child did not exit after kill";
                         leaked = true;
                         break;
                     }
                     Err(e) => {
-                        *reason += &format!("; child did not exit after kill (could not be polled: {e})");
+                        *reason +=
+                            &format!("; child did not exit after kill (could not be polled: {e})");
                         leaked = true;
                         break;
                     }
@@ -130,12 +127,13 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
             }
         }
         if leaked {
-            // Dropping a std `Child` is non-blocking and leaves the process running: that is
-            // the leak. Keeping it in the wrapper would call blocking `wait` in `Child::drop`.
-            child.0 = None;
+            // Forgetting `OwnedChild` skips blocking `wait` in `Drop`, leaving the handle leaked.
+            if let Some(leaked_child) = child.take() {
+                std::mem::forget(leaked_child);
+            }
         }
     }
-    // Exited (or reaped after the kill): the wrapper's Drop only reaps here.
+    // Exited (or reaped after the kill): `OwnedChild::drop` only reaps here.
     drop(child);
     let grace = Instant::now() + PIPE_GRACE;
     while !(stdout.closed() && stderr.closed()) && Instant::now() < grace {
@@ -173,164 +171,89 @@ struct Server {
     reply: Arc<Mutex<Reply>>,
     /// Cookie headers of the requests that reached `path`, in order.
     cookies: Arc<Mutex<Vec<String>>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    _mock: ConcurrentMockServer,
 }
 impl Server {
     fn new(path: &'static str, reply: Reply) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
         let reply = Arc::new(Mutex::new(reply));
         let state = reply.clone();
         let cookies = Arc::new(Mutex::new(Vec::new()));
         let seen = cookies.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopping = stop.clone();
-        let thread = std::thread::spawn(move || {
-            use std::sync::atomic::Ordering;
-            while !stopping.load(Ordering::Relaxed) {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                };
-                let accepted_at = Instant::now();
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(100)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_millis(100)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buf = [0; 4096];
-                let read_limit = Instant::now() + Duration::from_secs(5);
-                let mut complete = false;
-                while !stopping.load(Ordering::Relaxed) && Instant::now() < read_limit {
-                    let n = match stream.read(&mut buf) {
-                        Ok(n) => n,
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::WouldBlock
-                                    | std::io::ErrorKind::Interrupted
-                            ) =>
-                        {
-                            continue
-                        }
-                        Err(_) => break,
-                    };
-                    if n == 0 {
-                        break;
+        let mock = ConcurrentMockServer::start(move |req, stopping| {
+            let selected = {
+                let mut state = state.lock().unwrap();
+                match &mut *state {
+                    Reply::Script(steps) if steps.len() > 1 => {
+                        let (status, body) = steps.remove(0);
+                        Reply::Json(status, body)
                     }
-                    request.extend_from_slice(&buf[..n]);
-                    if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                line.strip_prefix("content-length:")
-                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + length {
-                            complete = true;
-                            break;
-                        }
-                    }
+                    Reply::Script(steps) => Reply::Json(steps[0].0, steps[0].1.clone()),
+                    other => other.clone(),
                 }
-                if !complete {
-                    eprintln!(
-                        "fixture expected={path}: incomplete request after {}ms, bytes={}",
-                        accepted_at.elapsed().as_millis(),
-                        request.len()
-                    );
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&request);
-                if text.is_empty() {
-                    continue;
-                } // supervisor connect-only observation
-                let selected = {
-                    let mut state = state.lock().unwrap();
-                    match &mut *state {
-                        Reply::Script(steps) if steps.len() > 1 => {
-                            let (status, body) = steps.remove(0);
-                            Reply::Json(status, body)
-                        }
-                        Reply::Script(steps) => Reply::Json(steps[0].0, steps[0].1.clone()),
-                        other => other.clone(),
-                    }
-                };
-                if text.lines().next().unwrap_or("").contains(path) {
-                    seen.lock().unwrap().push(
-                        text.lines()
-                            .find(|line| line.starts_with("Cookie: "))
-                            .unwrap_or("")
-                            .to_string(),
-                    );
-                }
-                let (status, body) = if !text.lines().next().unwrap_or("").contains(path) {
-                    (404, json!({}))
-                } else if path == "/get_status"
-                    && !text.contains("Authorization: Bearer fixture-snow")
-                {
-                    (401, json!({}))
-                } else if path == "/api/settings/describe" && !text.contains("Cookie: dsh-auth-") {
-                    (401, json!({}))
-                } else {
-                    match selected {
-                        Reply::Json(status, mut body) => {
-                            // Real DSH (frozen JS `dsh-client.js` checks `full.rpcId !== message.rpcId`) answers a
-                            // `client-request` with a `server-response` carrying that request's `rpcId`.
-                            if path == "/api/settings/describe"
-                                && body.get("type") == Some(&json!("server-response"))
-                            {
-                                let request_body =
-                                    text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
-                                if let Some(id) = serde_json::from_str::<Value>(request_body)
-                                    .ok()
-                                    .and_then(|envelope| envelope.get("rpcId").cloned())
-                                {
-                                    body["rpcId"] = id;
-                                }
-                            }
-                            (status, body)
-                        }
-                        Reply::Script(_) => unreachable!("resolved above"),
-                        Reply::Silent => {
-                            while !stopping.load(Ordering::Relaxed)
-                                && matches!(*state.lock().unwrap(), Reply::Silent)
-                            {
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                            continue;
-                        }
-                    }
-                };
-                let mut body = body;
-                // DSH echoes the request's rpcId in its server-response (the bounded client checks it).
-                if body["type"] == "server-response" && body.get("rpcId").is_none() {
-                    let request_body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
-                    if let Some(id) = serde_json::from_str::<Value>(request_body)
-                        .ok()
-                        .and_then(|v| v.get("rpcId").cloned())
-                    {
-                        body["rpcId"] = id;
-                    }
-                }
-                let body = body.to_string();
-                let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                let sent = stream.write_all(response.as_bytes());
-                eprintln!("fixture expected={path}, request={:?}, elapsed={}ms: HTTP {status}, body={body}, write={sent:?}", text.lines().next(), accepted_at.elapsed().as_millis());
+            };
+            let matches_path = req.request_line.contains(path);
+            if matches_path {
+                seen.lock().unwrap().push(
+                    req.header("Cookie")
+                        .map_or_else(String::new, |v| format!("Cookie: {v}")),
+                );
             }
+            let (status, mut body) = if !matches_path {
+                (404, json!({}))
+            } else if path == "/get_status"
+                && req.header("Authorization") != Some("Bearer fixture-snow")
+            {
+                (401, json!({}))
+            } else if path == "/api/settings/describe"
+                && !req
+                    .header("Cookie")
+                    .is_some_and(|cookie| cookie.contains("dsh-auth-"))
+            {
+                (401, json!({}))
+            } else {
+                match selected {
+                    Reply::Json(status, mut body) => {
+                        // Real DSH (frozen JS `dsh-client.js` checks `full.rpcId !== message.rpcId`) answers a
+                        // `client-request` with a `server-response` carrying that request's `rpcId`.
+                        if path == "/api/settings/describe"
+                            && body.get("type") == Some(&json!("server-response"))
+                        {
+                            if let Some(id) = serde_json::from_slice::<Value>(&req.body)
+                                .ok()
+                                .and_then(|envelope| envelope.get("rpcId").cloned())
+                            {
+                                body["rpcId"] = id;
+                            }
+                        }
+                        (status, body)
+                    }
+                    Reply::Script(_) => unreachable!("resolved above"),
+                    Reply::Silent => {
+                        while !stopping.load(Ordering::Relaxed)
+                            && matches!(*state.lock().unwrap(), Reply::Silent)
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        return MockAction::Close;
+                    }
+                }
+            };
+            // DSH echoes the request's rpcId in its server-response (the bounded client checks it).
+            if body["type"] == "server-response" && body.get("rpcId").is_none() {
+                if let Some(id) = serde_json::from_slice::<Value>(&req.body)
+                    .ok()
+                    .and_then(|v| v.get("rpcId").cloned())
+                {
+                    body["rpcId"] = id;
+                }
+            }
+            MockAction::Reply(MockResponse::json(status, &body))
         });
         Self {
-            port,
+            port: mock.port(),
             reply,
             cookies,
-            stop,
-            thread: Some(thread),
+            _mock: mock,
         }
     }
     fn set(&self, reply: Reply) {
@@ -340,20 +263,10 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 }
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.thread.take().unwrap().join().unwrap();
-    }
-}
 
 fn hidden(exe: &str) -> Command {
     let mut cmd = Command::new(exe);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
+    support::hide_window(&mut cmd);
     cmd.env_remove("HER_RUNTIME_ROOT");
     cmd
 }
@@ -579,8 +492,8 @@ struct Rig {
     /// Every process instance this rig caused, by role (`console`, `live`, `supervisor`):
     /// recorded at spawn and from the owner markers, stopped by `Drop` with `kill_verified`.
     owners: Vec<(&'static str, ProcessIdentity)>,
-    console: Option<Child>,
-    supervisor: Option<Child>,
+    console: Option<OwnedChild>,
+    supervisor: Option<OwnedChild>,
     fixture: Fixture,
     snowluma: Server,
     dsh: Server,
@@ -603,8 +516,6 @@ impl Rig {
                 json!({"type":"server-response", "result":{"ok":true,"value":{}}}),
             ),
         );
-        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserve.local_addr().unwrap().port();
         let mut tasks = json!({});
         for task in [
             "watchdog",
@@ -617,10 +528,9 @@ impl Rig {
         ] {
             tasks[task] = json!({"enabled":false});
         }
-        let config = json!({"consoleToken":"fixture-console", "consolePort":port,
+        let mut config = json!({"consoleToken":"fixture-console", "consolePort":0,
             "snowluma":{"accessToken":"fixture-snow"}, "tasks":tasks,
             "backends":{"mcpRustBridge":false}, "rollout":{"rustGroups":[]}});
-        std::fs::write(fixture.0.join("config/config.json"), config.to_string()).unwrap();
         std::fs::write(
             fixture.0.join("user/dsh/.credentials.yaml"),
             "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
@@ -631,9 +541,8 @@ impl Rig {
             json!({"onebot":snowluma.url(), "dsh":dsh.url(), "model":dsh.url()}).to_string(),
         )
         .unwrap();
-        drop(reserve);
         let spawn = |args: &[&str]| {
-            Child(Some(
+            OwnedChild(
                 hidden(env!("CARGO_BIN_EXE_her"))
                     .args(args)
                     .arg("--runtime-root")
@@ -642,20 +551,26 @@ impl Rig {
                     .stderr(std::process::Stdio::null())
                     .spawn()
                     .unwrap(),
-            ))
+            )
         };
-        let console = Some(spawn(&[
-            "--console-serve",
-            "--console-port",
-            &port.to_string(),
-        ]));
+        let (console_child, port) = start_console(Duration::from_secs(10), |port| {
+            config["consolePort"] = port.into();
+            std::fs::write(fixture.0.join("config/config.json"), config.to_string()).unwrap();
+            hidden(env!("CARGO_BIN_EXE_her"))
+                .args(["--console-serve", "--console-port", &port.to_string()])
+                .arg("--runtime-root")
+                .arg(&fixture.0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        });
+        config["consolePort"] = port.into();
+        let console = Some(OwnedChild(console_child));
         let supervisor = Some(spawn(&["supervise"]));
         let mut owners = Vec::new();
         for (role, child) in [("console", &console), ("supervisor", &supervisor)] {
-            let pid = child
-                .as_ref()
-                .and_then(|child| child.0.as_ref())
-                .map(std::process::Child::id);
+            let pid = child.as_ref().map(|child| child.id());
             if let Some(Ok(Some(identity))) = pid.map(process_identity::identity_of) {
                 owners.push((role, identity));
             }
@@ -669,24 +584,20 @@ impl Rig {
             dsh,
             config,
         };
-        let limit = Instant::now() + Duration::from_secs(10);
-        loop {
+        let mut last_status = Value::Null;
+        if !wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
             let out = hidden(env!("CARGO_BIN_EXE_her-cli"))
                 .args(["lifecycle", "status", "--runtime-root"])
                 .arg(&rig.fixture.0)
                 .output()
                 .unwrap();
-            let status: Value = serde_json::from_slice(&out.stdout).unwrap();
-            if status["owners"]["console"]["state"] == "held"
-                && status["owners"]["supervisor"]["state"] == "held"
-            {
-                // The owner is acquired just before the console binds its listener.
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-            }
-            assert!(Instant::now() < limit, "owners not ready: {status}");
-            std::thread::sleep(Duration::from_millis(20));
+            last_status = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            last_status["owners"]["console"]["state"] == "held"
+                && last_status["owners"]["console"]["owner"].is_object()
+                && last_status["owners"]["supervisor"]["state"] == "held"
+                && last_status["owners"]["supervisor"]["owner"].is_object()
+        }) {
+            panic!("owners not ready: {last_status}");
         }
         rig
     }
@@ -780,10 +691,9 @@ impl Drop for Rig {
             self.record_owners();
         }
         // 2. Give the recorded owners time to exit on their own.
-        let deadline = Instant::now() + CLEANUP_BOUND;
-        while Instant::now() < deadline && !self.running_owners().is_empty() {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let _ = wait_until(CLEANUP_BOUND, Duration::from_millis(50), || {
+            self.running_owners().is_empty()
+        });
         // 3. Pinned kills by pid plus start stamp; the supervisor goes last.
         self.kill_recorded(|role| role != "supervisor");
         self.kill_recorded(|role| role == "supervisor");
@@ -798,17 +708,13 @@ impl Drop for Rig {
             std::thread::sleep(Duration::from_millis(100));
         }
         // 5. TerminateProcess is asynchronous: confirm exits before Fixture removes the directory.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let running = self.running_owners();
-            if running.is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                cleanup_note(format_args!("still running after cleanup: {running:?}"));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if !wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+            self.running_owners().is_empty()
+        }) {
+            cleanup_note(format_args!(
+                "still running after cleanup: {:?}",
+                self.running_owners()
+            ));
         }
     }
 }
@@ -866,7 +772,7 @@ fn only_fails(fixture: &Fixture, part: &str) {
 #[test]
 fn a_console_reporting_failure_is_unhealthy_even_with_a_matching_owner_pid() {
     let mut rig = Rig::new();
-    let pid = rig.console.as_ref().unwrap().0.as_ref().unwrap().id();
+    let pid = rig.console.as_ref().unwrap().id();
     let fake = Server::new(
         "/api/health",
         Reply::Json(200, json!({"ok":false,"pid":pid})),
@@ -939,14 +845,13 @@ fn each_required_part_can_fail_independently_without_changing_desired_state() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    rig.supervisor = Some(Child(Some(child)));
-    let limit = Instant::now() + Duration::from_secs(10);
-    while rig.fixture.check(&[]).0 != 0 {
-        assert!(
-            Instant::now() < limit,
-            "replacement fixture supervisor not ready"
-        );
-    }
+    rig.supervisor = Some(OwnedChild(child));
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || rig.fixture.check(&[]).0 == 0,
+        || "replacement fixture supervisor not ready".into(),
+    );
     drop(rig.console.take());
     only_fails(&rig.fixture, "console");
     std::fs::write(rig.fixture.0.join("config/config.json"), "invalid").unwrap();
@@ -1176,7 +1081,7 @@ fn restore_with_fake_peers(never_ready: bool) {
     }
     impl SocketPeer {
         fn new() -> Self {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = support::ports::reserve().into_listener();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             listener.set_nonblocking(true).unwrap();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1261,14 +1166,12 @@ fn restore_with_fake_peers(never_ready: bool) {
         rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
         rig.config["tasks"]["watchdog"]["enabled"] = json!(true);
         rig.save_config();
-        let initialized = Instant::now() + Duration::from_secs(10);
-        while !rig.fixture.0.join("data/backup-notices.json").exists() {
-            assert!(
-                Instant::now() < initialized,
-                "supervisor initialization did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_eventually(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            || rig.fixture.0.join("data/backup-notices.json").exists(),
+            || "supervisor initialization did not finish".into(),
+        );
         if offline {
             let stopped = hidden(env!("CARGO_BIN_EXE_her-cli"))
                 .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
@@ -1405,27 +1308,28 @@ fn restore_with_fake_peers(never_ready: bool) {
                 json!({"archive":name,"memoryOnly":false,"confirmation":plan["preview"]["confirmation"]}),
             );
             assert_eq!(status, 202, "{accepted}");
-            let deadline = Instant::now() + Duration::from_secs(150);
-            loop {
-                let audit = std::fs::read_to_string(root.join("data/audit/audit.jsonl"))
-                    .unwrap_or_default();
-                let result = audit
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .find(|event| {
-                        event["action"] == "backup.restore"
-                            && matches!(event["result"].as_str(), Some("succeeded" | "failed"))
-                    });
-                if let Some(result) = result {
-                    assert_eq!(result["result"], "succeeded", "{result}");
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "detached console restore did not finish"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            assert_eventually(
+                Duration::from_secs(150),
+                Duration::from_millis(20),
+                || {
+                    let audit = std::fs::read_to_string(root.join("data/audit/audit.jsonl"))
+                        .unwrap_or_default();
+                    let result = audit
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .find(|event| {
+                            event["action"] == "backup.restore"
+                                && matches!(event["result"].as_str(), Some("succeeded" | "failed"))
+                        });
+                    if let Some(result) = result {
+                        assert_eq!(result["result"], "succeeded", "{result}");
+                        true
+                    } else {
+                        false
+                    }
+                },
+                || "detached console restore did not finish".into(),
+            );
         }
         let status = hidden(env!("CARGO_BIN_EXE_her-cli"))
             .args(["lifecycle", "status", "--runtime-root"])
@@ -1455,11 +1359,7 @@ fn restore_with_fake_peers(never_ready: bool) {
         assert_eq!(value, "archived memory");
         if !offline {
             assert!(
-                rig
-                    .supervisor
-                    .as_mut()
-                    .unwrap()
-                    .0
+                rig.supervisor
                     .as_mut()
                     .unwrap()
                     .try_wait()
@@ -1491,14 +1391,12 @@ fn restore_with_fake_peers(never_ready: bool) {
 #[test]
 fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change() {
     let mut rig = Rig::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !rig.fixture.0.join("data/backup-notices.json").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "supervisor did not complete its first poll"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || rig.fixture.0.join("data/backup-notices.json").exists(),
+        || "supervisor did not complete its first poll".into(),
+    );
     rig.config["backends"]["mcpRustBridge"] = json!(true);
     rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
     rig.save_config();
@@ -1519,19 +1417,13 @@ fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change(
 /// Makes the rig's supervisor start a console the fixture holds no handle for; returns its identity.
 fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
     let notices = rig.fixture.0.join("data/backup-notices.json");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !notices.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "supervisor did not complete its first poll"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let original = rig
-        .console
-        .as_ref()
-        .and_then(|console| console.0.as_ref())
-        .map(std::process::Child::id);
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || notices.exists(),
+        || "supervisor did not complete its first poll".into(),
+    );
+    let original = rig.console.as_ref().map(|console| console.id());
     rig.config["backends"]["mcpRustBridge"] = json!(true);
     rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
     rig.save_config();
@@ -1551,26 +1443,35 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
         .0
         .join("data/logs/rbridge-console.lock.owner.json");
     // Same budget as the reconcile test: ~7 s to a healthy console measured on the Windows host.
-    let deadline = Instant::now() + Duration::from_secs(40);
-    let identity = loop {
-        let identity = std::fs::read(&marker)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
-        if let Some(identity) = identity {
-            if Some(identity.pid) != original
-                && process_identity::check_identity(&identity) == Liveness::Matches
-            {
-                break identity;
+    let mut matched = None;
+    assert_eventually(
+        Duration::from_secs(40),
+        Duration::from_millis(50),
+        || {
+            let identity = std::fs::read(&marker)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| {
+                    serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok()
+                });
+            if let Some(identity) = identity {
+                if Some(identity.pid) != original
+                    && process_identity::check_identity(&identity) == Liveness::Matches
+                {
+                    matched = Some(identity);
+                    return true;
+                }
             }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the supervisor did not start a console within 40 s; marker={}",
-            std::fs::read_to_string(&marker).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+            false
+        },
+        || {
+            format!(
+                "the supervisor did not start a console within 40 s; marker={}",
+                std::fs::read_to_string(&marker).unwrap_or_default()
+            )
+        },
+    );
+    let identity = matched.unwrap();
     // The owner marker is published before the console loads its config (entry.rs acquires the
     // gate first), so a live marker pid does not yet prove the console runs: a console that
     // exits once the fixture is deleted during that window makes both tests pass falsely.
@@ -1594,18 +1495,23 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
 }
 
 fn assert_stopped_after_drop(console: &ProcessIdentity) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match process_identity::check_identity(console) {
-            Liveness::Gone | Liveness::Mismatch(_) => return,
-            state => assert!(
-                Instant::now() < deadline,
-                "the supervisor-started console {} outlived the rig: {state:?}",
-                console.pid
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            matches!(
+                process_identity::check_identity(console),
+                Liveness::Gone | Liveness::Mismatch(_)
+            )
+        },
+        || {
+            format!(
+                "the supervisor-started console {} outlived the rig: {:?}",
+                console.pid,
+                process_identity::check_identity(console)
+            )
+        },
+    );
 }
 
 #[test]
@@ -1628,4 +1534,245 @@ fn rig_drop_stops_a_console_the_supervisor_started_when_the_test_panics() {
     assert!(unwound.is_err(), "the closure must panic");
     let console = console.expect("the console was started before the panic");
     assert_stopped_after_drop(&console);
+}
+
+#[test]
+fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_gateway_appears() {
+    struct DelayedGateway {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        url: String,
+    }
+    impl DelayedGateway {
+        fn new() -> Self {
+            let listener = support::ports::reserve().into_listener();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let is_up = up.clone();
+            let is_connected = connected.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    if !is_up.load(Ordering::SeqCst) {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
+                    }
+                    let Ok(mut socket) = tokio_tungstenite::tungstenite::accept(stream) else {
+                        continue;
+                    };
+                    is_connected.store(true, Ordering::SeqCst);
+                    while !stopping.load(Ordering::Relaxed) {
+                        match socket.read() {
+                            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                if let Ok(request) = serde_json::from_str::<Value>(&text) {
+                                    let data = if request["action"] == "get_login_info" {
+                                        json!({"user_id": 10001, "nickname": "delayed gateway"})
+                                    } else {
+                                        json!({})
+                                    };
+                                    let reply = json!({
+                                        "status": "ok",
+                                        "retcode": 0,
+                                        "echo": request["echo"],
+                                        "data": data
+                                    });
+                                    if socket
+                                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                                            reply.to_string(),
+                                        ))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio_tungstenite::tungstenite::Error::Io(e))
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+            Self {
+                stop,
+                up,
+                connected,
+                thread: Some(thread),
+                url,
+            }
+        }
+    }
+    impl Drop for DelayedGateway {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    let mut rig = Rig::new();
+    let root = rig.fixture.0.clone();
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || root.join("data/backup-notices.json").exists(),
+        || "supervisor initialization did not finish".into(),
+    );
+
+    let gateway = DelayedGateway::new();
+    let deps_path = root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&std::fs::read(&deps_path).unwrap()).unwrap();
+    deps["onebot_ws"] = json!(gateway.url);
+    std::fs::write(&deps_path, deps.to_string()).unwrap();
+
+    // Plant a fresh-looking heartbeat from a non-existent previous owner before live starts.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::fs::write(
+        root.join("data/rust-heartbeat-live.json"),
+        json!({
+            "ts": now_ms,
+            "pid": 999_999,
+            "live": true,
+            "groups": ["group:123456"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    rig.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.config["tasks"]["watchdog"]["enabled"] = json!(true);
+    rig.save_config();
+
+    // Health check must never report a stale previous-owner heartbeat as running or ready.
+    let (code, before) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{before}");
+    assert_eq!(before["live"]["state"], "not-running", "{before}");
+    assert!(before["live"].get("pid").is_none(), "{before}");
+
+    // Trigger immediate watchdog reconciliation through a fresh desired-state revision.
+    let mut set = hidden(env!("CARGO_BIN_EXE_her-cli"));
+    set.args(["lifecycle", "set", "running", "--runtime-root"])
+        .arg(&root);
+    let running = run_bounded(&mut set, Duration::from_secs(12)).unwrap();
+    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+
+    // Supervisor must start the live bridge cleanly while the gateway is down and wait in
+    // `waiting-for-gateway` without killing it at the 15s deadline.
+    let read_live_identity = || -> Option<ProcessIdentity> {
+        let bytes = std::fs::read(root.join("data/logs/rbridge-live.lock.owner.json")).ok()?;
+        let marker: Value = serde_json::from_slice(&bytes).ok()?;
+        serde_json::from_value(marker["identity"].clone()).ok()
+    };
+    let read_hb = || -> Option<Value> {
+        let bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let mut started_identity = None;
+    assert_eventually(
+        Duration::from_secs(25),
+        Duration::from_millis(50),
+        || {
+            let mut runs_cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
+            runs_cmd
+                .args(["tasks", "runs", "--task", "watchdog", "--limit", "5", "--runtime-root"])
+                .arg(&root);
+            let Ok(out) = run_bounded(&mut runs_cmd, Duration::from_secs(10)) else {
+                return false;
+            };
+            let runs: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            let Some(latest) = runs["runs"].as_array().and_then(|list| list.first()) else {
+                return false;
+            };
+            if latest["state"] == "failed" {
+                panic!("watchdog failed instead of accepting waiting-for-gateway: {latest}");
+            }
+            if latest["state"] != "succeeded" {
+                return false;
+            }
+            let Some(id) = read_live_identity() else {
+                return false;
+            };
+            if process_identity::check_identity(&id) != Liveness::Matches {
+                return false;
+            }
+            let Some(hb) = read_hb() else {
+                return false;
+            };
+            if hb["pid"] == id.pid
+                && hb["state"] == "waiting-for-gateway"
+                && hb["gatewayConnected"] == false
+                && hb["live"] == true
+                && hb["groups"] == json!(["group:123456"])
+            {
+                started_identity = Some(id);
+                true
+            } else {
+                false
+            }
+        },
+        || {
+            format!(
+                "live bridge did not enter waiting-for-gateway cleanly; hb={:?}, identity={:?}",
+                read_hb(),
+                read_live_identity()
+            )
+        },
+    );
+    let live_identity = started_identity.unwrap();
+    assert!(!gateway.connected.load(Ordering::SeqCst));
+
+    let (code, waiting_verdict) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{waiting_verdict}");
+    assert_eq!(waiting_verdict["live"]["state"], "waiting-for-gateway", "{waiting_verdict}");
+    assert_eq!(waiting_verdict["live"]["pid"], live_identity.pid, "{waiting_verdict}");
+
+    // Bring the gateway up: the running live bridge connects automatically without a restart.
+    gateway.up.store(true, Ordering::SeqCst);
+    assert_eventually(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || {
+            gateway.connected.load(Ordering::SeqCst)
+                && read_hb().is_some_and(|hb| {
+                    hb["pid"] == live_identity.pid
+                        && hb["state"] == "ready"
+                        && hb["gatewayConnected"] == true
+                        && hb["live"] == true
+                })
+        },
+        || format!("live bridge did not transition to ready; hb={:?}", read_hb()),
+    );
+    assert_eq!(
+        read_live_identity().as_ref(),
+        Some(&live_identity),
+        "live owner must connect without being killed or restarted"
+    );
+
+    let (code, ready_verdict) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{ready_verdict}");
+    assert_eq!(ready_verdict["live"]["state"], "ready", "{ready_verdict}");
+    assert_eq!(ready_verdict["live"]["pid"], live_identity.pid, "{ready_verdict}");
 }

@@ -382,22 +382,18 @@ impl Platform for Native {
         // Retain every observed owner before invoking retirement. If the CLI
         // dies or times out after a kill, its exit code alone cannot report it.
         let mut observed = vec![old.clone()];
-        for name in ["rbridge-live.lock", "rbridge-console.lock"] {
-            let path = self
-                .root
-                .root()
-                .join("runtime/data/logs")
-                .join(format!("{name}.owner.json"));
-            let marker = fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-            if let Some(identity) = marker.and_then(|marker| {
-                serde_json::from_value::<ProcessIdentity>(marker["identity"].clone()).ok()
-            }) {
-                if crate::update::same_release_image(&old.exe, &identity.exe)
-                    && crate::process_identity::check_identity(&identity) == Liveness::Matches
-                {
-                    observed.push(identity);
+        let logs_dir = self.root.root().join("runtime/data/logs");
+        if fs::symlink_metadata(&logs_dir)
+            .is_ok_and(|meta| meta.is_dir() && !crate::guarded_file::is_link(&meta))
+        {
+            for (name, role) in [("rbridge-live.lock", "live"), ("rbridge-console.lock", "console")] {
+                let lock_path = logs_dir.join(name);
+                if let Some(identity) = crate::update::probe_held_owner_identity(&lock_path, role) {
+                    if crate::update::same_release_image(&old.exe, &identity.exe)
+                        && crate::process_identity::check_identity(&identity) == Liveness::Matches
+                    {
+                        observed.push(identity);
+                    }
                 }
             }
         }

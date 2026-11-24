@@ -1,6 +1,7 @@
 mod dsh;
 mod dsh_credential;
 mod digest;
+mod loopback_http;
 mod onebot;
 mod outbound_message;
 mod mcp;
@@ -16,7 +17,9 @@ mod model_text_policy;
 mod model_failure;
 mod mcp_validate;
 mod memory;
-mod conversation_authority;
+mod config_tx;
+mod social_state;
+mod conversation_state;
 mod memory_actions;
 mod pipeline;
 mod harness;
@@ -44,6 +47,8 @@ mod reserved;
 mod sticker;
 mod failover;
 mod console;
+mod console_auth;
+mod console_ui;
 mod desktop;
 mod qq_login;
 mod pricing;
@@ -66,13 +71,13 @@ mod forward_fmt;
 mod preset_prompt;
 mod runtime;
 mod guarded_file;
-mod guarded_credentials;
+mod guarded_fs;
 mod scheduled_task;
 mod release;
 mod release_signature;
 mod release_store;
 mod update;
-mod parity_clock;
+use her_memory::parity_clock;
 mod config;
 mod inbound;
 mod send_outbox;
@@ -100,6 +105,7 @@ mod restore;
 mod console_tasks;
 mod console_persona;
 mod console_settings;
+pub(crate) use console::front as console_front;
 mod settings;
 mod supervisor;
 mod supervisor_dependencies;
@@ -124,7 +130,6 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const SOCIAL_PATH: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const DECISION_LOG: &str = crate::legacy_path!("logs/rbridge-live.jsonl");
 /// 状态机真正「醒」的时刻（含合批延迟），A/B 与 P6 验收都用这份对拍。
 const WAKE_LOG: &str = crate::legacy_path!("logs/rbridge-live-wakes.jsonl");
@@ -197,18 +202,6 @@ struct Triggers {
 struct WakeConfig {
     #[serde(default)]
     triggers: Triggers,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct Conversation {
-    #[serde(rename = "wakeConfig", default)]
-    wake_config: Option<WakeConfig>,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct SocialState {
-    #[serde(default)]
-    conversations: HashMap<String, Conversation>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -368,7 +361,7 @@ fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Ve
     let mut replay = Vec::new();
     let mut settle = Vec::new();
     for item in items {
-        if console::inbound_admitted(cfg, &item.conversation) {
+        if social_state::inbound_admitted(cfg, &item.conversation) {
             replay.push(item);
         } else {
             settle.push(item.event_key);
@@ -381,7 +374,10 @@ fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Ve
 /// configuration read now admits or, when it cannot be read, those of the last readable configuration.
 fn gap_lists(read: Result<Value, &'static str>, last: &(Vec<String>, Vec<String>)) -> (Vec<String>, Vec<String>) {
     match read {
-        Ok(cfg) => (console::admitted_ids(&cfg, "group"), console::admitted_ids(&cfg, "private")),
+        Ok(cfg) => (
+            social_state::admitted_ids(&cfg, "group"),
+            social_state::admitted_ids(&cfg, "private"),
+        ),
         Err(error) => {
             println!("[her] ❌ 读取配置失败，本次连接按上次读到的允许列表记录断线缺口：{error}");
             last.clone()
@@ -520,7 +516,7 @@ fn sync_wake_configs(
     if let Some(cfg) = current_cfg.as_ref().filter(|cfg| {
         cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) != Some(false)
             && state.get("paused").and_then(Value::as_bool) != Some(true)
-            && console::runtime_mode(context) == "reserved2"
+            && social_state::mode(context) == "reserved2"
     }) {
         if let Some(conversations) = state.get("conversations").and_then(Value::as_object) {
             for (key, conversation) in conversations {
@@ -528,7 +524,7 @@ fn sync_wake_configs(
                     wc.get("infinite").and_then(Value::as_bool) == Some(false)
                         && wc.get("sleepUntil").and_then(Value::as_str).and_then(wake::parse_iso_ms).is_some()
                 });
-                if finite && console::inbound_admitted(cfg, key) {
+                if finite && social_state::inbound_admitted(cfg, key) {
                     drivers.entry(key.clone()).or_insert_with(|| {
                         session::Driver::new(session::scheduler_from_state(wake_cfg_of(cfg), conversation), text_seed(key, None))
                     });
@@ -843,32 +839,10 @@ fn is_loopback_ws_url(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Extract the authority from the explicit OneBot HTTP dependency. Isolated runtimes only accept
-/// `http://<loopback-ip>:<non-zero-port>` endpoints; keep brackets around IPv6 so both the socket
-/// address and HTTP Host header remain valid.
+#[cfg(test)]
 fn loopback_http_endpoint(url: &str) -> Option<(String, u16)> {
-    let authority = url.strip_prefix("http://")?;
-    if authority.is_empty() || authority.chars().any(|ch| matches!(ch, '/' | '?' | '#' | '@')) {
-        return None;
-    }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, rest) = bracketed.split_once(']')?;
-        let port = rest.strip_prefix(':')?;
-        (host, port)
-    } else {
-        authority.rsplit_once(':')?
-    };
-    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
-    let address = host.parse::<std::net::IpAddr>().ok()?;
-    if !address.is_loopback() {
-        return None;
-    }
-    let host = if address.is_ipv6() {
-        format!("[{address}]")
-    } else {
-        address.to_string()
-    };
-    Some((host, port))
+    let ep = loopback_http::LoopbackEndpoint::parse(url).ok()?;
+    Some((ep.host().to_string(), ep.port()))
 }
 
 fn parse_live_groups(value: Option<&str>) -> Vec<String> {
@@ -914,20 +888,6 @@ fn append_runtime_json_line(
         file.write_all(&line)?;
     }
     Ok(())
-}
-
-fn runtime_json(
-    context: &runtime::RuntimeContext,
-    area: runtime::RuntimeArea,
-    relative: &str,
-    legacy_path: &str,
-) -> Option<Value> {
-    let text = if context.is_isolated() {
-        context.read_text(area, relative).ok()?
-    } else {
-        std::fs::read_to_string(legacy_path).ok()?
-    };
-    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
 
 /// 从 config.json 提取唤醒调度参数（在线主循环与离线重放共用一份口径）。
@@ -1003,6 +963,73 @@ fn prepare_live_pipeline(
     }
 }
 
+fn prepare_live_startup(
+    context: &runtime::RuntimeContext,
+    cfg_raw: &Value,
+    live_mode: bool,
+) -> Result<(Vec<String>, bool, Option<pipeline::Pipeline>), Box<dyn std::error::Error>> {
+    let live_groups = std::env::args()
+        .position(|arg| arg == "--live-groups")
+        .and_then(|index| std::env::args().nth(index + 1));
+    let live_groups = parse_live_groups(live_groups.as_deref());
+    if let Some(missing) = if live_mode { rollout_mismatch(cfg_raw, &live_groups) } else { None } {
+        println!("[her] ❌ 灰度配置不一致，拒绝启动：");
+        println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
+        println!("           命令行 --live-groups = {live_groups:?}");
+        println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
+        println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
+        std::process::exit(2);
+    }
+    let live_all = std::env::args().any(|a| a == "--live-all");
+    let pipeline = prepare_live_pipeline(context, cfg_raw, live_mode, &live_groups, live_all)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    Ok((live_groups, live_all, pipeline))
+}
+
+fn publish_live_heartbeat(
+    context: &runtime::RuntimeContext,
+    name: &str,
+    groups: &[String],
+    gateway_connected: bool,
+) {
+    let state = if gateway_connected {
+        "ready"
+    } else {
+        "waiting-for-gateway"
+    };
+    let payload = json!({
+        "ts": now_ms(),
+        "pid": std::process::id(),
+        "live": !groups.is_empty(),
+        "groups": groups,
+        "state": state,
+        "gatewayConnected": gateway_connected,
+    });
+    if context.is_isolated() {
+        let _ = context.write_atomic(
+            runtime::RuntimeArea::Data,
+            name,
+            payload.to_string().as_bytes(),
+        );
+    } else {
+        let _ = std::fs::write(
+            format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
+            payload.to_string(),
+        );
+    }
+}
+
+fn set_gateway_connected(tx: &tokio::sync::watch::Sender<bool>, ready: bool) {
+    tx.send_if_modified(|connected| {
+        if *connected == ready {
+            false
+        } else {
+            *connected = ready;
+            true
+        }
+    });
+}
+
 /// Feed one group message to the slang window and, when due, start an extraction in the background.
 fn feed_slang(learning: &slang_learn::SlangLearning, auto: bool, cfg_raw: &Value, key: &str, sender: &str, body: &str) {
     let feed = learning.try_feed_window(key, sender, body);
@@ -1026,30 +1053,13 @@ fn feed_slang(learning: &slang_learn::SlangLearning, auto: bool, cfg_raw: &Value
     }
 }
 
-/// 极简 HTTP/1.1 POST（只用于本机 OneBot HTTP API，不需要 TLS）。
-fn http_post_json(host: &str, port: u16, path: &str, token: &str, body: &str) -> Option<String> {
-    use std::io::{Read, Write};
-    let addr = format!("{host}:{port}");
-    let mut s = std::net::TcpStream::connect(addr).ok()?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(8))).ok()?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    s.write_all(req.as_bytes()).ok()?;
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).ok()?;
-    let (_, body) = raw.split_once("\r\n\r\n")?;
-    Some(body.to_string())
-}
-
 /// 查某条消息是不是自己发的（引用回复的判定）。JS 用 resolveReplyInfo 做同样的事。
-fn fetch_msg_sender_is_self(host: &str, port: u16, token: &str, msg_id: i64, self_id: i64) -> bool {
-    let body = format!(r#"{{"message_id":{msg_id}}}"#);
-    let Some(text) = http_post_json(host, port, "/get_msg", token, &body) else {
-        return false;
-    };
-    let Ok((v, _)) = aux_text::parse_json_replacing_lone_surrogates::<serde_json::Value>(&text) else {
+fn fetch_msg_sender_is_self(ob: &onebot::OneBot, msg_id: i64, self_id: i64) -> bool {
+    let Some(v) = ob.request_with_timeout(
+        "get_msg",
+        json!({ "message_id": msg_id }),
+        std::time::Duration::from_secs(8),
+    ) else {
         return false;
     };
     let sender = v
@@ -1062,10 +1072,12 @@ fn fetch_msg_sender_is_self(host: &str, port: u16, token: &str, msg_id: i64, sel
 }
 
 /// 查某个群里自己的群名片。
-fn fetch_group_card(host: &str, port: u16, token: &str, gid: i64, self_id: i64) -> Option<String> {
-    let body = format!(r#"{{"group_id":{gid},"user_id":{self_id},"no_cache":false}}"#);
-    let text = http_post_json(host, port, "/get_group_member_info", token, &body)?;
-    let (v, _) = aux_text::parse_json_replacing_lone_surrogates::<serde_json::Value>(&text).ok()?;
+fn fetch_group_card(ob: &onebot::OneBot, gid: i64, self_id: i64) -> Option<String> {
+    let v = ob.request_with_timeout(
+        "get_group_member_info",
+        json!({ "group_id": gid, "user_id": self_id, "no_cache": false }),
+        std::time::Duration::from_secs(8),
+    )?;
     v.get("data")?
         .get("card")?
         .as_str()
@@ -1180,6 +1192,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("backup") {
         std::process::exit(restore::run_cli(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("console") {
+        std::process::exit(console_auth::run_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("lifecycle") {
         std::process::exit(lifecycle_cli::run_lifecycle(&args[2..]));
     }
@@ -1204,6 +1219,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.iter().skip(1).any(|arg| matches!(arg.as_str(),
         "--ab-full" | "--ab-probe" | "--shadow-turn" | "--shadow-state-root"
         | "--replay" | "--wake-replay" | "--replay-jsonl" | "--replay-triggers"
+        | "--memory-probe" | "--memory-write-probe" | "--hot-render" | "--index-hint"
     )) {
         eprintln!("[her] unknown option");
         std::process::exit(2);
@@ -1211,8 +1227,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // These diagnostic/maintenance modes use legacy paths rather than a selected runtime.
     // They remain development-only even when launched through an installed image.
     let development_mode = args.iter().skip(1).any(|arg| matches!(arg.as_str(),
-        "--send-probe" | "--ask" | "--memory-probe" | "--memory-write-probe"
-        | "--hot-render" | "--index-hint" | "--price-probe" | "--role-probe"
+        "--send-probe" | "--ask" | "--price-probe" | "--role-probe"
         | "--prompt-wrapped" | "--rpc-probe" | "--slang-parse-test" | "--selftest-401"
         | "--failover-probe" | "--sticker-sync" | "--build-prompt" | "--dsh-dump"
         | "--dsh-watch" | "--dsh-probe" | "--dsh-demo" | "--question-probe"
@@ -1298,115 +1313,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             Err(e) => println!("[ask] ❌ 初始化失败：{e}"),
-        }
-        return Ok(());
-    }
-
-    // P3 探针：直接在 Rust 里查记忆库，结果与 JS 对拍
-    if std::env::args().any(|a| a == "--memory-probe") {
-        let reader = std::env::args()
-            .position(|a| a == "--memory-probe")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "private:7001".to_string());
-        let query = std::env::args()
-            .position(|a| a == "--query")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "管理员偏好".to_string());
-        let json_mode = std::env::args().any(|a| a == "--json");
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?;
-        // The parity fixture's owner is private:7001.
-        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-        let memory_reader = store.for_reader(&reader);
-        let is_owner = memory_reader.is_owner();
-        if !json_mode {
-            println!("[memory] 库 {} 条，reader={reader} isOwner={is_owner}", total);
-        }
-        let scope = memory_reader.scope()?;
-        if !json_mode {
-            println!("[memory] 可见范围 allowAll={} ids={:?}", scope.allow_all, scope.ids);
-        }
-        let hits = memory_reader.search(&query, &[], 5)?;
-        if std::env::args().any(|a| a == "--json") {
-            // 给对拍脚本用：只输出纯 JSON，不要别的行
-            let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
-            let payload = json!({
-                "reader": reader,
-                "isOwner": is_owner,
-                "query": query,
-                "total": total,
-                "allowAll": scope.allow_all,
-                "ids": ids,
-                "hits": hits,
-            });
-            println!("{}", serde_json::to_string(&payload)?);
-            return Ok(());
-        }
-        println!("[memory] 查询 {query:?} 命中 {} 条", hits.len());
-        for h in &hits {
-            println!("  #{} [{}·{}] {:.3} {}", h.id, h.scope, h.kind, h.score, activity::preview_chars(&h.content, 40));
-        }
-        return Ok(());
-    }
-
-    // P3 写路径验证：upsert 去重 + 检索命中（默认用临时副本，不动真库）
-    if std::env::args().any(|a| a == "--memory-write-probe") {
-        let content = std::env::args()
-            .position(|a| a == "--content")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "Rust 写入验证：这条由 her 写入".to_string());
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-
-        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-        let probe = store.for_reader("private:7001");
-        let mk = |imp: f64| memory::NewMemory {
-            owner_type: "session",
-            scope: Some("private"),
-            kind: "fact",
-            subject: Some("rust-write-probe"),
-            content: &content,
-            tags: None,
-            source: "rust-probe",
-            importance: imp,
-        };
-        let first = probe.write(&mk(0.6))?;
-        let second = probe.write(&mk(0.7))?;
-        let hits = probe.search(&content, &[], 5)?;
-        println!("{}", serde_json::to_string(&json!({
-            "db": db_path,
-            "first": { "id": first.id, "deduped": first.deduped },
-            "second": { "id": second.id, "deduped": second.deduped },
-            "hitIds": hits.iter().map(|h| h.id).collect::<Vec<_>>(),
-        }))?);
-        return Ok(());
-    }
-
-    // P3 热缓存/索引提示探针：--hot-render 输出渲染结果，--index-hint 输出词表
-    if std::env::args().any(|a| a == "--hot-render" || a == "--index-hint") {
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        if std::env::args().any(|a| a == "--hot-render") {
-            let items = memory::pick_hot(&conn, 40)?;
-            let (text, count, chars) = memory::render_hot(&items);
-            println!("{}", serde_json::to_string(&json!({
-                "candidates": items.len(),
-                "count": count,
-                "chars": chars,
-                "text": text,
-            }))?);
-        } else {
-            let reader = std::env::args()
-                .position(|a| a == "--index-hint")
-                .and_then(|i| std::env::args().nth(i + 1))
-                .unwrap_or_else(|| "private:7001".to_string());
-            let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-            let (total, terms) = store.for_reader(&reader).index(12)?;
-            println!("{}", serde_json::to_string(&json!({
-                "reader": reader, "total": total, "terms": terms,
-            }))?);
         }
         return Ok(());
     }
@@ -1577,11 +1483,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 .unwrap_or(3101)
         };
         if runtime_context.is_isolated() {
-            let cfg = match runtime_context.load_config() {
-                Ok(config) => config,
-                Err(message) => {
-                    eprintln!("[her] {message}");
-                    std::process::exit(2);
+            let cfg = {
+                let _config = social_state::acquire_config_gate(&runtime_context)?;
+                if restore::recovery_pending(&runtime_context) {
+                    json!({})
+                } else {
+                    if console_auth::reconcile_token_rotation(&runtime_context).is_err() {
+                        crate::safe_eprintln!("[console] console credentials require recovery");
+                    }
+                    runtime_context.load_config().map_err(str::to_owned)?
                 }
             };
             console::serve_with_context(&cfg, port, runtime_context)?;
@@ -1919,6 +1829,29 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         dependency_watch::report_last_crash(&runtime_context, &cfg_raw);
         // #179: write the guarded DSH profile rows back and check the whole profile once at start.
         dsh_profile::startup(&runtime_context);
+        harness::route_health::reconcile_startup(&runtime_context, &cfg_raw);
+        if let Err(error) = harness::usage::reconcile_startup(&runtime_context) {
+            recovery_log::record(
+                &runtime_context,
+                run_record::Trigger::Recovery,
+                run_record::Component::ModelChain,
+                "usage-reconcile-failed",
+                run_record::Outcome::Failed,
+                &error,
+            );
+        }
+        let price_table = crate::pricing::resolve(cfg_raw.get("pricing"));
+        if let Err(error) = ledger::LedgerStorage::compact_if_needed(&runtime_context, &price_table)
+        {
+            recovery_log::record(
+                &runtime_context,
+                run_record::Trigger::Recovery,
+                run_record::Component::ModelChain,
+                "usage-compact-failed",
+                run_record::Outcome::Failed,
+                &error,
+            );
+        }
     }
     let mut reserved2_hub = if runtime_context.is_isolated() && live_mode {
         let args: Vec<String> = std::env::args().collect();
@@ -1943,41 +1876,57 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let mut ws = ws;
     let mut token = token;
     // #186: the gap lists of the last readable configuration, for a reconnect that cannot read it.
-    let mut gap_admitted = (console::admitted_ids(&cfg_raw, "group"), console::admitted_ids(&cfg_raw, "private"));
+    let mut gap_admitted = (
+        social_state::admitted_ids(&cfg_raw, "group"),
+        social_state::admitted_ids(&cfg_raw, "private"),
+    );
     // #192 (F3): saved events held while the configuration cannot be read (journal keys, arrival order), kept across
     // reconnects, and the refusals not recorded yet.
     let mut held: Vec<String> = Vec::new();
     let mut refusals = UnreadableRefusals::default();
+    // Validate local live state (rollout scope, session map, DSH credentials, dependencies)
+    // before publishing any heartbeat or contacting the gateway. Once local initialization
+    // succeeds, publish the waiting-for-gateway heartbeat immediately and spawn the single
+    // heartbeat task so a down gateway does not cause a supervisor startup kill.
+    let initial_startup = prepare_live_startup(&runtime_context, &cfg_raw, live_mode)?;
+    if !initial_startup.0.is_empty() {
+        println!("[her] 灰度接管：{:?}", initial_startup.0);
+    }
+    let heartbeat_name = if live_mode {
+        "rust-heartbeat-live.json"
+    } else {
+        "rust-heartbeat.json"
+    };
+    publish_live_heartbeat(&runtime_context, heartbeat_name, &initial_startup.0, false);
+    let (gateway_tx, mut gateway_rx) = tokio::sync::watch::channel(false);
+    {
+        let groups = initial_startup.0.clone();
+        let heartbeat_context = runtime_context.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    changed = gateway_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let connected = *gateway_rx.borrow_and_update();
+                publish_live_heartbeat(&heartbeat_context, heartbeat_name, &groups, connected);
+            }
+        });
+    }
+    let mut initial_startup = Some(initial_startup);
     'reconnect: loop {
         // Isolated startup validates all selected-root state before contacting its WebSocket.
         // Keep this inside the reconnect loop: a failed handshake drops this candidate pipeline,
         // and the next attempt repeats local validation before dialing again. The selected-root
         // gate is already held, so pipeline setup may create only its selected workspace folder.
-        let isolated_live_startup = if runtime_context.is_isolated() {
-            let live_groups = std::env::args()
-                .position(|arg| arg == "--live-groups")
-                .and_then(|index| std::env::args().nth(index + 1));
-            let live_groups = parse_live_groups(live_groups.as_deref());
-            if let Some(missing) = if live_mode { rollout_mismatch(&cfg_raw, &live_groups) } else { None } {
-                println!("[her] ❌ 灰度配置不一致，拒绝启动：");
-                println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
-                println!("           命令行 --live-groups = {live_groups:?}");
-                println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
-                println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
-                std::process::exit(2);
-            }
-            let live_all = std::env::args().any(|arg| arg == "--live-all");
-            let pipeline = prepare_live_pipeline(
-                &runtime_context,
-                &cfg_raw,
-                live_mode,
-                &live_groups,
-                live_all,
-            )
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            Some((live_groups, live_all, pipeline))
+        let (live_groups, live_all, mut pipeline) = if let Some(prepared) = initial_startup.take() {
+            prepared
         } else {
-            None
+            prepare_live_startup(&runtime_context, &cfg_raw, live_mode)?
         };
 
         let mut request = ws.as_str().into_client_request()?;
@@ -1992,6 +1941,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 let mut wait = gateway_backoff.on_failure(dependency::jitter_unit(now_ms() as i64, u64::from(gateway_backoff.streak())));
                 println!("[her] 连接失败：{e}；{} 秒后重试（连续第 {} 次）", wait / 1000, gateway_backoff.streak());
                 gateway_health::with(|h| h.connected = false);
+                set_gateway_connected(&gateway_tx, false);
                 recovery_log::record(
                     &runtime_context,
                     run_record::Trigger::Timer,
@@ -2016,6 +1966,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     &mut ws, &mut token, &mut heal_http_token, &mut cfg_raw,
                 ).await {
                     wait = 500;
+                }
+                if lock_touched.elapsed().as_secs() >= 10 {
+                    let _ = lock.refresh(now_ms() as i64);
+                    lock_touched = std::time::Instant::now();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                 continue 'reconnect;
@@ -2067,18 +2021,19 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             .and_then(|s| s.http_url.clone())
             .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
     };
-    let (http_host, http_port) = if runtime_context.is_isolated() {
-        loopback_http_endpoint(&http_base)
-            .ok_or("isolated runtime requires a valid loopback OneBot HTTP endpoint")?
-    } else {
-        loopback_http_endpoint(&http_base).unwrap_or_else(|| ("127.0.0.1".to_string(), 3000))
-    };
     let http_token = heal_http_token.clone().unwrap_or_else(|| {
         cfg.snowluma
             .as_ref()
             .and_then(|s| s.access_token.clone())
             .unwrap_or_default()
     });
+    let http_ob = if runtime_context.is_isolated() {
+        onebot::OneBot::try_new_url(&http_base, http_token.clone())
+            .map_err(|_| "isolated runtime requires a valid loopback OneBot HTTP endpoint")?
+    } else {
+        onebot::OneBot::try_new_url(http_base.trim_end_matches('/'), http_token.clone())
+            .map_err(|error| format!("live runtime requires a valid loopback OneBot HTTP endpoint: {error}"))?
+    };
 
     // 断线缺口与重放（ticket 07）。每次（重）连接：先按网关历史能力补收未解决的缺口，
     // 再把已保存但尚未处理完的实时事件按原顺序重放，然后才读取新帧。
@@ -2101,11 +2056,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         tokio::task::spawn_blocking(move || {
             dependency_watch::report_unresolved_gaps(&notice_context, &notice_cfg, "inbound-gap-opened");
         }).await?;
-        let (host, port, token) = (http_host.clone(), http_port, http_token.clone());
+        let history_ob = http_ob.clone();
         let recovery_context = runtime_context.clone();
         let spawned = inbound::spawn_gap_recovery(
             move || inbound::Journal::open(&recovery_context),
-            move |group_id, seq| inbound::fetch_group_history(&host, port, &token, group_id, seq),
+            move |group_id, seq| inbound::fetch_group_history(&history_ob, group_id, seq),
             now_ms() as i64,
             {
                 let (gap_context, gap_cfg) = (runtime_context.clone(), cfg_raw.clone());
@@ -2153,51 +2108,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         println!("[her] 重放已保存但未处理完的入站事件 {} 条", replay_queue.len());
     }
 
-    // 灰度：只接管列出来的会话（"group:123,private:456"）。空 = 不接管任何会话。
-    let (live_groups, live_all, mut pipeline) = match isolated_live_startup {
-        Some((live_groups, live_all, pipeline)) => {
-            if !live_groups.is_empty() {
-                println!("[her] 灰度接管：{live_groups:?}");
-            }
-            (live_groups, live_all, pipeline)
-        }
-        None => {
-    let live_groups = std::env::args()
-        .position(|arg| arg == "--live-groups")
-        .and_then(|index| std::env::args().nth(index + 1));
-    let live_groups = parse_live_groups(live_groups.as_deref());
-    if !live_groups.is_empty() {
-        println!("[her] 灰度接管：{live_groups:?}");
-    }
-    // 交接一致性：JS 的闸门是 `rollout.rustGroups`（配置文件），Rust 实际服务的是
-    // 命令行 `--live-groups`。两者不一致的后果是**静默失联**：
-    // JS 看到 rustGroups 就把这些会话的唤醒让给 Rust，而 Rust 没打算服务它们 ——
-    // 两边都不回，群里就是"机器人突然哑了"，而且没有任何报错。
-    //
-    // 所以发现不一致就**直接退出**：Rust 退出后心跳停更，JS 在 TTL 内自动收回这些会话，
-    // 最坏是短暂停顿。比起"永久哑掉直到有人发现"，这个失败方式好得多。
-    if let Some(missing) = if live_mode { rollout_mismatch(&cfg_raw, &live_groups) } else { None } {
-        println!("[her] ❌ 灰度配置不一致，拒绝启动：");
-        println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
-        println!("           命令行 --live-groups = {live_groups:?}");
-        println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
-        println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
-        std::process::exit(2);
-    }
-    let live_all = std::env::args().any(|a| a == "--live-all");
-    // Do this before the heartbeat task starts. An isolated candidate that cannot load its own
-    // session/credentials/dependencies must exit without claiming the selected groups.
-    let pipeline = prepare_live_pipeline(
-        &runtime_context,
-        &cfg_raw,
-        live_mode,
-        &live_groups,
-        live_all,
-    )
-    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            (live_groups, live_all, pipeline)
-        }
-    };
     // 回合恢复（ticket 10）：先向 DSH 与发送账本核对上次中断的回合，再决定重放、等待还是暂停。
     if pipeline.is_some() {
         turn_recovery::spawn(runtime_context.clone());
@@ -2217,39 +2127,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         None
     };
-    // Publish the live heartbeat consumed by the Rust supervisor.
-    {
-        let groups = live_groups.clone();
-        let heartbeat_context = runtime_context.clone();
-        let name = if live_mode {
-            "rust-heartbeat-live.json"
-        } else {
-            "rust-heartbeat.json"
-        };
-        tokio::spawn(async move {
-            loop {
-                let payload = json!({
-                    "ts": now_ms(),
-                    "pid": std::process::id(),
-                    "live": !groups.is_empty(),
-                    "groups": groups,
-                });
-                if heartbeat_context.is_isolated() {
-                    let _ = heartbeat_context.write_atomic(
-                        runtime::RuntimeArea::Data,
-                        name,
-                        payload.to_string().as_bytes(),
-                    );
-                } else {
-                    let _ = std::fs::write(
-                        format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
-                        payload.to_string(),
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            }
-        });
-    }
+    // Transition the heartbeat state to ready now that the gateway connection and
+    // local recovery setup are active.
+    set_gateway_connected(&gateway_tx, true);
     // 每个会话最近几句，用来构造唤醒提示（完整版应该按 JS 的 buildWakePromptV2 来）
     let mut recent_by_key: HashMap<String, Vec<String>> = HashMap::new();
     // DSH 的完整提示也要看当前 Rust 进程收到的消息。与字符串版 CLI 窗口分开保存，
@@ -2419,7 +2299,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     continue;
                 }
                 // 没有新消息也要推进定时器：合批窗口、回复检查、有限潜水全靠它。
-                if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
+                if let Some(state) = conversation_state::read_document_with_bom(&runtime_context) {
                     sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, tick_now);
                 }
                 for (k, e) in session::pump_all(&mut drivers, tick_now) {
@@ -2471,7 +2351,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 // #46: QQ's whole-group mute notice has user_id 0, which `Event` refuses.
                 if !replayed && self_id > 0 {
                     if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
-                        if runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
+                        if runtime_context.load_config().is_ok_and(|now_cfg| {
+                            social_state::inbound_admitted(&now_cfg, &format!("group:{gid}"))
+                        }) {
                             // Older refreshes predate this notice: drop them before the new one starts.
                             let (context, key) = (runtime_context.clone(), format!("group:{gid}"));
                             if let Err(error) = tokio::task::spawn_blocking(move || group_mute::note_whole_group_notice(&context, &key)).await {
@@ -2498,7 +2380,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             if me > 0 {
                 mute_refresh_armed = true;
                 // #186: the groups admitted at this connection.
-                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                let admitted = runtime_context
+                    .load_config()
+                    .map(|now_cfg| social_state::admitted_ids(&now_cfg, "group"))
+                    .unwrap_or_default();
                 let groups: Vec<(i64, Option<i64>)> = admitted.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
                 group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), me, groups);
             }
@@ -2540,10 +2425,13 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         {
             if !http_token.is_empty() && self_id != 0 {
                 // #186: the groups admitted when the login answer arrives.
-                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                let admitted = runtime_context
+                    .load_config()
+                    .map(|now_cfg| social_state::admitted_ids(&now_cfg, "group"))
+                    .unwrap_or_default();
                 for g in &admitted {
                     if let Ok(gid) = g.parse::<i64>() {
-                        match fetch_group_card(&http_host, http_port, &http_token, gid, self_id) {
+                        match fetch_group_card(&http_ob, gid, self_id) {
                             Some(card) => {
                                 println!("[her] 群 {gid} 的群名片：{card}");
                                 self_cards.insert(gid, card);
@@ -2599,7 +2487,12 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         if is_notice && ev.notice_type.as_ref().and_then(Value::as_str) == Some("group_ban") {
             let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
             if let (false, Some(gid)) = (replayed, ev.group_id) {
-                if me > 0 && ev.user_id == Some(me) && runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
+                if me > 0
+                    && ev.user_id == Some(me)
+                    && runtime_context.load_config().is_ok_and(|now_cfg| {
+                        social_state::inbound_admitted(&now_cfg, &format!("group:{gid}"))
+                    })
+                {
                     let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
                     let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
                     // Settled before the next frame: a message right after the ban never wakes her.
@@ -2628,7 +2521,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // dropped silently.
         let event_cfg = if runtime_context.is_isolated() {
             let read = runtime_context.load_config();
-            let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
+            let reserved2_now = reserved2_hub.is_some() && social_state::mode(&runtime_context) == "reserved2";
             let key = held_conversation(&ev).unwrap_or_default();
             let served = reserved2_serves(live_all, &live_groups, &key);
             let listed = !key.is_empty() && live_groups.iter().any(|g| g == &key);
@@ -2729,7 +2622,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // Chat mode (ticket 12): the runtime's stored mode picks the pipeline. Everything below this
         // block is the reserved2 wake machinery, which chat never touches (pokes are not chat input).
         if let Some(hub) = chat_hub.as_mut() {
-            if matches!(console::runtime_mode(&runtime_context).as_str(), "chat" | "reserved" | "closed-agent") {
+            if matches!(
+                social_state::mode(&runtime_context).as_str(),
+                "chat" | "reserved" | "closed-agent"
+            ) {
                 if !is_message {
                     continue;
                 }
@@ -2751,7 +2647,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         continue;
                     }
                 };
-                if !chat::allowed_in_mode(&chat_cfg, &console::runtime_mode(&runtime_context), &key) {
+                if !chat::allowed_in_mode(&chat_cfg, &social_state::mode(&runtime_context), &key) {
                     continue;
                 }
                 let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
@@ -2779,7 +2675,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     message_id: event_message_id(&ev),
                     message: ev.message.clone(),
                 };
-                if console::runtime_mode(&runtime_context)=="reserved" {
+                if social_state::mode(&runtime_context) == "reserved" {
                     if let Some(reserved)=reserved_hub.as_mut(){if let Err(error)=reserved.handle(&inb,&inbound_key,&self_nick).await{println!("[reserved] ingress error: {error}");}}
                     continue;
                 }
@@ -2800,7 +2696,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         if let Some(hub) = reserved2_hub.as_mut() {
-            if console::runtime_mode(&runtime_context) == "reserved2" {
+            if social_state::mode(&runtime_context) == "reserved2" {
                 // #192 (F3): the hub decides with the configuration read above, so a file that becomes unreadable in
                 // between cannot drop the event.
                 let handled = match event_cfg {
@@ -2824,7 +2720,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
         // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
         let allowed = match runtime_context.load_config() {
-            Ok(gate_cfg) => console::inbound_admitted(&gate_cfg, &key),
+            Ok(gate_cfg) => social_state::inbound_admitted(&gate_cfg, &key),
             Err(error) => {
                 println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
                 false
@@ -2838,16 +2734,17 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let body = if plain.is_empty() { ev.raw_message.clone() } else { plain };
         // 引用了我的消息 = 在对我说话（对齐 JS 的 isQuoteTargetSelf）
         let quote_self = match (reply_id, self_id != 0) {
-            (Some(mid), true) => fetch_msg_sender_is_self(&http_host, http_port, &http_token, mid, self_id),
+            (Some(mid), true) => fetch_msg_sender_is_self(&http_ob, mid, self_id),
             _ => false,
         };
         let at_self = at_self_direct || quote_self;
         // 与 JS 一致：**状态里没有这个会话就直接跳过**。
         // 之前这里 unwrap_or_default() 会给未知会话套上默认触发器（@/概率 0.05），
         // 于是重放出来的唤醒数比 JS 多一截 —— 数据对不上的第一来源就是这个。
-        let Some(mut tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
-            .and_then(|v| serde_json::from_value::<SocialState>(v).ok())
-            .and_then(|s| s.conversations.get(&key).and_then(|c| c.wake_config.clone()))
+        let Some(mut tr) = conversation_state::read_document_with_bom(&runtime_context)
+            .and_then(|v| conversation_state::Conversation::from_value(&v["conversations"][&key]))
+            .and_then(|c| c.field("wakeConfig").filter(|w| !w.is_null()).cloned())
+            .and_then(|w| serde_json::from_value::<WakeConfig>(w).ok())
             .map(|w| w.triggers)
         else {
             continue;
@@ -2866,7 +2763,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
         events += 1;
-        let conv = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+        let conv = conversation_state::read_document_with_bom(&runtime_context)
             .map(|s|s["conversations"][&key].clone()).unwrap_or(Value::Null);
         let directed = question::directed(&ev, &body, quote_self, &conv, &cfg_raw, now_ms() as i64);
         let (mut wake, mut reason) = decide(&ev, &body, at_self_direct || quote_self, &self_nick, &self_cards, &tr, directed);
@@ -2877,7 +2774,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             && (live_groups.is_empty() || live_groups.iter().any(|g| g == &key))
             && (is_message || ev.sub_type == "poke")
         {
-            match console::claim_first_wake(&runtime_context, &cfg_raw, &key) {
+            match social_state::claim_first_wake(&runtime_context, &cfg_raw, &key) {
                 Ok(true) => {
                     println!("[her] {key} 首次唤醒：升级为 bootstrap");
                     wake = true;
@@ -2996,7 +2893,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 决策喂给状态机；真正的唤醒由它按合批窗口/优先级吐出来。
         let now_i = now_ms() as i64;
         let _created = drivers.entry(key.clone()).or_insert_with(|| {
-            let sess = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+            let sess = conversation_state::read_document_with_bom(&runtime_context)
                 .and_then(|s| s.get("conversations").and_then(|c| c.get(&key)).cloned())
                 .unwrap_or_else(|| serde_json::json!({}));
             let mut sched = session::scheduler_from_state(wake_cfg_of(&cfg_raw), &sess);
@@ -3010,7 +2907,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             d
         });
 
-        if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
+        if let Some(state) = conversation_state::read_document_with_bom(&runtime_context) {
             sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, now_i);
         }
         let driver = drivers.get_mut(&key).expect("driver exists");
@@ -3138,6 +3035,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             break 'reconnect;
         }
         gateway_health::with(|h| h.connected = false);
+        set_gateway_connected(&gateway_tx, false);
         if got_traffic {
             gateway_backoff.on_traffic();
         }
@@ -3274,6 +3172,66 @@ mod tests {
             "candidate initialization failure must not create a live owner heartbeat"
         );
         assert!(!root.join("data/logs/rbridge-live.jsonl").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_live_heartbeat_transitions_waiting_for_gateway_to_ready() {
+        let root = isolated_runtime_fixture("live-heartbeat-state");
+        let context = runtime::RuntimeContext::from_root(&root)
+            .unwrap()
+            .with_console_port(43112);
+        let groups = vec!["group:42".to_string()];
+        let marker = lifecycle::OwnerMarker {
+            v: lifecycle::FORMAT_VERSION,
+            role: "live".into(),
+            identity: lifecycle::ProcessIdentity {
+                pid: std::process::id(),
+                start: 1,
+                exe: "her".into(),
+            },
+            acquired_at: 0,
+            refreshed_at: 0,
+            groups: Some(groups.clone()),
+        };
+
+        publish_live_heartbeat(&context, "rust-heartbeat-live.json", &groups, false);
+        let waiting_bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).unwrap();
+        let waiting_json: Value = serde_json::from_slice(&waiting_bytes).unwrap();
+        assert_eq!(waiting_json["state"], "waiting-for-gateway");
+        assert_eq!(waiting_json["gatewayConnected"], false);
+        assert_eq!(waiting_json["live"], true);
+        assert_eq!(waiting_json["groups"], json!(["group:42"]));
+        assert_eq!(waiting_json["pid"], std::process::id());
+        assert_eq!(
+            watchdog::read_heartbeat_for_owner(
+                Ok(waiting_bytes),
+                Some(&marker),
+                now_ms() as i64,
+            ),
+            watchdog::Heartbeat::WaitingForGateway {
+                live: true,
+                groups: groups.clone(),
+            }
+        );
+
+        publish_live_heartbeat(&context, "rust-heartbeat-live.json", &groups, true);
+        let ready_bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).unwrap();
+        let ready_json: Value = serde_json::from_slice(&ready_bytes).unwrap();
+        assert_eq!(ready_json["state"], "ready");
+        assert_eq!(ready_json["gatewayConnected"], true);
+        assert_eq!(
+            watchdog::read_heartbeat_for_owner(
+                Ok(ready_bytes),
+                Some(&marker),
+                now_ms() as i64,
+            ),
+            watchdog::Heartbeat::Fresh {
+                live: true,
+                groups,
+            }
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

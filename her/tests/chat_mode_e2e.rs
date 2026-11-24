@@ -2468,6 +2468,41 @@ fn hotfix81_dsh_quota_alert_is_content_free_and_deduped_per_conversation() {
 }
 
 #[test]
+fn dsh_refusal_records_wait_and_unread_refs_for_the_refused_call() {
+    let mut rig = Rig::new("dsh-refused-call", Seed { mode: "reserved2", ..Seed::default() });
+    rig.start();
+    rig.push(group_event(4701, 1001, "tester", "", vec![
+        json!({"type":"at","data":{"qq":SELF_ID.to_string()}}),
+        text_seg("#REFUSE47# CHAT_SECRET_47"),
+    ]));
+    assert!(wait_for(LONG, || !rig.data_lines("logs/model-refusals.jsonl").is_empty()));
+    let rows = rig.data_lines("logs/model-refusals.jsonl");
+    let record = &rows[0];
+    assert_eq!(record["backend"], "dsh");
+    let refs = record["messages"].as_array().unwrap();
+    assert!(refs.iter().any(|r| r["messageId"] == "4701"), "wake reference missing");
+    for (id, seq) in [("wait-fixture-one", 71), ("wait-fixture-two", 72), ("unread-fixture", 73)] {
+        assert!(refs.contains(&json!({"messageId":id,"seq":seq})), "DSH wait or unread reference missing: {id}");
+    }
+    assert_eq!(record["modelCall"], 4, "DSH refused model call index includes retry");
+    assert!(!record.to_string().contains("CHAT_SECRET_47"), "refusal record contains message text");
+    let ledger = rig.ledger();
+    let submission = |kind: &str| ledger.iter().find(|row| row["k"] == kind
+        && row["turn"] == record["turnId"] && row["rpcId"] == record["rpcId"]);
+    let (Some(attempt), Some(binding)) = (submission("attempt"), submission("dsh_turn")) else {
+        panic!("refusal must identify a replayable DSH submission");
+    };
+    let dsh = lock(&rig.dsh.inner);
+    let session = &dsh.sessions[attempt["sessionId"].as_str().unwrap()];
+    let replay: Vec<_> = session.events.iter()
+        .filter(|event| event["data"]["turn"] == binding["dshTurn"])
+        .take_while(|event| event["type"] != "turn/end")
+        .filter(|event| event["type"] == "tool/result")
+        .collect();
+    assert_eq!(replay.len(), 3, "replay must recover the refused DSH call's tool results");
+}
+
+#[test]
 fn hotfix83_dsh_empty_candidates_records_carried_ids_once_per_turn_without_chat() {
     // Live DSH carries recent context in its authenticated packet. Offer the nine
     // older messages this fixture previously carried in the full recent block.
@@ -2812,6 +2847,7 @@ impl DependencyMetadata16 {
         let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));let done=stop.clone();
         let worker=thread::spawn(move||while !done.load(std::sync::atomic::Ordering::SeqCst) {
             if let Ok((mut stream,_))=listener.accept() {
+                let _=stream.set_nonblocking(false);
                 let _=read_request(&mut stream);
                 respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}));
             } else {thread::sleep(Duration::from_millis(10));}

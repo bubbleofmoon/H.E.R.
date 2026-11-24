@@ -72,7 +72,7 @@ impl SettingKind for Integer {
                 .or_else(|| found.as_u64().map(|_| json!(max))),
             FileRule::Media | FileRule::VoiceBytes => {
                 let n = if self.file == FileRule::Media {
-                    crate::console::social_v1_number(found)
+                    crate::social_state::social_v1_number(found)
                 } else {
                     crate::console::voice_config_number(found)
                 };

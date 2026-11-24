@@ -10,25 +10,27 @@
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
 //! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
-//! (`chat_setting`, `console::settings_action`); `console_changes` and `apply_changes` store the registry settings a
+//! (`chat_setting`, `config_tx::settings_action`); `console_changes` and `apply_changes` store the registry settings a
 //! console configuration page changes (#177), and `keep_file_members` keeps every console write of `config.json` off
 //! the registry members; `history` lists the audit rows. Each write first seeds the store from
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
 //! `config/config.json.pre-settings`; after it, `write_back` mirrors ordinary stored values into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
-//! (`console::config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
+//! (`config_tx::acquire_config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
 //!
-//! Secret settings (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
+//! Endpoint credentials (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
 //! `secret_value`. Ordinary overlays, seeding and mirroring exclude them. History holds a fixed marker on both sides
 //! of every change and refuses undo. Reset clears the stored credential and lets an explicit compatibility source apply.
+//! The administrator password keeps a PHC string and uses its own transaction for first-run and reset. Settings exposes
+//! only its presence, and the configuration loader has no password value to apply.
 //!
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
 //! a change of a list or the owner is an access change (`Setting::access`), revoked as a whitelist write is
-//! (`console::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
+//! (`config_tx::commit_access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
 //! setting never takes the access lists over from `config.json`.
 //!
 //! Scopes (#218): a setting of `registry()` is global. A setting of `conversation_registry()` (`ConversationSetting`)
@@ -55,7 +57,8 @@ pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
-pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use registry::{REMINDER_CONVERSATION_CAP, REMINDER_HORIZON, REMINDER_REPEAT_FLOOR, REMINDER_TOTAL_CAP};
 pub(crate) use registry::{
     daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
     RELATED_TOP_K,
@@ -68,9 +71,12 @@ pub(crate) use registry::{
     LAYER_RELATIONSHIP,
     LAYER_CONVERSATION,
     LAYER_MATERIAL,
-    chat_registry, chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
-    DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
+    chat_registry, chat_setting, conversation_registry, find, find_conversation, registry,
+    CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_CONTEXT_TOKENS,
+    HARNESS_FIRST_ROUTE, HARNESS_HISTORY_SHARE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
+    HARNESS_MODEL, INTERCEPT_NOTIFY, HARNESS_ROUTES, HARNESS_SUMMARIES, OUTBOUND_GUARD, OWNER,
+    REQUIRE_PASSWORD_LOCALLY, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK,
+    VOICE_ENABLED,
     VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
     COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
     STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL, ALERT_HOURLY_CAP, ALERT_KEY_WINDOW,
@@ -83,12 +89,18 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
-    complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
-    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
-    holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
-    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
-    resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
-    store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
+    check_store_schema, complete_timing, console_changes, conversation_admitted, conversation_value,
+    conversation_view, direct_change_error, engine_choice, harness_credential,
+    has_endpoint_credentials, has_legacy_engine_choices, has_stored_setting, has_stored_values,
+    history, holds_any, import_engine_choices, inspect_store, keep_file_members,
+    keep_registry_values, last_good_text, migrate_store_v2, mirror_into, open_store_for_write,
+    overlay, overlay_checked, overlay_values, place_changes, preview, read_archive_values,
+    read_store, record_setting_change, registry_free, reset, reset_conversation, resolve_config,
+    resolve_live_batch, restore_gate, restore_switch_choice, schema_version_checked,
+    secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
+    stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
+    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, LEGACY_ERROR,
+    STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

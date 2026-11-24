@@ -9,19 +9,17 @@ pub(crate) const IMAGES: [&str; 3] = ["her.exe", "her-cli.exe", "herupdate.exe"]
 
 /// Bounded metadata reads for installed checksum lists and detached signatures.
 pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, String> {
-    let meta = fs::symlink_metadata(path).map_err(|_| "release metadata unavailable")?;
-    if !meta.is_file() || crate::guarded_file::is_link(&meta) || meta.len() > max as u64 {
-        return Err("release metadata redirected or oversized".into());
+    match crate::guarded_file::read_bounded_no_follow(path, max as u64, false) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err("release metadata unavailable".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            Err("release metadata oversized".into())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err("release metadata redirected or oversized".into())
+        }
+        Err(_) => Err("release metadata unreadable".into()),
     }
-    let file = fs::File::open(path).map_err(|_| "release metadata unavailable")?;
-    let mut bytes = Vec::new();
-    file.take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "release metadata unreadable")?;
-    if bytes.len() > max {
-        return Err("release metadata oversized".into());
-    }
-    Ok(bytes)
 }
 
 pub(crate) fn version(tag: &str) -> Option<(u64, u64, u64)> {
@@ -43,25 +41,13 @@ pub(crate) fn version(tag: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(crate) fn directory(path: &Path) -> Result<(), String> {
-    for part in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
-        match fs::symlink_metadata(part) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(part) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => return Err("release directory cannot be created".into()),
-                }
-            }
-            Err(_) => return Err("release directory cannot be inspected".into()),
-        }
-        let metadata =
-            fs::symlink_metadata(part).map_err(|_| "release directory cannot be inspected")?;
-        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) {
-            return Err("release directory is redirected or not a directory".into());
-        }
-    }
-    Ok(())
+    crate::guarded_file::ensure_plain_directory(path).map_err(|failure| {
+        String::from(match failure.class() {
+            "refused" => "release directory is redirected or not a directory",
+            "dir/create" => "release directory cannot be created",
+            _ => "release directory cannot be inspected",
+        })
+    })
 }
 
 pub(crate) fn sums(bytes: &[u8]) -> Result<HashMap<String, String>, String> {
@@ -133,10 +119,7 @@ pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
 /// Every ancestor of `path` exists as a plain directory (no link or reparse point). Unlike
 /// `directory`, never creates anything.
 fn plain_directory(path: &Path) -> bool {
-    path.ancestors().all(|part| {
-        fs::symlink_metadata(part)
-            .is_ok_and(|meta| meta.is_dir() && !crate::guarded_file::is_link(&meta))
-    })
+    crate::guarded_file::is_plain_directory(path)
 }
 
 /// True only when another handle holds the gate (a non-blocking lock attempt reports it would
@@ -162,17 +145,32 @@ pub(crate) fn gate_contended(lock: &Path) -> bool {
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     directory(path.parent().ok_or("release state has no parent")?)?;
     let mode = if path.extension().is_some_and(|ext| ext == "exe") { 0o700 } else { 0o600 };
-    crate::guarded_file::stage(path, &mut &contents[..], Some(mode))
-        .and_then(|staged| staged.commit(&mut || Ok::<(), String>(())))
-        .map_err(|failure| {
-            String::from(match failure.class() {
-                "refused" => "release state is redirected",
-                "temp/create" => "release file cannot be created",
-                "temp/write" | "temp/sync" => "release file cannot be saved",
-                "dir/sync" => "release directory cannot sync",
-                _ => "release state cannot publish",
-            })
+    crate::guarded_file::publish_atomic_with(
+        path,
+        &mut &contents[..],
+        |temp| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            options.open(temp)
+        },
+        &mut || Ok::<(), String>(()),
+    )
+    .map_err(|failure| {
+        String::from(match failure.class() {
+            "refused" => "release state is redirected",
+            "temp/create" => "release file cannot be created",
+            "temp/write" | "temp/sync" => "release file cannot be saved",
+            "dir/sync" => "release directory cannot sync",
+            _ => "release state cannot publish",
         })
+    })
 }
 
 /// Persist directory entries after publishing synced files or release links.

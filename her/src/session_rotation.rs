@@ -29,9 +29,13 @@ pub(crate) fn candidate(
     key: &str,
     now: i64,
 ) -> Result<Option<Plan>, String> {
-    let state = context.read_social_state()?;
-    let conv = &state["conversations"][key];
-    let epoch = conv["agentToken"].as_str().unwrap_or("");
+    let conv = crate::conversation_state::ConversationState::for_runtime(context)
+        .read(key)
+        .map_err(|(_, e)| e)?;
+    let epoch = conv
+        .as_ref()
+        .and_then(|c| c.token())
+        .unwrap_or("");
     let sid = match crate::session_map::lookup(context, key)? {
         Some(sid) => sid,
         None => match crate::session_map::unrevoked_rotation(context, key, epoch)? {
@@ -60,7 +64,13 @@ pub(crate) fn candidate(
             return Ok(None);
         }
         let closed = r["closedAtEnd"] == true;
-        if !closed || conv["adminWakes"].as_array().is_some_and(|v| !v.is_empty()) {
+        if !closed
+            || conv
+                .as_ref()
+                .and_then(|c| c.field("adminWakes"))
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.is_empty())
+        {
             return Ok(None);
         }
         let model = r["lastCall"]["model"]
@@ -93,8 +103,10 @@ pub(crate) fn candidate(
         let Some(ttl) = ttl.filter(|n| n.is_finite() && *n > 0.0) else {
             return Ok(None);
         };
-        let idle_from = conv["lastIncomingAt"]
-            .as_i64()
+        let idle_from = conv
+            .as_ref()
+            .and_then(|c| c.field("lastIncomingAt"))
+            .and_then(Value::as_i64)
             .unwrap_or(now)
             .max(r["lastEnded"].as_i64().unwrap_or(now));
         if ((now - idle_from) as f64) < (ttl - 1.0).max(0.0) * 60_000.0 {
@@ -109,7 +121,7 @@ pub(crate) fn candidate(
         key: key.into(),
         sid,
         epoch: epoch.into(),
-        guard: conv.clone(),
+        guard: conv.map(|c| c.to_value()).unwrap_or(Value::Null),
         turn_seq,
         input: r["lastCall"]["input"].as_f64().unwrap_or(0.0) as u64,
         recovering: pending,
@@ -281,7 +293,7 @@ pub(crate) async fn digest(
         &plan.key,
         "token-read",
         crate::parity_clock::now_ms(),
-        crate::console::conversation_token(&context, &plan.key),
+        crate::social_state::token(&context, &plan.key).map_err(String::from),
     ) {
         Ok(Some(epoch)) if epoch != plan.epoch => {
             return DigestResult::Done {
@@ -437,7 +449,8 @@ async fn digest_inner(context: &RuntimeContext, cfg: &Value, plan: &Plan, cancel
     }
     let (context, cfg, key, flag) = (context.clone(), cfg.clone(), plan.key.clone(), cancel.clone());
     let mut task = tokio::task::spawn_blocking(move || {
-        let model = crate::digest::model_for(&context, &cfg).map_err(|error| crate::digest::DigestError::Model(error.0))?;
+        let model = crate::harness::one_shot::digest_model(&context, &cfg)
+            .map_err(|error| crate::digest::DigestError::Model(error.0))?;
         crate::digest::Digest::new(&context, &cfg, model.as_ref())
             .run_conversation(&key, &crate::digest::Limits { min_messages: 1, min_interval_ms: 0 }, &*flag)
     });

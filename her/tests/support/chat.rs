@@ -60,6 +60,7 @@ struct HttpReq {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
+    stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -449,6 +450,24 @@ impl Dsh {
         }
         if prompt.contains("#RATE81#") {
             return finish(json!({"kind":"error","error":{"code":"QUOTA_EXCEEDED","message":"HTTP 429 quota exceeded CHAT_SECRET_81"}}));
+        }
+        if prompt.contains("#REFUSE47#") {
+            let mut inner = lock(&self.inner);
+            let session = inner.sessions.get_mut(sid).unwrap();
+            for (step, name, field, id, seq) in [
+                (0, "qq_wait_for_messages", "newMessages", "wait-fixture-one", 71),
+                (1, "qq_wait_for_messages", "newMessages", "wait-fixture-two", 72),
+                (1, "qq_get_unread_messages", "messages", "unread-fixture", 73),
+            ] {
+                let call = format!("fixture-read-{seq}");
+                event(session, "tool/call", json!({"turn":turn,"step":step,"callId":call,"name":format!("mcp__snowluma__{name}")}));
+                let packet = json!({(field):[{"messageId":id,"seq":seq,"text":"CHAT_SECRET_47"}]});
+                event(session, "tool/result", json!({"turn":turn,"message":{
+                    "source":{"callId":call},"content":[{"type":"text","text":packet.to_string()}]}}));
+            }
+            event(session, "llm/retry-started", json!({"turn":turn,"step":2,"retry":1}));
+            drop(inner);
+            return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content"}}));
         }
         if prompt.contains("#REFUSE83#") {
             return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content CHAT_SECRET_83"}}));
@@ -995,9 +1014,22 @@ impl Rig {
     }
 
     fn data_lines(&self, name: &str) -> Vec<Value> {
-        fs::read_to_string(self.root.join("data").join(name))
-            .unwrap_or_default()
-            .lines()
+        let path = self.root.join("data").join(name);
+        let mut text = String::new();
+        for attempt in 0..20 {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    text = content;
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) if cfg!(windows) && err.raw_os_error() == Some(33) && attempt < 19 => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("read {}: {err}", path.display()),
+            }
+        }
+        text.lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     }
