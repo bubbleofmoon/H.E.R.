@@ -1918,7 +1918,17 @@ mod tests {
         let start_day = crate::pricing::beijing_parts(1_700_000_000_000).2;
         let attr = l.dsh_attribution(&table, &start_day, 1_700_000_005_000);
         assert_eq!(attr.samples, 1, "only DSH sample enters attribution");
-        let resp = attr.to_response(7, &start_day, &start_day, &table, 3, 210.0, 0.0);
+        let resp = attr.to_response(
+            7,
+            &start_day,
+            &start_day,
+            &table,
+            DshTotals {
+                turns: 3,
+                tokens: 210.0,
+                cost: 0.0,
+            },
+        );
         assert_eq!(resp["unattributed"]["turns"], 2);
 
         let b_legacy = Buckets {
