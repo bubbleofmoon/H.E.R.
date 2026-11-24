@@ -4462,6 +4462,143 @@ fn refusal_replays_two_waits_and_unread_at_the_failed_model_call() {
 }
 
 #[test]
+fn refusal_model_call_index_counts_retry_and_failover() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let release = Arc::new(AtomicBool::new(false));
+    let wait_args = json!({
+        "key": GROUP_KEY,
+        "token": "",
+        "purpose": "messages",
+        "timeoutMs": 5000
+    });
+    let model = FakeModel::script(vec![
+        ModelReply::HeldTools {
+            calls: vec![reserved2_call("wait-one", "qq_wait_for_messages", wait_args)],
+            started: Arc::new(AtomicBool::new(false)),
+            release: release.clone(),
+        },
+        ModelReply::Text(String::new()),
+        ModelReply::Refusal,
+        ModelReply::Refusal,
+    ]);
+    let mut rig = reserved2_fixture("refusal-retry-failover", &model, "harness");
+    set_harness_config(
+        &rig,
+        json!({
+            "routes": [
+                {"id": "a", "model": "model-a"},
+                {"id": "b", "model": "model-b"}
+            ]
+        }),
+        60,
+    );
+    rig.start();
+    reserved2_push_mention(&rig, 4701, "WAKE_SECRET");
+    assert!(wait_for(LONG, || !lock(&model.requests).is_empty()));
+    reserved2_push_mention(&rig, 4702, "WAIT_SECRET_ONE");
+    let mut expected_ref = Value::Null;
+    assert!(wait_for(LONG, || {
+        let state = rig.data_json("social-v2.json");
+        let found = state["conversations"][GROUP_KEY]["recentMessages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|m| m["messageId"] == "4702"));
+        if let Some(found) = found {
+            expected_ref = json!({"messageId": found["messageId"], "seq": found["seq"]});
+        }
+        found.is_some()
+    }));
+    release.store(true, Ordering::SeqCst);
+
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1));
+    assert!(wait_for(LONG, || {
+        rig.data_lines("logs/model-refusals.jsonl").len() == 2
+    }));
+
+    let requests = lock(&model.requests);
+    let models: Vec<&str> = requests
+        .iter()
+        .map(|req| req["model"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(models, ["model-a", "model-a", "model-a", "model-b"]);
+    let delivered = tool_wire_result(&requests[3], "wait-one");
+    drop(requests);
+
+    let rows = rig.data_lines("logs/model-refusals.jsonl");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let turn_id = rows[0]["turnId"].as_str().unwrap().to_string();
+    assert!(!turn_id.is_empty());
+    for (record, expected_model, expected_call) in
+        [(&rows[0], "model-a", 3_i64), (&rows[1], "model-b", 4_i64)]
+    {
+        assert_eq!(record["key"], GROUP_KEY);
+        assert_eq!(record["turnId"], turn_id);
+        assert_eq!(record["model"], expected_model);
+        assert_eq!(
+            record["modelCall"], expected_call,
+            "refusal call index must include retries and failovers: {record}"
+        );
+        let refs = record["messages"].as_array().unwrap();
+        assert!(refs.iter().any(|r| r["messageId"] == "4701"));
+        assert!(refs.contains(&expected_ref));
+        assert!(!record.to_string().contains("_SECRET"));
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        rig.root.join("data/conversations.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let attempt_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM events
+             WHERE turn_id = ?1 AND kind = 'model_attempt_started'",
+            rusqlite::params![turn_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 4);
+    let mut attempt_query = conn
+        .prepare(
+            "SELECT json_extract(payload, '$.route') FROM events
+             WHERE turn_id = ?1 AND kind = 'model_attempt_started'
+             ORDER BY seq LIMIT 1 OFFSET (?2 - 1)",
+        )
+        .unwrap();
+    let mut replay_query = conn
+        .prepare(
+            "WITH refused AS (
+                SELECT seq, session_id FROM events
+                WHERE turn_id = ?1 AND kind = 'model_attempt_started'
+                ORDER BY seq LIMIT 1 OFFSET (?2 - 1)
+            )
+            SELECT events.payload FROM events JOIN refused USING (session_id)
+            WHERE events.turn_id = ?1 AND events.seq < refused.seq AND events.kind = 'tool_result'
+            ORDER BY events.seq",
+        )
+        .unwrap();
+    for (record, expected_route) in [(&rows[0], "a"), (&rows[1], "b")] {
+        let call_index = record["modelCall"].as_i64().unwrap();
+        let route = attempt_query
+            .query_row(rusqlite::params![turn_id.as_str(), call_index], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(route, expected_route);
+        let replay: Vec<Value> = replay_query
+            .query_map(rusqlite::params![turn_id.as_str(), call_index], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        let restored: Vec<_> = replay.into_iter().map(|fact| fact["result"].clone()).collect();
+        assert_eq!(restored, vec![delivered.clone()]);
+    }
+}
+
+#[test]
 fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut sequences = Vec::new();
