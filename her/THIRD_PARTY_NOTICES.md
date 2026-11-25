@@ -1045,7 +1045,18 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+```
 
+## Playwright 1.65.1 (console UI tests only)
+
+`playwright` and `playwright-core` are installed by the console UI test job under Apache-2.0. The npm packages include `LICENSE`, `NOTICE` and `ThirdPartyNotices.txt`. [Playwright source and license](https://github.com/microsoft/playwright/tree/v1.65.1).
+
+```text
+Playwright
+Copyright (c) Microsoft Corporation
+
+This software contains code derived from the Puppeteer project (https://github.com/puppeteer/puppeteer),
+available under the Apache 2.0 license (https://github.com/puppeteer/puppeteer/blob/master/LICENSE).
 ```
 
 ## Jiff 0.2.39
@@ -1054,6 +1065,17 @@ HER uses Jiff for IANA time zone lookup, civil scheduling and calendar conversio
 
 - [Jiff license and source](https://docs.rs/crate/jiff/0.2.39/source/COPYING)
 - [Jiff time-zone database package](https://docs.rs/crate/jiff-tzdb/0.1.9/source/LICENSE)
+
+## Console password and credential comparison dependencies
+
+HER uses RustCrypto Argon2 0.5.3 under MIT. Its new transitive dependencies Blake2 0.10.6, Password Hash 0.5.0 and Base64ct 1.8.3 also use the MIT option of their dual license. Hidden terminal prompts use rpassword 7.5.4 under Apache-2.0. Fixed-size credential comparisons use subtle 2.6.1 under BSD-3-Clause.
+
+- [Argon2 MIT license](https://docs.rs/crate/argon2/0.5.3/source/LICENSE-MIT)
+- [Blake2 MIT license](https://docs.rs/crate/blake2/0.10.6/source/LICENSE-MIT)
+- [Password Hash MIT license](https://docs.rs/crate/password-hash/0.5.0/source/LICENSE-MIT)
+- [Base64ct MIT license](https://docs.rs/crate/base64ct/1.8.3/source/LICENSE-MIT)
+- [rpassword Apache-2.0 license](https://docs.rs/crate/rpassword/7.5.4/source/LICENSE-APACHE)
+- [subtle BSD-3-Clause license](https://docs.rs/crate/subtle/2.6.1/source/LICENSE)
 
 ## Signed release verification dependencies
 
@@ -1186,4 +1208,84 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+## LongMemEval
+
+The `memory-bench` binary ports the per-question QA evaluation loop from [LongMemEval](https://github.com/xiaowu0162/LongMemEval/blob/main/src/evaluation/evaluate_qa.py).
+
+```text
+MIT License
+
+Copyright (c) 2024 Di Wu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Embedded web console frontend dependencies (`her-ui`)
+
+`her` embeds the compiled frontend bundle built from `her-ui/` (`react` 19.3.1, `react-dom` 19.3.1, and `scheduler` 0.28.0 under MIT; `lucide-react` 0.511.0 under ISC).
+
+```text
+MIT License (react, react-dom, scheduler)
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+```text
+ISC License (lucide-react)
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```

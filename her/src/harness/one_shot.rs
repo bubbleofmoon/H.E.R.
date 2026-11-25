@@ -1,26 +1,44 @@
-//! Tool-less one-shot model jobs: non-streaming completions on model routes of the selected runtime's relay,
-//! authenticated with the harness credential, with no tools and no history. Slang learning asks one route
-//! (`RelayModel`); the digest walks its routes as harness turns walk their chain (`RouteWalk`, #238). Each job picks
-//! its routes itself (`harness::routes`). Tests install a fake per runtime root and job.
-use crate::harness::route_health::{self, Seen};
-use crate::harness::routes::{self, Miss, RouteSpec};
+//! Tool-less one-shot model jobs: non-streaming completions on model routes of the selected
+//! runtime's relay, authenticated with the harness credential, with no tools and no history.
+//! Both the digest (`Job::Digest`, #238) and slang learning (`Job::SlangLearner`, #258) walk
+//! their routes through `harness::routes::ChainExecutor` + `OneShotStep` (`RouteWalk`), sharing
+//! `genai::Client`, `routes::block_on_shared`, and centralized refusal/timeout/empty-response
+//! normalization. Tests install per-context fakes via `install_test_model`.
+use crate::harness::routes::{
+    self, Cancellation, ChainConfig, ChainError, ChainExecutor, ModelRoute, OneShotStep,
+    RouteSpec,
+};
 use crate::harness::usage;
-use crate::run_record::{Component, Outcome, Trigger};
+use crate::model_failure::Failure;
 use crate::runtime::RuntimeContext;
+use serde_json::Value;
 use std::{
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 #[cfg(test)]
 mod walk_tests;
 
-/// A fixed failure class (`quota`, `timeout`, `backend`, `network`, `refusal`, `empty-response`, `unconfigured`, ...);
-/// never provider text.
+/// The output cap of one digest request.
+pub(crate) const DIGEST_MAX_TOKENS: u32 = 2048;
+
+/// A fixed failure class (`quota`, `timeout`, `backend`, `network`, `refusal`, `empty-response`,
+/// `unconfigured`, ...); never provider text.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ModelError(pub &'static str);
 
-/// The job that asks. Tests install their fake per runtime root and job.
+/// Classified one-shot failure carrying the redacted model id that answered or failed last.
+#[derive(Debug)]
+pub(crate) struct JobFailure {
+    pub failure: Failure,
+    pub model: String,
+}
+
+/// The job that asks. Tests install their fake per context and job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Job {
     Digest,
@@ -31,86 +49,318 @@ impl Job {
     /// The `job` value of this job's usage facts (`harness::usage`).
     fn usage_job(self) -> &'static str {
         match self {
-            Job::Digest => crate::harness::usage::DIGEST,
-            Job::SlangLearner => crate::harness::usage::SLANG,
+            Job::Digest => usage::DIGEST,
+            Job::SlangLearner => usage::SLANG,
         }
     }
-}
-
-/// The route a one-shot request asks: its id (a usage fact's `route`) and its relay model.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RouteModel<'a> {
-    pub id: &'a str,
-    pub model: &'a str,
 }
 
 pub(crate) trait OneShot: Send + Sync {
     /// One completion: the `system` text (left out when empty), then the user `input`.
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError>;
 
-    /// One completion that takes no longer than `within` and sends no request once `abandoned` is set (a caller that
-    /// stopped waiting sets it). The default answers through `complete`, which ignores both: test fakes only.
-    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
+    /// One completion returning the classified `Failure` (preserving `errorCode`) on miss.
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, Failure> {
+        self.complete(system, input)
+            .map_err(|error| normalize_failure(Failure::new(error.0, error.0)))
+    }
+
+    /// One completion taking no longer than `within` and sending nothing once `abandoned` is set.
+    fn complete_within(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        abandoned: &Arc<AtomicBool>,
+    ) -> Result<String, ModelError> {
         let _ = (within, abandoned);
         self.complete(system, input)
     }
 }
 
-#[cfg(test)]
-type TestModels = std::sync::Mutex<Vec<(std::path::PathBuf, Job, Arc<dyn OneShot>)>>;
-
-#[cfg(test)]
-static TEST_MODELS: TestModels = std::sync::Mutex::new(Vec::new());
-
-/// Tests: every `job` request on the runtime at `root` uses `model`.
-#[cfg(test)]
-pub(crate) fn install_test_model(root: &std::path::Path, job: Job, model: Arc<dyn OneShot>) {
-    let mut models = TEST_MODELS.lock().unwrap_or_else(|p| p.into_inner());
-    models.retain(|(r, j, _)| !(r == root && *j == job));
-    models.push((root.to_path_buf(), job, model));
-}
-
-/// Tests: the fake installed for `job` on the runtime of `context`, if any.
-#[cfg(test)]
-fn test_model(context: &RuntimeContext, job: Job) -> Option<Arc<dyn OneShot>> {
-    let root = context.runtime_root()?;
-    TEST_MODELS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .find(|(r, j, _)| r == root && *j == job)
-        .map(|(_, _, model)| model.clone())
-}
-
-/// The model `job` asks on `context`: `route` (`None`: not configured) on the relay, bounded by `timeout`, answering at
-/// most `max_tokens` tokens. Each answered request is a usage fact (`harness::usage`) under the ledger key `key`.
-pub(crate) fn model_for(
-    context: &RuntimeContext,
-    job: Job,
-    key: &str,
-    route: Option<RouteModel<'_>>,
-    timeout: Duration,
-    max_tokens: u32,
-) -> Result<Arc<dyn OneShot>, ModelError> {
-    #[cfg(test)]
-    if let Some(model) = test_model(context, job) {
-        return Ok(model);
+/// Centralized output normalization across live `OneShotStep` and test `OneShot` mocks: classifies
+/// whitespace-only responses as `empty-response`, diagnostic/error envelopes via
+/// `backend::plain_output_failure`, and refusal prose (unless carrying a JSON array `[`) as
+/// `refusal`.
+pub(crate) fn normalize_response_text(text: &str) -> Result<String, Failure> {
+    if text.trim().is_empty() {
+        return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
     }
-    let route = route.ok_or(ModelError("unconfigured"))?;
-    Ok(Arc::new(RelayModel::for_model(context, job, key, route, timeout, max_tokens)?))
+    if let Some(failure) = crate::backend::plain_output_failure(text) {
+        return Err(failure);
+    }
+    if !text.contains('[') && Failure::is_refusal(text) {
+        return Err(Failure::new("refusal", "MODEL_REFUSAL"));
+    }
+    Ok(text.to_string())
 }
 
-/// The routes a one-shot walk tries (`RouteWalk`), in order, and whether they are the configured harness chain
-/// (`harness::routes::chain`), whose route health the walk observes (`route_health`).
+/// Normalizes a `Failure` whose `code` only echoes its `class` (e.g. from `ModelError` shims) into
+/// canonical error codes without losing existing structured codes.
+pub(crate) fn normalize_failure(failure: Failure) -> Failure {
+    if failure.code != failure.class {
+        return failure;
+    }
+    match failure.class {
+        "timeout" => Failure::new("timeout", "TIMEOUT"),
+        "quota" => Failure::new("quota", "QUOTA_EXCEEDED"),
+        "refusal" => Failure::new("refusal", "MODEL_REFUSAL"),
+        "empty-response" => Failure::new("empty-response", "EMPTY_ANSWER"),
+        "network" => Failure::new("network", "MODEL_CONNECTION_ERROR"),
+        "cancelled" | "unconfigured" | "backend" => failure,
+        other => Failure::classify("", other),
+    }
+}
+
+#[cfg(test)]
+struct NormalizedTestModel(Arc<dyn OneShot>);
+
+#[cfg(test)]
+impl OneShot for NormalizedTestModel {
+    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
+        // Keep raw `complete` passthrough for direct `Digest::run_conversation` unit fixtures
+        // (`session_rotation/tests.rs` distinguishes `DigestError::Output("refusal-or-error")`).
+        self.0.complete(system, input)
+    }
+
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, Failure> {
+        self.0
+            .complete_failure(system, input)
+            .map_err(normalize_failure)
+            .and_then(|text| normalize_response_text(&text))
+    }
+
+    fn complete_within(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        abandoned: &Arc<AtomicBool>,
+    ) -> Result<String, ModelError> {
+        self.0.complete_within(system, input, within, abandoned)
+    }
+}
+
+/// Tests: every `job` request on `context` uses `model`.
+#[cfg(test)]
+pub(crate) fn install_test_model(context: &RuntimeContext, job: Job, model: Arc<dyn OneShot>) {
+    context.set_test_one_shot(job, model);
+}
+
+/// The routes a one-shot walk tries (`RouteWalk`), in order, and whether they are the configured
+/// harness chain (`harness::routes::chain`), whose route health the walk observes (`route_health`).
 #[derive(Clone, Debug)]
 pub(crate) struct Walk {
     pub routes: Vec<RouteSpec>,
     pub chain: bool,
 }
 
-/// The model `job` asks on `context` through a route walk (`RouteWalk`) over `walk` (`None`: not configured), bounded
-/// as a whole by `timeout`, each request answering at most `max_tokens` tokens. Each response end is a usage fact
-/// (`harness::usage`) under the ledger key `key`.
+/// Retry and failover policy for a `RouteWalk`.
+#[derive(Clone, Copy, Debug)]
+struct WalkPolicy {
+    allow_retries: bool,
+    retry_empty: bool,
+    use_failover_memory: bool,
+    record_events: bool,
+}
+
+impl WalkPolicy {
+    fn for_job(job: Job) -> Self {
+        Self {
+            allow_retries: true,
+            retry_empty: matches!(job, Job::Digest),
+            use_failover_memory: true,
+            record_events: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn single_route() -> Self {
+        Self {
+            allow_retries: false,
+            retry_empty: false,
+            use_failover_memory: false,
+            record_events: false,
+        }
+    }
+}
+
+/// The routes a digest request walks: `memory.digest.model` alone (no failover, no route health),
+/// else the harness chain (`harness::routes::chain`: `harness.routes`, else `harness.model`);
+/// `None` when neither is configured or the chain is invalid.
+pub(crate) fn digest_walk_of(cfg: &Value) -> Option<Walk> {
+    if let Some(model) = crate::settings::DIGEST_MODEL.text(cfg) {
+        return Some(Walk {
+            routes: vec![RouteSpec::implicit(model)],
+            chain: false,
+        });
+    }
+    routes::chain(cfg)
+        .ok()
+        .map(|routes| Walk { routes, chain: true })
+}
+
+/// The digest's first route model id; `None` when unconfigured or invalid.
+#[cfg(test)]
+pub(crate) fn digest_model_id(cfg: &Value) -> Option<String> {
+    digest_walk_of(cfg)
+        .and_then(|walk| walk.routes.into_iter().next())
+        .map(|route| route.model)
+}
+
+/// The bound on one digest request, every route its walk tries included:
+/// `memory.digest.timeoutSecs`.
+pub(crate) fn digest_timeout(cfg: &Value) -> Duration {
+    Duration::from_secs(
+        crate::settings::DIGEST_TIMEOUT_SECS
+            .integer(cfg)
+            .unsigned_abs(),
+    )
+}
+
+/// The digest's `OneShot` model on `context`.
+pub(crate) fn digest_model(
+    context: &RuntimeContext,
+    cfg: &Value,
+) -> Result<Arc<dyn OneShot>, ModelError> {
+    walk_for(
+        context,
+        Job::Digest,
+        usage::DIGEST_KEY,
+        digest_walk_of(cfg),
+        digest_timeout(cfg),
+        DIGEST_MAX_TOKENS,
+    )
+}
+
+/// Sets its flag when dropped so a cancelled summary's test fake stops waiting.
+#[cfg(test)]
+struct AbandonOnExit(Arc<AtomicBool>);
+
+#[cfg(test)]
+impl Drop for AbandonOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Async digest route walk (or installed test fake) bounded by `within` and
+/// `memory.digest.timeoutSecs`, attributing usage under `key` and `usage_job`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn digest_summarise_async(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    usage_job: &'static str,
+    system: &str,
+    input: &str,
+    within: Duration,
+    cancel: &mut Cancellation,
+) -> Result<String, ModelError> {
+    #[cfg(test)]
+    if let Some(model) = context.test_one_shot(Job::Digest) {
+        if cancel.is_cancelled() {
+            return Err(ModelError("cancelled"));
+        }
+        if within.is_zero() {
+            return Err(ModelError("timeout"));
+        }
+        let system = system.to_string();
+        let input = input.to_string();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = AbandonOnExit(abandoned.clone());
+        let flag = abandoned.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            model.complete_within(&system, &input, within, &flag)
+        });
+        let joined = tokio::select! { biased;
+            joined = tokio::time::timeout(within, task) => joined,
+            _ = cancel.cancelled() => return Err(ModelError("cancelled")),
+        };
+        if cancel.is_cancelled() {
+            return Err(ModelError("cancelled"));
+        }
+        return match joined {
+            Err(_elapsed) => Err(ModelError("timeout")),
+            Ok(Err(_join)) => Err(ModelError("worker")),
+            Ok(Ok(res)) => res,
+        };
+    }
+    let walk = digest_walk_of(cfg).ok_or(ModelError("unconfigured"))?;
+    let route = ModelRoute::for_specs(context, walk.routes.clone(), walk.routes)
+        .map_err(|_| ModelError("unconfigured"))?;
+    if within.is_zero() {
+        return Err(ModelError("timeout"));
+    }
+    run_walk_async(
+        WalkRequest {
+            context: context.clone(),
+            route,
+            chain: walk.chain,
+            key: key.to_string(),
+            usage_job,
+            timeout: digest_timeout(cfg),
+            max_tokens: DIGEST_MAX_TOKENS,
+            unit: Duration::from_secs(1),
+            system: system.to_string(),
+            input: input.to_string(),
+            within,
+            policy: WalkPolicy::for_job(Job::Digest),
+        },
+        cancel,
+    )
+    .await
+}
+
+/// Runs one slang-learning completion on `context` across the configured harness route chain (or
+/// installed `Job::SlangLearner` test fake), normalizing failures and preserving the failing model.
+pub(crate) fn slang_complete(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, JobFailure> {
+    let chain = routes::chain(cfg).ok();
+    let fallback_model = chain
+        .as_ref()
+        .and_then(|routes| routes.first())
+        .map_or_else(|| "unspecified".to_string(), |route| route.model.clone());
+    #[cfg(test)]
+    if let Some(model) = context.test_one_shot(Job::SlangLearner) {
+        return NormalizedTestModel(model)
+            .complete_failure("", prompt)
+            .map_err(|failure| JobFailure {
+                failure,
+                model: fallback_model,
+            });
+    }
+    let routes = chain.ok_or_else(|| JobFailure {
+        failure: Failure::new("unconfigured", "unconfigured"),
+        model: "unspecified".to_string(),
+    })?;
+    let walk = Walk {
+        routes,
+        chain: true,
+    };
+    let walker = RouteWalk::new(
+        context,
+        Job::SlangLearner,
+        key,
+        walk,
+        timeout,
+        routes::MAX_OUTPUT_TOKENS,
+    )
+    .map_err(|error| JobFailure {
+        failure: Failure::new(error.0, error.0),
+        model: fallback_model,
+    })?;
+    walker.run_within_failure("", prompt, timeout, Cancellation::none())
+}
+
+/// The model `job` asks on `context` through a route walk (`RouteWalk`) over `walk` (`None`: not
+/// configured), bounded as a whole by `timeout`, each request answering at most `max_tokens`
+/// tokens. Each response end is a usage fact (`harness::usage`) under the ledger key `key`.
 pub(crate) fn walk_for(
     context: &RuntimeContext,
     job: Job,
@@ -120,172 +370,164 @@ pub(crate) fn walk_for(
     max_tokens: u32,
 ) -> Result<Arc<dyn OneShot>, ModelError> {
     #[cfg(test)]
-    if let Some(model) = test_model(context, job) {
-        return Ok(model);
+    if let Some(model) = context.test_one_shot(job) {
+        return Ok(Arc::new(NormalizedTestModel(model)));
     }
     let walk = walk.ok_or(ModelError("unconfigured"))?;
-    Ok(Arc::new(RouteWalk::new(context, job, key, walk, timeout, max_tokens)?))
+    Ok(Arc::new(RouteWalk::new(
+        context, job, key, walk, timeout, max_tokens,
+    )?))
 }
 
-/// The relay's OpenAI-compatible endpoint for one model with the harness credential (`ModelRoute::for_model`): one
-/// non-streaming request without tools, bounded by `timeout`. An armed upstream capture (route `harness`) takes the
-/// request as it is handed to the model client.
-pub(crate) struct RelayModel {
+/// Single-route non-retrying relay model for digest unit tests.
+#[cfg(test)]
+pub(crate) fn digest_relay_model(
+    context: &RuntimeContext,
+    cfg: &Value,
+) -> Result<RouteWalk, ModelError> {
+    let first = digest_walk_of(cfg)
+        .and_then(|walk| walk.routes.into_iter().next())
+        .ok_or(ModelError("unconfigured"))?;
+    RouteWalk::single_route(
+        context,
+        Job::Digest,
+        usage::DIGEST_KEY,
+        first,
+        digest_timeout(cfg),
+        DIGEST_MAX_TOKENS,
+    )
+}
+
+/// Maps a `ChainError` from `routes::ChainExecutor` to a classified `Failure`.
+fn chain_failure(error: ChainError) -> Failure {
+    match error {
+        ChainError::Cancelled => Failure::new("cancelled", "cancelled"),
+        ChainError::Aborted(reason) if reason == "timeout" => Failure::new("timeout", "TIMEOUT"),
+        ChainError::Aborted(_) => Failure::new("network", "MODEL_CONNECTION_ERROR"),
+        ChainError::Missed { class, summary } => {
+            let parsed = Failure::classify("", &summary);
+            if parsed.class == class {
+                parsed
+            } else {
+                Failure::new(class, &parsed.code)
+            }
+        }
+    }
+}
+
+/// Request configuration for `run_walk_async`.
+struct WalkRequest {
     context: RuntimeContext,
-    model: String,
-    route: crate::harness::ModelRoute,
+    route: ModelRoute,
+    chain: bool,
+    key: String,
+    usage_job: &'static str,
     timeout: Duration,
     max_tokens: u32,
-    /// The ledger key, the route id and the `job` value of each request's usage fact (`harness::usage`).
-    usage_key: String,
-    usage_route: String,
-    usage_job: &'static str,
+    unit: Duration,
+    system: String,
+    input: String,
+    within: Duration,
+    policy: WalkPolicy,
 }
 
-impl RelayModel {
-    pub(crate) fn for_model(
-        context: &RuntimeContext,
-        job: Job,
-        key: &str,
-        route: RouteModel<'_>,
-        timeout: Duration,
-        max_tokens: u32,
-    ) -> Result<Self, ModelError> {
-        let relay = crate::harness::ModelRoute::for_model(context, route.model).map_err(|_| ModelError("unconfigured"))?;
-        // The request target keeps the model as configured (`ModelRoute::target`); every record and capture keeps it redacted.
-        let model = relay.redact(route.model);
-        let usage_route = relay.redact(route.id);
-        Ok(Self {
-            context: context.clone(),
-            model,
-            route: relay,
-            timeout,
-            max_tokens,
-            usage_key: key.to_string(),
-            usage_route,
-            usage_job: job.usage_job(),
-        })
-    }
-
-    /// The usage fact of one response end (`harness::usage`), filed at turn `turn` with `retry` earlier requests for the
-    /// same unchanged request.
-    fn record_usage(&self, reported: &genai::chat::Usage, turn: i64, retry: i64) {
-        let place = usage::Place { key: self.usage_key.clone(), turn, step: 0, retry };
-        usage::record(&self.context, &place, &self.usage_route, &self.model, self.usage_job, Some(reported));
-    }
-
-    /// One request bounded by `timeout`, filed in the token ledger at turn `turn` with `retry` earlier requests for it:
-    /// the answer's text (empty when it has none), or how it missed, as the route module reads a miss (`routes::Miss`:
-    /// an HTTP 429 with its wait hint, else the failure's class; a content-filter stop is `refusal`). Every response end
-    /// is a usage fact, a refused one included: it is recorded before the refusal is decided.
-    fn send(&self, system: &str, input: &str, timeout: Duration, turn: i64, retry: i64) -> Result<String, Miss> {
-        use genai::chat::{ChatMessage, ChatOptions, ChatRequest, StopReason};
-        let mut messages = Vec::with_capacity(2);
-        if !system.is_empty() {
-            messages.push(ChatMessage::system(self.route.redact(system)));
-        }
-        messages.push(ChatMessage::user(self.route.redact(input)));
-        let request = ChatRequest::new(messages);
-        let max_tokens = self.max_tokens;
-        // #183: a capture the operator armed takes this request as it is handed to the model client.
-        crate::upstream_capture::offer(&self.context, crate::upstream_capture::Route::Harness, || {
-            serde_json::json!({
-                "model": self.model,
-                "maxTokens": max_tokens,
-                "request": serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
-            })
+/// Async one-shot route walk over `request.route` via `routes::ChainExecutor` and `OneShotStep`,
+/// returning classified failures and the failing route model.
+async fn run_walk_failure_async(
+    mut request: WalkRequest,
+    cancel: &mut Cancellation,
+) -> Result<String, JobFailure> {
+    let fallback_model = |route: &ModelRoute| {
+        route
+            .routes
+            .get(route.start)
+            .or_else(|| route.routes.first())
+            .map_or_else(|| "unspecified".to_string(), |r| r.model.clone())
+    };
+    if cancel.is_cancelled() {
+        return Err(JobFailure {
+            failure: Failure::new("cancelled", "cancelled"),
+            model: fallback_model(&request.route),
         });
-        let target = self.route.target();
-        let call = async move {
-            let client = genai::Client::new().map_err(|_| Miss::Failed { class: "network" })?;
-            let options = ChatOptions::default().with_max_tokens(max_tokens);
-            tokio::time::timeout(timeout, client.exec_chat(genai::ModelSpec::Target(target), request, Some(&options)))
-                .await
-                .map_err(|_| Miss::Failed { class: "timeout" })?
-                .map_err(|error| miss_of(&error))
-        };
-        // A fresh thread has no runtime context, so this works from sync jobs and spawn_blocking alike.
-        let response = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| Miss::Failed { class: "network" })?
-                .block_on(call)
+    }
+    if request.policy.use_failover_memory {
+        routes::select_start(&request.context, &mut request.route, &request.key, "");
+    }
+    let default_model = fallback_model(&request.route);
+    let max_steps = if request.policy.allow_retries {
+        usize::MAX
+    } else {
+        1
+    };
+    let mut executor = ChainExecutor::new(ChainConfig {
+        context: request.context.clone(),
+        route: request.route,
+        key: request.key,
+        generation: String::new(),
+        usage_job: request.usage_job,
+        track_steps: false,
+        observe_health: request.chain,
+        use_failover_memory: request.policy.use_failover_memory,
+        record_events: request.policy.record_events,
+        record_usage: true,
+        allow_retries: request.policy.allow_retries,
+        retry_empty: request.policy.retry_empty,
+        allow_stream_retry: false,
+        complete_on_answer: true,
+        fail_action: "the request ends",
+        deadline_error: "timeout",
+        retry_unit: request.unit,
+        max_steps,
+        max_tokens: None,
+        job_max_tokens: request.max_tokens,
+        deadline: tokio::time::Instant::now() + request.within.min(request.timeout),
+    });
+    let mut adapter = OneShotStep {
+        context: request.context,
+        system: request.system,
+        input: request.input,
+        shortened_by_bound: request.within < request.timeout,
+        last_model: None,
+    };
+    executor
+        .next_answer(&mut adapter, cancel)
+        .await
+        .map(|success| success.value)
+        .map_err(|error| JobFailure {
+            failure: chain_failure(error),
+            model: adapter.last_model.unwrap_or(default_model),
         })
-        .join()
-        .unwrap_or(Err(Miss::Failed { class: "network" }))?;
-        self.record_usage(&response.usage, turn, retry);
-        if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
-            return Err(Miss::Failed { class: "refusal" });
-        }
-        Ok(self.route.redact(&response.into_first_text().unwrap_or_default()))
-    }
 }
 
-impl OneShot for RelayModel {
-    /// One request with a turn number of its own (`usage::next_number`), bounded by the model's timeout; a 429 is
-    /// `quota`.
-    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        self.send(system, input, self.timeout, usage::next_number(), 0)
-            .map_err(|miss| ModelError(miss_class(&miss)))
-    }
-
-    /// One request bounded by the lesser of `within` and the model's timeout, unless `abandoned` is set before it.
-    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
-        if abandoned.load(Ordering::SeqCst) {
-            return Err(ModelError("cancelled"));
-        }
-        self.send(system, input, within.min(self.timeout), usage::next_number(), 0)
-            .map_err(|miss| ModelError(miss_class(&miss)))
-    }
+/// Async one-shot route walk over `request.route` via `routes::ChainExecutor` and `OneShotStep`.
+async fn run_walk_async(
+    request: WalkRequest,
+    cancel: &mut Cancellation,
+) -> Result<String, ModelError> {
+    run_walk_failure_async(request, cancel)
+        .await
+        .map_err(|err| ModelError(err.failure.class))
 }
 
-/// How a failed request missed (`routes::Miss`): an HTTP 429 with the wait its response asked for
-/// (`harness::rate_limit_wait`), else the failure's class (`harness::model_failure`); never provider text.
-fn miss_of(error: &genai::Error) -> Miss {
-    let failure = crate::harness::model_failure(error);
-    if failure.class == "quota" && failure.code == "429" {
-        return Miss::RateLimited { wait: crate::harness::rate_limit_wait(error) };
-    }
-    Miss::Failed { class: failure.class }
-}
-
-/// The content-free class of a miss (`model_failure::Failure::class`): a 429 is `quota`, an empty answer
-/// `empty-response` and a dropped stream `network`.
-fn miss_class(miss: &Miss) -> &'static str {
-    match miss {
-        Miss::RateLimited { .. } => "quota",
-        Miss::Empty => "empty-response",
-        Miss::Dropped => "network",
-        Miss::Failed { class } => *class,
-    }
-}
-
-/// One-shot requests over routes in order, as a harness turn walks its chain (`routes::decide`): a first 429 is retried
-/// once on the same route after its hint, a repeat 429 and any other failure (an HTTP error, a timeout, a network
-/// failure, a refusal, an error-shaped answer: `backend::plain_output_failure`) move to the next route, and an empty
-/// answer is retried on the same route up to `routes::EMPTY_RETRIES` times first. The walk is bounded as a whole by the
-/// `within` its caller gives (at most its `timeout`): each request gets the time left, a wait never reaches the end, a
-/// request that times out had all the time left and ends the walk, and nothing is sent once the end has passed or the
-/// caller has set `abandoned`. A request the walk's bound shortens is no route failure when it
-/// times out (the first request is shortened only when `within` is less than `timeout`; every later one is). The
-/// first usable answer is returned and never
-/// sent again. It shares the failover memory of harness turns (`routes::with_memory`) under its ledger key, as one
-/// conversation: its degraded route starts the next walks, and at most `routes::RETRY_CAP` failovers are made until a
-/// route answers. Every response end is a usage fact on the route that gave it, one turn number per walk with its retry
-/// count (`RelayModel::send`); a walk over the configured chain marks each answer and route failure in route health
-/// (`route_health`); every retry, failover and final route failure goes to the run record (component `model-chain`).
+/// One-shot requests over routes in order, as a harness turn walks its chain
+/// (`routes::ChainExecutor`): a first 429 is retried once on the same route after its hint, a
+/// repeat 429 and any other failure (HTTP error, timeout, network, refusal, error-shaped answer)
+/// move to the next route, and for `Job::Digest` an empty answer retries up to
+/// `routes::EMPTY_RETRIES` times first. The walk is bounded by `within` (at most `timeout`).
 pub(crate) struct RouteWalk {
     context: RuntimeContext,
-    routes: Vec<(RouteSpec, RelayModel)>,
+    route: ModelRoute,
     /// The routes are the configured chain, whose route health the walk observes.
     chain: bool,
-    /// The ledger key: the usage facts' key, the failover memory's conversation and the run record's subject.
+    /// The ledger key: the usage facts' key, failover memory conversation, and run-record subject.
     key: String,
+    usage_job: &'static str,
     /// The bound of one request on any route; the walk's bound is at most this.
     timeout: Duration,
+    max_tokens: u32,
     /// The base wait of retries (`routes::Situation::unit`): one second; tests shorten it.
     unit: Duration,
+    policy: WalkPolicy,
 }
 
 impl RouteWalk {
@@ -297,22 +539,42 @@ impl RouteWalk {
         timeout: Duration,
         max_tokens: u32,
     ) -> Result<Self, ModelError> {
-        if walk.routes.is_empty() {
-            return Err(ModelError("unconfigured"));
-        }
-        let mut routes = Vec::with_capacity(walk.routes.len());
-        for spec in walk.routes {
-            let route = RouteModel { id: &spec.id, model: &spec.model };
-            let model = RelayModel::for_model(context, job, key, route, timeout, max_tokens)?;
-            routes.push((spec, model));
-        }
+        let route = ModelRoute::for_specs(context, walk.routes.clone(), walk.routes)
+            .map_err(|_| ModelError("unconfigured"))?;
         Ok(Self {
             context: context.clone(),
-            routes,
+            route,
             chain: walk.chain,
             key: key.to_string(),
+            usage_job: job.usage_job(),
             timeout,
+            max_tokens,
             unit: Duration::from_secs(1),
+            policy: WalkPolicy::for_job(job),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single_route(
+        context: &RuntimeContext,
+        job: Job,
+        key: &str,
+        spec: RouteSpec,
+        timeout: Duration,
+        max_tokens: u32,
+    ) -> Result<Self, ModelError> {
+        let route = ModelRoute::for_specs(context, vec![spec], Vec::new())
+            .map_err(|_| ModelError("unconfigured"))?;
+        Ok(Self {
+            context: context.clone(),
+            route,
+            chain: false,
+            key: key.to_string(),
+            usage_job: job.usage_job(),
+            timeout,
+            max_tokens,
+            unit: Duration::from_secs(1),
+            policy: WalkPolicy::single_route(),
         })
     }
 
@@ -323,137 +585,70 @@ impl RouteWalk {
         self
     }
 
-    fn specs(&self) -> Vec<RouteSpec> {
-        self.routes.iter().map(|(spec, _)| spec.clone()).collect()
-    }
-
-    /// Marks what route `at` did in route health (`route_health::observe`), for a walk over the configured chain only.
-    fn observe(&self, at: usize, seen: Seen) {
-        if self.chain {
-            route_health::observe(&self.context, &self.specs(), at, seen);
-        }
-    }
-
-    /// The answer of route `at`: the route is ok in route health, the walks' failover budget starts over, and the answer
-    /// is returned, never sent again.
-    fn answered(&self, at: usize, scope: &str, memory_key: &routes::ChainKey, text: String) -> Result<String, ModelError> {
-        self.observe(at, Seen::Answered);
-        routes::with_memory(scope, |memory| memory.on_completed(memory_key));
-        Ok(text)
-    }
-
-    /// One run record of route `at` (component `model-chain`): the ledger key, the route id as records keep it (the
-    /// credential redacted), the miss's class and the request's size in bytes, never content.
-    fn record(&self, event: &str, outcome: Outcome, at: usize, class: &str, bytes: usize, action: &str) {
-        let route = &self.routes[at].1.usage_route;
-        let reason = format!("{}: route {route} ({class}) on a request of {bytes} bytes; {action}", self.key);
-        crate::recovery_log::record(&self.context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
+    fn run_within_failure(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        mut cancel: Cancellation,
+    ) -> Result<String, JobFailure> {
+        let default_model = self
+            .route
+            .routes
+            .first()
+            .map_or_else(|| "unspecified".to_string(), |r| r.model.clone());
+        let request = WalkRequest {
+            context: self.context.clone(),
+            route: self.route.clone(),
+            chain: self.chain,
+            key: self.key.clone(),
+            usage_job: self.usage_job,
+            timeout: self.timeout,
+            max_tokens: self.max_tokens,
+            unit: self.unit,
+            system: system.to_string(),
+            input: input.to_string(),
+            within,
+            policy: self.policy,
+        };
+        routes::block_on_shared(async move { run_walk_failure_async(request, &mut cancel).await })
+            .unwrap_or_else(|_| {
+                Err(JobFailure {
+                    failure: Failure::new("network", "MODEL_CONNECTION_ERROR"),
+                    model: default_model,
+                })
+            })
     }
 }
 
-/// The abandon flag of a walk that nobody abandons: `complete`, which the digest job waits for.
-static NEVER: AtomicBool = AtomicBool::new(false);
-
 impl OneShot for RouteWalk {
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        self.complete_within(system, input, self.timeout, &NEVER)
+        self.complete_failure(system, input)
+            .map_err(|f| ModelError(f.class))
     }
 
-    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
-        let deadline = Instant::now() + within.min(self.timeout);
-        let specs = self.specs();
-        let scope = routes::scope_of(&self.context);
-        let memory_key = routes::ChainKey {
-            conversation: self.key.clone(),
-            generation: String::new(),
-            signature: routes::chain_signature(&specs),
-        };
-        let mut at = routes::with_memory(&scope, |memory| memory.start(&memory_key, specs.len(), Instant::now()));
-        let turn = usage::next_number();
-        let bytes = system.len() + input.len();
-        let (mut retry, mut rate_limited, mut empty_answers) = (0i64, false, 0u32);
-        loop {
-            if abandoned.load(Ordering::SeqCst) {
-                return Err(ModelError("cancelled"));
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ModelError("timeout"));
-            }
-            // The walk's bound shortens a request when `within` is less than the route's timeout (the first request) and
-            // every later request, which follows a failover or a retry that has spent time. Decided from the bound, never
-            // from a clock re-read, so a first request given the full bound is not cut. A cut request that times out is no
-            // route failure.
-            let cut = within < self.timeout || retry > 0;
-            let (spec, model) = &self.routes[at];
-            let miss = match model.send(system, input, left, turn, retry) {
-                Ok(text) => match crate::backend::plain_output_failure(&text) {
-                    None => return self.answered(at, &scope, &memory_key, text),
-                    Some(failure) if failure.class == "empty-response" => Miss::Empty,
-                    Some(failure) => Miss::Failed { class: failure.class },
-                },
-                Err(miss) => miss,
-            };
-            let class = miss_class(&miss);
-            let observed = !(cut && class == "timeout");
-            let now = Instant::now();
-            let remaining = deadline.saturating_duration_since(now);
-            let next_route = at + 1 < self.routes.len()
-                && routes::with_memory(&scope, |memory| memory.can_fail_over(&memory_key, now));
-            let situation = routes::Situation {
-                retry_429: spec.retry_429,
-                rate_limited_before: rate_limited,
-                empty_answers,
-                // A one-shot request does not stream, dispatches no tool and sends nothing.
-                stream_retried: true,
-                dispatched: false,
-                sent: false,
-                next_route,
-                // A request that timed out had all the time left: no request follows it.
-                steps_left: !remaining.is_zero(),
-                unit: self.unit,
-                remaining,
-            };
-            match routes::decide(&miss, &situation) {
-                routes::Next::Fail => {
-                    if observed {
-                        self.observe(at, Seen::Failed { class });
-                    }
-                    self.record("route-failed", Outcome::Failed, at, class, bytes, "the request ends");
-                    return Err(ModelError(class));
-                }
-                routes::Next::FailOver => {
-                    if observed {
-                        self.observe(at, Seen::Failed { class });
-                    }
-                    // An abandoned walk asks no next route, so it records no failover step naming one.
-                    if !abandoned.load(Ordering::SeqCst) {
-                        let action = format!("next route {}", self.routes[at + 1].1.usage_route);
-                        self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
-                    }
-                    routes::with_memory(&scope, |memory| memory.on_failover(&memory_key, at + 1, now));
-                    at += 1;
-                    rate_limited = false;
-                    empty_answers = 0;
-                }
-                routes::Next::Retry { wait } => {
-                    // An abandoned walk does not wait out a retry: nothing is sent for it any more.
-                    if abandoned.load(Ordering::SeqCst) {
-                        return Err(ModelError("cancelled"));
-                    }
-                    let action = format!("retrying the same route after {} ms", wait.as_millis());
-                    self.record("route-retry", Outcome::Ok, at, class, bytes, &action);
-                    match miss {
-                        Miss::RateLimited { .. } => rate_limited = true,
-                        Miss::Empty => empty_answers += 1,
-                        Miss::Dropped | Miss::Failed { .. } => {}
-                    }
-                    std::thread::sleep(wait);
-                }
-            }
-            // A retry and a failover each send the same unchanged request once more.
-            retry += 1;
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, Failure> {
+        self.run_within_failure(system, input, self.timeout, Cancellation::none())
+            .map_err(|err| err.failure)
+    }
+
+    fn complete_within(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        abandoned: &Arc<AtomicBool>,
+    ) -> Result<String, ModelError> {
+        if abandoned.load(Ordering::SeqCst) {
+            return Err(ModelError("cancelled"));
         }
+        self.run_within_failure(
+            system,
+            input,
+            within,
+            Cancellation::from_flag(abandoned.clone()),
+        )
+        .map_err(|err| ModelError(err.failure.class))
     }
 }
 
@@ -461,37 +656,62 @@ impl OneShot for RouteWalk {
 mod tests {
     use super::*;
     use crate::upstream_capture::test_support as capture;
-    use serde_json::{json, Value};
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
-    /// A relay that answers one request with a completion of `content`; the handle yields the request body.
+    /// A relay that answers one request with a completion of `content`; the handle yields the
+    /// request body.
     fn relay(content: &'static str) -> (String, std::thread::JoinHandle<Value>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut bytes = Vec::new();
             let mut chunk = [0u8; 4096];
             let start = loop {
                 let n = stream.read(&mut chunk).unwrap();
                 assert!(n > 0, "the request ended early");
                 bytes.extend_from_slice(&chunk[..n]);
-                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
                 let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
                 let length = head
                     .lines()
-                    .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
                     .unwrap_or(0);
                 if bytes.len() >= end + 4 + length {
                     break end + 4;
                 }
             };
-            let body = json!({"id":"fixture","object":"chat.completion","created":1,"model":"fake-chat",
-                "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
+            let body = json!({
+                "id": "fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fake-chat",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
             .to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
             serde_json::from_slice(&bytes[start..]).unwrap()
         });
         (url, handle)
@@ -501,11 +721,30 @@ mod tests {
     fn one_shot_sends_its_input_alone_without_tools() {
         let (url, request) = relay("[]");
         let (_root, context) = capture::runtime("one-shot-alone", &url);
-        let model = RelayModel::for_model(&context, Job::Digest, "internal:digest", RouteModel { id: "route-a", model: "fake-chat" }, Duration::from_secs(5), 321).unwrap();
+        let spec = RouteSpec {
+            id: "route-a".into(),
+            model: "fake-chat".into(),
+            effort: None,
+            max_output_tokens: 321,
+            retry_429: false,
+        };
+        let model = RouteWalk::single_route(
+            &context,
+            Job::Digest,
+            "internal:digest",
+            spec,
+            Duration::from_secs(5),
+            321,
+        )
+        .unwrap();
         assert_eq!(model.complete("", "one-shot-input-11"), Ok("[]".to_string()));
         let body = request.join().unwrap();
         assert_eq!(body["model"], "fake-chat");
         assert_eq!(body["max_tokens"], 321);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "no effort is sent when omitted: {body}"
+        );
         assert_ne!(body["stream"], true, "a one-shot job does not stream: {body}");
         assert!(body.get("tools").is_none(), "a one-shot job offers no tool: {body}");
         let messages = body["messages"].as_array().unwrap();
@@ -518,41 +757,144 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_forwards_configured_reasoning_effort_on_relay_and_walk() {
+        let (url, request) = relay("[]");
+        let (_root, context) = capture::runtime("one-shot-effort-relay", &url);
+        let spec = RouteSpec {
+            id: "route-a".into(),
+            model: "fake-chat".into(),
+            effort: Some("high".into()),
+            max_output_tokens: 321,
+            retry_429: false,
+        };
+        let model = RouteWalk::single_route(
+            &context,
+            Job::SlangLearner,
+            "group:7003",
+            spec,
+            Duration::from_secs(5),
+            321,
+        )
+        .unwrap();
+        assert_eq!(model.complete("", "one-shot-effort"), Ok("[]".to_string()));
+        let body = request.join().unwrap();
+        assert_eq!(body["reasoning_effort"], "high", "{body}");
+
+        let (url, request) = relay("[]");
+        let (_root, context) = capture::runtime("one-shot-effort-walk", &url);
+        let walk = Walk {
+            routes: vec![RouteSpec {
+                id: "route-m".into(),
+                model: "fake-chat".into(),
+                effort: Some("medium".into()),
+                max_output_tokens: 4096,
+                retry_429: true,
+            }],
+            chain: false,
+        };
+        let walker = walk_for(
+            &context,
+            Job::Digest,
+            "internal:digest",
+            Some(walk),
+            Duration::from_secs(5),
+            256,
+        )
+        .unwrap();
+        assert_eq!(walker.complete("sys", "walk-effort"), Ok("[]".to_string()));
+        let body = request.join().unwrap();
+        assert_eq!(body["reasoning_effort"], "medium", "{body}");
+    }
+
+    #[test]
     fn one_shot_request_is_taken_by_an_armed_capture() {
         let (url, request) = relay("[]");
         let (_root, context) = capture::runtime("one-shot-capture", &url);
         capture::arm(&context, "harness");
-        let model = RelayModel::for_model(&context, Job::Digest, "internal:digest", RouteModel { id: "route-a", model: "fake-chat" }, Duration::from_secs(5), 321).unwrap();
+        let spec = RouteSpec {
+            id: "route-a".into(),
+            model: "fake-chat".into(),
+            effort: None,
+            max_output_tokens: 321,
+            retry_429: false,
+        };
+        let model = RouteWalk::single_route(
+            &context,
+            Job::Digest,
+            "internal:digest",
+            spec,
+            Duration::from_secs(5),
+            321,
+        )
+        .unwrap();
         assert_eq!(model.complete("", "one-shot-input-11"), Ok("[]".to_string()));
         request.join().unwrap();
-        let record = capture::settled(&context).expect("the armed capture took the one-shot request");
+        let record =
+            capture::settled(&context).expect("the armed capture took the one-shot request");
         assert_eq!(
             (record["route"].as_str(), record["request"]["model"].as_str()),
             (Some("harness"), Some("fake-chat")),
             "{record}"
         );
         assert_eq!(record["request"]["maxTokens"], 321, "{record}");
-        assert!(record["request"]["request"].to_string().contains("one-shot-input-11"), "{record}");
+        assert!(
+            record["request"]["request"]
+                .to_string()
+                .contains("one-shot-input-11"),
+            "{record}"
+        );
     }
 
     #[test]
     fn harness_usage_the_slang_one_shot_records_one_fact_under_its_key() {
         let (url, request) = relay("[]");
         let (root, context) = capture::runtime("one-shot-usage", &url);
-        let route = RouteModel { id: "route-a", model: "fake-chat" };
-        let model = model_for(&context, Job::SlangLearner, "group:7002", Some(route), Duration::from_secs(5), 321).unwrap();
-        assert_eq!(model.complete("", "one-shot-usage-input"), Ok("[]".to_string()));
-        request.join().unwrap();
-        let text = std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
-        let rows: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(rows.len(), 1, "one answered request is one usage fact: {rows:?}");
+        let cfg = json!({
+            "harness": {"routes": [{"id": "route-a", "model": "fake-chat", "maxOutputTokens": 321}]}
+        });
         assert_eq!(
-            (rows[0]["key"].as_str(), rows[0]["route"].as_str(), rows[0]["model"].as_str(), rows[0]["job"].as_str()),
-            (Some("group:7002"), Some("route-a"), Some("fake-chat"), Some("slang")),
+            slang_complete(
+                &context,
+                &cfg,
+                "group:7002",
+                "one-shot-usage-input",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            "[]"
+        );
+        request.join().unwrap();
+        let text =
+            std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one answered request is one usage fact: {rows:?}"
+        );
+        assert_eq!(
+            (
+                rows[0]["key"].as_str(),
+                rows[0]["route"].as_str(),
+                rows[0]["model"].as_str(),
+                rows[0]["job"].as_str(),
+            ),
+            (
+                Some("group:7002"),
+                Some("route-a"),
+                Some("fake-chat"),
+                Some("slang"),
+            ),
             "{}",
             rows[0]
         );
-        assert_eq!(rows[0]["b"], json!({"cacheMiss": 1, "cacheHit": 0, "cacheWrite": 0, "output": 1, "reasoning": 0}));
+        assert_eq!(
+            rows[0]["b"],
+            json!({"cacheMiss": 1, "cacheHit": 0, "cacheWrite": 0, "output": 1, "reasoning": 0})
+        );
     }
 
     #[test]
@@ -563,12 +905,30 @@ mod tests {
         capture::arm(&context, "harness");
         let route_id = format!("route-{secret}");
         let model_name = format!("fake-chat-{secret}");
-        let route = RouteModel { id: &route_id, model: &model_name };
-        let model = model_for(&context, Job::Digest, "internal:digest", Some(route), Duration::from_secs(5), 321).unwrap();
+        let spec = RouteSpec {
+            id: route_id,
+            model: model_name,
+            effort: None,
+            max_output_tokens: 321,
+            retry_429: false,
+        };
+        let model = RouteWalk::single_route(
+            &context,
+            Job::Digest,
+            "internal:digest",
+            spec,
+            Duration::from_secs(5),
+            321,
+        )
+        .unwrap();
         assert_eq!(model.complete("", "one-shot-redact-input"), Ok("[]".to_string()));
         request.join().unwrap();
-        let text = std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
-        let rows: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let text =
+            std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(
             (rows[0]["route"].as_str(), rows[0]["model"].as_str()),
@@ -576,8 +936,233 @@ mod tests {
             "{}",
             rows[0]
         );
-        assert!(!text.contains(secret), "the ledger never keeps the harness credential: {text}");
-        let record = capture::settled(&context).expect("the armed capture took the one-shot request");
+        assert!(
+            !text.contains(secret),
+            "the ledger never keeps the harness credential: {text}"
+        );
+        let record =
+            capture::settled(&context).expect("the armed capture took the one-shot request");
         assert_eq!(record["request"]["model"], "fake-chat-[REDACTED]", "{record}");
+    }
+
+    struct MockOneShot(Mutex<VecDeque<Result<String, ModelError>>>);
+
+    impl OneShot for MockOneShot {
+        fn complete(&self, _system: &str, _input: &str) -> Result<String, ModelError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ModelError("backend")))
+        }
+    }
+
+    #[test]
+    fn one_shot_normalizes_refusal_empty_diagnostic_and_timeout_on_mock_seam() {
+        let (_root, context) = capture::runtime("one-shot-norm-mock", "http://127.0.0.1:1");
+        let cfg = json!({"harness": {"model": "mock-model"}});
+        let mock = Arc::new(MockOneShot(Mutex::new(VecDeque::from([
+            Ok("   ".to_string()),
+            Ok("content_filter".to_string()),
+            Ok("Error: upstream failed".to_string()),
+            Ok(r#"[{"content":"content filter","source_id":1}]"#.to_string()),
+            Err(ModelError("timeout")),
+            Err(ModelError("quota")),
+        ]))));
+        install_test_model(&context, Job::SlangLearner, mock);
+
+        let e1 =
+            slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (e1.failure.class, e1.failure.code.as_str()),
+            ("empty-response", "EMPTY_ANSWER")
+        );
+
+        let e2 =
+            slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (e2.failure.class, e2.failure.code.as_str()),
+            ("refusal", "MODEL_REFUSAL")
+        );
+
+        let e3 =
+            slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(e3.failure.class, "backend");
+
+        let ok = slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap();
+        assert!(ok.contains("content filter"));
+
+        let e4 =
+            slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (e4.failure.class, e4.failure.code.as_str()),
+            ("timeout", "TIMEOUT")
+        );
+
+        let e5 =
+            slang_complete(&context, &cfg, "group:1", "p", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (e5.failure.class, e5.failure.code.as_str()),
+            ("quota", "QUOTA_EXCEEDED")
+        );
+    }
+
+    #[test]
+    fn slang_complete_fails_over_across_routes_on_error_refusal_and_empty() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let replies = Arc::new(Mutex::new(VecDeque::from([
+            (500u16, json!({"error": {"message": "busy"}}).to_string()),
+            (
+                200u16,
+                json!({
+                    "id": "r1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "model-b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "[]"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            ),
+            (
+                200u16,
+                json!({
+                    "id": "r2",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "model-b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "   "},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            ),
+            (
+                200u16,
+                json!({
+                    "id": "r3",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "model-a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "content_filter"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            ),
+            (
+                200u16,
+                json!({
+                    "id": "r4",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "model-b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "content_filter"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string(),
+            ),
+        ])));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let asked_log = asked.clone();
+        let server_replies = replies.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                            .unwrap();
+                    }
+                };
+                asked_log
+                    .lock()
+                    .unwrap()
+                    .push(body["model"].as_str().unwrap_or("").to_string());
+                let (code, text) = server_replies.lock().unwrap().pop_front().unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                )
+                .unwrap();
+            }
+        });
+        let (_root, context) = capture::runtime("slang-failover", &url);
+        let cfg = json!({
+            "harness": {
+                "routes": [
+                    {"id": "a", "model": "model-a"},
+                    {"id": "b", "model": "model-b"}
+                ]
+            }
+        });
+        // Call 1: model-a returns 500 -> fails over to model-b -> returns "[]".
+        assert_eq!(
+            slang_complete(&context, &cfg, "group:fo", "p1", Duration::from_secs(5)).unwrap(),
+            "[]"
+        );
+        // Call 2: sticky start is model-b, which returns whitespace -> normalized empty-response,
+        // fails without 3x same-route retry since model-b is the tail of this walk.
+        let err_empty =
+            slang_complete(&context, &cfg, "group:fo", "p2", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (err_empty.failure.class, err_empty.model.as_str()),
+            ("empty-response", "model-b")
+        );
+
+        // Call 3 on fresh key: model-a returns plain-text refusal "content_filter", fails over
+        // to model-b which also returns refusal -> JobFailure names model-b.
+        let err_refusal =
+            slang_complete(&context, &cfg, "group:fo2", "p3", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            (
+                err_refusal.failure.class,
+                err_refusal.failure.code.as_str(),
+                err_refusal.model.as_str(),
+            ),
+            ("refusal", "MODEL_REFUSAL", "model-b")
+        );
+        server.join().unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["model-a", "model-b", "model-b", "model-a", "model-b"]
+        );
     }
 }

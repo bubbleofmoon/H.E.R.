@@ -40,9 +40,10 @@ fn serve_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, std::th
     let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..n {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     (context, server)
@@ -91,7 +92,7 @@ fn wake_bookkeeping_stays_out_of_model_output_and_tool_input() {
     }
     context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
 
-    let (context, server) = serve_packets(&context, 6);
+    let (context, server) = serve_packets(&context, 7);
     let _ = wake(&context, &cfg, "rpc-bookkeeping-full");
     crate::session_context::observe(&context, KEY, "sid-18", "epoch-18", &json!({
         "type": "user/message",
@@ -108,7 +109,12 @@ fn wake_bookkeeping_stays_out_of_model_output_and_tool_input() {
     let args = json!({"key": KEY, "token": "epoch-18"});
     let prompt = crate::mcp::call_prepared("qq_get_prompt", &args, &context);
     let social = crate::mcp::call_prepared_recorded("qq_social_state", &args, &context);
-    let marked = crate::mcp::call_prepared("qq_mark_read", &args, &context);
+    let unread = crate::mcp::call_prepared("qq_get_unread_messages", &args, &context);
+    assert_ne!(unread["isError"], true, "{unread}");
+    let unread: Value = serde_json::from_str(unread["content"][0]["text"].as_str().unwrap()).unwrap();
+    let through = unread["readThroughSeq"].as_i64().unwrap();
+    let mark_args = json!({"key": KEY, "token": "epoch-18", "throughSeq": through});
+    let marked = crate::mcp::call_prepared("qq_mark_read", &mark_args, &context);
     let mut set_args = args;
     set_args["config"] = json!({
         "mode": "active",

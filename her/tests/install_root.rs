@@ -186,6 +186,28 @@ fn lifecycle_option_value_double_dash_cannot_bypass_runtime_guard() {
 }
 
 #[test]
+fn retired_memory_probe_options_are_rejected() {
+    let fixture = Fixture::new();
+    let install = fixture.0.join("unused-install");
+    for mode in [
+        "--memory-probe",
+        "--memory-write-probe",
+        "--hot-render",
+        "--index-hint",
+    ] {
+        let output = command(Path::new(env!("CARGO_BIN_EXE_her-cli")))
+            .env("HER_INSTALL_ROOT", &install)
+            .args(["--console-serve", "--runtime-root"])
+            .arg(install.join("runtime"))
+            .arg(mode)
+            .output()
+            .unwrap();
+        refused(output, "unknown option");
+    }
+    assert!(!install.exists());
+}
+
+#[test]
 fn development_destinations_are_guarded_without_a_runtime_even_from_installed_cli() {
     let fixture = Fixture::new();
     let install = fixture.0.join("production");
@@ -198,25 +220,6 @@ fn development_destinations_are_guarded_without_a_runtime_even_from_installed_cl
     });
     std::fs::copy(env!("CARGO_BIN_EXE_her-cli"), &cli).unwrap();
     for image in [Path::new(env!("CARGO_BIN_EXE_her-cli")), cli.as_path()] {
-        for mode in [
-            "--memory-write-probe",
-            "--memory-probe",
-            "--hot-render",
-            "--index-hint",
-        ] {
-            let db = install.join("probe.db");
-            let output = command(image)
-                .env("HER_INSTALL_ROOT", &install)
-                .env("HER_MEMORY_DB", &db)
-                .arg(mode)
-                .output()
-                .unwrap();
-            refused(
-                output,
-                "development runtime root is under the production install root",
-            );
-            assert!(!db.exists());
-        }
         let patch = install.join("patch/new.yml");
         let output = command(image)
             .env("HER_INSTALL_ROOT", &install)

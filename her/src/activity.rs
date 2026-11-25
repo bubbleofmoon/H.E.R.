@@ -186,7 +186,11 @@ fn known_tokens(context: &RuntimeContext) -> Vec<String> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "legacy".to_string());
     let identity = context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::ReadOptionalFile)
+        .resolve_path(
+            RuntimeArea::Data,
+            crate::conversation_state::FILE,
+            PathIntent::ReadOptionalFile,
+        )
         .ok()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
@@ -198,21 +202,7 @@ fn known_tokens(context: &RuntimeContext) -> Vec<String> {
             return tokens.clone();
         }
     }
-    let tokens: Vec<String> = context
-        .read_text(RuntimeArea::Data, "social-v2.json")
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|state| {
-            state.get("conversations").and_then(Value::as_object).map(|conversations| {
-                conversations
-                    .values()
-                    .filter_map(|c| c.get("agentToken").and_then(Value::as_str))
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-        })
-        .unwrap_or_default();
+    let tokens: Vec<String> = crate::conversation_state::read_active_tokens(context).unwrap_or_default();
     cache.insert(scope, (identity, tokens.clone()));
     tokens
 }

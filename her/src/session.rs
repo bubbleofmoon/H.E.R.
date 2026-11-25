@@ -106,7 +106,9 @@ impl Driver {
     /// Refresh actual ingress/read/send outcomes, never infer a send from model text.
     pub fn refresh_observed_state(&mut self, conv: &serde_json::Value, now: i64) {
         let previous_reply = self.sched.last_ai_reply_at;
-        self.unread_seqs = conv["unread"].as_array().map(|a| a.iter().filter_map(|m| m["seq"].as_i64()).collect()).unwrap_or_default();
+        self.unread_seqs = crate::conversation_state::Conversation::from_value(conv)
+            .map(|c| c.unread().iter().filter_map(|m| m.raw_i64_seq()).collect())
+            .unwrap_or_default();
         self.sched.last_unread_seq = conv["lastUnreadSeq"].as_i64().unwrap_or(0);
         self.sched.wake_times=conv["wakeTimes"].as_array().map(|a|a.iter().filter_map(|v|v.as_i64()).collect()).unwrap_or_default();
         self.sched.last_incoming_at = conv["lastIncomingAt"].as_i64().unwrap_or(0);
@@ -860,10 +862,10 @@ mod tests {
         let mut d = Driver::new(scheduler_from_state(crate::wake_cfg_of(&cfg), &conv), 1);
         d.sched.cfg.proactive_enabled = false;
         d.apply(Input::TurnStart { at_ms: T0 });
-        assert_eq!(crate::wake::pre_sleep_remaining(&conv, &cfg, T0), Some(300_000));
+        assert_eq!(crate::wake::pre_sleep_remaining(&conv, &cfg, "group:1", T0), Some(300_000));
         assert!(d.apply(Input::Tick { at_ms: T0 + 300_000 }).is_empty(),
             "default observation must finish before the turn cap");
-        assert!(crate::wake::pre_sleep_remaining(&conv, &cfg, T0 + 300_000).is_none());
+        assert!(crate::wake::pre_sleep_remaining(&conv, &cfg, "group:1", T0 + 300_000).is_none());
         assert!(d.apply(Input::TurnEnd { at_ms: T0 + 301_000 }).is_empty());
         assert_eq!(d.sched.cfg.turn_hard_cap_ms, 515_000);
         assert!(d.apply(Input::Tick { at_ms: T0 + 515_001 }).is_empty(), "closed turn must not be cancelled later");

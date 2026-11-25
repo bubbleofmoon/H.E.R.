@@ -21,7 +21,10 @@
 //! Writers go through `recorded_send.rs`; this module owns the record format and folding.
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
+pub(crate) use crate::conversation_state::token_epoch;
+#[cfg(test)]
+pub(crate) use crate::conversation_state::token_epoch_matches;
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
@@ -29,12 +32,6 @@ use crate::runtime::{RuntimeArea, RuntimeContext};
 pub const LEGACY_OUTBOX_FILE: &str = crate::legacy_path!("state/send-outbox-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_OUTBOX_FILE: &str = "send-outbox.jsonl";
-
-/// Non-reversible identity of the agent token a batch was created under.
-pub fn token_epoch(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Read every outbox record in append order. A truncated record (crash mid-append) is skipped with a
 /// warning; any other damaged line is an error (see `runtime::parse_evidence_jsonl`).
@@ -483,6 +480,9 @@ mod tests {
         assert_eq!(epoch.len(), 16);
         assert_eq!(epoch, token_epoch("secret-token-value"));
         assert!(!epoch.contains("secret"));
+        assert!(token_epoch_matches("secret-token-value", &epoch));
+        assert!(!token_epoch_matches("fixture-replaced-agent-token", &epoch));
+        assert!(!token_epoch_matches("", &token_epoch("")));
     }
 
     fn history_files(root: &std::path::Path) -> Vec<Value> {
