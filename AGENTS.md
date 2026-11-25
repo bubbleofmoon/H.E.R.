@@ -39,6 +39,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Child DOX Index
 
+- [Chinese owner guide](docs/user-guide.zh-CN.md)
 - `her/AGENTS.md`: Crate layout and pointers to the bridge contracts.
 - `her-ui/AGENTS.md`: Embedded console UI contracts and layout.
 - `docs/adr/0001-cleanup-retention.md`: Repository retention.
