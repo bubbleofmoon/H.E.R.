@@ -15,17 +15,19 @@ mod install_root;
 mod console_fixture;
 
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_tungstenite::tungstenite::{accept, Message};
+use tokio_tungstenite::tungstenite::{
+    accept, Error as WsError, HandshakeError, Message, WebSocket,
+};
 
 const GROUP_ID: i64 = 420042;
 const GROUP_KEY: &str = "group:420042";
@@ -96,12 +98,60 @@ struct HttpReq {
     body: Vec<u8>,
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
-    stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+fn read_with_stop(
+    stream: &mut TcpStream,
+    control: &ListenerControl,
+    deadline: Instant,
+    mut op: impl FnMut(&mut TcpStream) -> std::io::Result<usize>,
+) -> Option<usize> {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).ok()?;
+    while !control.is_stopped() && Instant::now() < deadline {
+        match op(stream) {
+            Ok(count) => return Some(count),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn accept_ws(stream: TcpStream, control: &ListenerControl) -> Option<WebSocket<TcpStream>> {
+    stream.set_nonblocking(true).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut pending = accept(stream);
+    loop {
+        match pending {
+            Ok(socket) => {
+                socket.get_ref().set_nonblocking(false).ok()?;
+                return Some(socket);
+            }
+            Err(HandshakeError::Interrupted(mid)) => {
+                if control.is_stopped() || Instant::now() >= deadline {
+                    return None;
+                }
+                control.wait_for_stop(Duration::from_millis(10));
+                if control.is_stopped() {
+                    return None;
+                }
+                pending = mid.handshake();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream, control: &ListenerControl) -> Option<HttpReq> {
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let count = stream.read(&mut chunk).ok()?;
+        let count = read_with_stop(stream, control, deadline, |s| s.read(&mut chunk))?;
         if count == 0 {
             return None;
         }
@@ -124,13 +174,13 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
     }
 }
 
-fn respond(stream: &mut TcpStream, status: u16, value: &Value) {
+fn respond(stream: &mut TcpStream, status: u16, value: &Value) -> bool {
     let body = value.to_string();
     let text = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(text.as_bytes());
+    stream.write_all(text.as_bytes()).is_ok()
 }
 
 fn http_call(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&Value>) -> Option<(u16, Value)> {
@@ -251,9 +301,99 @@ struct DshInner {
     cancel_reply_gate: Option<std::sync::mpsc::Receiver<()>>,
 }
 
+const DSH_PHASE_CAPACITY: usize = 128;
+
+struct DshPhase {
+    elapsed: Duration,
+    connection: usize,
+    method: &'static str,
+    phase: &'static str,
+    outcome: &'static str,
+    records: Option<usize>,
+    bytes: Option<usize>,
+}
+
+struct DshTrace {
+    started: Instant,
+    phases: Mutex<VecDeque<DshPhase>>,
+}
+
+impl DshTrace {
+    fn dump(&self, turn_index: usize) {
+        let phases = lock(&self.phases);
+        eprintln!(
+            "---- fake DSH phases for turn {} ({} recent entries) ----",
+            turn_index + 1,
+            phases.len()
+        );
+        for phase in phases.iter() {
+            eprintln!(
+                "+{}ms connection={} method={} phase={} outcome={} records={:?} bytes={:?}",
+                phase.elapsed.as_millis(), phase.connection, phase.method, phase.phase,
+                phase.outcome, phase.records, phase.bytes,
+            );
+        }
+    }
+}
+
+struct ConnectionTrace<'a> {
+    trace: &'a DshTrace,
+    connection: usize,
+    method: &'static str,
+}
+
+impl ConnectionTrace<'_> {
+    fn record(&self, phase: &'static str, outcome: &'static str) {
+        self.record_counts(phase, outcome, None, None);
+    }
+
+    fn record_counts(
+        &self,
+        phase: &'static str,
+        outcome: &'static str,
+        records: Option<usize>,
+        bytes: Option<usize>,
+    ) {
+        let mut phases = lock(&self.trace.phases);
+        if phases.len() == DSH_PHASE_CAPACITY {
+            phases.pop_front();
+        }
+        phases.push_back(DshPhase {
+            elapsed: self.trace.started.elapsed(),
+            connection: self.connection,
+            method: self.method,
+            phase,
+            outcome,
+            records,
+            bytes,
+        });
+    }
+}
+
+fn write_outcome(written: bool) -> &'static str {
+    if written { "written" } else { "write-error" }
+}
+
+fn classify_rpc(method: &str) -> &'static str {
+    match method {
+        "agentPresets/list" => "agentPresets/list",
+        "session/cancel" => "session/cancel",
+        "session/create" => "session/create",
+        "session/projections" => "session/projections",
+        "session/prompt" => "session/prompt",
+        "session/selectModel" => "session/selectModel",
+        "session/updateQueue" => "session/updateQueue",
+        "workspace/archiveSession" => "workspace/archiveSession",
+        "workspace/create" => "workspace/create",
+        "workspace/rename" => "workspace/rename",
+        _ => "other-rpc",
+    }
+}
+
 struct Dsh {
     inner: Mutex<DshInner>,
     console_port: AtomicU16,
+    trace: DshTrace,
 }
 
 fn event(sess: &mut Sess, kind: &str, data: Value) {
@@ -265,6 +405,10 @@ impl Dsh {
     fn new(console_port: u16) -> Arc<Self> {
         Arc::new(Self {
             console_port: AtomicU16::new(console_port),
+            trace: DshTrace {
+                started: Instant::now(),
+                phases: Mutex::new(VecDeque::with_capacity(DSH_PHASE_CAPACITY)),
+            },
             inner: Mutex::new(DshInner {
                 observation_waits: false,
                 engage_send: None,
@@ -350,7 +494,7 @@ impl Dsh {
         lock(&self.inner).digest_requests.len()
     }
     /// The relay's chat-completions endpoint answers rotation digests (`dependencies.model` is this server).
-    fn model_digest(self: &Arc<Self>, stream: &mut TcpStream, body: &[u8]) {
+    fn model_digest(self: &Arc<Self>, stream: &mut TcpStream, body: &[u8]) -> bool {
         let (fault, hold, text) = {
             let mut inner = lock(&self.inner);
             inner.digest_requests.push(serde_json::from_slice(body).unwrap_or(Value::Null));
@@ -364,12 +508,11 @@ impl Dsh {
             }
         }
         if fault {
-            respond(stream, 500, &json!({"error":{"message":"synthetic-private-error-text"}}));
-            return;
+            return respond(stream, 500, &json!({"error":{"message":"synthetic-private-error-text"}}));
         }
         respond(stream, 200, &json!({"id":"fixture","object":"chat.completion","created":1,"model":"ticket10-digest",
             "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}));
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}))
     }
 
     /// The old turn finally calls its send tool with the token it was given.
@@ -521,7 +664,7 @@ impl Dsh {
             loop {
                 {
                     let inner = lock(&self.inner);
-                    if inner.released || inner.sessions.get(sid).map(|s| s.cancelled).unwrap_or(true) {
+                    if inner.shutting_down || inner.released || inner.sessions.get(sid).map(|s| s.cancelled).unwrap_or(true) {
                         break;
                     }
                 }
@@ -635,34 +778,73 @@ fn relay_send(console_port: u16, prompt: &str, text: &str) -> Option<(u16, Value
     )
 }
 
-fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
+fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream, connection: &AcceptedSocket) {
+    let mut trace = ConnectionTrace {
+        trace: &world.trace,
+        connection: connection.id,
+        method: "unclassified",
+    };
+    trace.record("peek", "start");
+    const WS_PREFIX: &str = "GET /api/remote.mux";
     let mut peek = [0u8; 64];
-    let Ok(n) = stream.peek(&mut peek) else { return };
-    let is_ws = String::from_utf8_lossy(&peek[..n]).starts_with("GET /api/remote.mux");
+    let peek_deadline = Instant::now() + Duration::from_secs(8);
+    let Some(n) =
+        read_with_stop(&mut stream, &connection.control, peek_deadline, |s| s.peek(&mut peek))
+    else {
+        trace.record("peek", "read-error");
+        return;
+    };
+    let prefix = &peek[..n];
+    let is_ws = String::from_utf8_lossy(prefix).starts_with(WS_PREFIX);
+    let route = if is_ws {
+        "websocket"
+    } else if n == 0 {
+        "eof"
+    } else if WS_PREFIX.as_bytes().starts_with(prefix) {
+        "partial-websocket-prefix-routed-to-http"
+    } else {
+        "http"
+    };
+    trace.record_counts("peek", route, None, Some(n));
     if lock(&world.inner).down {
-        return; // connection dropped: DSH is unreachable
+        trace.record("connection", "offline");
+        return;
     }
     if is_ws {
+        trace.method = "session/follow";
         if lock(&world.inner).probe == ProbeFault::Http404 {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
+            let result = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
+            trace.record("probe-http-404", write_outcome(result.is_ok()));
             return;
         }
-        dsh_follow(world, stream);
+        dsh_follow(&world, stream, &trace, &connection.control);
         return;
     }
-    let Some(request) = read_request(&mut stream) else { return };
+    trace.record("http-read", "start");
+    let Some(request) = read_request(&mut stream, &connection.control) else {
+        trace.record("http-read", "incomplete");
+        return;
+    };
+    trace.record("http-read", "complete");
     if request.request_line.split_whitespace().nth(1) == Some("/v1/chat/completions") {
-        world.model_digest(&mut stream, &request.body);
+        trace.method = "model/digest";
+        trace.record("http-write", "start");
+        let written = world.model_digest(&mut stream, &request.body);
+        trace.record("http-write", write_outcome(written));
         return;
     }
-    let Ok(envelope) = serde_json::from_slice::<Value>(&request.body) else { return };
-    let method = envelope.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+    let Ok(envelope) = serde_json::from_slice::<Value>(&request.body) else {
+        trace.record("rpc-decode", "invalid-json");
+        return;
+    };
+    let method = envelope.get("method").and_then(Value::as_str).unwrap_or("");
+    trace.method = classify_rpc(method);
     let rpc_id = envelope.get("rpcId").and_then(Value::as_str).unwrap_or("").to_string();
     let probe_fault = lock(&world.inner).probe;
     if method == "session/projections" && probe_fault != ProbeFault::None {
-        match probe_fault {
+        let written = match probe_fault {
             ProbeFault::Http404 => {
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found").is_ok()
             }
             fault => {
                 let message = if fault == ProbeFault::MethodNotFound { "Method not found" } else { "widget not found in registry" };
@@ -671,28 +853,51 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
                     200,
                     &json!({"type": "server-response", "rpcId": rpc_id,
                             "result": {"ok": false, "error": {"code": "internal", "message": message}}}),
-                );
+                )
             }
-        }
+        };
+        trace.record("rpc-probe-error", write_outcome(written));
         return;
     }
     let args = envelope.pointer("/payload/args").cloned().unwrap_or(Value::Null);
+    trace.record("rpc-handler", "start");
     let outcome = if method == "session/prompt" {
         match world.prompt(&args, &rpc_id) {
             Some(result) => result,
             None => {
-                // withheld reply: hold the connection until the bridge goes away
-                thread::sleep(Duration::from_secs(45));
+                trace.record("rpc-handler", "withheld");
+                // Withhold the reply for the fault window or until fixture shutdown.
+                connection.control.wait_for_stop(Duration::from_secs(45));
                 return;
             }
         }
     } else {
-        world.rpc(&method, &args)
+        world.rpc(method, &args)
     };
+    trace.record(
+        "rpc-handler",
+        match &outcome {
+            Ok(value) if value["accepted"] == false => "refused",
+            Ok(_) => "ok",
+            Err(_) => "rpc-error",
+        },
+    );
     if method == "session/cancel" {
         let gate = lock(&world.inner).cancel_reply_gate.take();
         if let Some(gate) = gate {
-            gate.recv_timeout(Duration::from_secs(20)).expect("release cancel response");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if connection.control.is_stopped() {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match gate.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if Instant::now() < deadline => {}
+                    Err(error) => panic!("release cancel response: {error}"),
+                }
+            }
         }
     }
     let reply = match outcome {
@@ -701,19 +906,58 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
             json!({"type": "server-response", "rpcId": rpc_id, "result": {"ok": false, "error": {"code": code, "message": message}}})
         }
     };
-    respond(&mut stream, 200, &reply);
+    trace.record("http-write", "start");
+    let written = respond(&mut stream, 200, &reply);
+    trace.record("http-write", write_outcome(written));
 }
 
-fn dsh_follow(world: Arc<Dsh>, stream: TcpStream) {
-    let Ok(mut socket) = accept(stream) else { return };
-    let Ok(Message::Text(open)) = socket.read() else { return };
-    let Ok(frame) = serde_json::from_str::<Value>(&open) else { return };
+fn dsh_follow(
+    world: &Dsh,
+    stream: TcpStream,
+    trace: &ConnectionTrace<'_>,
+    control: &ListenerControl,
+) {
+    trace.record("handshake", "start");
+    let Some(mut socket) = accept_ws(stream, control) else {
+        trace.record("handshake", "error");
+        return;
+    };
+    trace.record("handshake", "ok");
+    trace.record("follow-open", "start");
+    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
+    let open_deadline = Instant::now() + Duration::from_secs(8);
+    let open = loop {
+        if control.is_stopped() || Instant::now() >= open_deadline {
+            trace.record("follow-open", "missing-text-frame");
+            return;
+        }
+        match socket.read() {
+            Ok(Message::Text(open)) => break open,
+            Err(WsError::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            _ => {
+                trace.record("follow-open", "missing-text-frame");
+                return;
+            }
+        }
+    };
+    let Ok(frame) = serde_json::from_str::<Value>(&open) else {
+        trace.record("follow-open", "invalid-json");
+        return;
+    };
+    trace.record("follow-open", "ok");
     let stream_id = frame.get("streamId").and_then(Value::as_str).unwrap_or("").to_string();
     let sid = frame.pointer("/payload/args/request/address/sessionId").and_then(Value::as_str).unwrap_or("").to_string();
     let probe_fault = lock(&world.inner).probe;
     if probe_fault != ProbeFault::None {
         let code = if probe_fault == ProbeFault::MethodNotFound { "method-not-found" } else { "resource not found" };
-        let _ = socket.send(Message::Text(json!({"type": "error", "streamId": stream_id, "error": {"code": code}}).to_string()));
+        let sent = socket.send(Message::Text(json!({"type": "error", "streamId": stream_id, "error": {"code": code}}).to_string()));
+        trace.record("follow-probe-error", write_outcome(sent.is_ok()));
         return;
     }
     let (events, truncate, gone) = {
@@ -724,11 +968,13 @@ fn dsh_follow(world: Arc<Dsh>, stream: TcpStream) {
         }
     };
     if gone {
-        let _ = socket.send(Message::Text(
+        let sent = socket.send(Message::Text(
             json!({"type": "error", "streamId": stream_id, "error": {"code": "session-not-found"}}).to_string(),
         ));
+        trace.record("follow-session-missing", write_outcome(sent.is_ok()));
         return;
     }
+    trace.record("snapshot-build", "start");
     let mut sent = events.last().and_then(|e| e["seq"].as_i64()).unwrap_or(0);
     let max = if lock(&world.inner).follow_history_cap {
         frame.pointer("/payload/args/request/maxMessages").and_then(Value::as_u64).unwrap_or(200) as usize
@@ -739,21 +985,30 @@ fn dsh_follow(world: Arc<Dsh>, stream: TcpStream) {
     let visible = if truncate { &events[events.len().saturating_sub(2)..] } else { &events[start..] };
     let has_more = truncate || visible.len() < events.len();
     let records: Vec<Value> = visible.iter().map(|e| json!({"type": "event", "event": e})).collect();
+    let record_count = records.len();
     let snapshot = json!({
         "type": "item", "streamId": stream_id,
         "value": {"type": "snapshot", "records": records, "hasMore": has_more,
                   "projections": {"values": {"inbox": {"next-turn": [], "next-step": []}}}}
     });
-    if socket.send(Message::Text(snapshot.to_string())).is_err() {
+    let snapshot = snapshot.to_string();
+    let byte_count = snapshot.len();
+    trace.record_counts("snapshot-write", "start", Some(record_count), Some(byte_count));
+    let result = socket.send(Message::Text(snapshot));
+    trace.record_counts(
+        "snapshot-write", write_outcome(result.is_ok()), Some(record_count), Some(byte_count),
+    );
+    if result.is_err() {
         return;
     }
     if lock(&world.inner).follow_drop && sid == "js-origin-session" {
+        trace.record("follow-close", "fixture-drop");
         let _ = socket.close(None);
         return;
     }
     let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
     let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
+    while !control.is_stopped() && Instant::now() < deadline {
         let fresh: Vec<Value> = {
             let inner = lock(&world.inner);
             inner
@@ -762,28 +1017,151 @@ fn dsh_follow(world: Arc<Dsh>, stream: TcpStream) {
                 .map(|s| s.events.iter().filter(|e| e["seq"].as_i64().unwrap_or(0) > sent).cloned().collect())
                 .unwrap_or_default()
         };
+        let fresh_count = fresh.len();
+        if fresh_count != 0 {
+            trace.record_counts("follow-event-write", "start", Some(fresh_count), None);
+        }
         for ev in fresh {
             sent = ev["seq"].as_i64().unwrap_or(sent);
             let item = json!({"type": "item", "streamId": stream_id, "value": {"type": "event", "event": ev}});
             if socket.send(Message::Text(item.to_string())).is_err() {
+                trace.record("follow-event-write", "write-error");
                 return;
             }
         }
+        if fresh_count != 0 {
+            trace.record("follow-event-write", "written");
+        }
         match socket.read() {
-            Ok(Message::Close(_)) => return,
+            Ok(Message::Close(_)) => {
+                trace.record("follow-close", "peer-close");
+                return;
+            }
             Err(tokio_tungstenite::tungstenite::Error::Io(e))
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-            Err(_) => return,
+            Err(_) => {
+                trace.record("follow-close", "read-error");
+                return;
+            }
             Ok(_) => {}
         }
     }
+    trace.record("follow-close", "deadline");
 }
 
-fn serve_dsh(listener: TcpListener, world: Arc<Dsh>) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let world = world.clone();
-        thread::spawn(move || dsh_connection(world, stream));
+// ───────────────────────── owned fake listeners ─────────────────────────
+
+#[derive(Default)]
+struct ListenerState {
+    stopped: bool,
+    next_connection: usize,
+    sockets: HashMap<usize, TcpStream>,
+}
+
+#[derive(Default)]
+struct ListenerControl {
+    state: Mutex<ListenerState>,
+    stopped: Condvar,
+}
+
+impl ListenerControl {
+    fn stop(&self) {
+        let mut state = lock(&self.state);
+        state.stopped = true;
+        for stream in state.sockets.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        self.stopped.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        lock(&self.state).stopped
+    }
+
+    fn wait_for_stop(&self, timeout: Duration) -> bool {
+        let (state, _) = self
+            .stopped
+            .wait_timeout_while(lock(&self.state), timeout, |state| !state.stopped)
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.stopped
+    }
+
+    fn register(self: &Arc<Self>, stream: &TcpStream) -> Option<AcceptedSocket> {
+        let mut state = lock(&self.state);
+        if state.stopped {
+            return None;
+        }
+        let interrupt = stream.try_clone().expect("clone fake listener socket");
+        state.next_connection += 1;
+        let id = state.next_connection;
+        state.sockets.insert(id, interrupt);
+        Some(AcceptedSocket { control: self.clone(), id })
+    }
+}
+
+struct AcceptedSocket {
+    control: Arc<ListenerControl>,
+    id: usize,
+}
+
+impl Drop for AcceptedSocket {
+    fn drop(&mut self) {
+        lock(&self.control.state).sockets.remove(&self.id);
+    }
+}
+
+#[derive(Default)]
+struct FakeListeners {
+    control: Arc<ListenerControl>,
+    accept_loops: Vec<thread::JoinHandle<()>>,
+    addresses: Vec<SocketAddr>,
+}
+
+impl FakeListeners {
+    fn start(
+        &mut self,
+        listener: TcpListener,
+        concurrent: bool,
+        handle: impl Fn(TcpStream, &AcceptedSocket) + Send + Sync + 'static,
+    ) {
+        listener.set_nonblocking(true).expect("set fake listener nonblocking");
+        self.addresses.push(listener.local_addr().expect("fake listener address"));
+        let control = self.control.clone();
+        let handle = Arc::new(handle);
+        self.accept_loops.push(thread::spawn(move || {
+            let mut connections: Vec<thread::JoinHandle<()>> = Vec::new();
+            while !control.is_stopped() {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Accepted sockets use blocking I/O, including on Windows.
+                        stream.set_nonblocking(false).expect("set fake socket blocking");
+                        let Some(registration) = control.register(&stream) else { break };
+                        if concurrent {
+                            connections.retain(|worker| !worker.is_finished());
+                            let handle = handle.clone();
+                            connections.push(thread::spawn(move || handle(stream, &registration)));
+                        } else {
+                            handle(stream, &registration);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        control.wait_for_stop(Duration::from_millis(5));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("fake listener accept: {error}"),
+                }
+            }
+            drop(listener);
+            for worker in connections {
+                let _ = worker.join();
+            }
+        }));
+    }
+
+    fn join(&mut self) {
+        for worker in self.accept_loops.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -821,85 +1199,85 @@ fn mention_event(message_id: i64, text: &str) -> Value {
     })
 }
 
-fn serve_gateway_ws(listener: TcpListener, gateway: Arc<Mutex<Gateway>>) {
-    loop {
-        let Ok((stream, _)) = listener.accept() else { return };
-        let Ok(mut socket) = accept(stream) else { continue };
-        let script = {
-            let mut g = lock(&gateway);
-            if g.scripts.is_empty() { Vec::new() } else { g.scripts.remove(0) }
-        };
-        for step in script {
-            match step {
-                Step::Frame(value) => {
-                    if socket.send(Message::Text(value.to_string())).is_err() { break; }
+fn gateway_connection(stream: TcpStream, gateway: &Mutex<Gateway>, control: &ListenerControl) {
+    let Some(mut socket) = accept_ws(stream, control) else { return };
+    let script = {
+        let mut g = lock(gateway);
+        if g.scripts.is_empty() { Vec::new() } else { g.scripts.remove(0) }
+    };
+    for step in script {
+        if control.is_stopped() {
+            return;
+        }
+        match step {
+            Step::Frame(value) => {
+                if socket.send(Message::Text(value.to_string())).is_err() { break; }
+            }
+            Step::Mention { message_id, text } => {
+                if socket.send(Message::Text(mention_event(message_id, text).to_string())).is_err() {
+                    break;
                 }
-                Step::Mention { message_id, text } => {
-                    if socket.send(Message::Text(mention_event(message_id, text).to_string())).is_err() {
-                        break;
-                    }
-                }
-                Step::Wait(ms) => thread::sleep(Duration::from_millis(ms)),
-                Step::WaitForSends(count) => {
-                    assert!(wait_for(LONG, || lock(&gateway).sends.len() >= count),
-                        "script did not observe {count} gateway sends");
-                }
-                Step::WaitForTurnStart(dsh) => {
-                    assert!(wait_for(LONG, || lock(&dsh.inner).sessions.values().any(|session| session.events.iter().any(|event| event["type"] == "turn/start"))), "script did not observe a running DSH turn");
-                }
+            }
+            Step::Wait(ms) => {
+                control.wait_for_stop(Duration::from_millis(ms));
+            }
+            Step::WaitForSends(count) => {
+                assert!(wait_for(LONG, || control.is_stopped() || lock(gateway).sends.len() >= count),
+                    "script did not observe {count} gateway sends");
+            }
+            Step::WaitForTurnStart(dsh) => {
+                assert!(wait_for(LONG, || control.is_stopped() || lock(&dsh.inner).sessions.values().any(|session| session.events.iter().any(|event| event["type"] == "turn/start"))), "script did not observe a running DSH turn");
             }
         }
-        // hold the connection open until the bridge goes away
-        let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(200)));
-        let end = Instant::now() + Duration::from_secs(300);
-        while Instant::now() < end {
-            for frame in std::mem::take(&mut lock(&gateway).frames) {
-                if socket.send(Message::Text(frame.to_string())).is_err() {break;}
-            }
-            match socket.read() {
-                Ok(Message::Close(_)) => break,
-                Err(tokio_tungstenite::tungstenite::Error::Io(e))
-                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-                Err(_) => break,
-                Ok(_) => {}
-            }
+    }
+    // hold the connection open until the bridge goes away
+    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(200)));
+    let end = Instant::now() + Duration::from_secs(300);
+    while !control.is_stopped() && Instant::now() < end {
+        for frame in std::mem::take(&mut lock(gateway).frames) {
+            if socket.send(Message::Text(frame.to_string())).is_err() {break;}
+        }
+        match socket.read() {
+            Ok(Message::Close(_)) => break,
+            Err(tokio_tungstenite::tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break,
+            Ok(_) => {}
         }
     }
 }
 
-fn serve_onebot(listener: TcpListener, gateway: Arc<Mutex<Gateway>>) {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let gateway = gateway.clone();
-        thread::spawn(move || {
-            let Some(request) = read_request(&mut stream) else { return };
-            let path = request.request_line.split_whitespace().nth(1).unwrap_or("").to_string();
-            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-            let reply = {
-                let mut g = lock(&gateway);
-                g.paths.push(path.clone());
-                g.requests.push((path.clone(),body.clone()));
-                match path.as_str() {
-                    "/get_msg" => json!({"status":"ok","retcode":0,"data":{"group_id":GROUP_ID,"sender":{"user_id":SELF_ID.to_string()}}}),
-                    "/send_group_msg" | "/send_private_msg" | "/send_msg" => {
-                        if g.reject_send {
-                            respond(&mut stream,200,&json!({"status":"failed","retcode":1404,"wording":"synthetic refusal"}));
-                            return;
-                        }
-                        g.sends.push(body.clone());
-                        if g.drop_send_reply {
-                            return; // close without a reply
-                        }
-                        g.next_message_id += 1;
-                        json!({"status": "ok", "retcode": 0, "data": {"message_id": 880000 + g.next_message_id}})
-                    }
-                    "/get_group_msg_history" => json!({"status": "ok", "retcode": 0, "data": {"messages": []}}),
-                    _ => json!({"status": "ok", "retcode": 0, "data": {"card": "", "nickname": "tester", "user_id": SELF_ID}}),
+fn onebot_connection(
+    mut stream: TcpStream,
+    gateway: &Mutex<Gateway>,
+    control: &ListenerControl,
+) {
+    let Some(request) = read_request(&mut stream, control) else { return };
+    let path = request.request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let reply = {
+        let mut g = lock(gateway);
+        g.paths.push(path.clone());
+        g.requests.push((path.clone(),body.clone()));
+        match path.as_str() {
+            "/get_msg" => json!({"status":"ok","retcode":0,"data":{"group_id":GROUP_ID,"sender":{"user_id":SELF_ID.to_string()}}}),
+            "/send_group_msg" | "/send_private_msg" | "/send_msg" => {
+                if g.reject_send {
+                    respond(&mut stream,200,&json!({"status":"failed","retcode":1404,"wording":"synthetic refusal"}));
+                    return;
                 }
-            };
-            respond(&mut stream, 200, &reply);
-        });
-    }
+                g.sends.push(body.clone());
+                if g.drop_send_reply {
+                    return; // close without a reply
+                }
+                g.next_message_id += 1;
+                json!({"status": "ok", "retcode": 0, "data": {"message_id": 880000 + g.next_message_id}})
+            }
+            "/get_group_msg_history" => json!({"status": "ok", "retcode": 0, "data": {"messages": []}}),
+            _ => json!({"status": "ok", "retcode": 0, "data": {"card": "", "nickname": "tester", "user_id": SELF_ID}}),
+        }
+    };
+    respond(&mut stream, 200, &reply);
 }
 
 // ───────────────────────── rig ─────────────────────────
@@ -921,13 +1299,14 @@ struct Rig {
     console_port: u16,
     dsh: Arc<Dsh>,
     gateway: Arc<Mutex<Gateway>>,
-    console: Child,
+    console: Option<Child>,
     candidate: Option<Child>,
+    listeners: FakeListeners,
+    failed_briefing_turn: Option<usize>,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        lock(&self.dsh.inner).shutting_down=true;
         if thread::panicking() {
             for name in ["candidate-out.log", "candidate-err.log", "console-out.log", "console-err.log"] {
                 let text = fs::read_to_string(self.root.join(name)).unwrap_or_default();
@@ -935,13 +1314,22 @@ impl Drop for Rig {
                 eprintln!("---- {name} (tail) ----\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
             }
             eprintln!("---- turn ledger ----\n{}", fs::read_to_string(self.root.join("data/turn-ledger.jsonl")).unwrap_or_default());
+            if let Some(index) = self.failed_briefing_turn {
+                // The hosted runner prints the tail of captured failure output.
+                self.dsh.trace.dump(index);
+            }
         }
+        lock(&self.dsh.inner).shutting_down = true;
+        self.listeners.control.stop();
         if let Some(mut c) = self.candidate.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
-        let _ = self.console.kill();
-        let _ = self.console.wait();
+        if let Some(mut console) = self.console.take() {
+            let _ = console.kill();
+            let _ = console.wait();
+        }
+        self.listeners.join();
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -958,15 +1346,29 @@ impl Rig {
     // The hook runs in the reservation-to-child-bind interval, only in this fixture.
     fn new_with_console_hook(name: &str, opts: Opts, epoch: Option<i64>, mut after_release: impl FnMut(u16)) -> Self {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-ticket10-{name}-{}-{}", std::process::id(), now_ms())));
-        for dir in ["config", "data/logs", "resources", "user/dsh", "ambient"] {
-            fs::create_dir_all(root.join(dir)).expect("create runtime dir");
-        }
         // Keep the port reserved while the fake listeners bind: the ephemeral allocator may
         // otherwise give it to OneBot, whose generic 200 response can impersonate readiness.
         let console_reservation = console_fixture::reserve_port();
         let console_port = console_reservation.local_addr().expect("console addr").port();
         let dsh = Dsh::new(console_port);
         let gateway = Arc::new(Mutex::new(Gateway::default()));
+        // Own the root and every started listener before invoking the console startup hook.
+        let mut rig = Self {
+            root,
+            console_port,
+            dsh: dsh.clone(),
+            gateway: gateway.clone(),
+            console: None,
+            candidate: None,
+            epoch,
+            clock_advance_file: None,
+            listeners: FakeListeners::default(),
+            failed_briefing_turn: None,
+        };
+        let root = &rig.root;
+        for dir in ["config", "data/logs", "resources", "user/dsh", "ambient"] {
+            fs::create_dir_all(root.join(dir)).expect("create runtime dir");
+        }
 
         let dsh_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind dsh");
         let dsh_url = format!("http://127.0.0.1:{}", dsh_listener.local_addr().unwrap().port());
@@ -974,15 +1376,6 @@ impl Rig {
         let ob_url = format!("http://127.0.0.1:{}", ob_listener.local_addr().unwrap().port());
         let ws_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ws");
         let ws_url = format!("ws://127.0.0.1:{}", ws_listener.local_addr().unwrap().port());
-        {
-            let dsh = dsh.clone();
-            thread::spawn(move || serve_dsh(dsh_listener, dsh));
-            let g = gateway.clone();
-            thread::spawn(move || serve_onebot(ob_listener, g));
-            let g = gateway.clone();
-            thread::spawn(move || serve_gateway_ws(ws_listener, g));
-        }
-
         fs::write(
             root.join("config/config.json"),
             json!({
@@ -1037,10 +1430,20 @@ impl Rig {
             )
             .unwrap();
         }
+        rig.listeners.start(dsh_listener, true, move |stream, connection| {
+            dsh_connection(dsh.clone(), stream, connection);
+        });
+        let onebot = gateway.clone();
+        rig.listeners.start(ob_listener, true, move |stream, connection| {
+            onebot_connection(stream, &onebot, &connection.control);
+        });
+        rig.listeners.start(ws_listener, false, move |stream, connection| {
+            gateway_connection(stream, &gateway, &connection.control);
+        });
+
         drop(console_reservation);
         after_release(console_port);
-        let console = spawn_console_at_epoch(&root, console_port, epoch, None);
-        let mut rig = Self { root, console_port, dsh, gateway, console, candidate: None, epoch, clock_advance_file:None };
+        rig.console = Some(spawn_console_at_epoch(root, console_port, epoch, None));
         rig.wait_for_console_with_hook(Duration::from_secs(20), &mut after_release);
         rig
     }
@@ -1091,9 +1494,12 @@ impl Rig {
 
     fn restart_console_at_epoch(&mut self) {
         self.kill_candidate();
-        self.console.kill().unwrap();
-        self.console.wait().unwrap();
-        self.console=spawn_console_at_epoch(&self.root,self.console_port,self.epoch,self.clock_advance_file.as_deref());
+        let console = self.console.as_mut().expect("owned console");
+        console.kill().unwrap();
+        console.wait().unwrap();
+        *console = spawn_console_at_epoch(
+            &self.root, self.console_port, self.epoch, self.clock_advance_file.as_deref(),
+        );
         self.wait_for_console(LONG);
     }
 
@@ -1102,7 +1508,7 @@ impl Rig {
     }
 
     fn wait_for_console_with_hook(&mut self, timeout: Duration, after_release: &mut impl FnMut(u16)) {
-        console_fixture::wait_for_console(&mut self.console, &mut self.console_port, &self.root, CONSOLE_TOKEN, timeout, |port| {
+        console_fixture::wait_for_console(self.console.as_mut().expect("owned console"), &mut self.console_port, &self.root, CONSOLE_TOKEN, timeout, |port| {
             self.dsh.console_port.store(port, Ordering::Relaxed);
             after_release(port);
             spawn_console_at_epoch(&self.root, port, self.epoch, self.clock_advance_file.as_deref())
@@ -1169,6 +1575,45 @@ fn mention(id: i64, text: &'static str) -> Vec<Step> {
 const LONG: Duration = Duration::from_secs(45);
 
 #[test]
+fn fixture_drop_joins_all_listeners_with_silent_peers() {
+    let rig = Rig::new("listener-shutdown", Opts { seed_session: None });
+    let addresses = rig.listeners.addresses.clone();
+    assert_eq!(addresses.len(), 3);
+    let peers: Vec<_> = addresses
+        .iter()
+        .map(|address| TcpStream::connect_timeout(address, Duration::from_secs(2)).unwrap())
+        .collect();
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            lock(&rig.listeners.control.state).sockets.len() == peers.len()
+        }),
+        "all fake listeners must accept their silent peer before drop"
+    );
+
+    let (done, dropped) = std::sync::mpsc::channel();
+    let dropper = thread::spawn(move || {
+        drop(rig);
+        let _ = done.send(());
+    });
+    dropped
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Rig drop did not join all fake listeners with connected silent peers");
+    dropper.join().unwrap();
+    for address in addresses {
+        let err = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .expect_err("fake listener still accepts connections after Rig drop");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected connect error after Rig drop: {err:?}"
+        );
+    }
+    drop(peers);
+}
+
+#[test]
 fn fixture_console_retries_port_taken_after_reservation_release() {
     let mut collision = None;
     let mut attempts = Vec::new();
@@ -1184,7 +1629,7 @@ fn fixture_console_retries_port_taken_after_reservation_release() {
     let (status, health) = rig.console("GET", "/api/health", None);
     assert_eq!(status, 200);
     assert_eq!(health["ok"], true);
-    assert_eq!(health["pid"], rig.console.id());
+    assert_eq!(health["pid"], rig.console.as_ref().unwrap().id());
     assert_eq!(health["port"], rig.console_port);
     // Fake DSH tools must follow the replacement port too.
     rig.start_candidate(mention(142001, "wake after console bind collision"));
@@ -1963,12 +2408,66 @@ fn engage_window_end_is_a_clean_sleep_with_one_terminal_record() {
 }
 
 #[test]
+fn dsh_exhausted_wait_completes_as_observation_sleep_and_rearms_deadline() {
+    let mut rig = Rig::new("dsh-wait-limit-closeout", Opts { seed_session: None });
+    rig.patch_config(|cfg| {
+        let wake = &mut cfg["socialV2"]["wake"];
+        wake["preSleepWaitEnabled"] = json!(false);
+        wake["recommendedSleepMinMs"] = json!(75_000);
+        wake["recommendedSleepMaxMs"] = json!(90_000);
+        cfg["socialV2"]["wait"] = json!({"minMs":100,"maxMs":1000,"maxPerTurn":2});
+    });
+    let path = rig.root.join("data/social-v2.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let wake = &mut state["conversations"][GROUP_KEY]["wakeConfig"];
+    let consumed_deadline = json!("2020-01-01T00:00:00.000Z");
+    wake["infinite"] = json!(false);
+    wake["sleepUntil"] = consumed_deadline.clone();
+    let previous = wake.clone();
+    fs::write(&path, state.to_string()).unwrap();
+    {
+        let mut inner = lock(&rig.dsh.inner);
+        inner.observation_waits = true;
+        inner.close_turns = false;
+        inner.plan = Plan { send: None, hold: false };
+    }
+
+    rig.start_candidate(vec![]);
+    assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "{:?}", rig.turns());
+    let waits = lock(&rig.dsh.inner).wait_results.clone();
+    assert_eq!(waits.len(), 2, "{waits:?}");
+    assert!(waits.iter().all(|(status, _)| *status == 200), "{waits:?}");
+    assert_ne!(waits[0].1["waitLimitReached"], true);
+    assert_eq!(waits[1].1["waitLimitReached"], true);
+    assert_eq!(waits[1].1["nextAction"], "end_turn");
+
+    let ledger = read_locked(&rig.root.join("data/turn-ledger.jsonl"));
+    let ends: Vec<Value> = ledger.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["k"] == "ended").collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0]["reason"], "observationSleep", "DSH completion must honor the exhausted wait");
+
+    assert!(wait_for(Duration::from_secs(5), || {
+        fs::read_to_string(rig.root.join("candidate-out.log")).unwrap()
+            .contains("observation budget ended; keeping wake config")
+    }), "hub did not collect the sleeping turn");
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let wake = &state["conversations"][GROUP_KEY]["wakeConfig"];
+    let deadline = wake["sleepUntil"].as_str().expect("consumed finite deadline was not rearmed");
+    assert!(deadline > consumed_deadline.as_str().unwrap(), "{wake}");
+    assert_eq!(wake["sleepRangeMs"], json!([75_000, 90_000]));
+    for field in ["mode", "infinite", "triggers"] {
+        assert_eq!(wake[field], previous[field], "{wake}");
+    }
+    assert_eq!(rig.dsh.count("session/cancel"), 0);
+}
+
+#[test]
 fn a_capped_turn_is_cancelled_and_its_late_send_is_refused() {
     let mut rig = Rig::new("timeout", Opts { seed_session: None });
     rig.patch_config(|c| {
         c["socialV2"]["wake"]["preSleepWaitEnabled"] = json!(false);
-        // The smallest valid cap: observation 1 + quiet extension (100 + 5000) + 30000 = 35101 ms.
-        c["socialV2"]["wake"]["preSleepWaitMs"] = json!(1);
+        // With observation disabled, the minimum is quiet extension (100 + 5000) plus 30000 ms.
         c["socialV2"]["wait"] = json!({"minMs": 100, "maxMs": 100, "minQuietAfterNewMs": 0,
             "batchWindowMs":100,"batchMaxMs":100});
         c["socialV2"]["wake"]["turnHardCapMs"] = json!(36000);
@@ -3101,6 +3600,21 @@ fn reattached_running_turn_usage_is_written_once_to_the_rust_ledger() {
     assert_eq!(usage[0]["key"], json!(GROUP_KEY), "{ledger}");
 }
 
+fn await_completed_briefing_turn(rig: &mut Rig, index: usize) {
+    let mut state = String::new();
+    let settled = wait_for(LONG, || {
+        state = rig.turn_state(index);
+        matches!(state.as_str(), "completed" | "failed" | "cancelled")
+    });
+    if state != "completed" {
+        rig.failed_briefing_turn = Some(index);
+    }
+    assert!(
+        settled && state == "completed",
+        "wake {index} did not finish as completed (last state {state:?})"
+    );
+}
+
 // #85 seam 1: observe the actual DSH user input and explicit QQ sends, never real services.
 #[test]
 fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
@@ -3108,7 +3622,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     lock(&rig.dsh.inner).acknowledge_snapshot=true;
     fs::write(rig.root.join("data/initial-prompts.json"), json!({GROUP_KEY:{"text":"operator-briefing-85","createdAt":1,"updatedAt":1}}).to_string()).unwrap();
     rig.start_candidate(mention(85000, "first fresh snapshot 85"));
-    assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
+    await_completed_briefing_turn(&mut rig, 0);
     let first = rig.dsh.applied()[0].text.clone();
     assert!(first.contains("operator-briefing-85"), "a non-bootstrap first hydration lost operator background");
     assert!(first.contains("【简报 revision="));
@@ -3116,7 +3630,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     assert!(first.contains("【简报节 sending】\n【发送规则】") && first.contains("文本输出不会发送到 QQ"), "first non-bootstrap briefing lost tool-only delivery rules");
     for i in 1..25 {
         lock(&rig.gateway).frames.push(mention_event(85000+i as i64,"fresh delta message"));
-        assert!(wait_for(LONG, || rig.turn_state(i) == "completed"), "wake {i} did not finish");
+        await_completed_briefing_turn(&mut rig, i);
         let text = rig.dsh.applied()[i].text.clone();
         assert!(text.contains("【唤醒增量】"), "wake {i}: {text}");
         assert!(!text.contains("【别像客服】"), "wake {i} repeated unchanged rules");
@@ -3145,7 +3659,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
 
     rig.restart(vec![]);
     assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
-    assert!(wait_for(LONG, || rig.turn_state(25) == "completed"));
+    await_completed_briefing_turn(&mut rig, 25);
     assert!(!rig.dsh.applied()[25].text.contains("【别像客服】"), "durable hydration lost on restart");
     assert!(!rig.dsh.applied()[25].text.contains("【替换简报节 identity】"),"restart replaced the known bot identity");
     assert_eq!(rig.dsh.count("session/create"), 0);
@@ -3421,19 +3935,58 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     rig.dsh.set_plan(Plan{send:None,hold:false});
     rig.start_candidate(mention(85900,"prior high input call"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
-    rig.dsh.set_plan(Plan{send:None,hold:true});
-    rig.epoch=Some(now_ms()+245_000);
-    rig.restart(mention(85901,"active turn prevents rotation"));
-    assert!(wait_for(LONG,||rig.turn_state(1)=="running"));
-    let before=rig.dsh.received();
-    let digests=rig.dsh.digest_calls();
-    rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":1.01}));
-    thread::sleep(Duration::from_secs(3));
-    assert_eq!(rig.dsh.received(),before,"maintenance submitted a prompt during a running turn");
-    assert_eq!(rig.dsh.digest_calls(),digests,"normal turn overlaps a digest");
-    assert_eq!(rig.dsh.count("workspace/archiveSession"),0);
+    rig.dsh.set_plan(Plan { send: None, hold: true });
+    let advance_file = rig.root.join("clock-advance-ms");
+    rig.clock_advance_file = Some(advance_file.clone());
+    // Five minutes of cache life allows rotation after 240 idle seconds.
+    rig.epoch = Some(now_ms() + 180_000);
+    rig.restart(vec![]);
+    assert!(
+        wait_for(LONG, || lock(&rig.gateway).scripts.is_empty()),
+        "restarted candidate did not connect to the idle gateway"
+    );
+    let rotation_observed = || {
+        rig.dsh.digest_calls() != 0 || rig.dsh.count("workspace/archiveSession") != 0
+    };
+    assert!(
+        !wait_for(Duration::from_secs(6), rotation_observed),
+        "rotation started a digest or archive before the second mention"
+    );
+
+    lock(&rig.gateway).frames.push(mention_event(
+        85901,
+        "active turn prevents rotation",
+    ));
+    assert!(
+        wait_for(LONG, || {
+            let turns = rig.turns();
+            let Some(turn) = turns.get(1) else { return false };
+            let prompts = rig.dsh.applied();
+            let Some(prompt) = prompts.get(1) else { return false };
+            turn["state"] == "running"
+                && turn["sessionId"] == "js-origin-session"
+                && prompt.session == "js-origin-session"
+                && turn["attempts"][0]["rpcId"] == prompt.rpc_id.as_str()
+                && prompt.text.contains("active turn prevents rotation")
+        }),
+        "second running turn did not match its fake DSH prompt receipt"
+    );
+    let before = rig.dsh.received();
+    // Cross the same idle threshold from the second ingress, during the held turn.
+    let staged = advance_file.with_extension("tmp");
+    fs::write(&staged, "245000").unwrap();
+    fs::rename(staged, &advance_file).unwrap();
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(rig.turn_state(1), "running", "second turn did not stay held");
+    assert_eq!(
+        rig.dsh.received(),
+        before,
+        "maintenance submitted a prompt during a running turn"
+    );
+    assert_eq!(rig.dsh.digest_calls(), 0, "normal turn overlaps a digest");
+    assert_eq!(rig.dsh.count("workspace/archiveSession"), 0);
     rig.dsh.release();
-    assert!(wait_for(LONG,||rig.turn_state(1)=="completed"));
+    assert!(wait_for(LONG, || rig.turn_state(1) == "completed"));
 }
 
 

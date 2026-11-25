@@ -1,5 +1,7 @@
 //! Deterministic busy-group replay, using the production decision and scheduler seams.
 use super::*;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 
 #[test]
 fn hf129_busy_group_replay_measures_awake_time_and_wakes_with_rules_on_and_off() {

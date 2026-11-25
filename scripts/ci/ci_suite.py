@@ -2,7 +2,7 @@
 
 Known-red list (scripts/ci/known-red.txt), one entry per line, whitespace-separated:
     <os> <target> <test> #<ticket>
-os: linux | windows | any. target: a run-tests.py target name (unit or an her/tests stem). test: the
+os: linux | windows | any. target: a run-tests.py target name (unit, herupdate, memory_library or an her/tests stem). test: the
 libtest name exactly as printed in `test <name> ... FAILED`; there are no wildcards, so a crash, compile
 error, timeout or count mismatch is never known. ticket: the open issue that tracks the failure. Blank
 lines and lines starting with '#' are ignored; any other malformed line is an error.

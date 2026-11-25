@@ -13,8 +13,6 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1159,11 +1157,11 @@ pub fn spawn_gap_recovery(
     }))
 }
 
+const HISTORY_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// 调用网关的 OneBot HTTP 历史接口 `get_group_msg_history`。
 pub fn fetch_group_history(
-    host: &str,
-    port: u16,
-    token: &str,
+    ob: &crate::onebot::OneBot,
     group_id: i64,
     message_seq: Option<i64>,
 ) -> Result<HistoryPage, FetchError> {
@@ -1171,14 +1169,25 @@ pub fn fetch_group_history(
     if let Some(seq) = message_seq {
         body["message_seq"] = json!(seq);
     }
-    let (status, text) = http_post(host, port, "/get_group_msg_history", token, &body.to_string())
-        .map_err(FetchError::Transport)?;
-    match status {
+    let reply = ob
+        .post_raw(
+            "/get_group_msg_history",
+            &body.to_string(),
+            crate::loopback_http::Deadlines::split(
+                Duration::from_secs(5),
+                Duration::from_secs(8),
+                Duration::from_secs(8),
+            ),
+            crate::loopback_http::ResponseLimits::new(HISTORY_MAX_BYTES),
+        )
+        .map_err(|err| FetchError::Transport(err.detail))?;
+    match reply.status {
         200 => {}
-        404 | 405 | 501 => return Err(FetchError::Rejected(format!("HTTP {status}"))),
+        404 | 405 | 501 => return Err(FetchError::Rejected(format!("HTTP {}", reply.status))),
         other => return Err(FetchError::Transport(format!("HTTP {other}"))),
     }
-    let (value, _) = crate::aux_text::parse_json_replacing_lone_surrogates::<Value>(&text)
+    let (value, _) = reply
+        .parse_json::<Value>(crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd)
         .map_err(|e| FetchError::Transport(format!("history response is not JSON: {e}")))?;
     let Some(retcode) = value.get("retcode").and_then(Value::as_i64) else {
         return Err(FetchError::Unclear("history response has no retcode".to_string()));
@@ -1217,69 +1226,6 @@ fn parse_history_message(raw: &Value) -> Option<HistoryMessage> {
         seq: raw.get("message_seq").and_then(Value::as_i64),
         raw: raw.clone(),
     })
-}
-
-fn http_post(host: &str, port: u16, path: &str, token: &str, body: &str) -> Result<(u16, String), String> {
-    let address = format!("{host}:{port}")
-        .to_socket_addrs()
-        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("no address for {host}:{port}"))?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(8)))
-        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(8))))
-        .map_err(|e| format!("set timeout: {e}"))?;
-    let auth = if token.is_empty() {
-        String::new()
-    } else {
-        format!("Authorization: Bearer {token}\r\n")
-    };
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("read: {e}"))?;
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let (head, payload) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| "malformed HTTP status line".to_string())?;
-    let chunked = head
-        .lines()
-        .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:") && line.to_ascii_lowercase().contains("chunked"));
-    let body = if chunked { decode_chunked(payload)? } else { payload.to_string() };
-    Ok((status, body))
-}
-
-/// 解码 `Transfer-Encoding: chunked` 的响应体。
-fn decode_chunked(payload: &str) -> Result<String, String> {
-    let mut rest = payload;
-    let mut out = String::new();
-    loop {
-        let (size_line, after) = rest
-            .split_once("\r\n")
-            .ok_or_else(|| "truncated chunked body".to_string())?;
-        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| "bad chunk size".to_string())?;
-        if size == 0 {
-            return Ok(out);
-        }
-        let chunk = after.get(..size).ok_or_else(|| "truncated chunk".to_string())?;
-        out.push_str(chunk);
-        rest = after
-            .get(size..)
-            .and_then(|tail| tail.strip_prefix("\r\n"))
-            .ok_or_else(|| "bad chunk terminator".to_string())?;
-    }
 }
 
 #[cfg(test)]
@@ -1559,8 +1505,33 @@ mod tests {
 
     #[test]
     fn chunked_bodies_decode_and_history_items_parse() {
-        assert_eq!(decode_chunked("3\r\nabc\r\n0\r\n\r\n").unwrap(), "abc");
-        assert!(decode_chunked("zz\r\nabc\r\n0\r\n\r\n").is_err());
+        use crate::loopback_http::test_support::{MemoryTransport, ScriptedStreamConfig, Step};
+        use crate::loopback_http::{request, Deadlines, HttpRequest, LoopbackEndpoint, ResponseLimits};
+
+        let transport = MemoryTransport::new(vec![
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec(),
+            )),
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n".to_vec(),
+            )),
+        ]);
+        let ep = LoopbackEndpoint::localhost_v4(43103).unwrap();
+        let req = HttpRequest {
+            method: "POST",
+            path: "/get_group_msg_history",
+            headers: &[],
+            body: Some(b"{}"),
+        };
+        let deadlines = Deadlines::split(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let ok = request(&transport, &ep, &req, deadlines, ResponseLimits::new(1024)).unwrap();
+        assert_eq!(ok.body, b"abc");
+        assert!(request(&transport, &ep, &req, deadlines, ResponseLimits::new(1024)).is_err());
+
         let parsed = parse_history_message(&json!({"message_id": 5, "time": 9, "message_seq": 3})).unwrap();
         assert_eq!((parsed.message_id.as_str(), parsed.time_ms, parsed.seq), ("5", 9000, Some(3)));
     }
@@ -1911,5 +1882,86 @@ mod tests {
         assert!(ids.contains(&capped) && !ids.contains(&other), "{ids:?}");
         let gap = journal.gaps().unwrap().into_iter().find(|g| g.id == capped).unwrap();
         assert_eq!((gap.status.as_str(), gap.attempts, gap.next_retry_ms), ("unknown", 0, 0));
+    }
+
+    #[test]
+    fn fetch_group_history_decodes_chunked_replaces_surrogates_and_enforces_loopback_and_wire_caps() {
+        use crate::loopback_http::test_support::{MemoryTransport, ScriptedStreamConfig, Step};
+        use std::collections::VecDeque;
+        use std::io::ErrorKind;
+
+        let ok_body = r#"{"status":"ok","retcode":0,"data":{"messages":[{"message_id":55,"time":100,"message_seq":9,"raw_message":"hi \ud83d"}]}}"#;
+        let (a, b) = ok_body.split_at(32);
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            a.len(),
+            a,
+            b.len(),
+            b
+        )
+        .into_bytes();
+
+        let transport = Arc::new(MemoryTransport::new(vec![
+            Step::Stream(ScriptedStreamConfig::reply_bytes(chunked)),
+            // Oversized Content-Length (> 16 MiB) rejected before reading body.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{{}}",
+                    32 * 1024 * 1024
+                )
+                .into_bytes(),
+            )),
+            // HTTP 404 -> Rejected.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )),
+            // HTTP 429 -> Transport.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )),
+            // HTTP 500 -> Transport.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )),
+            // Timeout -> Transport.
+            Step::Stream(ScriptedStreamConfig {
+                write_plan: Vec::new(),
+                read_plan: VecDeque::from([Err(ErrorKind::TimedOut)]),
+                delay_per_read: Duration::ZERO,
+                delay_per_write: Duration::ZERO,
+            }),
+            // HTTP 200 with non-ok retcode -> Rejected/Transient/Unclear.
+            Step::Stream(ScriptedStreamConfig::reply_bytes({
+                let body = r#"{"status":"failed","retcode":1200}"#;
+                let len = body.len();
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n{body}").into_bytes()
+            })),
+            // HTTP 200 with empty body -> Transport.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )),
+        ]));
+        let ob = crate::onebot::OneBot::with_transport(
+            "http://127.0.0.1:43103",
+            "tok".into(),
+            transport.clone(),
+        )
+        .unwrap();
+
+        let page = fetch_group_history(&ob, 12, Some(8)).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].raw["raw_message"], "hi \u{FFFD}");
+
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transport(ref m)) if m.contains("exceeds limit")));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Rejected(_))));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transport(_))));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transport(_))));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transport(_))));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transient(_))));
+        assert!(matches!(fetch_group_history(&ob, 12, None), Err(FetchError::Transport(_))));
+
+        // Non-loopback OneBot fails strict loopback check without connecting.
+        let non_loopback = crate::onebot::OneBot::new("http://192.0.2.1:3000", String::new());
+        assert!(matches!(fetch_group_history(&non_loopback, 12, None), Err(FetchError::Transport(_))));
     }
 }

@@ -1,11 +1,17 @@
 //! The model and cost group, and the model route chosen per conversation (#162, `ConversationSetting`, the
 //! conversation scope).
 
-use crate::settings::kinds::{FileRule, Integer, ModelId, RouteId, RouteList};
+use crate::harness::budget::{
+    CONTEXT_TOKENS_MAX, CONTEXT_TOKENS_MIN, DEFAULT_HISTORY_SHARE, HISTORY_SHARE_MAX,
+    HISTORY_SHARE_MIN,
+};
+use crate::settings::kinds::{
+    BoundedNumber, FileRule, Integer, ModelId, RouteId, RouteList, RouteTokens, Switch,
+};
 use crate::settings::{ConversationSetting, Setting};
 
-/// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which `digest::model` falls back
-/// to); its model id rule also checks each route's model.
+/// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which
+/// `harness::one_shot` falls back to); its model id rule also checks each route's model.
 pub(crate) const HARNESS_MODEL: Setting = Setting {
     key: "harness.model",
     pointer: "/harness/model",
@@ -57,7 +63,7 @@ pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     secret: false,
 };
 
-/// Read by `digest::model`.
+/// Read by `harness::one_shot`.
 pub(crate) const DIGEST_MODEL: Setting = Setting {
     key: "memory.digest.model",
     pointer: "/memory/digest/model",
@@ -70,7 +76,7 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
     secret: false,
 };
 
-/// Read by `digest::model`.
+/// Read by `harness::one_shot`.
 pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     key: "memory.digest.timeoutSecs",
     pointer: "/memory/digest/timeoutSecs",
@@ -109,12 +115,58 @@ pub(crate) const HARNESS_FIRST_ROUTE: Setting = Setting {
     secret: false,
 };
 
+/// Read by `harness::budget::window`.
+pub(crate) const HARNESS_CONTEXT_TOKENS: Setting = Setting {
+    key: "harness.contextTokens",
+    pointer: "/harness/contextTokens",
+    kind: &RouteTokens { min: CONTEXT_TOKENS_MIN as i64, max: CONTEXT_TOKENS_MAX as i64 },
+    applies: "live",
+    group: "model and cost",
+    label: "Route context windows",
+    hint: "Estimated context window in tokens per route id (1000 to 10 million); unlisted routes use 64000. Read when each turn starts.",
+    chat: false,
+    secret: false,
+};
+
+/// Read by `harness::budget::share`.
+pub(crate) const HARNESS_HISTORY_SHARE: Setting = Setting {
+    key: "harness.historyShare",
+    pointer: "/harness/historyShare",
+    kind: &BoundedNumber {
+        min: HISTORY_SHARE_MIN,
+        max: HISTORY_SHARE_MAX,
+        default: DEFAULT_HISTORY_SHARE,
+    },
+    applies: "live",
+    group: "model and cost",
+    label: "History budget share",
+    hint: "Fraction of a route's context window one harness request may fill (0.1 to 0.95); read when each turn starts.",
+    chat: false,
+    secret: false,
+};
+
+/// Read by `harness::handover::prepare`.
+pub(crate) const HARNESS_SUMMARIES: Setting = Setting {
+    key: "harness.summaries",
+    pointer: "/harness/summaries",
+    kind: &Switch::new(true),
+    applies: "live",
+    group: "model and cost",
+    label: "History handover summaries",
+    hint: "Summarise older rounds when a session checkpoint folds history; false drops older rounds without asking a summary model.",
+    chat: false,
+    secret: false,
+};
+
 /// The group's settings, in registry order.
 pub(super) const SETTINGS: &[Setting] = &[
     HARNESS_MODEL,
     HARNESS_ROUTES,
     HARNESS_MAX_STEPS,
     HARNESS_MAX_TOKENS,
+    HARNESS_CONTEXT_TOKENS,
+    HARNESS_HISTORY_SHARE,
+    HARNESS_SUMMARIES,
     DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS,
     WEB_SEARCH_MODEL,

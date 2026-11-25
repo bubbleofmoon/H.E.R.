@@ -114,6 +114,12 @@ impl StoreProbe {
         self.open().query_row("SELECT count(*) FROM settings_audit", [], |row| row.get(0)).unwrap()
     }
 
+    /// The raw text of a global setting, or none when it has no row.
+    pub(crate) fn value(&self, key: &str) -> Option<String> {
+        use rusqlite::OptionalExtension as _;
+        self.open().query_row("SELECT value FROM settings WHERE key=?1", [key], |row| row.get(0)).optional().unwrap()
+    }
+
     /// Replaces the stored text of `key` without an audit row.
     pub(crate) fn set_value(&self, key: &str, text: &str) {
         self.open().execute("UPDATE settings SET value=?1 WHERE key=?2", [text, key]).unwrap();

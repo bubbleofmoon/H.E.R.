@@ -11,7 +11,7 @@
 //! 所以 `stream_events` 在 trait 里**故意不存在**：现在没有实现需要它，
 //! 摆一个空抽象比没有更糟 —— 会让人以为已经支持了。
 
-// 抽象层的接口现在只被 --backends 和单测用到，接进主链路之前整体允许 dead_code。
+// 抽象层接口允许保留未接进主链路的辅助方法（见 `#![allow(dead_code)]`）。
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
@@ -1286,7 +1286,7 @@ impl CliOutputFiles {
             if checked != path {
                 return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
             }
-            crate::guarded_credentials::create_credential(path)
+            crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
                 .map(Stdio::from)
                 .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
         } else {
@@ -1648,23 +1648,10 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     if key.trim().is_empty() {
         return Vec::new();
     }
-    let text = if context.is_isolated() {
-        context.read_text(RuntimeArea::Data, "social-v2.json").ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json")).ok()
+    let Ok(Some(conv)) = crate::conversation_state::ConversationState::for_runtime(context).read(key) else {
+        return Vec::new();
     };
-    let Some(text) = text else { return Vec::new() };
-    let v: Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let token = v
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|s| s.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .trim();
+    let token = conv.token().unwrap_or("").trim();
     if token.is_empty() {
         return Vec::new();
     }
@@ -1678,8 +1665,8 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
 ///
 /// 为什么必须自己解析：`std::process::Command::new("opencode")` 在 Windows 上
 /// **不会**按 PATHEXT 去找 .cmd/.ps1 —— 它只认 .exe，于是 npm 装的 CLI 一律
-/// 报 `program not found`。实测就是这么翻车的：`--backends` 说 ✅，`--backend-ask`
-/// 却说启动失败。**"在不在 PATH 里"和"能不能启动"是两回事。**
+/// 报 `program not found`。实测就是这么翻车的：配置检查通过，实际拉起子进程
+/// 却报启动失败。**"在不在 PATH 里"和"能不能启动"是两回事。**
 pub fn resolve_command(cmd: &str) -> Option<std::path::PathBuf> {
     if cmd.contains('/') || cmd.contains('\\') {
         let p = std::path::Path::new(cmd);

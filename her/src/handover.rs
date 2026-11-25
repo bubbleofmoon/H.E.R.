@@ -28,9 +28,7 @@ pub fn handover(
     old: &ProcessIdentity,
     platform: &mut dyn Platform,
 ) -> Result<(), String> {
-    let _gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
+    let _gate = crate::update::handover_gate(root)?;
     let current = platform
         .current("current")?
         .ok_or("current release unavailable")?;
@@ -384,22 +382,18 @@ impl Platform for Native {
         // Retain every observed owner before invoking retirement. If the CLI
         // dies or times out after a kill, its exit code alone cannot report it.
         let mut observed = vec![old.clone()];
-        for name in ["rbridge-live.lock", "rbridge-console.lock"] {
-            let path = self
-                .root
-                .root()
-                .join("runtime/data/logs")
-                .join(format!("{name}.owner.json"));
-            let marker = fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-            if let Some(identity) = marker.and_then(|marker| {
-                serde_json::from_value::<ProcessIdentity>(marker["identity"].clone()).ok()
-            }) {
-                if crate::update::same_release_image(&old.exe, &identity.exe)
-                    && crate::process_identity::check_identity(&identity) == Liveness::Matches
-                {
-                    observed.push(identity);
+        let logs_dir = self.root.root().join("runtime/data/logs");
+        if fs::symlink_metadata(&logs_dir)
+            .is_ok_and(|meta| meta.is_dir() && !crate::guarded_file::is_link(&meta))
+        {
+            for (name, role) in [("rbridge-live.lock", "live"), ("rbridge-console.lock", "console")] {
+                let lock_path = logs_dir.join(name);
+                if let Some(identity) = crate::update::probe_held_owner_identity(&lock_path, role) {
+                    if crate::update::same_release_image(&old.exe, &identity.exe)
+                        && crate::process_identity::check_identity(&identity) == Liveness::Matches
+                    {
+                        observed.push(identity);
+                    }
                 }
             }
         }
@@ -757,9 +751,7 @@ fn run(
     if !recovery {
         return handover(root, target, old, platform);
     }
-    let _gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
+    let _gate = crate::update::handover_gate(root)?;
     if platform.current("current")?.as_deref() != Some(target) {
         return Err("current changed before crash recovery".into());
     }
@@ -814,4 +806,66 @@ fn prune(root: &InstallRoot, platform: &mut dyn Platform) -> Result<(), String> 
         fs::remove_dir_all(path).map_err(|_| "old release could not be pruned")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_stop_retires_current_through_the_selected_cli() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let fixture = Fixture(crate::install_root::development_root(
+            std::env::temp_dir().join(format!(
+                "her-native-stop-{}-{}",
+                std::process::id(),
+                crate::update::wall_clock_ms()
+            )),
+        ));
+        let current = "v1.2.3";
+        let fallback = "v1.2.2";
+        for path in [
+            "runtime/data/lifecycle",
+            "runtime/data/logs",
+            "releases/v1.2.3",
+            "releases/v1.2.2",
+        ] {
+            fs::create_dir_all(fixture.0.join(path)).unwrap();
+        }
+        for name in ["rbridge-supervisor", "rbridge-live", "rbridge-console"] {
+            fs::File::create(fixture.0.join(format!("runtime/data/logs/{name}.lock"))).unwrap();
+        }
+        // The suite builds the CLI in the target directory before running this test.
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| PathBuf::from("target"), PathBuf::from);
+        let cli = target
+            .join("debug")
+            .join(format!("her-cli{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(&cli, fixture.0.join("releases/v1.2.2/her-cli.exe"))
+            .unwrap_or_else(|error| panic!("copy built CLI from {}: {error}", cli.display()));
+
+        let root = InstallRoot::new(&fixture.0).unwrap();
+        switch_link(&root, "current", current).unwrap();
+        let mut native = Native {
+            root,
+            target: current.into(),
+            recovery: false,
+            automatic: false,
+            child: None,
+            launches: 0,
+        };
+        // Only the fallback has a CLI. There are no owned processes in the fixture.
+        native.stop(current, fallback).unwrap();
+        assert_eq!(
+            native.stop(fallback, fallback).unwrap_err(),
+            "failed release could not be retired",
+            "retire-current must receive the failed tag and propagate CLI refusal"
+        );
+    }
 }

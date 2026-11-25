@@ -872,18 +872,15 @@ const MIN_TURN_HARD_CAP_MS: i64 = 120_000;
 pub const DEFAULT_TURN_HARD_CAP_MS: i64 =
     PRE_SLEEP_WAIT_DEFAULT_MS + DEFAULT_WAIT_MAX_QUIET_MS + WAIT_QUIET_SLACK_MS + TURN_HEADROOM_MS;
 
-/// The pre-sleep gate's reading (`pre_sleep_remaining`, wait results).
+/// Effective pre-sleep and engagement duration. Zero disables both.
 pub fn pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    timing::PRE_SLEEP.integer(cfg)
+    let duration = timing::PRE_SLEEP.integer(cfg);
+    if timing::PRE_SLEEP_ENABLED.switch(cfg) { duration } else { 0 }
 }
 
-/// The observation the agent is told to wait for (prompt, closing reminder, closing refusals).
-/// JS `Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000)`: 0 and non-numbers mean 300000.
-pub fn prompt_pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    match timing::PRE_SLEEP.integer(cfg) {
-        0 => timing::PRE_SLEEP.integer(&Value::Null),
-        ms => ms,
-    }
+/// Private conversations may use the engagement window without a mandatory observation.
+pub fn required_pre_sleep_ms(cfg: &Value, key: &str) -> i64 {
+    if key.starts_with("private:") { 0 } else { pre_sleep_wait_ms(cfg) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,11 +890,9 @@ pub struct TurnBudget {
 }
 
 /// The longest observation a turn may be asked for, plus the messages wait's quiet extension.
-/// The prompt does not read `preSleepWaitEnabled`, so neither does the budget.
 fn observation_with_quiet_ms(cfg: &Value) -> i64 {
-    prompt_pre_sleep_wait_ms(cfg)
-        .max(pre_sleep_wait_ms(cfg))
-        .saturating_add(crate::console::wait_max_quiet_ms(cfg))
+    pre_sleep_wait_ms(cfg)
+        .saturating_add(crate::social_state::wait_max_quiet_ms(cfg))
         .saturating_add(WAIT_QUIET_SLACK_MS)
 }
 
@@ -986,9 +981,6 @@ pub fn reserved2_collector_ms(cfg: &Value) -> u64 {
 /// Length of her engagement window (`preSleepWaitMs`), or `None` when the window does not
 /// exist (`preSleepWaitEnabled=false` or a non-positive gate reading).
 pub fn engagement_window_ms(cfg: &Value) -> Option<i64> {
-    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
-        return None;
-    }
     Some(pre_sleep_wait_ms(cfg)).filter(|ms| *ms > 0)
 }
 
@@ -1002,8 +994,9 @@ pub fn engagement_end(st: &Value, cfg: &Value) -> Option<i64> {
 
 /// JS 的 `preSleepWaitBlockedV2`：返回还要等多久（None = 不拦）。
 /// While she is engaged the requirement never outlasts her engagement window.
-pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
-    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
+pub fn pre_sleep_remaining(st: &Value, cfg: &Value, key: &str, now: i64) -> Option<i64> {
+    let wait_ms = required_pre_sleep_ms(cfg, key);
+    if wait_ms == 0 {
         return None;
     }
     if has_explicit_end(st) {
@@ -1013,7 +1006,6 @@ pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
     if window_end.is_some_and(|end| now >= end) {
         return None;
     }
-    let wait_ms = pre_sleep_wait_ms(cfg);
     let last_incoming = st.get("lastIncomingAt").and_then(|v| v.as_i64()).unwrap_or(0);
     if last_incoming > 0 && now - last_incoming >= wait_ms {
         return None;

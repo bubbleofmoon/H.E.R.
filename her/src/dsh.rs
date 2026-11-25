@@ -7,7 +7,7 @@
 //!   特例  session/prompt 必须带 requestId`
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use crate::dsh_credential::Credential;
 use crate::runtime::RuntimeContext;
@@ -296,6 +296,20 @@ pub(crate) fn mint_request_id() -> String {
         &hex[17..20],
         &hex[20..32]
     )
+}
+
+pub(crate) fn rpc_for(context: &RuntimeContext, cfg: &serde_json::Value) -> Result<Rpc, String> {
+    let base = if context.is_isolated() {
+        context
+            .dependency_url("dsh")
+            .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?
+    } else {
+        cfg.get("dsh")
+            .and_then(|d| d.get("baseUrl"))
+            .and_then(|b| b.as_str())
+            .unwrap_or("http://127.0.0.1:3080")
+    };
+    Rpc::connect_with_runtime(context, base)
 }
 
 pub struct Rpc {
@@ -633,77 +647,6 @@ impl Rpc {
     }
 }
 
-// ── 演示：建会话 + 投 prompt（A2 验收）────────────────────────────────────────
-
-/// 用 Rust 建一个会话并投一句 prompt，打印每步结果。
-pub async fn demo_create_and_prompt(base: &str, preset: &str) -> Result<(), String> {
-    let rpc = Rpc::connect(base)?;
-    println!("[dsh] 1/5 Cookie 铸造成功");
-
-    let list = rpc.call("session/list", serde_json::json!({}))?;
-    let n = list.get("items").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(0);
-    println!("[dsh] 2/5 session/list ok：{n} 个会话");
-
-    let presets = rpc.call("agentPresets/list", serde_json::Value::Null)?;
-    let names: Vec<String> = presets
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    println!("[dsh] 3/5 可用预设：{}", names.join(", "));
-
-    let ws_dir = crate::legacy_path!("state/rust-demo");
-    let _ = std::fs::create_dir_all(ws_dir);
-    let ws = rpc.call("workspace/create", serde_json::json!({ "path": ws_dir }))?;
-    let ws_id = ws
-        .get("workspace")
-        .and_then(|w| w.get("workspaceId"))
-        .and_then(|i| i.as_str())
-        .ok_or_else(|| format!("workspace/create 没返回 workspaceId：{ws}"))?
-        .to_string();
-    println!("[dsh] 4/5 workspace/create ok：{ws_id}");
-    let _ = rpc.call(
-        "workspace/rename",
-        serde_json::json!({ "workspaceId": ws_id, "title": "Rust 移植验证" }),
-    );
-
-    let sess = rpc.call(
-        "session/create",
-        serde_json::json!({ "workspaceId": ws_id, "agentPreset": preset }),
-    )?;
-    let sid = sess
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| format!("session/create 没返回 sessionId：{sess}"))?
-        .to_string();
-    println!("[dsh] 5/5 session/create ok：{sid}（预设 {preset}）");
-
-    // A3：**先订阅再投 prompt**。反过来的话回合可能在订阅建立前就结束，
-    // 实时流不会重放，只能读快照，那样分不清是这轮还是上一轮的回复。
-    let mut follow = FollowStream::open(base, &rpc.cookie(), &sid).await?;
-    println!("[dsh] 已订阅事件流（baseline seq={}）", follow.baseline_seq());
-
-    let accepted = rpc.call(
-        "session/prompt",
-        serde_json::json!({
-            "sessionId": sid,
-            "mode": "queue",
-            "content": [{ "type": "text", "text": "只回复两个字：收到" }]
-        }),
-    )?;
-    println!("[dsh] prompt 已投递：{}", accepted);
-
-    println!("[dsh] 等回复（实时事件流）…");
-    let reply = follow.next_turn(std::time::Duration::from_secs(120)).await?;
-    follow.close().await;
-    println!("[dsh] ✅ 拿到回复：{reply}");
-    println!("[dsh] ✅ A2+A3 通过（会话 {sid}）");
-    Ok(())
-}
-
 // ── A3：session/follow 事件流 ────────────────────────────────────────────────
 
 use futures_util::{SinkExt, StreamExt};
@@ -980,6 +923,7 @@ pub struct FollowStream {
     briefing: Option<(RuntimeContext, String, String, String)>,
     /// 本回合的工具调用（`turn/start` 时清空）。
     pub tools: Vec<ToolFact>,
+    pub(crate) refusal: RefusalSources,
 }
 
 /// 开场快照：历史事件、inbox 与覆盖范围。
@@ -1016,6 +960,7 @@ pub struct ToolFact {
     pub name: String,
     pub done: bool,
     pub ok: bool,
+    pub(crate) step: Option<u64>,
 }
 
 impl ToolFact {
@@ -1039,7 +984,8 @@ pub fn fold_tool_event(tools: &mut Vec<ToolFact>, event: &serde_json::Value) {
         Some("tool/call") => {
             let call_id = call_id_text(data.and_then(|d| d.get("callId")));
             let name = data.and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
-            tools.push(ToolFact { call_id, name, done: false, ok: false });
+            let step = data.and_then(|d| d["step"].as_u64());
+            tools.push(ToolFact { call_id, name, done: false, ok: false, step });
         }
         Some("tool/result") => {
             let message = data.and_then(|d| d.get("message"));
@@ -1052,6 +998,63 @@ pub fn fold_tool_event(tools: &mut Vec<ToolFact>, event: &serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// DSH emits calls and results for each tool round. Count distinct completed rounds and
+/// retry starts, since several tool results can share one model call.
+#[derive(Default)]
+pub(crate) struct RefusalSources {
+    pub messages: Vec<serde_json::Value>,
+    tool_steps: HashSet<u64>,
+    retries: HashSet<(u64, u64)>,
+    missing_step: bool,
+}
+
+impl RefusalSources {
+    pub fn model_call(&self) -> Option<usize> {
+        (!self.missing_step).then(|| self.tool_steps.len() + self.retries.len() + 1)
+    }
+
+    fn observe(&mut self, kind: &str, data: &serde_json::Value, tools: &[ToolFact]) {
+        let step = data["step"].as_u64();
+        if kind == "llm/retry-started" {
+            if let Some(step) = step {
+                self.retries.insert((step, data["retry"].as_u64().unwrap_or(1)));
+            } else {
+                self.missing_step = true;
+            }
+            return;
+        }
+        if kind != "tool/result" {
+            return;
+        }
+        let message = &data["message"];
+        let call_id = call_id_text(message.pointer("/source/callId"));
+        let tool = tools.iter().rev().find(|tool| !call_id.is_empty() && tool.call_id == call_id && !tool.done);
+        if let Some(step) = step.or_else(|| tool.and_then(|tool| tool.step)) {
+            self.tool_steps.insert(step);
+        } else {
+            self.missing_step = true;
+        }
+        let Some(tool) = tool.filter(|tool| !tool.done && message["isError"] != true && data["error"].is_null()) else {
+            return;
+        };
+        let field = match tool.name.rsplit("__").next() {
+            Some("qq_wait_for_messages") => "newMessages",
+            Some("qq_get_unread_messages") => "messages",
+            _ => return,
+        };
+        if let Some(blocks) = message["content"].as_array() {
+            for block in blocks.iter().filter(|block| block["type"] == "text") {
+                if let Some(packet) = block["text"].as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                {
+                    let refs = crate::model_failure::message_refs(&packet[field]);
+                    crate::model_failure::merge_refs(&mut self.messages, refs);
+                }
+            }
+        }
     }
 }
 
@@ -1198,6 +1201,7 @@ impl FollowStream {
             snapshot,
             briefing: None,
             tools: Vec::new(),
+            refusal: RefusalSources::default(),
         })
     }
 
@@ -1222,9 +1226,9 @@ impl FollowStream {
 
     fn track_mapped_briefing(&mut self, rpc: &Rpc, sid: &str) -> Result<(), String> {
         let context = rpc.credential().context();
-        if context.is_isolated() && crate::console::runtime_mode(context) == "reserved2" {
+        if context.is_isolated() && crate::social_state::mode(context) == "reserved2" {
             if let Some((key, _)) = crate::session_map::all(context)?.into_iter().find(|(_, mapped)| mapped == sid) {
-                if let Some(epoch) = crate::console::conversation_token(context, &key)? {
+                if let Some(epoch) = crate::social_state::token(context, &key)? {
                     self.track_briefing(context, &key, sid, &epoch)?;
                 }
             }
@@ -1232,6 +1236,8 @@ impl FollowStream {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn baseline_seq(&self) -> i64 {
         self.baseline_seq
     }
@@ -1321,8 +1327,13 @@ impl FollowStream {
                 crate::session_context::observe(context,key,sid,epoch,event)?;
             }
             self.observe_usage(event);
-            if (etype == "tool/call" || etype == "tool/result") && turn_id == self.current_turn {
-                fold_tool_event(&mut self.tools, event);
+            if turn_id.is_some() && turn_id == self.current_turn {
+                if let Some(data) = data {
+                    self.refusal.observe(etype, data, &self.tools);
+                }
+                if matches!(etype, "tool/call" | "tool/result") {
+                    fold_tool_event(&mut self.tools, event);
+                }
             }
             match etype {
                 "turn/start" => {
@@ -1331,6 +1342,7 @@ impl FollowStream {
                     self.turn_text.clear();
                     self.turn_usage.clear();
                     self.tools.clear();
+                    self.refusal = RefusalSources::default();
                 }
                 "assistant/message" => {
                     if turn_id.is_some() && turn_id == self.current_turn {
@@ -1835,54 +1847,9 @@ pub(crate) fn switch_history(rpc: &Rpc, sid: &str, limit: usize) -> Result<Vec<S
     })
 }
 
-pub async fn watch_raw(base: &str, cookie: &str, session_id: &str, secs: u64) -> Result<(), String> {
-    let ws_url = format!("{}/api/remote.mux", base.replacen("http://", "ws://", 1));
-    let mut request = ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|e| format!("构造 WS 请求失败：{e}"))?;
-    request
-        .headers_mut()
-        .insert("Cookie", cookie.parse().map_err(|_| "Cookie 头非法".to_string())?);
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("连 mux 失败：{e}"))?;
-    println!("[watch] WS 已连上");
-
-    let stream_id = mint_request_id();
-    let open = serde_json::json!({
-        "type": "open",
-        "streamId": stream_id,
-        "endpoint": "session/follow",
-        "payload": { "args": { "request": {
-            "address": { "kind": "session", "sessionId": session_id },
-            "maxMessages": 10
-        } } }
-    });
-    ws.send(Message::Text(open.to_string())).await.map_err(|e| e.to_string())?;
-    println!("[watch] 已发送 open（stream {stream_id}）");
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while !deadline.saturating_duration_since(tokio::time::Instant::now()).is_zero() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let head: String = crate::activity::preview_chars(&t, 400);
-                println!("[watch] 帧：{head}");
-            }
-            Ok(Some(Ok(_))) => println!("[watch] 非文本帧"),
-            Ok(Some(Err(e))) => { println!("[watch] 错误：{e}"); break }
-            Ok(None) => { println!("[watch] 流结束"); break }
-            Err(_) => break,
-        }
-    }
-    let _ = ws.close(None).await;
-    Ok(())
-}
-
-
-/// 诊断用：拉一次 snapshot，列出事件类型与该会话里所有 assistant 文本。
-pub async fn dump_snapshot(base: &str, cookie: &str, session_id: &str) -> Result<(), String> {
+/// Snapshot diagnostic used by live-bridge log-masking tests.
+#[cfg(test)]
+pub(crate) async fn dump_snapshot(base: &str, cookie: &str, session_id: &str) -> Result<(), String> {
     let ws_url = format!("{}/api/remote.mux", base.replacen("http://", "ws://", 1));
     let mut request = ws_url.as_str().into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Cookie", cookie.parse().map_err(|_| "Cookie 非法".to_string())?);
