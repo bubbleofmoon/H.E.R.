@@ -298,7 +298,10 @@ pub(super) fn rank(
     if !reader.conn.is_autocommit() {
         return None;
     }
-    let runner = &semantic.model.unwrap_or_else(DenseModel::shared).runner;
+    let runner = match semantic.model {
+        Some(model) => &model.runner,
+        None => &DenseModel::shared().runner,
+    };
     let deadline = Instant::now() + INFERENCE_BUDGET;
     let Inference {
         query: result,
