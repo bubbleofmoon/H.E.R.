@@ -1,28 +1,23 @@
 //! P10：控制台 HTTP 服务（Rust 版）。
 //!
-//! 目标是把 JS 桥接那 99 个 `/api/*` 端点搬过来，前端 `public/console.html` 原样 serve，
-//! 不重写页面 —— 页面只是一堆 `fetch('/api/...')`，跟后端语言无关。
-//!
-//! 这一版只做骨架 + 两个最好对拍的读类端点（status / whitelist）：
-//! 先把「路由 + 令牌 + JSON 契约」这套地基验住，再往里加端点。
+//! API endpoints (`/api/*`) paired with the embedded V3 SPA served from `console_ui` (`her-ui/dist/`).
 //!
 //! 设计约束（都是踩过的坑）：
 //!   · 令牌校验用定长比较，且**所有**路由都要过，包括 `/`
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
-//!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
+use crate::console_auth::{credential_digest, credential_eq};
+use crate::conversation_state::{Conversation, ConversationState, SocialDocument};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 /// 写类端点改的那份文件（与 CONFIG_PATH 同一个，单独命名是为了让读/写意图在代码里可辨）
 const CFG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
-const CONSOLE_HTML: &str = crate::legacy_path!("qq-bridge/public/console.html");
 /// DSH Web 总账文件名：events 里的 day/model/cost/tokens 是**所有入口**（含 Web GUI / CLI）的用量。
 /// No-root callers find it under the explicit DSH home; isolated callers use `user/dsh`.
 const DSH_USAGE_FILE_NAME: &str = ".dshw-usage.json";
@@ -41,14 +36,75 @@ mod feedback_routes;
 mod voice_http;
 #[path = "console_access.rs"]
 mod access;
-pub(crate) use access::take_admin_wake;
-pub(crate) use access::access_setting_change;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
-pub(crate) use crate::conversation_authority::{
-    ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
-    revoke as revoke_agent_token, token as conversation_token,
+#[path = "console/inspector.rs"]
+pub(crate) mod inspector;
+#[path = "console_front.rs"]
+pub(crate) mod front;
+use crate::dsh::rpc_for as dsh_rpc_for;
+use crate::role::sanitize_name as sanitize_role_name;
+use crate::social_state::{
+    self, approved_group_allowed, canonical_key as canonical_v2_key,
+    is_js_trim_char as social_policy_js_trim_char, js_string as social_policy_js_string,
+    js_truthy, legacy_write_error, now_ms,
+    projection_session_allowed as social_v2_projection_session_allowed,
+    session_allowed as social_v2_session_allowed, social_v1_number, social_v1_spread,
+    turn_send_cap, wait_console_generation, wait_live_path, wait_policy, SocialError, END_TURN,
 };
+
+fn config_gate(
+    context: &RuntimeContext,
+) -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
+    crate::config_tx::acquire_config_gate(context)
+}
+
+fn acquire_social_state_gate(
+    context: &RuntimeContext,
+) -> Result<crate::conversation_state::Gate, (u16, String)> {
+    social_state::acquire_gate(context).map_err(SocialError::into_http)
+}
+
+use crate::config_tx::redact_setting;
+#[cfg(test)]
+use crate::config_tx::{
+    is_setting_writable, setting_is_secret, SETTINGS_MIRROR_UNFINISHED, SETTINGS_READ_REFUSED,
+    SETTINGS_WRITABLE,
+};
+#[cfg(test)]
+use crate::conversation_state::{
+    new_conversation, read_console_document as load_social_state_for,
+    update_raw as mutate_social_state_for,
+};
+#[cfg(test)]
+use crate::social_state::{
+    key_in_allowlist, observation_wait_turn, record_reserved2_incoming, rotate_idle_session,
+    turn_budget_ended,
+};
+#[cfg(test)]
+fn conversation_token(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
+    social_state::token(context, key).map_err(String::from)
+}
+#[cfg(test)]
+fn ensure_or_rotate_agent_token(
+    context: &RuntimeContext,
+    key: &str,
+    rotate: bool,
+) -> Result<String, String> {
+    social_state::ensure_or_rotate(context, key, rotate).map_err(String::from)
+}
+#[cfg(test)]
+fn conversation_scope_change(
+    context: &RuntimeContext,
+    conversation: &str,
+    action: &str,
+) -> Result<Value, (u16, String)> {
+    crate::config_tx::change_conversation_scope(context, conversation, action)
+        .map_err(SocialError::into_http)
+}
+#[cfg(test)]
+use crate::conversation_state::update_selected_raw as update_selected_social_state;
+#[cfg(test)]
 use crate::memory_actions::handle as handle_memory_action;
 #[cfg(test)]
 pub(crate) use crate::memory_actions::tool_action as memory_tool_action;
@@ -178,9 +234,8 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
         _ => return Err((400, "memoryOnly must be boolean".into())),
     };
     let applying = req.path == "/api/backups/restore";
-    let _authority = if applying { config_gate(context)? } else { None };
+    let _authority = config_gate(context)?;
     let cfg = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &cfg) { return Err((401, "console credential was revoked".into())); }
     let root = context.runtime_root().ok_or((400, "restore requires a selected runtime".to_string()))?;
     let settings = crate::backup::Settings::from_config_resolved(root, &cfg).map_err(|e| (400, e))?;
     let archive = settings.destination.join(name);
@@ -194,46 +249,72 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
     })
 }
 
-fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
+fn handle_backup_settings_post_tx(
+    context: &RuntimeContext,
+    req: &Request,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&req.body) else {
-        return Err((400, "body must be a JSON object".into()));
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "body must be a JSON object",
+        ));
     };
-    if fields.keys().any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState")) {
-        return Err((400, "unknown backup setting".into()));
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState"))
+    {
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "unknown backup setting",
+        ));
     }
-    let _gate = config_gate(context)?;
-    let current = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &current) {
-        return Err((401, "console credential was revoked".into()));
-    }
-    let mut cfg = raw_config_for_write(context)?;
-    if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
-    let base = cfg.clone();
-    let time = fields.remove("time").map(|value| {
-        if value.is_null() { crate::settings::BACKUP_TIME.default_value() } else { value }
-    });
-    let backup = cfg["backup"].as_object_mut().ok_or((400, "backup must be a JSON object".to_string()))?;
-    backup.extend(fields);
-    let mut proposed = cfg.clone();
-    proposed["backup"]["time"] = time.clone().unwrap_or_else(|| crate::settings::BACKUP_TIME.read(&current));
-    let root = context.runtime_root().ok_or((400, "backup requires a selected runtime root".to_string()))?;
-    let settings = crate::backup::Settings::from_config_resolved(root, &proposed).map_err(|error| (400, error))?;
-    let view = settings.view().map_err(|error| (400, error))?;
-    if let Some(time) = time {
-        let changes = crate::settings::console_changes(context, &base, &json!({"backup":{"time":time}}))?;
-        if !changes.is_empty() {
-            note_config_before_request(context);
-            crate::settings::apply_changes(context, changes, "administrator", "console")?;
-            let latest = raw_config_object(context)?;
-            crate::settings::keep_registry_values(&latest, &mut cfg)
-                .map_err(|key| (400, format!("config.json cannot hold {key}")))?;
+    crate::config_tx::commit_page_config(context, |ctx| {
+        let current = selected_config_for_handler(ctx)?;
+        let mut cfg = raw_config_for_write(ctx)?;
+        if cfg.get("backup").is_none_or(Value::is_null) {
+            cfg["backup"] = json!({});
         }
-    }
-    let text = serde_json::to_string_pretty(&cfg).map_err(|error| (500, error.to_string()))?;
-    write_selected_config_text(context, &text).map_err(|error| config_write_error(context, error))?;
-    Ok(json!({"ok":true,"settings":view}))
+        let base = cfg.clone();
+        let time = fields.remove("time").map(|value| {
+            if value.is_null() {
+                crate::settings::BACKUP_TIME.default_value()
+            } else {
+                value
+            }
+        });
+        let backup = cfg["backup"]
+            .as_object_mut()
+            .ok_or((400, "backup must be a JSON object".to_string()))?;
+        backup.extend(fields);
+        let mut proposed = cfg.clone();
+        proposed["backup"]["time"] = time
+            .clone()
+            .unwrap_or_else(|| crate::settings::BACKUP_TIME.read(&current));
+        let root = ctx
+            .runtime_root()
+            .ok_or((400, "backup requires a selected runtime root".to_string()))?;
+        let settings = crate::backup::Settings::from_config_resolved(root, &proposed)
+            .map_err(|error| (400, error))?;
+        let view = settings.view().map_err(|error| (400, error))?;
+        let carried = match time {
+            Some(time) => json!({ "backup": { "time": time } }),
+            None => json!({}),
+        };
+        Ok(crate::config_tx::PageConfigWrite {
+            file: cfg,
+            base_for_changes: base,
+            carried,
+            confirm: false,
+            check_canonical_before_store: false,
+            keep_stored_always: false,
+            prior_wake: None,
+            keep_error_fmt: |key| (400, format!("config.json cannot hold {key}")),
+            isolated_write_error_503: true,
+            wake_error_prefix: "",
+            finish: Box::new(move |_, _| Ok(json!({ "ok": true, "settings": view }))),
+        })
+    })
 }
-
 
 fn handle_release_approve(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
     let body: Value =
@@ -244,37 +325,53 @@ fn handle_release_approve(context: &RuntimeContext, req: &Request) -> Result<Val
     let tag = body["tag"]
         .as_str()
         .ok_or((400, "displayed release tag is required".into()))?;
-    let _gate = config_gate(context)?;
-    let cfg = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &cfg) {
-        return Err((401, "console credential was revoked".into()));
-    }
-    crate::release::approve(context, &cfg, tag).map_err(|error| (409, error))
+    crate::release::approve_authorized(context, tag, || {
+        let gate = config_gate(context)?;
+        let cfg = selected_config_for_handler(context)?;
+        Ok((gate, cfg))
+    })
+    .map_err(|error| match error {
+        crate::release::ApproveError::Release(message) => (409, message),
+        crate::release::ApproveError::Authorize(error) => error,
+    })
 }
 
-
-fn handle_release_settings_post(context:&RuntimeContext,req:&Request)->Result<Value,(u16,String)> {
-    let Ok(Value::Object(fields))=serde_json::from_str::<Value>(&req.body) else {return Err((400,"body must be a JSON object".into()))};
-    if fields.keys().any(|key|!matches!(key.as_str(),"policy"|"feedUrl")){return Err((400,"unknown update setting".into()));}
-    let _gate=config_gate(context)?;
-    let current=selected_config_for_handler(context)?;
-    if !authorized_in(context,req,&current){return Err((401,"console credential was revoked".into()));}
-    let mut cfg=raw_config_for_write(context)?;
-    if cfg.get("update").is_none_or(Value::is_null){cfg["update"]=json!({});}
-    let update=cfg["update"].as_object_mut().ok_or((400,"update must be an object".into()))?;
-    for(key,value)in fields{update.insert(key,value);}
-    cfg["update"]=crate::release::settings(&cfg).map_err(|error|(400,error))?;
-    let text=serde_json::to_string_pretty(&cfg).map_err(|_|(500,"configuration cannot be serialized".into()))?;
-    write_selected_config_text(context,&text).map_err(|error|config_write_error(context,error))?;
-    Ok(json!({"ok":true,"settings":cfg["update"]}))
-}
-
-fn config_write_error(context: &RuntimeContext, error: String) -> (u16, String) {
-    if context.is_isolated() {
-        (503, "runtime config is unavailable".to_string())
-    } else {
-        (500, error)
+fn handle_release_settings_post_tx(
+    context: &RuntimeContext,
+    req: &Request,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&req.body) else {
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "body must be a JSON object",
+        ));
+    };
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "policy" | "feedUrl"))
+    {
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "unknown update setting",
+        ));
     }
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::Canonical,
+        |cfg| {
+            if cfg.get("update").is_none_or(Value::is_null) {
+                cfg["update"] = json!({});
+            }
+            let update = cfg["update"]
+                .as_object_mut()
+                .ok_or((400, "update must be an object".to_string()))?;
+            for (key, value) in fields {
+                update.insert(key, value);
+            }
+            cfg["update"] = crate::release::settings(cfg).map_err(|error| (400, error))?;
+            Ok(json!({ "ok": true, "settings": cfg["update"] }))
+        },
+    )
 }
 
 fn write_text_atomic_for(context: &RuntimeContext, path: &str, text: &str) -> Result<(), String> {
@@ -283,187 +380,13 @@ fn write_text_atomic_for(context: &RuntimeContext, path: &str, text: &str) -> Re
     }
     let (area, relative) = runtime_location(path)?;
     if area == RuntimeArea::Config && relative == "config.json" {
-        return write_selected_config_text(context, text);
+        return Err("config.json writes must use config_tx".to_string());
     }
     context.write_atomic(area, &relative, text.as_bytes())
 }
 
-thread_local! {
-    /// The selected `config.json` before this request's first write and after its last one, noted
-    /// by the writer while it holds the config gate: an audit record holds exactly the change its
-    /// own request made, never a concurrent writer's.
-    static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). An ordinary setting's
-/// member is never changed here (#177, `settings::keep_file_members`): one the document lacks or holds as `null` is put
-/// back from the stored file, and any other change of one is refused with nothing written, because console pages change
-/// registry settings through the store (`settings::console_changes`). Stored settings are then put back at their
-/// registry pointers (`settings::mirror_into`), so no writer puts back an older value of one.
-fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
-    let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
-        .map_err(|_| "runtime config is invalid".to_string())?;
-    let kept = if context.is_isolated() {
-        // An unreadable file holds no registry member, so any registry member in the document is refused.
-        let current = context
-            .read_optional_text(RuntimeArea::Config, "config.json")
-            .ok()
-            .flatten()
-            .and_then(|current| serde_json::from_str::<Value>(current.trim_start_matches('\u{feff}')).ok())
-            .unwrap_or(Value::Null);
-        crate::settings::keep_file_members(&current, &mut doc).map_err(crate::settings::direct_change_error)?
-    } else {
-        false
-    };
-    let mirrored = crate::settings::mirror_into(context, &mut doc)?;
-    let backup = doc.get("backup").is_some();
-    if backup {
-        doc["backup"] = crate::config::backup_config(&doc)?;
-    }
-    let normalized = if backup || mirrored || kept {
-        Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
-    } else { None };
-    let text = normalized.as_deref().unwrap_or(text);
-    let before = context
-        .read_optional_text(RuntimeArea::Config, "config.json")
-        .map(Option::unwrap_or_default)
-        .map_err(|e| format!("cannot read config.json before the write: {e}"));
-    context.write_atomic(RuntimeArea::Config, "config.json", text.as_bytes())?;
-    CONFIG_WRITES.with(|writes| {
-        let mut writes = writes.borrow_mut();
-        match writes.as_mut() {
-            Some((_, after)) => *after = text.to_string(),
-            None => *writes = Some((before, text.to_string())),
-        }
-    });
-    Ok(())
-}
-
-fn take_config_writes() -> Option<(Result<String, String>, String)> {
-    CONFIG_WRITES.with(|writes| writes.borrow_mut().take())
-}
-
-/// Notes the selected `config.json` as this request found it, before a settings write-back changes it (#177). The
-/// write-back is not a write of `write_selected_config_text`, so without this the request's audit record would take its
-/// before-state from the file after the write-back, and an undo would not see the registry change. The request's own
-/// write then sets the after-state, as for any other write.
-fn note_config_before_request(context: &RuntimeContext) {
-    let before = context
-        .read_optional_text(RuntimeArea::Config, "config.json")
-        .map(Option::unwrap_or_default)
-        .map_err(|e| format!("cannot read config.json before the write: {e}"));
-    CONFIG_WRITES.with(|writes| {
-        let mut writes = writes.borrow_mut();
-        if writes.is_none() {
-            let after = before.clone().unwrap_or_default();
-            *writes = Some((before, after));
-        }
-    });
-}
-
-/// Ticket 24: every selected-runtime `config.json` read-modify-write holds the social-state gate
-/// (one gate, `SOCIAL_STATE_GATE_WAIT`) from a fresh read of the file to its atomic write, so no
-/// writer puts back an allow list or token another writer replaced meanwhile. Legacy contexts are
-/// not coordinated.
-pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
-    if context.is_isolated() {
-        acquire_social_state_gate(context).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
-pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    if !crate::settings::has_legacy_engine_choices(context)? { return Ok(()); }
-    let _gate = config_gate(context)?;
-    if let Some(config) = crate::settings::import_engine_choices(context)? {
-        write_selected_config_text(context, &config.to_string())
-            .map_err(|_| (503, "conversation engine import could not update config.json".into()))?;
-    }
-    Ok(())
-}
-
-/// Startup and turn admission have no HTTP request to own the writer's record.
-pub(crate) fn import_engine_choices_outside_request(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    let previous = take_config_writes();
-    let result = import_engine_choices(context);
-    CONFIG_WRITES.with(|writes| *writes.borrow_mut() = previous);
-    result
-}
-
-/// The raw selected `config.json` object a writer modifies; never the effective view from
-/// `load_config` (canonical defaults and the closed-agent owner overlay are not file contents).
 fn raw_config_for_write(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let text = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
-    // A file the runtime cannot load is refused as before (writers never repair it partially).
-    if !value.is_object() || crate::config::canonical_config(&value).is_err() {
-        return Err((503, "runtime config is invalid".to_string()));
-    }
-    Ok(value)
-}
-
-/// The selected `config.json` object as it is on disk, for the registry members a social page save keeps
-/// (`settings::keep_registry_values`): the object check of `raw_config_for_write`, without its canonical check.
-fn raw_config_object(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let text = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
-    if !value.is_object() {
-        return Err((503, "runtime config is invalid".to_string()));
-    }
-    Ok(value)
-}
-
-/// Ticket 25 (SnowLuma token self-heal, JS `persistSnowLumaEndpoint`): write the confirmed access token and, when given,
-/// the endpoint into the selected `config.json`'s `snowluma` object. Only the fields that differ are written, nothing
-/// else changes, and the read-modify-write holds the social-state gate. Returns the names of the fields written.
-pub(crate) fn persist_snowluma_endpoint(
-    context: &RuntimeContext,
-    access_token: &str,
-    ws_url: Option<&str>,
-    http_url: Option<&str>,
-) -> Result<Vec<&'static str>, String> {
-    if !context.is_isolated() {
-        return Err("token self-heal writes only a selected runtime's config".to_string());
-    }
-    let _gate = config_gate(context).map_err(|(_, message)| message)?;
-    let mut doc = raw_config_for_write(context).map_err(|(_, message)| message)?;
-    let mut changed: Vec<&'static str> = Vec::new();
-    let snowluma = doc
-        .as_object_mut()
-        .expect("raw_config_for_write returns an object")
-        .entry("snowluma".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(snowluma) = snowluma.as_object_mut() else {
-        return Err("config.json snowluma is not an object".to_string());
-    };
-    for (name, value) in [("accessToken", Some(access_token)), ("wsUrl", ws_url), ("httpUrl", http_url)] {
-        let Some(value) = value.filter(|v| !v.is_empty()) else { continue };
-        if snowluma.get(name).and_then(Value::as_str) != Some(value) {
-            snowluma.insert(name.to_string(), json!(value));
-            changed.push(name);
-        }
-    }
-    if changed.is_empty() {
-        return Ok(changed);
-    }
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())? + "\n";
-    let result = write_selected_config_text(context, &text);
-    let _ = take_config_writes();
-    result?;
-    Ok(changed)
-}
-
-fn write_json_atomic_for(context: &RuntimeContext, path: &str, value: &Value) -> Result<(), String> {
-    if !context.is_isolated() {
-        return write_json_atomic(path, value);
-    }
-    let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
-    write_text_atomic_for(context, path, &text)
+    social_state::raw_config_for_write(context).map_err(SocialError::into_http)
 }
 
 fn create_dir_all_for(context: &RuntimeContext, path: &str) -> Result<(), String> {
@@ -528,23 +451,15 @@ fn copy_file_for(context: &RuntimeContext, from: &str, to: &str) -> Result<(), S
     context.write_atomic(to_area, &to_relative, &bytes)
 }
 
-/// 定长比较，避免按字节提前返回泄露长度信息。
-fn token_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
-
-struct Request {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
+#[derive(Clone)]
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: HashMap<String, String>,
+    pub(crate) headers: HashMap<String, String>,
     /// 请求体。写类端点（P10-b）会用到，现在只有读类，先放行 dead_code。
     #[allow(dead_code)]
-    body: String,
+    pub(crate) body: String,
     /// The bounded reader stopped after proving this selected POST exceeds its 1 MB cap.
     body_too_large: bool,
 }
@@ -556,42 +471,6 @@ const BODY_TOO_LARGE_ERROR: &str = "请求体过大（超过 1MB）";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestReadError {
     Invalid,
-}
-
-fn is_role_management_post(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("POST", "/api/roles/create")
-            | ("POST", "/api/roles/rename")
-            | ("POST", "/api/roles/delete")
-            | ("POST", "/api/roles/update")
-            | ("POST", "/api/roles/limit")
-            | ("POST", "/api/role")
-            | ("POST", "/api/role-mode")
-    )
-}
-
-fn is_bounded_json_post(method: &str, path: &str) -> bool {
-    is_role_management_post(method, path)
-        || (method == "POST" && path == "/api/socialV2/send-message")
-        || (method == "POST" && path.starts_with("/api/tasks/"))
-        || (method == "POST" && (path == "/api/schedule" || path.starts_with("/api/schedule/")))
-        || (method == "POST" && path.starts_with("/api/backups/"))
-        || (method == "POST" && path.starts_with("/api/releases/"))
-        || (method == "POST" && path.starts_with("/api/dependencies/"))
-        || (method == "POST" && path == "/api/restart")
-        || (method == "POST" && path.starts_with("/api/settings/"))
-}
-
-fn bounded_post_body_too_large(req: &Request) -> bool {
-    is_bounded_json_post(&req.method, &req.path)
-        && (req.body_too_large
-            || req
-                .headers
-                .get("content-length")
-                .map(|value| decimal_exceeds_limit(value, BOUNDED_POST_MAX_BODY_BYTES))
-                .unwrap_or(false)
-            || req.body.as_bytes().len() > BOUNDED_POST_MAX_BODY_BYTES)
 }
 
 fn parse_query(q: &str) -> HashMap<String, String> {
@@ -681,7 +560,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
         None => (target.clone(), String::new()),
     };
 
-    let bounded_json_post = is_bounded_json_post(&method, &path);
+    let bounded_json_post = front::is_bounded_json_request(&method, &path);
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut duplicate_framing_header = false;
     for line in lines {
@@ -694,9 +573,9 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
                 duplicate_framing_header = true;
             }
             let value = v.trim().to_string();
-            if matches!(key.as_str(), "x-console-token" | "x-agent-token") {
+            if matches!(key.as_str(), "x-console-token" | "x-agent-token" | "host" | "origin" | "cookie" | "sec-fetch-site") {
                 if let Some(existing) = headers.get_mut(&key) {
-                    existing.push_str(", ");
+                    existing.push_str(if key == "cookie" { "; " } else { ", " });
                     existing.push_str(&value);
                 } else {
                     headers.insert(key, value);
@@ -731,14 +610,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
                 initial_body,
                 BOUNDED_POST_MAX_BODY_BYTES,
             )? {
-                ChunkedRequestBody::Complete(body_bytes) => Ok(Request {
-                    method,
-                    path,
-                    query: parse_query(&raw_query),
-                    headers,
-                    body: String::from_utf8_lossy(&body_bytes).to_string(),
-                    body_too_large: false,
-                }),
+                ChunkedRequestBody::Complete(body_bytes) => {
+                    let body = decode_request_body(&path, &body_bytes)?;
+                    Ok(Request {
+                        method, path, query: parse_query(&raw_query), headers, body,
+                        body_too_large: false,
+                    })
+                },
                 ChunkedRequestBody::TooLarge => Ok(Request {
                     method,
                     path,
@@ -799,14 +677,21 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
         let remaining = want - body_bytes.len();
         body_bytes.extend_from_slice(&chunk[..n.min(remaining)]);
     }
+    if path == "/api/memory/acl" && body_bytes.len() != want {
+        return Err(RequestReadError::Invalid);
+    }
+    let body = decode_request_body(&path, &body_bytes)?;
     Ok(Request {
-        method,
-        path,
-        query: parse_query(&raw_query),
-        headers,
-        body: String::from_utf8_lossy(&body_bytes).to_string(),
+        method, path, query: parse_query(&raw_query), headers, body,
         body_too_large: false,
     })
+}
+
+fn decode_request_body(path: &str, bytes: &[u8]) -> Result<String, RequestReadError> {
+    if path == "/api/memory/acl" {
+        return std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| RequestReadError::Invalid);
+    }
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 enum ChunkedRequestBody {
@@ -986,23 +871,59 @@ fn read_chunked_request_body(
     }
 }
 
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+fn respond(stream: &mut TcpStream, response: front::ConsoleResponse) {
+    let front::ConsoleResponse {
+        status,
+        content_type,
+        body,
+        redirect,
+        cookies,
+        raw_body,
+        csp,
+    } = response;
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        body.len()
+    let nosniff = crate::console_ui::NOSNIFF;
+    let content_len = raw_body.map_or(body.len(), <[u8]>::len);
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {content_len}\r\nCache-Control: no-store\r\nX-Content-Type-Options: {nosniff}\r\nConnection: close\r\n",
     );
+    if let Some(csp) = csp {
+        head.push_str(&format!("Content-Security-Policy: {csp}\r\n"));
+    }
+    match redirect {
+        Some(front::ConsoleRedirect::CanonicalOrigin(port, mount)) => {
+            head.push_str(&format!(
+                "Location: {}{mount}\r\n",
+                crate::console_auth::canonical_origin(port)
+            ));
+        }
+        Some(front::ConsoleRedirect::Path(mount)) => {
+            head.push_str(&format!("Location: {mount}\r\n"));
+        }
+        None => {}
+    }
+    for cookie in cookies {
+        head.push_str(&format!("Set-Cookie: {}\r\n", cookie.header()));
+    }
+    head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.write_all(raw_body.unwrap_or(body.as_bytes()));
     let _ = stream.flush();
 }
 
@@ -1015,74 +936,19 @@ fn console_token(cfg: &Value) -> String {
         .to_string()
 }
 
-fn authorized(req: &Request, cfg: &Value) -> bool {
-    token_supplied(req, &console_token(cfg))
-}
-
 /// `authorized` against the credential the runtime actually accepts (a selected runtime's
 /// generated token lives in `data/console-token` while `config.json` holds "").
+#[cfg(test)]
 fn authorized_in(context: &RuntimeContext, req: &Request, cfg: &Value) -> bool {
-    token_supplied(req, &context.effective_console_token(cfg))
-}
-
-fn token_supplied(req: &Request, expected: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    req.query
-        .get("token")
-        .or_else(|| req.headers.get("x-console-token"))
-        .map(|t| console_credential_matches(t, expected))
-        .unwrap_or(false)
-}
-
-fn console_credential_matches(supplied: &str, expected: &str) -> bool {
-    !expected.is_empty() && (token_eq(expected, supplied) || desktop_session_valid(supplied, expected))
-}
-
-struct DesktopSession {
-    token: String,
-    epoch: String,
-    generation: u64,
-    expires: std::time::Instant,
-}
-
-// Independent of credential contents: restoring an old token never restores its sessions.
-static DESKTOP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn desktop_sessions() -> &'static std::sync::Mutex<std::collections::VecDeque<DesktopSession>> {
-    static SESSIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<DesktopSession>>> = std::sync::OnceLock::new();
-    SESSIONS.get_or_init(Default::default)
-}
-
-fn desktop_session_valid(token: &str, expected: &str) -> bool {
-    let Ok(mut sessions) = desktop_sessions().lock() else { return false; };
-    let now = std::time::Instant::now();
-    sessions.retain(|session| session.expires > now);
-    let epoch = sha256_hex(expected);
-    let generation = DESKTOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    sessions.iter().any(|session| token_eq(&session.token, token) && session.epoch == epoch && session.generation == generation)
-}
-
-fn issue_desktop_session(expected: &str, generation: u64) -> Result<String, String> {
-    let token = generate_console_token()?;
-    let mut sessions = desktop_sessions().lock().map_err(|_| "desktop sessions are unavailable")?;
-    let now = std::time::Instant::now();
-    sessions.retain(|session| session.expires > now);
-    // A bounded number of browser sessions; the oldest is replaced on a new sign-in.
-    while sessions.len() >= 128 { sessions.pop_front(); }
-    sessions.push_back(DesktopSession {
-        token: token.clone(),
-        epoch: sha256_hex(expected),
-        generation,
-        expires: now + std::time::Duration::from_secs(12 * 60 * 60),
-    });
-    Ok(token)
+    front::token_supplied(req, &context.effective_console_token(cfg))
 }
 
 /// File-backed administrator status fields; `agent::finish_status` adds the agent readiness probe.
 fn handle_status(cfg: &Value) -> Value {
-    let state = read_json(SOCIAL_STATE).unwrap_or_else(|| json!({}));
+    let state = ConversationState::for_runtime(&RuntimeContext::legacy())
+        .read_optional_document()
+        .map(SocialDocument::into_value)
+        .unwrap_or_else(|_| json!({}));
     handle_status_with_state(cfg, state)
 }
 
@@ -1175,15 +1041,10 @@ const ROLES_DIR: &str = crate::legacy_path!("qq-bridge/roles");
 /// JS 只回 7 个字段：wakeConfig / wakeSafety / unreadCount / recentCount /
 /// lastWakeReason / lastAiReplyAt。之前我把 social-v2.json 里那一段整个回过去，
 /// 结果多出 18 个字段（recentMessages / unread / wakeTimes …），对拍直接爆。
-fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: &str) -> Value {
-    let sess = state
-        .get("conversations")
-        .and_then(|c| c.get(lookup_key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
+fn social_state_summary_for_doc(doc: &SocialDocument, lookup_key: &str, response_key: &str) -> Value {
+    let sess = doc.conversation(lookup_key).unwrap_or_default();
     let wc = sess
-        .get("wakeConfig")
+        .field("wakeConfig")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -1197,15 +1058,16 @@ fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: 
         "key": response_key,
         "wakeConfig": wc,
         "wakeSafety": wake_safety(&wc, now),
-        "unreadCount": sess.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
-        "recentCount": sess.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
-        "lastWakeReason": sess.get("lastWakeReason").cloned().unwrap_or(Value::Null),
-        "lastAiReplyAt": sess.get("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
+        "unreadCount": sess.unread_count(),
+        "recentCount": sess.field("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+        "lastWakeReason": sess.field("lastWakeReason").cloned().unwrap_or(Value::Null),
+        "lastAiReplyAt": sess.field("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
     })
 }
 
-fn social_state_summary(state: &Value, key: &str) -> Value {
-    social_state_summary_for_keys(state, key, key)
+fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: &str) -> Value {
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    social_state_summary_for_doc(&doc, lookup_key, response_key)
 }
 
 fn projection_storage_key(requested_key: &str) -> Result<String, (u16, String)> {
@@ -1229,8 +1091,9 @@ fn social_state_summary_for_request(
 }
 
 fn handle_social_state(context: &RuntimeContext, key: &str) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
-    social_state_summary_for_request(&state, key)
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    let canonical_key = projection_storage_key(key)?;
+    Ok(social_state_summary_for_doc(&doc, &canonical_key, key))
 }
 
 /// JS 的 `computeWakeSafetyV2`。
@@ -1383,25 +1246,8 @@ fn handle_roles(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     }))
 }
 
-fn default_role_state() -> Value {
-    json!({ "role": null, "mode": "active" })
-}
-
-fn read_role_state(context: &RuntimeContext) -> Result<Value, &'static str> {
-    if !context.is_isolated() {
-        return Ok(read_json_for(context, ROLE_STATE_FILE).unwrap_or_else(default_role_state));
-    }
-    let Some(text) = context
-        .read_optional_text(RuntimeArea::Data, "current-role.json")
-        .map_err(|_| "runtime role state is unavailable")?
-    else {
-        return Ok(default_role_state());
-    };
-    let state: Value = serde_json::from_str(&text).map_err(|_| "runtime role state is invalid")?;
-    if !state.is_object() {
-        return Err("runtime role state is invalid");
-    }
-    Ok(state)
+fn read_role_state(context: &RuntimeContext) -> Result<Value, String> {
+    social_state::role_state(context).map_err(String::from)
 }
 
 fn parse_role_management_body(
@@ -1447,10 +1293,21 @@ fn decimal_exceeds_limit(value: &str, limit: usize) -> bool {
 /// role mutation routes. This parser contract applies in selected and legacy
 /// contexts without changing which routes the isolated allowlist opens.
 fn role_management_dispatch_body(req: &Request) -> Result<Option<String>, (u16, String)> {
-    if !is_role_management_post(&req.method, &req.path) {
+    let is_role_post = req.method == "POST"
+        && matches!(
+            req.path.as_str(),
+            "/api/roles/create"
+                | "/api/roles/rename"
+                | "/api/roles/delete"
+                | "/api/roles/update"
+                | "/api/roles/limit"
+                | "/api/role"
+                | "/api/role-mode"
+        );
+    if !is_role_post {
         return Ok(None);
     }
-    if bounded_post_body_too_large(req) {
+    if front::bounded_post_body_too_large(req) {
         return Err((413, BODY_TOO_LARGE_ERROR.to_string()));
     }
     let parsed = parse_object_body(&req.body)?;
@@ -1473,12 +1330,11 @@ fn role_inject_max(context: &RuntimeContext) -> usize {
 /// （身份行 / 表情上下文 / 短期记忆 / 参与度），不重写一遍文案 ——
 /// 文案一旦两份，改一边忘另一边就是必然。
 fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
-    let state = read_json_for(context, SOCIAL_STATE).unwrap_or_else(|| json!({}));
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let doc = ConversationState::for_runtime(context)
+        .read_optional_document()
+        .unwrap_or_else(|_| SocialDocument::empty());
+    let conv = doc.conversation(key).unwrap_or_default();
+    let st = conv.to_value();
 
     // 机器人身份：Rust 侧目前从环境变量/默认值取（影子启动时也能从 OneBot 拿到，
     // 但还没有落盘）。这里跟 prompt::build 用同一份来源，保证两边一致。
@@ -1506,8 +1362,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         crate::prompt::role_hint_v1(context, cfg, key)
     };
 
-    let wc = st.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-    let wake_safety = social_state_summary(&state, key)
+    let wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+    let wake_safety = social_state_summary_for_doc(&doc, key, key)
         .get("wakeSafety")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -1614,12 +1470,12 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
             "quietMinMs": reply_window.min, "quietMaxMs": reply_window.max,
             "typing": true, "revisionLimit": 3,
         },
-        "unreadCount": st.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
+        "unreadCount": conv.unread_count(),
         "recentCount": st.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
         "currentWakeConfig": wc,
         "wakeSafety": wake_safety,
-        "memory": crate::prompt::memory_formatted(&st, &cfg),
-        "participation": crate::prompt::participation_block(&st).trim_end(),
+        "memory": crate::prompt::memory_formatted_conversation(&conv, &cfg),
+        "participation": crate::prompt::participation_block_conversation(&conv).trim_end(),
         "slang": {
             "enabled": cfg.get("slang").and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true),
             "entries": crate::slang::confirmed_list(&slang_entries, slang_max),
@@ -1654,16 +1510,6 @@ fn handle_social_legacy(cfg: &Value) -> Value {
         "pendingSummaries": {},
         "states": {},
     })
-}
-
-fn js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().map(|number| number != 0.0).unwrap_or(false),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
 }
 
 fn config_js_string_or(value: Option<&Value>, fallback: &str) -> String {
@@ -1821,29 +1667,6 @@ fn handle_dsh_model(context: &RuntimeContext, cfg: &Value) -> Value {
 }
 
 /// `/api/presets`：DSH 的 agent 预设列表（`agentPresets/list`）。
-///
-/// 每个请求新建一次 `Rpc` —— 它只是在本机铸一个 cookie，成本可以忽略，
-/// 换来的是「DSH 没起来时控制台其他端点照常工作」。
-///
-/// 失败时**回 500 并带原因**，不静默回空数组：空数组在页面上看起来就是
-/// 「一个预设都没有」，会被当成真实状态。实测碰到过一次瞬时 401，
-/// 当时如果回 `{presets: []}`，排查方向会被带偏到 DSH 的 preset 配置上。
-pub(crate) fn dsh_rpc_for(context: &RuntimeContext, cfg: &Value) -> Result<crate::dsh::Rpc, String> {
-    let base = if context.is_isolated() {
-        context
-            .dependency_url("dsh")
-            .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?
-    } else {
-        let base = cfg
-            .get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080");
-        base
-    };
-    crate::dsh::Rpc::connect_with_runtime(context, base)
-}
-
 fn handle_presets(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     let rpc = dsh_rpc_for(context, cfg)?;
     // 401 重试一次：实测控制台进程里这条路会间歇性 401（6 次里坏 3 次），
@@ -1895,12 +1718,11 @@ fn read_through_seq(st: &Value) -> i64 {
                 .collect()
         })
         .unwrap_or_default();
-    let unread: Vec<i64> = st
-        .get("unread")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m.get("seq").and_then(js_safe_integer))
+    let unread: Vec<i64> = Conversation::from_value(st)
+        .map(|conv| {
+            conv.unread()
+                .iter()
+                .filter_map(|m| m.safe_seq())
                 .filter(|s| *s > 0 && *s <= MAX_SAFE_INTEGER)
                 .collect()
         })
@@ -1953,7 +1775,7 @@ fn handle_unread(
     after_seq: Option<i64>,
     is_agent: bool,
 ) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let state = ConversationState::for_runtime(context).read_document()?.into_value();
     handle_unread_from_state(context, state, key, limit, after_seq, is_agent)
 }
 
@@ -1977,16 +1799,9 @@ fn handle_unread_from_state_with_auth(
     is_agent: bool,
     write_auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<Value, (u16, String)> {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("unread")
-        .and_then(|u| u.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    let conv_typed = doc.conversation(key).unwrap_or_default();
+    let all = conv_typed.unread_values();
     let limit = limit.clamp(1, 100) as usize;
     let messages: Vec<Value> = match after_seq {
         None => {
@@ -2012,18 +1827,17 @@ fn handle_unread_from_state_with_auth(
     // 结果是**模型读过之后水位不前进**，未读数一直挂着，容易重复唤醒、重复回复。
     //
     // 只在带 agent token 的调用里记（控制台看未读不算「模型看过」），和 JS 一致。
-    let st = if is_agent {
+    let conv = if is_agent {
         note_model_seen_with_auth(context, &mut state, key, &all, &messages, write_auth)?;
-        state
-            .get("conversations")
-            .and_then(|c| c.get(key))
-            .cloned()
-            .unwrap_or_else(|| json!({}))
+        SocialDocument::from_value(state)
+            .ok()
+            .and_then(|doc| doc.conversation(key))
+            .unwrap_or_default()
     } else {
-        st.clone()
+        conv_typed
     };
-    let mut st = st;
-    agent::attach_receipts(context, key, &mut st);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     Ok(json!({
         "ok": true,
         "key": key,
@@ -2173,37 +1987,41 @@ fn note_model_seen_with_auth(
     seen_msgs: &[Value],
     auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<(), (u16, String)> {
-    // The receipt is process memory (see `agent::attach_receipts`) and is never written to the state file. In a
+    // The receipt is process memory (see `agent::attach_receipts_conv`) and is never written to the state file. In a
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
-        let _gate = acquire_social_state_gate(context)?;
-        let mut fresh = load_social_state_for(context)?;
+        let _gate = crate::conversation_state::acquire(context)?;
+        let fresh_doc = ConversationState::for_runtime(context).read_document()?;
         if let Some(auth) = auth {
-            social_projection_write_denial(context, &fresh, key, auth)?;
+            social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
         }
-        let fresh_unread = fresh
-            .get("conversations")
-            .and_then(|conversations| conversations.get(key))
-            .and_then(|conversation| conversation.get("unread"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(conv) = fresh.get("conversations").and_then(|c| c.get(key)) {
-            agent::note_receipts(context, key, conv, &fresh_unread, seen_msgs);
+        let receipts = if let Some(conv) = fresh_doc.conversation(key) {
+            let fresh_unread = conv.unread_values();
+            agent::note_receipts_conv(context, key, &conv, &fresh_unread, seen_msgs);
+            Some(agent::receipts_of_conv(context, key, &conv))
+        } else {
+            None
+        };
+        let mut fresh = fresh_doc.into_value();
+        if let Some(seen) = receipts {
+            agent::write_state_receipts(&mut fresh, key, seen);
         }
-        agent::attach_state_receipts(context, &mut fresh, key);
         *state = fresh;
         return Ok(());
     }
     if let Some(auth) = auth {
-        let fresh = load_social_state_for(context)?;
-        social_projection_write_denial(context, &fresh, key, auth)?;
+        let fresh_doc = ConversationState::for_runtime(context).read_document()?;
+        social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
     }
-    if let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) {
-        agent::note_receipts(context, key, conv, unread, seen_msgs);
+    if let Some(conv) = SocialDocument::from_value(state.clone())
+        .ok()
+        .and_then(|doc| doc.conversation(key))
+    {
+        agent::note_receipts_conv(context, key, &conv, unread, seen_msgs);
+        let seen = agent::receipts_of_conv(context, key, &conv);
+        agent::write_state_receipts(state, key, seen);
     }
-    agent::attach_state_receipts(context, state, key);
     Ok(())
 }
 
@@ -2229,13 +2047,10 @@ fn handle_recent_from_state_with_auth(
     is_agent: bool,
     write_auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<Value, (u16, String)> {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("recentMessages")
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    let conv_typed = doc.conversation(key).unwrap_or_default();
+    let all: Vec<Value> = conv_typed
+        .field("recentMessages")
         .and_then(|u| u.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2246,23 +2061,18 @@ fn handle_recent_from_state_with_auth(
     // limit/offset before subtraction changes results for e.g. (1.5, 0).
     let (start, end) = recent_slice_bounds(all.len(), limit, offset);
     let messages = if start < end { all[start..end].to_vec() } else { Vec::new() };
-    let st = if is_agent {
-        let unread = st
-            .get("unread")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+    let conv = if is_agent {
+        let unread = conv_typed.unread_values();
         note_model_seen_with_auth(context, &mut state, key, &unread, &messages, write_auth)?;
-        state
-            .get("conversations")
-            .and_then(|conversations| conversations.get(key))
-            .cloned()
-            .unwrap_or_else(|| json!({}))
+        SocialDocument::from_value(state)
+            .ok()
+            .and_then(|doc| doc.conversation(key))
+            .unwrap_or_default()
     } else {
-        st
+        conv_typed
     };
-    let mut st = st;
-    agent::attach_receipts(context, key, &mut st);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     Ok(json!({
         "ok": true,
         "key": key,
@@ -2294,14 +2104,15 @@ fn js_slice_index(value: f64, len: usize) -> usize {
 /// `/api/socialV2/my-recent?key=&limit=`：**自己**最近发过的消息。
 ///
 /// 只筛 `isSelf`，取尾部 limit 条；顺序与 recentMessages 一致（旧→新）。
-fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("recentMessages")
+fn handle_my_recent_from_doc(
+    context: &RuntimeContext,
+    doc: &SocialDocument,
+    key: &str,
+    limit: i64,
+) -> Value {
+    let conv = doc.conversation(key).unwrap_or_default();
+    let all: Vec<Value> = conv
+        .field("recentMessages")
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2311,6 +2122,8 @@ fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
         .collect();
     let limit = limit.clamp(1, 50) as usize;
     let start = mine.len().saturating_sub(limit);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     json!({
         "ok": true,
         "key": key,
@@ -2323,14 +2136,10 @@ fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
 ///
 /// 排序是 `count` 降序、再按 `lastTime` 降序（JS 用的是 `b.count - a.count ||
 /// b.lastTime - a.lastTime`）。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
-fn handle_active_members_from_state(state: &Value, key: &str, limit: i64) -> Value {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let msgs = st
-        .get("recentMessages")
+fn handle_active_members_from_doc(doc: &SocialDocument, key: &str, limit: i64) -> Value {
+    let conv = doc.conversation(key).unwrap_or_default();
+    let msgs = conv
+        .field("recentMessages")
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2403,24 +2212,23 @@ fn handle_active_members_from_state(state: &Value, key: &str, limit: i64) -> Val
 /// 比 `/api/socialV2/state` 多了 `noActionCount`、少了 `wakeSafety` —— 两个接口
 /// 的形状**不一样**，别看名字像就当成同一个。
 fn handle_states(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     let mut out = Vec::new();
-    if let Some(map) = state.get("conversations").and_then(|c| c.as_object()) {
-        for (key, sess) in map {
-            out.push(json!({
-                "key": key,
-                "wakeConfig": sess.get("wakeConfig").cloned().unwrap_or_else(|| json!({})),
-                "unreadCount": sess.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
-                "recentCount": sess.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
-                "lastWakeReason": sess.get("lastWakeReason").cloned().unwrap_or(Value::Null),
-                "lastAiReplyAt": sess.get("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
-                "noActionCount": sess.get("wakeConfig")
-                    .and_then(|wake| wake.get("noActionCount"))
-                    .filter(|value| js_truthy(value))
-                    .cloned()
-                    .unwrap_or(json!(0)),
-            }));
-        }
+    for (key, sess) in doc.conversations() {
+        let wc = sess.field("wakeConfig");
+        out.push(json!({
+            "key": key,
+            "wakeConfig": wc.cloned().unwrap_or_else(|| json!({})),
+            "unreadCount": sess.unread_count(),
+            "recentCount": sess.field("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+            "lastWakeReason": sess.field("lastWakeReason").cloned().unwrap_or(Value::Null),
+            "lastAiReplyAt": sess.field("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
+            "noActionCount": wc
+                .and_then(|wake| wake.get("noActionCount"))
+                .filter(|value| js_truthy(value))
+                .cloned()
+                .unwrap_or(json!(0)),
+        }));
     }
     Ok(json!({ "ok": true, "conversations": out }))
 }
@@ -2713,260 +2521,15 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
     let limit = limit.clamp(1, 500) as usize;
     let mut out = ledger.summary(&table, limit);
     if let Some(obj) = out.as_object_mut() {
-        obj.insert("ledger".into(), ledger.stats(&table, 20_000));
+        obj.insert("ledger".into(), ledger.stats(&table, crate::ledger::DEFAULT_MAX_LINES));
     }
     Ok(out)
 }
 
-/// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 3] = [
-    "socialV2.context.wakeMaxChars",
-    "socialV2.context.wakeRecentLimit",
-    "role.maxInjectChars",
-];
-
-const SETTINGS_READONLY_HINT: &str =
-    "白名单 allow.* / ownerQQ / 后端与网关配置 / consoleToken / 任何路径类字段只能本地改";
-
-/// What `settings-get` shows in place of a secret.
-const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
-
-/// The refusal for a settings read outside the chat-writable settings. It never repeats the requested key.
-const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
-
-/// The chat's answer when the settings store cannot take a write. The store's own error names its files, so it stays
-/// in the console (`/api/settings` `storeError`).
-const SETTINGS_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
-
-/// The chat's note when a registry setting was stored but `config.json` was not updated (`settings::Applied`'s
-/// `mirror_error`). The write-back's own error names files, so it stays on the console's stderr; the next settings
-/// change or the console's start finishes the write-back.
-const SETTINGS_MIRROR_UNFINISHED: &str = "配置文件这次没有同步，下次改设置或控制台重启时会补上";
-
-/// When a chat change to a registry setting takes effect, as `settings_set` replies (`settings::Setting::applies`).
-fn settings_applies_note(applies: &str) -> &'static str {
-    match applies {
-        "live" => "已立即生效",
-        "next wake" => "下次唤醒时生效",
-        _ => "重启后生效",
-    }
-}
-
-/// A secret config path: everything under `security.*`, and every path with a segment (lower case,
-/// `-` and `_` removed) that ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
-/// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`. Every segment
-/// counts, ancestors included, so `relay.credentials.0` is as secret as `relay.credentials`.
-fn setting_is_secret(path: &str) -> bool {
-    if path.split('.').next().is_some_and(|first| first.eq_ignore_ascii_case("security")) {
-        return true;
-    }
-    path.split('.').any(|segment| {
-        let segment: String = segment.chars().filter(|c| *c != '-' && *c != '_').collect::<String>().to_lowercase();
-        ["token", "tokens", "secret", "secrets", "password", "passwd", "apikey", "apikeys", "key", "keys", "credential", "credentials"]
-            .iter()
-            .any(|suffix| segment.ends_with(suffix))
-    })
-}
-
-/// `value`, read at `path`, with every secret replaced by the marker, nested members and array items included.
-fn redact_setting(path: &str, value: Value) -> Value {
-    if setting_is_secret(path) {
-        return json!(SETTINGS_SECRET_MARKER);
-    }
-    match value {
-        Value::Object(members) => Value::Object(
-            members
-                .into_iter()
-                .map(|(name, member)| {
-                    let redacted = redact_setting(&format!("{path}.{name}"), member);
-                    (name, redacted)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.into_iter().map(|item| redact_setting(path, item)).collect()),
-        other => other,
-    }
-}
-
-/// 是否允许对话式修改：**黑名单优先** —— 只要看起来像凭据/白名单/路径就一律拒绝。
-fn is_setting_writable(path: &str) -> bool {
-    let p = path.trim();
-    if p.is_empty() {
-        return false;
-    }
-    let lower = p.to_lowercase();
-    for bad in ["allow", "token", "secret", "password", "path", "ownerqq", "dbpath", "consoletoken"] {
-        if lower.contains(bad) {
-            return false;
-        }
-    }
-    if p.starts_with("dsh.") || p.starts_with("snowluma.") {
-        return false;
-    }
-    SETTINGS_WRITABLE.contains(&p)
-}
-
-/// 按点分路径读配置。
-/// 返回 None 表示**路径不存在**（和"值是 null"是两件事）。
-///
-/// 这个区分是必要的：JS 里 `undefined` 的键在 `JSON.stringify` 时会被**丢掉**，
-/// 而 `null` 会保留。用 `Value::Null` 顶替会让"没配过"变成"配成了 null"。
-fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
-    // Project the settings defaults of frozen bridge.js loadConfig without rewriting the file.
-    // Context uses shallow replacement and role merges defaults.
-    if let Some(value) = path.split('.').try_fold(cfg, |cur, key| cur.get(key)) {
-        return Some(value.clone()); // Explicit null, zero and false survive JS object spread.
-    }
-    let (group, default) = match path {
-        "socialV2.context.wakeMaxChars" => ("context", json!(6000)),
-        "socialV2.context.wakeRecentLimit" => ("context", json!(4)),
-        "role.maxInjectChars" => return Some(json!(6000)),
-        _ => return None,
-    };
-    if cfg.get("socialV2").and_then(|v| v.get(group)).is_none() {
-        Some(default)
-    } else {
-        None
-    }
-}
-
-/// 按点分路径写配置（原子落盘），返回写入后的值。
-///
-/// 中间层不存在就建对象；**不碰运行期内存里的 cfg** —— Rust 控制台每次请求重读文件，
-/// 没有 JS 那份"原地更新 cfg"的问题。
-fn write_setting_path(context: &RuntimeContext, path: &str, value: &Value) -> Result<(), String> {
-    let mut file = if context.is_isolated() {
-        read_json_for(context, CONFIG_PATH)
-            .ok_or_else(|| "selected runtime config is unavailable".to_string())?
-    } else {
-        read_json(CONFIG_PATH).unwrap_or_else(|| json!({}))
-    };
-    if context.is_isolated() && !file.is_object() {
-        return Err("selected runtime config is invalid".to_string());
-    }
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut node = &mut file;
-    for (i, k) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            if let Some(obj) = node.as_object_mut() {
-                obj.insert(k.to_string(), value.clone());
-            }
-            break;
-        }
-        let obj = node.as_object_mut().ok_or_else(|| format!("{path} 的路径中段不是对象"))?;
-        if !obj.get(*k).map(|v| v.is_object()).unwrap_or(false) {
-            obj.insert(k.to_string(), json!({}));
-        }
-        node = obj.get_mut(*k).ok_or_else(|| format!("{path} 的路径段 {k} 写入失败"))?;
-    }
-    write_json_atomic_for(context, CONFIG_PATH, &file)
-}
-/// Memory routes accept the raw configured console token or a desktop session bound to the
-/// effective credential and current generation; a generated file token confers no memory authority.
-pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, context: &RuntimeContext) -> bool {
-    let expected = cfg.get("consoleToken").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let raw = !expected.is_empty()
-        && headers.get("x-console-token").map(|t| t.trim() == expected).unwrap_or(false);
-    raw || headers.get("x-console-token").is_some_and(|token| {
-        desktop_session_valid(token.trim(), &context.effective_console_token(cfg))
-    })
-}
-
-/// `settings-get` / `settings-set` for a caller that already proved owner-private authority. In a selected runtime a
-/// registry setting the chat may use (`settings::chat_setting`, named by its configuration path) reads as the next use
-/// reads it and is written through `settings::apply` (actor `owner`, source `chat`): validated by the registry, audited
-/// and written back into `config.json`; a write-back that fails keeps the change, and the reply's `mirrorError` and
-/// note carry `SETTINGS_MIRROR_UNFINISHED`. The caller (`memory_actions::handle`) holds the configuration gate, which
-/// the settings store requires of every writer. A legacy context has no settings store, so it offers none. The other
-/// `SETTINGS_WRITABLE` paths keep their `config.json` write until their settings batch registers them.
-pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &RuntimeContext) -> Result<Value, (u16, String)> {
-        if action == "settings-get" {
-            let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if path.is_empty() {
-                let mut all = serde_json::Map::new();
-                for p in SETTINGS_WRITABLE {
-                    if let Some(v) = read_setting_path(cfg, p) {
-                        all.insert(p.to_string(), redact_setting(p, v));
-                    }
-                }
-                let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
-                for setting in crate::settings::chat_registry().filter(|_| context.is_isolated()) {
-                    let name = setting.chat_name();
-                    all.insert(name.clone(), redact_setting(&name, setting.read(cfg)));
-                    writable.push(name);
-                }
-                return Ok(json!({
-                    "ok": true,
-                    "settings": all,
-                    "writable": writable,
-                    "readonly": SETTINGS_READONLY_HINT,
-                }));
-            }
-            if setting_is_secret(&path) {
-                return Err((403, SETTINGS_READ_REFUSED.to_string()));
-            }
-            if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
-                let value = redact_setting(&path, setting.read(cfg));
-                return Ok(json!({"ok": true, "key": path, "writable": true, "value": value}));
-            }
-            // Only the settings the model may also change are readable. Any other key (a console token,
-            // a gateway, backend, relay or model setting, an unknown path) is refused without naming it.
-            if !SETTINGS_WRITABLE.contains(&path.as_str()) {
-                return Err((403, SETTINGS_READ_REFUSED.to_string()));
-            }
-            let mut result = json!({
-                "ok": true,
-                "key": path,
-                "writable": is_setting_writable(&path),
-            });
-            if let Some(value) = read_setting_path(cfg, &path) {
-                result["value"] = redact_setting(&path, value);
-            }
-            return Ok(result);
-        }
-        // settings-set
-        let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated() && !setting_is_secret(&path)) {
-            let value = b.get("value").cloned().unwrap_or(Value::Null);
-            // A refused value answers under the chat's name; the store's own errors stay out of the chat.
-            let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {
-                if status == 400 {
-                    (400, setting.chat_requirement())
-                } else {
-                    (503, SETTINGS_STORE_UNAVAILABLE.to_string())
-                }
-            })?;
-            let mut reply = json!({
-                "ok": true,
-                "key": path,
-                "value": applied.value,
-                "changed": applied.changed,
-                "hot": setting.applies != "restart",
-                "note": settings_applies_note(setting.applies),
-            });
-            // The stored change stands; the write-back's own error names files, so the chat gets one fixed text.
-            if applied.mirror_error.is_some() {
-                reply["mirrorError"] = json!(SETTINGS_MIRROR_UNFINISHED);
-                reply["note"] = json!(format!("{}；{SETTINGS_MIRROR_UNFINISHED}", settings_applies_note(setting.applies)));
-            }
-            return Ok(reply);
-        }
-        if !is_setting_writable(&path) {
-            return Err((
-                403,
-                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）".to_string(),
-            ));
-        }
-        let value = b.get("value").cloned().unwrap_or(Value::Null);
-        write_setting_path(context, &path, &value).map_err(|e| (400, e))?;
-        crate::safe_eprintln!("[console] settings 改了 {path} -> {value}");
-        return Ok(json!({
-            "ok": true,
-            "key": path,
-            "value": value,
-            "hot": true,
-            "note": "已立即生效",
-        }));
+#[cfg(test)]
+fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, _context: &RuntimeContext) -> bool {
+    let expected = console_token(cfg);
+    headers.get("x-console-token").is_some_and(|token| credential_eq(&expected, token.trim()))
 }
 /// `/api/tokens/by-provider`：**按 provider 分列**的用量（R3）。
 ///
@@ -2978,30 +2541,6 @@ fn handle_tokens_by_provider(context: &RuntimeContext, cfg: &Value) -> Result<Va
     let mut out = ledger.by_provider(&table);
     out["ok"] = json!(true);
     Ok(out)
-}
-
-/// 一个归属分组的累计（轮次用 `(sid, turn)` 去重，避免多 step 把轮数放大）。
-#[derive(Default)]
-struct UsageAgg {
-    turns: HashSet<(String, i64)>,
-    tokens: f64,
-    cost: f64,
-}
-
-impl UsageAgg {
-    fn add(&mut self, sid: &str, turn: i64, tokens: f64, cost: f64) {
-        self.turns.insert((sid.to_string(), turn));
-        self.tokens += tokens;
-        self.cost += cost;
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "turns": self.turns.len() as i64,
-            "tokens": self.tokens,
-            "cost": self.cost,
-        })
-    }
 }
 
 /// `.dshw-usage.json` 的按天合计。`day` 缺失时用 `ts` 推北京时间日期，不因为缺字段漏账。
@@ -3069,113 +2608,16 @@ fn handle_usage_attribution(context: &RuntimeContext, cfg: &Value, days: i64) ->
     let today = crate::pricing::beijing_parts(now).2;
     let start_day = crate::pricing::beijing_parts(now - (days - 1) * 86_400_000).2;
 
-    // 复用 ledger 的载入 + 幂等折叠（同 (turn,step,retry) 只留 seq 最大的一条），
-    // 不直接扫 JSONL —— 原始文件里会有被覆盖的旧采样，直接加会重复计费。
     let ledger = ledger_for_runtime(context)?;
-    let mut our = UsageAgg::default();
-    let mut by_key: BTreeMap<String, UsageAgg> = BTreeMap::new();
-    let mut by_provider: BTreeMap<String, UsageAgg> = BTreeMap::new();
-    let mut samples = 0i64;
-    // Harness samples (`harness::usage`) never went through DSH, so they are never subtracted from its total.
-    for s in ledger.dsh_comparable_samples() {
-        // 只统计有归属的记录；没有 key 的历史采样不属于「我们」，差额会体现出来。
-        let Some(key) = s
-            .key
-            .clone()
-            .or_else(|| ledger.key_of(&s.session_id))
-            .filter(|k| !k.is_empty())
-        else {
-            continue;
-        };
-        let at = if s.t != 0 { s.t } else { now };
-        if crate::pricing::beijing_parts(at).2 < start_day {
-            continue;
-        }
-        let (_, cost) = crate::pricing::price_usage(&s.buckets, &s.model, at, &table);
-        let tokens = s.buckets.total();
-        our.add(&s.session_id, s.turn, tokens, cost.total);
-        let provider = if s.provider.is_empty() {
-            "unknown".to_string()
-        } else {
-            s.provider.clone()
-        };
-        by_key
-            .entry(key)
-            .or_default()
-            .add(&s.session_id, s.turn, tokens, cost.total);
-        by_provider
-            .entry(provider)
-            .or_default()
-            .add(&s.session_id, s.turn, tokens, cost.total);
-        samples += 1;
-    }
-
-    let (dsh_turns, dsh_tokens, dsh_cost) = dsh_usage_total(context, &start_day)?;
-
-    let token_sort_key = |v: &Value| v.get("tokens").and_then(|t| t.as_f64()).unwrap_or(0.0);
-    let mut by_key_rows: Vec<Value> = by_key
-        .iter()
-        .map(|(k, a)| {
-            let mut row = a.to_json();
-            row["key"] = json!(k);
-            row
-        })
-        .collect();
-    by_key_rows.sort_by(|a, b| {
-        token_sort_key(b)
-            .partial_cmp(&token_sort_key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut by_provider_rows: Vec<Value> = by_provider
-        .iter()
-        .map(|(p, a)| {
-            let mut row = a.to_json();
-            row["provider"] = json!(p);
-            row
-        })
-        .collect();
-    by_provider_rows.sort_by(|a, b| {
-        token_sort_key(b)
-            .partial_cmp(&token_sort_key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // 差额不隐藏，负数也照实回：负数 = 账本领先于总账（回合刚跑完、总账还没落盘）。
-    // 同口径相减：总账事件与账本采样都是 LLM 请求（一条 usage 一次）；our.turns 是对话轮数，不能直接相减。
-    let unattributed_turns = dsh_turns - samples;
-    let unattributed_tokens = dsh_tokens - our.tokens;
-    let unattributed_cost = dsh_cost - our.cost;
-    let note = "DSH 总账（.dshw-usage.json）减去桥接账本（token-usage.jsonl 里带 key 的记录）。\
-差额没有被吞掉：可能是 Web GUI / CLI 探针等没有 QQ 会话归属的调用，也可能是回合刚跑完、\
-总账尚未落盘（此时为负）。dshTotal.turns 与 unattributed.turns 都按 LLM 请求计（总账事件\
-条数减去账本里带 key 的 usage 采样数 our.samples）；our.turns 是账本里的对话轮数，不参与相减。";
-
-    Ok(json!({
-        "ok": true,
-        "days": days,
-        "symbol": table.symbol,
-        "window": { "fromDay": start_day, "toDay": today },
-        "our": {
-            "turns": our.turns.len() as i64,
-            "tokens": our.tokens,
-            "cost": our.cost,
-            "samples": samples,
-        },
-        "dshTotal": {
-            "turns": dsh_turns,
-            "tokens": dsh_tokens,
-            "cost": dsh_cost,
-            "events": dsh_turns,
-        },
-        "unattributed": {
-            "turns": unattributed_turns,
-            "tokens": unattributed_tokens,
-            "cost": unattributed_cost,
-            "note": note,
-        },
-        "byKey": by_key_rows,
-        "byProvider": by_provider_rows,
-    }))
+    let attr = ledger.dsh_attribution(&table, &start_day, now);
+    let (turns, tokens, cost) = dsh_usage_total(context, &start_day)?;
+    Ok(attr.to_response(
+        days,
+        &today,
+        &start_day,
+        &table,
+        crate::ledger::DshTotals { turns, tokens, cost },
+    ))
 }
 /// `/api/tokens/recent?limit=`：最近 N 条按轮计费的采样（带金额与峰谷标记）。
 ///
@@ -3243,24 +2685,6 @@ fn handle_pending(_context: &RuntimeContext) -> Value {
     json!({ "pending": [] })
 }
 
-/// 规范会话 key：`group:数字` / `private:数字`，数字必须是正 JS safe integer。
-fn canonical_v2_key(key: &str) -> Option<String> {
-    let (kind, id) = key
-        .trim_matches(social_policy_js_trim_char)
-        .split_once(':')?;
-    if kind != "group" && kind != "private" {
-        return None;
-    }
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: i64 = id.parse().ok()?;
-    if n <= 0 || n > 9_007_199_254_740_991 {
-        return None;
-    }
-    Some(format!("{kind}:{n}"))
-}
-
 /// 归一化操作者输入：去 BOM、统一行尾、删控制字符、只裁首尾空白（保留段落换行）。
 fn normalize_initial_prompt_text(raw: &str) -> String {
     let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
@@ -3322,20 +2746,9 @@ fn handle_initial_prompt_post(context: &RuntimeContext, cfg: &Value, body: &str)
 }
 
 const ROLES_DIR_PATH: &str = crate::legacy_path!("qq-bridge/roles");
-const ROLE_STATE_FILE: &str = crate::legacy_path!("qq-bridge/state/current-role.json");
 const ROLE_NAME_MAX: usize = 40;
 /// 内容上限 64KB：create/update 要校验。
 const ROLE_CONTENT_MAX_BYTES: usize = 64 * 1024;
-
-/// 人格名清洗：与 JS 的 `/[^\w\u4e00-\u9fff-]/g` **同义**。
-///
-/// 注意不能图省事写 `is_alphanumeric()` —— Rust 那个含西里尔、希腊、全角数字，
-/// 会把 JS 会删掉的字符留下，改名/建卡时就可能造出 JS 侧打不开的文件名。
-pub(crate) fn sanitize_role_name(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || ((0x4e00..=0x9fff).contains(&(*c as u32))))
-        .collect()
-}
 
 /// 校验人格名。返回 Err(提示文案)，与 JS 的抛错文案逐字一致。
 fn validate_role_name(raw: &str) -> Result<String, String> {
@@ -3393,8 +2806,7 @@ fn handle_roles_rename(context: &RuntimeContext, body: &str) -> Result<Value, (u
     let switched = current == from;
     if switched {
         let mode = state.get("mode").and_then(|v| v.as_str()).unwrap_or("active");
-        write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": to, "mode": mode }))
-            .map_err(|e| (500, e))?;
+        social_state::write_role_state(context, Some(&to), mode).map_err(SocialError::into_http)?;
     }
     Ok(json!({ "ok": true, "role": to, "renamed": true, "currentFollowed": switched }))
 }
@@ -3419,14 +2831,9 @@ fn handle_roles_delete(context: &RuntimeContext, body: &str) -> Result<Value, (u
     let cleared = current == name;
     if cleared {
         let mode = state.get("mode").and_then(|v| v.as_str()).unwrap_or("active");
-        write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": Value::Null, "mode": mode }))
-            .map_err(|e| (500, e))?;
+        social_state::write_role_state(context, None, mode).map_err(SocialError::into_http)?;
     }
     Ok(json!({ "ok": true, "deleted": name, "clearedCurrent": cleared }))
-}
-
-fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
-    if error.class().starts_with("temp/") { format!("写临时文件失败：{error}") } else { format!("改名失败：{error}") }
 }
 
 /// 原子写文本：与 `write_json_atomic` 同一套「临时文件 + 改名」。
@@ -3538,36 +2945,44 @@ fn handle_roles_update(context: &RuntimeContext, body: &str) -> Result<Value, (u
 ///
 /// 只动 `role.maxInjectChars` 一个键，配置里其它内容原样保留 ——
 /// 这里最容易写错成「整份 config 只剩 role」。
-fn handle_roles_limit(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+fn handle_roles_limit_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let req = parse_role_management_body(context, body)?;
     let next = crate::role::apply_inject_limit(req.get("maxInjectChars"));
-    let _gate = config_gate(context)?;
-    let mut cfg = read_json_for(context, CONFIG_PATH).ok_or((500, "读不到 config.json".to_string()))?;
-    if !cfg.is_object() {
-        return Err((500, "config.json 不是合法 JSON，已拒绝写入".to_string()));
-    }
-    let mut role_obj = cfg
-        .get("role")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    role_obj.insert("maxInjectChars".to_string(), json!(next));
-    cfg["role"] = Value::Object(role_obj);
-    write_json_atomic_for(context, CONFIG_PATH, &cfg).map_err(|e| (500, e))?;
-    Ok(json!({ "ok": true, "maxInjectChars": next, "limits": { "injectMaxChars": next } }))
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::RawObject,
+        |cfg| {
+            let mut role_obj = cfg
+                .get("role")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            role_obj.insert("maxInjectChars".to_string(), json!(next));
+            cfg["role"] = Value::Object(role_obj);
+            Ok(json!({ "ok": true, "maxInjectChars": next, "limits": { "injectMaxChars": next } }))
+        },
+    )
 }
 
-/// 原子写 JSON：先写临时文件再改名。
-///
-/// 为什么不能直接 `fs::write`：写到一半进程被杀会留下半截 JSON，
-/// 下次启动读到损坏配置 —— 桥接对「配置损坏」是 fail-fast 直接报错的，
-/// 等于机器人起不来。同盘改名在 Windows 上是原子的。
+#[cfg(test)]
+fn handle_roles_limit(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_roles_limit_tx(context, body)
+        .map(|o| o.value)
+        .map_err(crate::config_tx::CommitError::into_http)
+}
+
 /// 原子写文本：先写临时文件再改名（同目录，保证 rename 是原子的）。
 fn write_file_atomic(path: &str, text: &str) -> Result<(), String> {
     crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
+
+#[cfg(test)]
 static JSON_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
 fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
     // Unique temp names protect contents; serialize replacement too, since overlapping
     // Windows replacements can transiently hold the target against another replacement.
@@ -3673,17 +3088,17 @@ fn handle_whitelist_post(context: &RuntimeContext, cfg_path: &str, body: &str) -
         obj.insert("deny".into(), deny.clone());
         obj.insert("ownerQQ".into(), owner.clone());
     }
-    write_json_atomic_for(context, cfg_path, &file).map_err(|e| (500, e))?;
+    crate::config_tx::write_config_json(context, &file).map_err(|e| (500, e))?;
 
     Ok(json!({ "ok": true, "allow": allow, "deny": deny, "ownerQQ": owner }))
 }
 
 /// `/api/socialV2/activity`：暂停标志（管理台的"暂停/恢复"按钮读它）。
 fn handle_activity(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     Ok(json!({
         "ok": true,
-        "paused": state.get("paused").and_then(|p| p.as_bool()).unwrap_or(false),
+        "paused": doc.paused(),
     }))
 }
 
@@ -3702,19 +3117,15 @@ fn handle_memory(
     agent_token: Option<&str>,
     cfg: &Value,
 ) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     if let Some(token) = agent_token {
         if let Some(denial) =
-            agent_memory_denial(&state, cfg, key, token, "qq_memory_query")
+            agent_memory_denial_doc(&doc, cfg, key, token, "qq_memory_query")
         {
             return Err(denial);
         }
     }
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let conv = doc.conversation(key).unwrap_or_default();
 
     let tail20 = |v: Option<&Value>| -> Vec<Value> {
         let arr = v.and_then(|a| a.as_array()).cloned().unwrap_or_default();
@@ -3726,8 +3137,8 @@ fn handle_memory(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let mut topics = tail20(st.get("activeTopics"));
-    let mut thoughts: Vec<Value> = tail20(st.get("pendingThoughts"))
+    let mut topics = tail20(conv.field("activeTopics"));
+    let mut thoughts: Vec<Value> = tail20(conv.field("pendingThoughts"))
         .into_iter()
         .filter(|t| {
             t.get("expiresAt")
@@ -3736,10 +3147,7 @@ fn handle_memory(
                 .unwrap_or(true)
         })
         .collect();
-    let mut impressions = st
-        .get("memberImpressions")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let mut impressions = conv.impressions_to_value();
 
     match category {
         "activeTopic" => {
@@ -3757,14 +3165,13 @@ fn handle_memory(
         _ => {}
     }
 
-    let merged = json!({
-        "activeTopics": topics,
-        "pendingThoughts": thoughts,
-        "memberImpressions": impressions,
-        "unread": st.get("unread").cloned().unwrap_or_else(|| json!([])),
-        "recentMessages": st.get("recentMessages").cloned().unwrap_or_else(|| json!([])),
-    });
-    let formatted = crate::prompt::memory_formatted(&merged, cfg);
+    let mut filtered = conv.clone();
+    filtered.set_field("activeTopics", Value::Array(topics.clone()));
+    filtered.set_field("pendingThoughts", Value::Array(thoughts.clone()));
+    if category == "activeTopic" || category == "pendingThought" {
+        filtered.clear_impressions();
+    }
+    let formatted = crate::prompt::memory_formatted_conversation(&filtered, cfg);
 
     Ok(json!({
         "ok": true,
@@ -3779,92 +3186,6 @@ fn handle_memory(
     }))
 }
 
-// ── 二代轻量记忆的写类端点（append / update / remove / clear）──────────────
-//
-// 状态在 `state/social-v2.json`，整个文件读-改-写。**已知差异**：JS 的
-// `getSocialV2State(key)` 对不存在的 key 会自动建一个会话（含随机 agentToken
-// 和一整套默认唤醒配置）；这里对不存在的 key 直接 404。理由：凭空造会话意味着
-// 要在这里复制「会话注册」的全套默认值，而那套东西属于 P6 的生命周期模块，
-// 不是记忆模块该管的。等会话注册搬过来再补自动建。
-
-fn load_social_state() -> Value {
-    read_json(SOCIAL_STATE).unwrap_or_else(|| json!({ "conversations": {} }))
-}
-
-pub(crate) fn load_social_state_for(
-    context: &RuntimeContext,
-) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        let state = context
-            .read_social_state()
-            .map_err(|error| (500, format!("social-state/read: {error}")))?;
-        if !state.is_object() {
-            return Err((500, "runtime data is invalid".to_string()));
-        }
-        let mut state = state;
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    } else {
-        let mut state = load_social_state();
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    }
-}
-
-fn write_social_state_for(context: &RuntimeContext, state: &Value) -> Result<(), String> {
-    let mut state = state.clone();
-    agent::strip_receipts(&mut state);
-    write_json_atomic_for(context, SOCIAL_STATE, &state)
-}
-
-const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
-/// Upper bound on how long a writer queues for `locks/social-v2.lock` before the request is
-/// refused with 503 (fail closed: no write happens without the gate).
-///
-/// The gate is held across read, mutate and a durable write (fsync plus write-through replace) of
-/// `social-v2.json`. A representative measurement showed that a
-/// hold is normally 3-25 ms, but a single fsync stalls for 0.4-2.4 s in about 4% of holds, even
-/// without added load. The frozen JS never refuses a concurrent writer (single event loop, in-memory
-/// state, no lock), so a bound shorter than one stall turned deterministic outcomes (the third of
-/// three sends is a 429) into 503s. 5 s covers the worst measured stall plus a short queue of
-/// writers behind it; a holder that is still alive after that (deadlock, hung disk) is refused.
-/// The OS releases the lock when its owner dies, so a crashed owner is never a stale lock.
-const SOCIAL_STATE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub(crate) fn acquire_social_state_gate(context: &RuntimeContext) -> Result<std::fs::File, (u16, String)> {
-    let deadline = std::time::Instant::now() + SOCIAL_STATE_GATE_WAIT;
-    loop {
-        match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
-            Ok(file) => return Ok(file),
-            Err(error) if error == "runtime file is already locked" => {
-                if std::time::Instant::now() >= deadline {
-                    return Err((
-                        503,
-                        "selected runtime social state is busy".to_string(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err((503, format!("social-state/gate: {error}"))),
-        }
-    }
-}
-
-fn update_selected_social_state<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<(Value, T), (u16, String)> {
-    if !context.is_isolated() {
-        return Err((500, "selected runtime is required".to_string()));
-    }
-    let _gate = acquire_social_state_gate(context)?;
-    let mut state = load_social_state_for(context)?;
-    let result = update(&mut state)?;
-    write_social_state_for(context, &state)
-        .map_err(|error| (500, format!("social-state/write: {error}")))?;
-    Ok((state, result))
-}
-
 #[derive(Clone, Copy)]
 struct SocialProjectionWriteAuth<'a> {
     token: &'a str,
@@ -3872,16 +3193,16 @@ struct SocialProjectionWriteAuth<'a> {
     tool_name: &'a str,
 }
 
-fn social_projection_write_denial(
+fn social_projection_write_denial_doc(
     context: &RuntimeContext,
-    state: &Value,
+    doc: &SocialDocument,
     key: &str,
     auth: SocialProjectionWriteAuth<'_>,
 ) -> Result<(), (u16, String)> {
     if auth.token.is_empty() {
         return Err((403, "agent token 不能为空".to_string()));
     }
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if doc.paused() {
         return Err((
             403,
             "当前已暂停，不允许执行 v2 工具".to_string(),
@@ -3907,8 +3228,8 @@ fn social_projection_write_denial(
         Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
         Err(error) => return Err(error),
     }
-    if let Some(denial) = social_projection_agent_denial(
-        state,
+    if let Some(denial) = social_projection_agent_denial_doc(
+        doc,
         &cfg,
         key,
         auth.token,
@@ -3918,24 +3239,6 @@ fn social_projection_write_denial(
         return Err(denial);
     }
     Ok(())
-}
-
-/// 需要脱敏的已知令牌：所有会话当前的 agentToken。
-///
-/// JS 还留着每个会话「上一代」的令牌（模型上下文里最可能残留的那一个）；
-/// Rust 目前只记当前代，所以上一代令牌如果被写进记忆，这里不会被打码。
-fn social_tokens(state: &Value) -> Vec<String> {
-    state
-        .get("conversations")
-        .and_then(|c| c.as_object())
-        .map(|m| {
-            m.values()
-                .filter_map(|c| c.get("agentToken").and_then(|t| t.as_str()))
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// 取出会话并发号，统一处理 key 归一化与「会话不存在」。
@@ -3948,7 +3251,7 @@ fn with_conversation<F>(
     f: F,
 ) -> Result<Value, (u16, String)>
 where
-    F: FnOnce(&mut Value, &[String], &Value) -> Result<Value, (u16, String)>,
+    F: FnOnce(&mut Conversation, &[String], &Value) -> Result<Value, (u16, String)>,
 {
     let Ok(req) = serde_json::from_str::<Value>(body) else {
         return Err((400, "请求体不是合法 JSON".to_string()));
@@ -3957,96 +3260,54 @@ where
     let Some(key) = canonical_v2_key(&raw_key) else {
         return Err((400, format!("无效的会话 key：{raw_key}")));
     };
-    if context.is_isolated() {
-        return with_selected_conversation(context, &key, agent_token, tool_name, &req, f);
-    }
-    let mut state = load_social_state_for(context)?;
-    if state.get("conversations").and_then(|c| c.get(&key)).is_none() {
-        if agent_token.is_some() {
-            return Err((403, "agent token 无效".to_string()));
+    ConversationState::for_runtime(context).update_document(|doc| {
+        if agent_token == Some("") {
+            return Err((403, "agent token 不能为空".to_string()));
         }
-        return Err((404, format!("会话不存在：{key}")));
-    }
-    let tokens = social_tokens(&state);
-    let out = {
-        let conv = state["conversations"].get_mut(&key).expect("上面刚确认存在");
-        f(conv, &tokens, &req)?
-    };
-    if let Some(token) = agent_token {
-        if let Some(denial) = agent_memory_denial(&state, cfg, &key, token, tool_name) {
-            return Err(denial);
+        if context.is_isolated() {
+            if let Some(token) = agent_token {
+                if doc.paused() {
+                    return Err((403, "当前已暂停，不允许执行 v2 工具".to_string()));
+                }
+                let fresh_cfg = context
+                    .load_config()
+                    .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+                if fresh_cfg
+                    .get("socialV2")
+                    .and_then(|social| social.get("enabled"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                {
+                    return Err((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+                }
+                match current_mode_for(context) {
+                    Ok(mode) if mode == "reserved2" => {}
+                    Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
+                    Err(error) => return Err(error),
+                }
+                if let Some(denial) = agent_memory_denial_doc(doc, &fresh_cfg, &key, token, tool_name) {
+                    return Err(denial);
+                }
+            }
         }
-    }
-    write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    Ok(out)
-}
-
-/// Perform an inline-memory read/modify/write against the selected state while
-/// holding the shared social-state OS gate. Authorization is re-evaluated from
-/// the selected state/config after acquiring the gate, so a request that waited
-/// behind another writer cannot commit against an obsolete agent token or mode.
-fn with_selected_conversation<F>(
-    context: &RuntimeContext,
-    key: &str,
-    agent_token: Option<&str>,
-    tool_name: &str,
-    req: &Value,
-    f: F,
-) -> Result<Value, (u16, String)>
-where
-    F: FnOnce(&mut Value, &[String], &Value) -> Result<Value, (u16, String)>,
-{
-    let _gate = acquire_social_state_gate(context)?;
-    if agent_token == Some("") {
-        return Err((403, "agent token 不能为空".to_string()));
-    }
-
-    let mut state = load_social_state_for(context)?;
-    if let Some(token) = agent_token {
-        if state.get("paused").and_then(Value::as_bool) == Some(true) {
-            return Err((
-                403,
-                "当前已暂停，不允许执行 v2 工具".to_string(),
-            ));
+        let Some(mut conv) = doc.conversation(&key) else {
+            if agent_token.is_some() {
+                return Err((403, "agent token 无效".to_string()));
+            }
+            return Err((404, format!("会话不存在：{key}")));
+        };
+        if !context.is_isolated() {
+            if let Some(token) = agent_token {
+                if let Some(denial) = agent_memory_denial_doc(doc, cfg, &key, token, tool_name) {
+                    return Err(denial);
+                }
+            }
         }
-        let cfg = context
-            .load_config()
-            .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-        if cfg
-            .get("socialV2")
-            .and_then(|social| social.get("enabled"))
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            return Err((
-                403,
-                "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-            ));
-        }
-        match current_mode_for(context) {
-            Ok(mode) if mode == "reserved2" => {}
-            Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
-            Err(error) => return Err(error),
-        }
-        if let Some(denial) = agent_memory_denial(&state, &cfg, key, token, tool_name) {
-            return Err(denial);
-        }
-    }
-
-    let tokens = social_tokens(&state);
-    let Some(conversation) = state
-        .get_mut("conversations")
-        .and_then(Value::as_object_mut)
-        .and_then(|conversations| conversations.get_mut(key))
-    else {
-        if agent_token.is_some() {
-            return Err((403, "agent token 无效".to_string()));
-        }
-        return Err((404, format!("会话不存在：{key}")));
-    };
-    let out = f(conversation, &tokens, req)?;
-    write_social_state_for(context, &state).map_err(|_| (500, "runtime data is unavailable".to_string()))?;
-    Ok(out)
+        let tokens = doc.active_tokens();
+        let out = f(&mut conv, &tokens, &req)?;
+        doc.set_conversation(&key, conv);
+        Ok(out)
+    })
 }
 
 /// `POST /api/socialV2/memory-append`
@@ -4078,7 +3339,7 @@ fn handle_memory_append(
             "key": key,
             "category": category,
             "content": content,
-            "memory": crate::prompt::memory_formatted(conv, cfg),
+            "memory": crate::prompt::memory_formatted_conversation(conv, cfg),
         }))
     })
 }
@@ -4124,7 +3385,7 @@ fn handle_memory_update(
             now_ms(),
             &crate::social_mem::ImpressionPolicy::from_cfg(cfg),
         )?;
-        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted(conv, cfg) }))
+        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted_conversation(conv, cfg) }))
     })
 }
 
@@ -4154,7 +3415,7 @@ fn handle_memory_remove(
             return Err((400, "该类别需要 content 指定要删除的记忆内容".to_string()));
         }
         crate::social_mem::remove_memory(conv, &category, &content, &target);
-        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted(conv, cfg) }))
+        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted_conversation(conv, cfg) }))
     })
 }
 
@@ -4177,20 +3438,12 @@ fn handle_memory_clear(
             "ok": true,
             "key": key,
             "category": if category.is_empty() { "all".to_string() } else { category },
-            "memory": crate::prompt::memory_formatted(conv, cfg),
+            "memory": crate::prompt::memory_formatted_conversation(conv, cfg),
         }))
     })
 }
 
 const MEMORY_CATEGORIES: [&str; 3] = ["activeTopic", "pendingThought", "memberImpression"];
-
-fn now_ms() -> i64 {
-    #[cfg(test)]
-    if let Some(now) = test_clock::now() {
-        return now;
-    }
-    crate::parity_clock::now_ms() as i64
-}
 
 /// Wait-handler polling pause; under a test clock it advances virtual time instead.
 fn wait_sleep(ms: u64) {
@@ -4298,24 +3551,29 @@ fn handle_slang_clear(context: &RuntimeContext, body: &str) -> Result<Value, (u1
             format!("无效的 status：{status}，仅支持 candidate/confirmed/rejected 或留空全部删除"),
         ));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let removed = if status.is_empty() {
-        let n = entries.len();
-        entries.clear();
-        n
-    } else {
-        let before = entries.len();
-        entries.retain(|e| e.get("status").and_then(|s| s.as_str()) != Some(status.as_str()));
-        before - entries.len()
-    };
+    let removed = crate::slang::mutate_entries(context, |entries| {
+        if status.is_empty() {
+            let n = entries.len();
+            entries.clear();
+            Ok::<_, (u16, String)>((true, n))
+        } else {
+            let before = entries.len();
+            entries.retain(|e| {
+                e.get("status").and_then(|s| s.as_str()) != Some(status.as_str())
+            });
+            let n = before - entries.len();
+            Ok((n > 0, n))
+        }
+    })
+    .map_err(slang_mutate_error)?;
     if status.is_empty() {
         crate::slang_learn::clear_windows(context).map_err(slang_store_error)?;
         let root = slang_rate_root(context);
-        slang_submit_times().lock().map_err(|_| (503, "黑话限频状态不可用".to_string()))?
+        slang_submit_times()
+            .lock()
+            .map_err(|_| (503, "黑话限频状态不可用".to_string()))?
             .retain(|(stored_root, _), _| stored_root != &root);
     }
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
     Ok(json!({ "ok": true, "removedCount": removed }))
 }
 
@@ -4324,102 +3582,112 @@ fn handle_slang_clear(context: &RuntimeContext, body: &str) -> Result<Value, (u1
 /// 归一化规则照抄 JS（`extractMinMessages` 至少 1、`injectMax` 夹 1~30、
 /// `inferenceThresholds` 去重排序空则回落 `[2,4,8]`）——这些不是装饰，
 /// 填个 0 进去会让提取窗口永远不触发。
-fn handle_slang_config(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    let req: Value = serde_json::from_str(body).map_err(|_| (400, "请求体不是合法 JSON".to_string()))?;
+fn handle_slang_config_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
+    let req: Value =
+        serde_json::from_str(body).map_err(|_| (400, "请求体不是合法 JSON".to_string()))?;
     let Some(req_obj) = req.as_object() else {
-        return Err((400, "请求体必须是对象".to_string()));
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "请求体必须是对象",
+        ));
     };
-    // Serialize the whole read-modify-write with settings-set and the other selected-runtime
-    // configuration writers, so a concurrent acknowledged change is not reverted by a stale snapshot.
-    let _gate = if context.is_isolated() {
-        Some(acquire_social_state_gate(context)?)
-    } else {
-        None
-    };
-    let mut cfg = read_json_for(context, CFG_PATH).ok_or((500, "读不到 config.json".to_string()))?;
-    if !cfg.is_object() {
-        return Err((500, "config.json 不是合法 JSON，已拒绝写入".to_string()));
-    }
-    let mut merged = cfg
-        .get("slang")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    for (k, v) in req_obj {
-        merged.insert(k.clone(), v.clone());
-    }
-
-    // `Number(x) || d`：0 和 NaN 都算「没填」
-    let num_or = |v: &Value, d: f64| -> f64 {
-        let n = js_number(v);
-        if n == 0.0 || n.is_nan() {
-            d
-        } else {
-            n
-        }
-    };
-
-    if let Some(v) = merged.get("enabled").cloned() {
-        if !v.is_boolean() {
-            merged.insert("enabled".into(), json!(v == json!(true)));
-        }
-    }
-    if let Some(v) = merged.get("extractMinMessages").cloned() {
-        merged.insert("extractMinMessages".into(), json!(num_or(&v, 1.0).round().max(1.0) as i64));
-    }
-    if let Some(v) = merged.get("extractCooldownMs").cloned() {
-        merged.insert("extractCooldownMs".into(), json!(num_or(&v, 0.0).round().max(0.0) as i64));
-    }
-    if let Some(v) = merged.get("injectMax").cloned() {
-        merged.insert("injectMax".into(), json!(num_or(&v, 1.0).round().clamp(1.0, 30.0) as i64));
-    }
-    if let Some(v) = merged.get("autoResearch").cloned() {
-        merged.insert("autoResearch".into(), json!(v == json!(true)));
-    }
-    if let Some(v) = merged.get("learnerPreset").cloned() {
-        merged.insert("learnerPreset".into(), json!(js_string(&v).trim()));
-    }
-    if let Some(v) = merged.get("learnerBackend").cloned() {
-        let id = js_string(&v).trim().to_string();
-        merged.insert("learnerBackend".into(), json!(if id.is_empty() { "dsh".to_string() } else { id }));
-    }
-    if let Some(v) = merged.get("learnerFallbackDsh").cloned() {
-        merged.insert("learnerFallbackDsh".into(), json!(v == json!(true)));
-    }
-    if let Some(v) = merged.get("workspaceTitle").cloned() {
-        let t = js_string(&v).trim().to_string();
-        merged.insert(
-            "workspaceTitle".into(),
-            json!(if t.is_empty() { "QQ 黑话学习".to_string() } else { t }),
-        );
-    }
-    if let Some(raw) = req_obj.get("inferenceThresholds") {
-        let items: Vec<Value> = match raw {
-            Value::Array(a) => a.clone(),
-            other => js_string(other)
-                .split([',', '，'])
-                .flat_map(|part| part.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
-                .filter(|s| !s.is_empty())
-                .map(|s| json!(s))
-                .collect(),
-        };
-        let mut nums: Vec<i64> = Vec::new();
-        for item in &items {
-            let n = num_or(item, 1.0).round().max(1.0) as i64;
-            if !nums.contains(&n) {
-                nums.push(n);
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::RawObject,
+        move |cfg| {
+            let mut merged = cfg
+                .get("slang")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (k, v) in req_obj {
+                if matches!(
+                    k.as_str(),
+                    "learnerPreset" | "workspaceTitle" | "learnerBackend"
+                ) {
+                    continue;
+                }
+                merged.insert(k.clone(), v.clone());
             }
-        }
-        nums.sort_unstable();
-        if nums.is_empty() {
-            nums = vec![2, 4, 8];
-        }
-        merged.insert("inferenceThresholds".into(), json!(nums));
-    }
 
-    cfg["slang"] = Value::Object(merged.clone());
-    write_json_atomic_for(context, CFG_PATH, &cfg).map_err(|e| (500, e))?;
-    Ok(json!({ "ok": true, "config": slang_config_defaults(&Value::Object(merged)) }))
+            // `Number(x) || d`：0 和 NaN 都算「没填」
+            let num_or = |v: &Value, d: f64| -> f64 {
+                let n = js_number(v);
+                if n == 0.0 || n.is_nan() {
+                    d
+                } else {
+                    n
+                }
+            };
+
+            if let Some(v) = merged.get("enabled").cloned() {
+                if !v.is_boolean() {
+                    merged.insert("enabled".into(), json!(v == json!(true)));
+                }
+            }
+            if let Some(v) = merged.get("extractMinMessages").cloned() {
+                let val = num_or(&v, 1.0).round().max(1.0) as i64;
+                merged.insert("extractMinMessages".into(), json!(val));
+            }
+            if let Some(v) = merged.get("extractCooldownMs").cloned() {
+                let val = num_or(&v, 0.0).round().max(0.0) as i64;
+                merged.insert("extractCooldownMs".into(), json!(val));
+            }
+            if let Some(v) = merged.get("injectMax").cloned() {
+                let val = num_or(&v, 1.0).round().clamp(1.0, 30.0) as i64;
+                merged.insert("injectMax".into(), json!(val));
+            }
+            if let Some(v) = merged.get("autoResearch").cloned() {
+                merged.insert("autoResearch".into(), json!(v == json!(true)));
+            }
+            if let Some(v) = merged.get("learnerFallbackDsh").cloned() {
+                merged.insert("learnerFallbackDsh".into(), json!(v == json!(true)));
+            }
+            if let Some(raw) = req_obj.get("inferenceThresholds") {
+                let items: Vec<Value> = match raw {
+                    Value::Array(a) => a.clone(),
+                    other => js_string(other)
+                        .split([',', '，'])
+                        .flat_map(|part| {
+                            part.split_whitespace()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|s| !s.is_empty())
+                        .map(|s| json!(s))
+                        .collect(),
+                };
+                let mut nums: Vec<i64> = Vec::new();
+                for item in &items {
+                    let n = num_or(item, 1.0).round().max(1.0) as i64;
+                    if !nums.contains(&n) {
+                        nums.push(n);
+                    }
+                }
+                nums.sort_unstable();
+                if nums.is_empty() {
+                    nums = vec![2, 4, 8];
+                }
+                merged.insert("inferenceThresholds".into(), json!(nums));
+            }
+
+            cfg["slang"] = Value::Object(merged.clone());
+            Ok(json!({
+                "ok": true,
+                "config": slang_config_defaults(&Value::Object(merged)),
+            }))
+        },
+    )
+}
+
+#[cfg(test)]
+fn handle_slang_config(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_slang_config_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 
 /// `POST /api/slang/batch-delete`：按 id 或按状态批量删除。
@@ -4431,19 +3699,20 @@ fn handle_slang_batch_delete(context: &RuntimeContext, body: &str) -> Result<Val
         .map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     let status = req.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
     if !ids.is_empty() {
-        let before = entries.len();
-        entries.retain(|e| {
-            let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            !ids.iter().any(|x| x == id)
-        });
-        let removed = before - entries.len();
-        if removed == 0 {
-            return Err((404, "没有匹配到要删除的黑话".to_string()));
-        }
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+        let removed = crate::slang::mutate_entries(context, |entries| {
+            let before = entries.len();
+            entries.retain(|e| {
+                let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                !ids.iter().any(|x| x == id)
+            });
+            let removed = before - entries.len();
+            if removed == 0 {
+                return Err((404, "没有匹配到要删除的黑话".to_string()));
+            }
+            Ok((true, removed))
+        })
+        .map_err(slang_mutate_error)?;
         return Ok(json!({ "ok": true, "removedCount": removed }));
     }
     if !status.is_empty() && !SLANG_STATUSES.contains(&status.as_str()) {
@@ -4452,10 +3721,15 @@ fn handle_slang_batch_delete(context: &RuntimeContext, body: &str) -> Result<Val
     if status.is_empty() {
         return Err((400, "请提供 ids 或 status".to_string()));
     }
-    let before = entries.len();
-    entries.retain(|e| e.get("status").and_then(|s| s.as_str()) != Some(status.as_str()));
-    let removed = before - entries.len();
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+    let removed = crate::slang::mutate_entries(context, |entries| {
+        let before = entries.len();
+        entries.retain(|e| {
+            e.get("status").and_then(|s| s.as_str()) != Some(status.as_str())
+        });
+        let removed = before - entries.len();
+        Ok::<_, (u16, String)>((removed > 0, removed))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({ "ok": true, "removedCount": removed }))
 }
 
@@ -4482,39 +3756,38 @@ fn handle_slang_batch_confirm(context: &RuntimeContext, body: &str) -> Result<Va
     if ids.is_empty() {
         return Err((400, "请选择要确认的黑话".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let now = crate::sticker::now_iso();
-    let mut confirmed = 0usize;
-    let mut skipped: Vec<Value> = Vec::new();
-    for id in &ids {
-        let Some(pos) = entries
-            .iter()
-            .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        else {
-            skipped.push(json!({ "id": id, "reason": "不存在" }));
-            continue;
-        };
-        let entry = &entries[pos];
-        let content = entry.get("content").cloned().unwrap_or(Value::Null);
-        if entry.get("status").and_then(|v| v.as_str()) != Some("candidate") {
-            skipped.push(json!({ "id": id, "content": content, "reason": "不是候选" }));
-            continue;
+    let (confirmed, skipped_count, skipped) = crate::slang::mutate_entries(context, |entries| {
+        let now = crate::sticker::now_iso();
+        let mut confirmed = 0usize;
+        let mut skipped: Vec<Value> = Vec::new();
+        for id in &ids {
+            let Some(pos) = entries
+                .iter()
+                .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            else {
+                skipped.push(json!({ "id": id, "reason": "不存在" }));
+                continue;
+            };
+            let entry = &entries[pos];
+            let content = entry.get("content").cloned().unwrap_or(Value::Null);
+            if entry.get("status").and_then(|v| v.as_str()) != Some("candidate") {
+                skipped.push(json!({ "id": id, "content": content, "reason": "不是候选" }));
+                continue;
+            }
+            let meaning = entry.get("meaning").and_then(|v| v.as_str()).unwrap_or("");
+            if meaning.trim().is_empty() {
+                skipped.push(json!({ "id": id, "content": content, "reason": "缺少含义" }));
+                continue;
+            }
+            entries[pos]["status"] = json!("confirmed");
+            entries[pos]["updatedAt"] = json!(now);
+            confirmed += 1;
         }
-        let meaning = entry.get("meaning").and_then(|v| v.as_str()).unwrap_or("");
-        if meaning.trim().is_empty() {
-            skipped.push(json!({ "id": id, "content": content, "reason": "缺少含义" }));
-            continue;
-        }
-        entries[pos]["status"] = json!("confirmed");
-        entries[pos]["updatedAt"] = json!(now);
-        confirmed += 1;
-    }
-    if confirmed > 0 {
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-    }
-    let skipped_count = skipped.len();
-    skipped.truncate(20);
+        let skipped_count = skipped.len();
+        skipped.truncate(20);
+        Ok::<_, (u16, String)>((confirmed > 0, (confirmed, skipped_count, skipped)))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({
         "ok": true,
         "confirmedCount": confirmed,
@@ -4534,27 +3807,26 @@ fn handle_slang_batch_reject(context: &RuntimeContext, body: &str) -> Result<Val
     if ids.is_empty() {
         return Err((400, "请选择要拒绝的黑话".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let now = crate::sticker::now_iso();
-    let mut rejected = 0usize;
-    for id in &ids {
-        let Some(pos) = entries
-            .iter()
-            .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        else {
-            continue;
-        };
-        if entries[pos].get("status").and_then(|v| v.as_str()) == Some("rejected") {
-            continue;
+    let rejected = crate::slang::mutate_entries(context, |entries| {
+        let now = crate::sticker::now_iso();
+        let mut rejected = 0usize;
+        for id in &ids {
+            let Some(pos) = entries
+                .iter()
+                .position(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            else {
+                continue;
+            };
+            if entries[pos].get("status").and_then(|v| v.as_str()) == Some("rejected") {
+                continue;
+            }
+            entries[pos]["status"] = json!("rejected");
+            entries[pos]["updatedAt"] = json!(now);
+            rejected += 1;
         }
-        entries[pos]["status"] = json!("rejected");
-        entries[pos]["updatedAt"] = json!(now);
-        rejected += 1;
-    }
-    if rejected > 0 {
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-    }
+        Ok::<_, (u16, String)>((rejected > 0, rejected))
+    })
+    .map_err(slang_mutate_error)?;
     Ok(json!({ "ok": true, "rejectedCount": rejected }))
 }
 
@@ -4568,43 +3840,10 @@ fn passthrough_error(msg: String) -> String {
     }
 }
 
-/// 会话是否在当前模式的白名单里（JS 的 `isSessionAllowedInCurrentMode`）。
-///
-/// 这里只做「白名单」这一层：JS 还要看当前模式（reserved2 / closed-agent），
-/// Rust 侧目前只有 reserved2，模式判定等 P10-c 的 /api/mode 落地后再补。
-/// 当前模式：以 `state/mode.json` 为准（JS 也是这么定的）。
-/// 缺文件时按 `reserved2` —— 这个桥接实际只在二代仿真模式下跑，
-/// 而 `chat`/`reserved` 会让所有发送类端点直接 403，缺省成那边等于"什么都没法用"。
-fn current_mode() -> String {
-    read_json(crate::legacy_path!("qq-bridge/state/mode.json"))
-        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
-        .map(|s| crate::config::normalize_mode(&s).map(str::to_string).unwrap_or(s))
-        .unwrap_or_else(|| "reserved2".to_string())
+fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
+    social_state::mode_checked(context).map_err(SocialError::into_http)
 }
 
-pub(crate) fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
-    if !context.is_isolated() {
-        return Ok(current_mode());
-    }
-    let text = context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| (500, "runtime mode is unavailable".to_string()))?;
-    let Some(text) = text else {
-        return Ok("reserved2".to_string());
-    };
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|_| (500, "runtime mode is invalid".to_string()))?;
-    let Some(object) = value.as_object() else {
-        return Err((500, "runtime mode is invalid".to_string()));
-    };
-    match object.get("mode") {
-        Some(Value::String(mode)) => Ok(crate::config::normalize_mode(mode)
-            .map(str::to_string)
-            .unwrap_or_else(|| mode.clone())),
-        None => Ok("reserved2".to_string()),
-        Some(_) => Err((500, "runtime mode is invalid".to_string())),
-    }
-}
 /// 会话是否在当前模式的白名单里（JS 的 isSessionAllowedInCurrentMode）。
 fn session_allowed(cfg: &Value, key: &str) -> bool {
     let Some((kind, id)) = key.split_once(':') else {
@@ -4638,186 +3877,9 @@ fn session_allowed(cfg: &Value, key: &str) -> bool {
     }
 }
 
-/// JS `isSessionAllowedInCurrentMode` behavior for selected-root social-v2 tools.
-/// This is kept separate from the legacy route preflight while that wider route
-/// family is still being migrated.
-pub(crate) fn social_policy_js_string(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value
-            .as_f64()
-            .map(|number| {
-                if number == 0.0 {
-                    // ECMAScript String(-0) is "0".
-                    "0".to_string()
-                } else if number.abs() >= 1.0e21 {
-                    // ECMAScript switches to exponent notation at 1e21; such
-                    // values therefore do not pass the decimal-ID filter.
-                    format!("{number:e}")
-                } else {
-                    number.to_string()
-                }
-            })
-            .unwrap_or_else(|| value.to_string()),
-        Value::String(value) => value.clone(),
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                if value.is_null() {
-                    String::new()
-                } else {
-                    social_policy_js_string(value)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        Value::Object(_) => "[object Object]".to_string(),
-    }
-}
-
-fn social_policy_normalized_id(value: &Value) -> Option<String> {
-    let value = social_policy_js_string(value);
-    let value = value.trim_matches(social_policy_js_trim_char);
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| value.to_string())
-}
-
-fn social_policy_js_trim_char(ch: char) -> bool {
-    // ECMAScript WhiteSpace + LineTerminator code points for String.trim().
-    // Rust's broader `char::is_whitespace` includes U+0085, which JS does not.
-    matches!(
-        ch,
-        '\u{0009}'
-            | '\u{000a}'
-            | '\u{000b}'
-            | '\u{000c}'
-            | '\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
-    )
-}
-
-fn social_policy_list(cfg: &Value, root: &str, kind: &str) -> Option<Vec<String>> {
-    let policy = cfg.get(root)?;
-    // Match bridge.js nullish alias precedence: group uses groups ?? group;
-    // private uses private ?? privates. A present non-array value normalizes
-    // to an empty list rather than falling through to the alternate alias.
-    let (preferred, fallback) = match kind {
-        "group" => ("groups", "group"),
-        "private" => ("private", "privates"),
-        _ => return None,
-    };
-    let values = policy
-        .get(preferred)
-        .filter(|value| !value.is_null())
-        .or_else(|| policy.get(fallback))?
-        .as_array()?;
-    Some(values.iter().filter_map(social_policy_normalized_id).collect())
-}
-
-fn social_v2_session_allowed(cfg: &Value, key: &str) -> bool {
-    let Some(canonical) = canonical_v2_key(key) else {
-        return false;
-    };
-    let Some((kind, id)) = canonical.split_once(':') else {
-        return false;
-    };
-    let deny = social_policy_list(cfg, "deny", kind).unwrap_or_default();
-    if deny.iter().any(|value| value == id) {
-        return false;
-    }
-    let allow = social_policy_list(cfg, "allow", kind).unwrap_or_default();
-    if allow.is_empty() {
-        cfg.get("allowAllWhenEmpty").and_then(Value::as_bool) == Some(true)
-    } else {
-        allow.iter().any(|value| value == id)
-    }
-}
-
-/// Frozen social-v2 projection middleware checks a numeric session key before
-/// the handler applies `canonical_v2_key`'s safe-integer storage constraint.
-/// It compares `String(Number(id))` against normalized allow/deny strings; this
-/// intentionally permits a seeded unsafe raw key through policy so the storage
-/// handler can return its later 400.
-fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
-    let Some((kind, raw_id)) = key
-        .trim_matches(social_policy_js_trim_char)
-        .split_once(':')
-    else {
-        return false;
-    };
-    if !matches!(kind, "group" | "private")
-        || raw_id.is_empty()
-        || !raw_id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let Ok(number) = raw_id.parse::<f64>() else {
-        return false;
-    };
-    let id = if number.is_infinite() {
-        if number.is_sign_negative() {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        }
-    } else if let Some(number) = serde_json::Number::from_f64(number) {
-        social_policy_js_string(&Value::Number(number))
-    } else {
-        "NaN".to_string()
-    };
-    let deny = social_policy_list(cfg, "deny", kind).unwrap_or_default();
-    if deny.iter().any(|value| value == &id) {
-        return false;
-    }
-    let allow = social_policy_list(cfg, "allow", kind).unwrap_or_default();
-    if allow.is_empty() {
-        cfg.get("allowAllWhenEmpty").and_then(Value::as_bool) == Some(true)
-    } else {
-        allow.iter().any(|value| value == &id)
-    }
-}
-
-/// Additional menu gates imposed by the reserved2 console routes.
-pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
-    match name {
-        "qq_send_private_message" => key.starts_with("private:"),
-        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
-        "qq_send_voice" | "qq_list_voices" =>
-            voice_http::voice_cfg(cfg).enabled && voice_http::send_voice_tool_enabled(cfg),
-        "qq_set_sticker_remark" => tool_enabled(cfg, "setStickerRemark"),
-        _ => true,
-    }
-}
-
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let state = load_social_state();
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|c| c.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    agent_token_ok_for(&RuntimeContext::legacy(), key, token).unwrap_or(false)
 }
 
 fn agent_token_ok_for(
@@ -4825,36 +3887,22 @@ fn agent_token_ok_for(
     key: &str,
     token: &str,
 ) -> Result<bool, (u16, String)> {
-    if token.is_empty() {
-        return Ok(false);
-    }
-    let state = load_social_state_for(context)?;
-    Ok(agent_token_matches_state(&state, key, token))
+    social_state::token_ok(context, key, token).map_err(SocialError::into_http)
 }
 
+fn agent_token_matches_doc(doc: &SocialDocument, key: &str, token: &str) -> bool {
+    social_state::token_matches_doc(doc, key, token)
+}
+
+#[cfg(test)]
 fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let canonical_key = canonical_v2_key(key);
-    let lookup_key = canonical_key.as_deref().unwrap_or(key);
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(lookup_key))
-        .and_then(|t| t.get("agentToken"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    SocialDocument::from_value(state.clone())
+        .ok()
+        .is_some_and(|doc| agent_token_matches_doc(&doc, key, token))
 }
 
-fn agent_memory_denial(
-    state: &Value,
+fn agent_memory_denial_doc(
+    doc: &SocialDocument,
     cfg: &Value,
     key: &str,
     token: &str,
@@ -4863,7 +3911,7 @@ fn agent_memory_denial(
     if token.is_empty() {
         return Some((403, "agent token 不能为空".to_string()));
     }
-    if !agent_token_matches_state(state, key, token) {
+    if !agent_token_matches_doc(doc, key, token) {
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_session_allowed(cfg, key) {
@@ -4901,10 +3949,11 @@ pub(super) fn handle_wait_post(
         }
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
-    let (state, is_agent) = social_projection_request_state(context, cfg, &raw_key, agent_token, "waitMessages", "qq_wait_for_messages")?;
+    let (doc, is_agent) = social_projection_request_doc(context, cfg, &raw_key, agent_token, "waitMessages", "qq_wait_for_messages")?;
     let key = projection_storage_key(&raw_key)?;
-    let conv = state.get("conversations").and_then(|c| c.get(&key)).cloned().unwrap_or_else(|| new_conversation(context));
-    if state.get("paused").and_then(|v| v.as_bool()) == Some(true) {
+    let conv_typed = doc.conversation(&key).unwrap_or_else(|| Conversation::new_default(context));
+    let conv = conv_typed.to_value();
+    if doc.paused() {
         return Ok(json!({
             "ok": true,
             "key": raw_key,
@@ -4913,37 +3962,40 @@ pub(super) fn handle_wait_post(
             "timeout": false,
             "waitedMs": 0,
             "newMessages": [],
-            "readThroughSeq": agent::through_of(context, &key, &conv),
-            "unreadCount": unread_count_of(&conv),
+            "readThroughSeq": agent::through_of_conv(context, &key, &conv_typed),
+            "unreadCount": unread_count_of(&conv_typed),
         }));
     }
     let wait_cfg = wait_section(cfg);
     let num = |k: &str, d: i64| -> i64 { wait_number(&wait_cfg, k, d) };
-    let WaitBounds { min_quiet_after_new, max_quiet_ms } = wait_bounds(cfg);
+    let (min_quiet_after_new, max_quiet_ms) = social_state::wait_quiet_bounds(cfg);
 
     let mut reply_wait = req.get("purpose").and_then(|v| v.as_str()) == Some("reply");
     // JS: Math.max(1, Math.round(Number(body.minNewMessages) || 1))
     let mut min_new = js_round(agent::js_number_or(req.get("minNewMessages"), 1.0)).max(1);
     let default_ms = num("defaultMs", 30_000);
-    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
+    let (min_ms, max_ms) = social_state::wait_timeout_range(cfg);
     // JS: Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)))
     let mut timeout_ms = js_round(agent::js_number_or(req.get("timeoutMs"), default_ms as f64)).max(min_ms).min(max_ms);
     let batch = wait_policy(cfg);
     // Reserve atomically before polling. Superseded calls still consumed a model/tool round trip.
     let admission = if is_agent {
-        mutate_social_state_for(context, |state| {
+        ConversationState::for_runtime(context).update_document(|doc| {
             let auth = SocialProjectionWriteAuth { token: agent_token.unwrap_or(""), tool_flag: "waitMessages", tool_name: "qq_wait_for_messages" };
-            social_projection_write_denial(context, state, &key, auth)?;
-            let current = &mut state["conversations"][&key];
-            let (scope, used) = wait_usage(context, &key, current)?;
+            social_projection_write_denial_doc(context, doc, &key, auth)?;
+            let mut current_conv = doc.conversation(&key).unwrap_or_default();
+            let (scope, used) = wait_usage(context, &key, &current_conv)?;
             if used >= batch.max_per_turn { return Ok(None); }
             let used = used + 1;
+            let mut current = current_conv.to_value();
             // Refunds for messages for her are counted per turn (scope) like the slots themselves.
             let refunds = Some(current["waitBudget"]["refunds"].clone())
                 .filter(|r| !r.is_null() && current["waitBudget"]["scope"].as_str() == Some(scope.as_str()));
-            current["waitBudget"] = json!({"scope":scope,"used":used});
+            current["waitBudget"] = json!({"scope":scope,"used":used,"max":batch.max_per_turn});
             if let Some(refunds) = refunds { current["waitBudget"]["refunds"] = refunds; }
-            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(current, cfg, now_ms()).is_some();
+            current_conv.set_field("waitBudget", current["waitBudget"].clone());
+            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(&current, cfg, &key, now_ms()).is_some();
+            doc.set_conversation(&key, current_conv);
             Ok(Some((used, observe, scope)))
         })?
     } else { Some((0, false, String::new())) };
@@ -4951,7 +4003,7 @@ pub(super) fn handle_wait_post(
         let mut out = json!({"ok":true,"key":raw_key,"purpose":if reply_wait {"reply"} else {"messages"},
             "arrived":false,"timeout":false,"waitedMs":0,"newMessages":[],
             "preSleepWaitSatisfied":false,"preSleepWaitObserved":false,
-            "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+            "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
         note_wait_budget(&mut out, batch.max_per_turn, batch.max_per_turn);
         // An engaged turn out of wait slots ends as a clean sleep, never as a missed close. Best
         // effort: a failure here is logged and the limit result (end the turn) still returns.
@@ -4971,7 +4023,7 @@ pub(super) fn handle_wait_post(
         reply_wait = false;
         min_new = 1;
         // The reserved slot must fit the complete observation, including when maxMs is shorter.
-        timeout_ms = timeout_ms.max(crate::wake::pre_sleep_wait_ms(cfg)).max(crate::wake::prompt_pre_sleep_wait_ms(cfg));
+        timeout_ms = timeout_ms.max(crate::wake::required_pre_sleep_ms(cfg, &key));
     }
     // The dispatch deadline is captured once, so hot reload and restarted observations
     // cannot extend the turn. Batching below must obey the same absolute boundary.
@@ -4989,15 +4041,21 @@ pub(super) fn handle_wait_post(
     };
     // A message for her past the baseline (bridge hint `forYou`).
     let for_her = |c: &Value| -> bool {
-        ["unread", "recentMessages"].iter()
-            .filter_map(|field| c.get(*field).and_then(Value::as_array)).flatten()
+        let unread = Conversation::from_value(c)
+            .map(|conv| conv.unread_values())
+            .unwrap_or_default();
+        let recent = c.get("recentMessages").and_then(Value::as_array).into_iter().flatten();
+        unread.iter().chain(recent)
             .any(|m| m["seq"].as_i64().unwrap_or(0) > baseline && m["isSelf"] != true
                 && crate::question::for_you(m, &key).0)
     };
     // An urgent message (an @ of her or the owner's) past the baseline.
     let urgent = |c: &Value| -> bool {
-        ["unread", "recentMessages"].iter()
-            .filter_map(|field| c.get(*field).and_then(Value::as_array)).flatten()
+        let unread = Conversation::from_value(c)
+            .map(|conv| conv.unread_values())
+            .unwrap_or_default();
+        let recent = c.get("recentMessages").and_then(Value::as_array).into_iter().flatten();
+        unread.iter().chain(recent)
             .any(|m| m["seq"].as_i64().unwrap_or(0) > baseline && m["isSelf"] != true
                 && (m["atSelf"] == true || m["isOwner"] == true))
     };
@@ -5011,7 +4069,7 @@ pub(super) fn handle_wait_post(
             let mut out = json!({"ok":true,"key":raw_key,"purpose":if reply_wait {"reply"} else {"messages"},
                 "arrived":false,"timeout":false,"waitedMs":0,"newMessages":[],
                 "preSleepWaitSatisfied":false,"preSleepWaitObserved":false,
-                "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+                "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
             note_wait_budget(&mut out, wait_used, batch.max_per_turn);
             note_turn_budget_ended(&mut out);
             return Ok(out);
@@ -5037,13 +4095,13 @@ pub(super) fn handle_wait_post(
             let mut out = json!({"ok":true,"key":raw_key,"purpose":"messages",
                 "arrived":!new_messages.is_empty(),"timeout":false,"waitedMs":0,"newMessages":new_messages,
                 "preSleepWaitSatisfied":true,"preSleepWaitObserved":false,
-                "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+                "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
             if is_agent { note_wait_budget(&mut out, wait_used, batch.max_per_turn); }
             note_engagement_ended(&mut out);
             if is_agent {
-                let unread = conv.get("unread").and_then(Value::as_array).cloned().unwrap_or_default();
+                let unread = conv_typed.unread_values();
                 agent::note_receipts(context, &key, &conv, &unread, out["newMessages"].as_array().unwrap());
-                out["readThroughSeq"] = json!(agent::through_of(context, &key, &conv));
+                out["readThroughSeq"] = json!(agent::through_of_conv(context, &key, &conv_typed));
             }
             return Ok(out);
         }
@@ -5085,12 +4143,13 @@ pub(super) fn handle_wait_post(
     // A failed read (replace window, parse error) proves nothing: that poll is skipped (`None`).
     // Only a state that was read shows a reset: a different token or no conversation.
     let poll_conversation = || -> Result<Option<Value>, (u16, String)> {
-        let Ok(state) = load_social_state_for(context) else { return Ok(None) };
-        let current = state.get("conversations").and_then(|c| c.get(&key)).cloned();
-        if is_agent && current.as_ref().and_then(|c| c.get("agentToken")).and_then(Value::as_str) != agent_token {
+        let Ok(doc) = ConversationState::for_runtime(context).read_document() else { return Ok(None) };
+        let current = doc.conversation(&key);
+        let live_token = current.as_ref().and_then(|c| c.token()).unwrap_or("");
+        if is_agent && !credential_eq(live_token, agent_token.unwrap_or("")) {
             return Err((403, CHANGED.to_string()));
         }
-        Ok(Some(current.unwrap_or_else(|| json!({}))))
+        Ok(Some(current.map(|c| c.to_value()).unwrap_or_else(|| json!({}))))
     };
     let superseded_result = || {
         let mut out = json!({
@@ -5220,7 +4279,7 @@ pub(super) fn handle_wait_post(
 
     let auth = agent_token.map(|token| SocialProjectionWriteAuth { token, tool_flag: "waitMessages", tool_name: "qq_wait_for_messages" });
     let mut superseded_at_write = false;
-    let out = mutate_social_state_for(context, |st| {
+    let out = ConversationState::for_runtime(context).update_document(|doc| {
     // Recheck under the state gate: takeover may happen while this handler queues for it.
     // Returning Err skips persistence; the private signal becomes a normal superseded result below.
     if !lease.still_current() {
@@ -5229,15 +4288,17 @@ pub(super) fn handle_wait_post(
     }
     // The session may have been reset, its token rotated or its permissions changed while we waited.
     if let Some(auth) = auth {
-        if social_projection_write_denial(context, st, &key, auth).is_err() {
+        if social_projection_write_denial_doc(context, doc, &key, auth).is_err() {
             return Err((403, CHANGED.to_string()));
         }
     }
-    let Some(entry) = st.get_mut("conversations").and_then(|c| c.get_mut(&key)) else {
+    let Some(entry_conv) = doc.conversation(&key) else {
         return Err((403, CHANGED.to_string()));
     };
+    let mut entry_val = entry_conv.to_value();
+    let entry = &mut entry_val;
     let pre_sleep_ms = crate::wake::pre_sleep_wait_ms(cfg);
-    let blocked = crate::wake::pre_sleep_remaining(entry, &cfg, now_ms());
+    let blocked = crate::wake::pre_sleep_remaining(entry, cfg, &key, now_ms());
     let pre_sleep_remaining_ms = blocked.unwrap_or(0);
     let now = now_ms();
     // The wait keeps its entry-time stop, but a successful send may have moved the turn cap.
@@ -5271,8 +4332,8 @@ pub(super) fn handle_wait_post(
         && engaged_end.is_some_and(|end| now >= end)
         && crate::wake::engagement_end(entry, cfg).is_none_or(|end| now >= end);
     let quiet = (reply_wait || (arrived && quiet_ms > 0)) && (now - last_new_at >= quiet_ms);
-    let pre_sleep_attempt = !reply_wait && (timeout_ms >= pre_sleep_ms || window_observation);
-    let pre_sleep_satisfied_now = window_ended || !budget_ended && !reply_wait
+    let pre_sleep_attempt = pre_sleep_ms > 0 && !reply_wait && (timeout_ms >= pre_sleep_ms || window_observation);
+    let pre_sleep_satisfied_now = window_ended || pre_sleep_ms > 0 && !budget_ended && !reply_wait
         && (if !arrived {
             waited_ms >= pre_sleep_ms
         } else {
@@ -5300,8 +4361,8 @@ pub(super) fn handle_wait_post(
     let new_messages = if reply_wait || arrived { pending } else { Vec::new() };
     let for_you = new_messages.iter().any(|m| m["forYou"] == true);
 
-    let read_through = agent::through_of(context, &key, entry);
-    let unread_total = unread_count_of(entry);
+    let read_through = agent::through_of_conv(context, &key, &entry_conv);
+    let unread_total = unread_count_of(&entry_conv);
     let observed_flag = entry.get("preSleepWaitObservedAt").and_then(|v| v.as_i64()).unwrap_or(0) > 0;
     let last_new = new_messages
         .last()
@@ -5339,7 +4400,7 @@ pub(super) fn handle_wait_post(
         "timeout": if reply_wait { !quiet } else { !arrived || (quiet_ms > 0 && !quiet && now - start >= timeout_ms) },
         "waitedMs": waited_ms,
         "preSleepWaitSatisfied": pre_sleep_satisfied_now,
-        "preSleepWaitObserved": !reply_wait && observed_flag,
+        "preSleepWaitObserved": pre_sleep_ms > 0 && !reply_wait && observed_flag,
         "newMessages": new_messages,
         "readThroughSeq": read_through,
         "unreadCount": unread_total,
@@ -5387,7 +4448,9 @@ pub(super) fn handle_wait_post(
         }
         note_engagement_ended(&mut out);
     }
-    Ok((out, entry.clone()))
+    let committed_conv = Conversation::from_value(entry).unwrap_or(entry_conv);
+    doc.set_conversation(&key, committed_conv.clone());
+    Ok((out, committed_conv))
     });
     if superseded_at_write {
         return Ok(superseded_result());
@@ -5396,9 +4459,10 @@ pub(super) fn handle_wait_post(
     // Only a successfully prepared and persisted result offers messages to the model.
     // Publishing inside the mutation would falsely cover an urgent wake on write failure.
     if is_agent {
-        let unread = committed.get("unread").and_then(Value::as_array).cloned().unwrap_or_default();
-        agent::note_receipts(context, &key, &committed, &unread, out["newMessages"].as_array().unwrap());
-        out["readThroughSeq"] = json!(agent::through_of(context, &key, &committed));
+        let unread = committed.unread_values();
+        let committed_val = committed.to_value();
+        agent::note_receipts(context, &key, &committed_val, &unread, out["newMessages"].as_array().unwrap());
+        out["readThroughSeq"] = json!(agent::through_of_conv(context, &key, &committed));
     }
     Ok(out)
 }
@@ -5412,7 +4476,9 @@ fn wait_pending(entry: &Value, cfg: &Value, key: &str, baseline: i64, reply_wait
     let mut history: Vec<Value> = Vec::new();
     if reply_wait {
         if unread_ok {
-            history.extend(entry.get("unread").and_then(|v| v.as_array()).cloned().unwrap_or_default());
+            if let Some(conv) = Conversation::from_value(entry) {
+                history.extend(conv.unread_values());
+            }
         }
         if recent_ok {
             history.extend(entry.get("recentMessages").and_then(|v| v.as_array()).cloned().unwrap_or_default());
@@ -5487,12 +4553,14 @@ impl WaitLease {
             let live = context.open_locked_file(RuntimeArea::Data, &path).map_err(|e| (503, e))?;
             self.live = Some((context.clone(), live, path));
         }
-        mutate_social_state_for(context, |state| {
-            social_projection_write_denial(context, state, &self.key, SocialProjectionWriteAuth {
+        ConversationState::for_runtime(context).update_document(|doc| {
+            social_projection_write_denial_doc(context, doc, &self.key, SocialProjectionWriteAuth {
                 token, tool_flag:"waitMessages", tool_name:"qq_wait_for_messages" })?;
             if !self.still_current() { return Ok(()); }
-            state["conversations"][&self.key]["activeWait"] = json!({"id":marker,"console":console,"turn":turn,
-                "epoch":crate::send_outbox::token_epoch(token),"purpose":purpose});
+            let mut conv = doc.conversation(&self.key).unwrap_or_default();
+            conv.set_field("activeWait", json!({"id":marker,"console":console,"turn":turn,
+                "epoch":crate::conversation_state::token_epoch(token),"purpose":purpose}));
+            doc.set_conversation(&self.key, conv);
             Ok(())
         })?;
         self.published = Some((context.clone(), marker));
@@ -5516,9 +4584,9 @@ impl Drop for WaitLease {
             }
         }
         if let Some((context, marker)) = self.published.take() {
-            if mutate_social_state_for(&context, |state| {
-                if state["conversations"][&self.key]["activeWait"]["id"] == marker {
-                    state["conversations"][&self.key].as_object_mut().unwrap().remove("activeWait");
+            if ConversationState::for_runtime(&context).update_existing(&self.key, |conv| {
+                if conv.field("activeWait").and_then(|w| w.get("id")).and_then(Value::as_str) == Some(marker.as_str()) {
+                    conv.remove_field("activeWait");
                 }
                 Ok(())
             }).is_err() { eprintln!("[wait] active wait cleanup failed"); }
@@ -5534,52 +4602,24 @@ fn wait_section(cfg: &Value) -> Value {
     cfg.get("socialV2").and_then(|s| s.get("wait")).cloned().unwrap_or_else(|| json!({}))
 }
 
-pub(crate) struct WaitPolicy {
-    pub window_ms: i64,
-    pub max_ms: i64,
-    pub max_per_turn: u64,
-}
-
-/// Invalid overrides never prevent config loading; bounded batches fit the turn's quiet budget.
-pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
-    let section = wait_section(cfg);
-    let duration = |name: &str, default: i64| section.get(name).and_then(Value::as_i64)
-        .filter(|n| (1..=120_000).contains(n)).unwrap_or(default);
-    WaitPolicy { window_ms: duration("batchWindowMs", 8_000), max_ms: crate::settings::wake_timing::WAIT_BATCH_MAX.integer(cfg),
-        max_per_turn: section.get("maxPerTurn").and_then(Value::as_u64)
-            .filter(|n| (1..=9_007_199_254_740_991).contains(n)).unwrap_or(4) }
-}
-
 /// Selected turns keep their durable identity across console restarts and DSH re-attachment.
 /// No-ledger callers use the persisted legacy turn ID, retaining lastWakeAt for older records.
-fn wait_usage(context: &RuntimeContext, key: &str, conv: &Value) -> Result<(String, u64), (u16, String)> {
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
+fn wait_usage(context: &RuntimeContext, key: &str, conv: &Conversation) -> Result<(String, u64), (u16, String)> {
+    let epoch = crate::conversation_state::token_epoch(conv.token().unwrap_or(""));
     let turn = if context.is_isolated() {
         let records = crate::turn_ledger::read_records(context).map_err(|_| (503, "wait turn ledger is unavailable".to_string()))?;
         crate::turn_ledger::fold(&records).0.into_iter().rev()
             .find(|t| t.key == key && t.epochs.contains(&epoch)).map(|t| t.id)
     } else { None };
-    let scope = format!("{epoch}:{}", turn.or_else(|| conv["waitTurnId"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("wake:{}", conv["wakeConfig"]["lastWakeAt"].as_i64().unwrap_or(0))));
-    let used = if conv["waitBudget"]["scope"].as_str() == Some(&scope) {
-        conv["waitBudget"]["used"].as_u64().unwrap_or(0)
+    let scope = format!("{epoch}:{}", turn.or_else(|| conv.field("waitTurnId").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| format!("wake:{}", conv.field("wakeConfig").and_then(|w| w.get("lastWakeAt")).and_then(Value::as_i64).unwrap_or(0))));
+    let used = if conv.field("waitBudget").and_then(|b| b.get("scope")).and_then(Value::as_str) == Some(&scope) {
+        conv.field("waitBudget").and_then(|b| b.get("used")).and_then(Value::as_u64).unwrap_or(0)
     } else { 0 };
     Ok((scope, used))
 }
 
-/// Effective per-turn text-send cap (`socialV2.send.maxPerTurn`, positive safe integer, default 20).
-pub(crate) fn turn_send_cap(cfg: &Value) -> u64 {
-    crate::settings::send::TURN_MAX.integer(cfg) as u64
-}
-
-pub(crate) const END_TURN: &str = "end this turn now: produce your final answer and make no further tool calls";
 const TURN_CLOSE_MARGIN_MS: i64 = 20_000;
-
-/// Effective deadline shared by live simulation and the console's durable wait budget.
-pub(crate) fn reserved2_deadline(deadline: i64, cap: i64, ceiling: i64, start: i64, conv: &Value) -> i64 {
-    conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
-        .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
-}
 
 /// Captured simulation budget shared by observation waits and snapshot read grants.
 fn captured_turn_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value, infer_legacy_wait: bool)
@@ -5625,10 +4665,12 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
 }
 
 fn mark_turn_budget_ended(context: &RuntimeContext, key: &str, token: &str, turn: &str) -> Result<(), (u16, String)> {
-    mutate_social_state_for(context, |state| {
-        social_projection_write_denial(context, state, key, SocialProjectionWriteAuth {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        social_projection_write_denial_doc(context, doc, key, SocialProjectionWriteAuth {
             token, tool_flag:"waitMessages", tool_name:"qq_wait_for_messages" })?;
-        state["conversations"][key]["turnBudgetEnded"] = json!(turn);
+        let mut conv = doc.conversation(key).unwrap_or_default();
+        conv.set_field("turnBudgetEnded", json!(turn));
+        doc.set_conversation(key, conv);
         Ok(())
     })
 }
@@ -5649,13 +4691,14 @@ fn note_engagement_ended(out: &mut Value) {
 
 /// #46: a send to a group where QQ has muted her is refused here, before quota, quote or gateway
 /// work. The result says until when; an open turn is marked ended so it closes as a clean sleep.
-pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
+pub(super) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
     let Some(mute) = crate::group_mute::active(context, key) else { return Ok(()) };
     if !token.is_empty() {
-        let epoch = crate::send_outbox::token_epoch(token);
-        let marked = load_social_state_for(context).and_then(|state| {
-            let Some(conv) = state["conversations"].get(key).cloned() else { return Ok(()) };
-            match turn_wait_budget(context, cfg, key, &epoch, &conv)? {
+        let epoch = crate::conversation_state::token_epoch(token);
+        let marked = ConversationState::for_runtime(context).read(key).and_then(|conv| {
+            let Some(conv) = conv else { return Ok(()) };
+            let conv_val = conv.to_value();
+            match turn_wait_budget(context, cfg, key, &epoch, &conv_val)? {
                 Some((turn, _)) => mark_turn_budget_ended(context, key, token, &turn),
                 None => Ok(()),
             }
@@ -5666,58 +4709,6 @@ pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str,
     }
     crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
     Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)))
-}
-
-fn wait_console_generation() -> &'static str {
-    static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    GENERATION.get_or_init(|| crate::turn_ledger::mint_id("console-")).as_str()
-}
-
-fn wait_live_path(console: &str, request: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("{console}:{request}").as_bytes());
-    format!("locks/observation-wait-{digest:x}.lock")
-}
-
-#[cfg(test)]
-pub(crate) fn hold_test_observation_wait(
-    context: &RuntimeContext, key: &str, token: &str, turn: &str,
-) -> std::fs::File {
-    // Hold the same request witness as the console without taking the process-wide wait lease.
-    let console = wait_console_generation();
-    let request = crate::turn_ledger::mint_id("wait-");
-    let lock = context.open_locked_file(RuntimeArea::Data, &wait_live_path(console, &request)).unwrap();
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["activeWait"] = json!({
-            "id":request,"console":console,"turn":turn,"purpose":"messages",
-            "epoch":crate::send_outbox::token_epoch(token)
-        });
-        Ok(())
-    }).unwrap();
-    lock
-}
-
-pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
-    let state = load_social_state_for(context).map_err(|(_, e)|e)?;
-    let conv = &state["conversations"][key];
-    let pending = &conv["activeWait"];
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
-    if pending["purpose"] != "messages" || pending["epoch"] != epoch { return Ok(None); }
-    let (Some(console), Some(request), Some(turn)) = (pending["console"].as_str(), pending["id"].as_str(), pending["turn"].as_str()) else { return Ok(None); };
-    // The pipeline and console are different processes. Only the live owning request
-    // holds this generation/request-specific OS witness; disk state alone proves nothing.
-    let relative = wait_live_path(console, request);
-    let path = context.resolve_path(RuntimeArea::Data, &relative, crate::runtime::PathIntent::ReadOptionalFile).map_err(str::to_string)?;
-    if !path.is_file() { return Ok(None); }
-    match context.open_locked_file(RuntimeArea::Data, &relative) {
-        Err(error) if error == "runtime file is already locked" => Ok(Some(turn.to_string())),
-        Ok(_) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn turn_budget_ended(context: &RuntimeContext, key: &str, turn: &str) -> bool {
-    load_social_state_for(context).ok().is_some_and(|s| s["conversations"][key]["turnBudgetEnded"] == turn)
 }
 
 fn note_wait_budget(out: &mut Value, used: u64, max: u64) {
@@ -5735,47 +4726,12 @@ fn wait_number(wait_cfg: &Value, key: &str, default: i64) -> i64 {
     wait_cfg.get(key).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(default)
 }
 
-/// The final admitted call can become a full observation even after a short caller timeout.
-pub(crate) fn wait_client_timeout_ms(cfg: &Value, args: &Value) -> u64 {
-    let section = wait_section(cfg);
-    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
-    let timeout = js_round(agent::js_number_or(args.get("timeoutMs"), wait_number(&section, "defaultMs", 30_000) as f64))
-        .max(min_ms).min(max_ms);
-    let observation = crate::wake::pre_sleep_wait_ms(cfg).max(crate::wake::prompt_pre_sleep_wait_ms(cfg));
-    timeout.max(observation).saturating_add(wait_policy(cfg).max_ms).saturating_add(20_000)
-        .clamp(1_000, 725_000) as u64
-}
-
-/// `socialV2.wait` minMs/maxMs as the wait handler clamps timeouts.
-fn wait_timeout_bounds(cfg: &Value) -> (i64, i64) {
-    use crate::settings::wake_timing::{WAIT_MAX, WAIT_MIN};
-    let min_ms = WAIT_MIN.integer(cfg).max(100);
-    (min_ms, WAIT_MAX.integer(cfg).max(min_ms))
-}
-
-struct WaitBounds {
-    min_quiet_after_new: i64,
-    max_quiet_ms: i64,
-}
-
-/// Quiet bounds of a messages wait. The reserved2 turn budget reads the same values.
-fn wait_bounds(cfg: &Value) -> WaitBounds {
-    let (_, max_ms) = wait_timeout_bounds(cfg);
-    let min_quiet_after_new = crate::settings::wake_timing::WAIT_QUIET.integer(cfg);
-    WaitBounds { min_quiet_after_new, max_quiet_ms: min_quiet_after_new.max((120_000i64).min(max_ms)) }
-}
-
-/// The longest quiet extension a messages wait may add after its timeout (plus 5000 ms of polling slack).
-pub(crate) fn wait_max_quiet_ms(cfg: &Value) -> i64 {
-    wait_bounds(cfg).max_quiet_ms.max(wait_policy(cfg).max_ms)
-}
-
 fn last_unread_seq(conv: &Value) -> i64 {
     conv.get("lastUnreadSeq").and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-fn unread_count_of(conv: &Value) -> usize {
-    conv.get("unread").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+fn unread_count_of(conv: &Conversation) -> usize {
+    conv.unread_count()
 }
 
 /// `POST /api/dsh/effort`：热更新思考强度。
@@ -5784,7 +4740,10 @@ fn unread_count_of(conv: &Value) -> usize {
 /// 配置快照；此 handler 不刷新该快照，运行中下一条消息自动生效仍待后续功能票接线。
 /// 配置损坏时直接 500、**绝不回写** —— 和白名单接口同一语义：宁可这次失败，
 /// 也不能把一份读坏的 config 覆盖上去。
-fn handle_dsh_effort(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+fn handle_dsh_effort_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let req: Value = if context.is_isolated() {
         parse_object_body(body)?
     } else {
@@ -5798,25 +4757,32 @@ fn handle_dsh_effort(context: &RuntimeContext, body: &str) -> Result<Value, (u16
         .to_lowercase();
     const OPTIONS: [&str; 4] = ["low", "medium", "high", "max"];
     if !OPTIONS.contains(&effort.as_str()) {
-        return Err((400, "思考强度只能是 low / medium / high / max".to_string()));
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "思考强度只能是 low / medium / high / max",
+        ));
     }
-    let _gate = config_gate(context)?;
-    let mut file = if context.is_isolated() {
-        raw_config_for_write(context)?
-    } else {
-        read_json_for(context, CONFIG_PATH)
-            .ok_or((500, "config.json 读取失败，已中止写入".to_string()))?
-    };
-    if !file.is_object() {
-        return Err((500, "config.json 结构异常，已中止写入".to_string()));
-    }
-    if !file.get("dsh").map(|d| d.is_object()).unwrap_or(false) {
-        file["dsh"] = json!({});
-    }
-    file["dsh"]["reasoningEffort"] = json!(effort);
-    write_json_atomic_for(context, CONFIG_PATH, &file)
-        .map_err(|error| config_write_error(context, error))?;
-    Ok(json!({ "ok": true, "reasoningEffort": effort }))
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::Canonical,
+        move |file| {
+            if !file.is_object() {
+                return Err((500, "config.json 结构异常，已中止写入".to_string()));
+            }
+            if !file.get("dsh").map(|d| d.is_object()).unwrap_or(false) {
+                file["dsh"] = json!({});
+            }
+            file["dsh"]["reasoningEffort"] = json!(effort);
+            Ok(json!({ "ok": true, "reasoningEffort": effort }))
+        },
+    )
+}
+
+#[cfg(test)]
+fn handle_dsh_effort(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_dsh_effort_tx(context, body)
+        .map(|o| o.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 /// `GET /api/socialV2/sticker-list`：表情列表（控制台与 qq_list_stickers 共用）。
 ///
@@ -5931,61 +4897,6 @@ pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
     }
 }
 
-pub(crate) fn social_v1_number(value: &Value) -> f64 {
-    match value {
-        Value::Null => 0.0,
-        Value::Bool(value) => {
-            if *value {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Value::Number(value) => value.as_f64().unwrap_or(f64::NAN),
-        Value::String(_) | Value::Array(_) => {
-            let text = social_policy_js_string(value);
-            let text = text.trim_matches(social_policy_js_trim_char);
-            if text.is_empty() {
-                return 0.0;
-            }
-            let (radix, digits) = if let Some(digits) = text
-                .strip_prefix("0x")
-                .or_else(|| text.strip_prefix("0X"))
-            {
-                (16_u32, Some(digits))
-            } else if let Some(digits) = text
-                .strip_prefix("0b")
-                .or_else(|| text.strip_prefix("0B"))
-            {
-                (2_u32, Some(digits))
-            } else if let Some(digits) = text
-                .strip_prefix("0o")
-                .or_else(|| text.strip_prefix("0O"))
-            {
-                (8_u32, Some(digits))
-            } else {
-                (10_u32, None)
-            };
-            if let Some(digits) = digits {
-                if digits.is_empty() {
-                    return f64::NAN;
-                }
-                let mut number = 0.0;
-                for ch in digits.chars() {
-                    let Some(digit) = ch.to_digit(radix) else {
-                        return f64::NAN;
-                    };
-                    number = number * f64::from(radix) + f64::from(digit);
-                }
-                number
-            } else {
-                text.parse::<f64>().unwrap_or(f64::NAN)
-            }
-        }
-        Value::Object(_) => f64::NAN,
-    }
-}
-
 fn social_v1_json_number(number: f64) -> Value {
     if !number.is_finite() {
         return Value::Null;
@@ -6008,23 +4919,6 @@ fn social_v1_truthy(value: &Value) -> bool {
         Value::Number(value) => value.as_f64().map(|n| n != 0.0).unwrap_or(false),
         Value::String(value) => !value.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
-pub(crate) fn social_v1_spread(value: Option<&Value>) -> serde_json::Map<String, Value> {
-    match value {
-        Some(Value::Object(values)) => values.clone(),
-        Some(Value::Array(values)) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (index.to_string(), value.clone()))
-            .collect(),
-        Some(Value::String(value)) => value
-            .chars()
-            .enumerate()
-            .map(|(index, value)| (index.to_string(), json!(value.to_string())))
-            .collect(),
-        _ => serde_json::Map::new(),
     }
 }
 
@@ -6116,149 +5010,83 @@ fn normalize_social_v1_config(body_v: &Value, prior_social: Option<&Value>) -> V
 /// 与二代配置的差别：这里没有子对象，只有一堆标量 + 一组 min/max 配对。
 /// 归一化做四件事：删掉已废弃字段、数值非负、概率 clamp 到 [0,1]、min/max 保证 min<=max
 /// （顺序反了会被**交换**，不是丢弃 —— 丢弃会让用户填的两个值都没了）。
-fn handle_social_v1_config(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+fn handle_social_v1_config_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let body_v: Value = if context.is_isolated() {
         parse_object_body(body)?
     } else {
-        match serde_json::from_str(body) {
-            Ok(value) => value,
-            Err(error) => return Err((400, format!("请求体不是合法 JSON：{error}"))),
-        }
+        serde_json::from_str(body)
+            .map_err(|error| (400, format!("请求体不是合法 JSON：{error}")))?
     };
-    let _gate = config_gate(context)?;
-    let mut file = if context.is_isolated() {
-        raw_config_for_write(context)?
+    let base = if context.is_isolated() {
+        crate::config_tx::ConfigBase::Canonical
     } else {
-        match read_json(CONFIG_PATH) {
-            Some(v) if v.is_object() => v,
-            _ => return Err((500, "config.json 读取失败或不是对象，已拒绝写入".to_string())),
-        }
+        crate::config_tx::ConfigBase::RawObject
     };
-    let prior = if context.is_isolated() {
-        let effective = context
-            .load_config()
-            .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-        crate::reserved::console_config(context, &effective).map_err(|e| (503, e))?
-    } else {
-        crate::reserved::config(&file)
-    };
-    let config = normalize_social_v1_config(&body_v, file.get("social"));
-    file["social"] = config.clone();
-    write_json_atomic_for(context, CONFIG_PATH, &file)
-        .map_err(|error| config_write_error(context, error))?;
+    let outcome = crate::config_tx::commit_config_edit(context, base, |file| {
+        let prior = if context.is_isolated() {
+            let effective = context
+                .load_config()
+                .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+            crate::reserved::console_config(context, &effective).map_err(|e| (503, e))?
+        } else {
+            crate::reserved::config(file)
+        };
+        let config = normalize_social_v1_config(&body_v, file.get("social"));
+        file["social"] = config.clone();
+        Ok((prior, config))
+    })?;
+    let (prior, config) = outcome.value;
     crate::safe_println!("[console] 社交配置已更新");
     let response = if context.is_isolated() {
-        crate::reserved::posted_console_config(context, prior, &config).map_err(|e| (503, e))?
+        crate::reserved::posted_console_config(context, prior, &config).map_err(|e| {
+            crate::config_tx::CommitError::with_diff(503, e, outcome.config_diff.clone())
+        })?
     } else {
         let mut next = social_v1_spread(Some(&prior));
         next.extend(social_v1_spread(Some(&config)));
         Value::Object(next)
     };
-    Ok(json!({ "ok": true, "config": response }))
+    Ok(crate::config_tx::CommitOutcome {
+        value: json!({ "ok": true, "config": response }),
+        config_diff: outcome.config_diff,
+    })
+}
+
+#[cfg(test)]
+fn handle_social_v1_config(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_social_v1_config_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 /// state/ 目录：ACL 收紧与自检的**唯一实现**（对应 JS 的 `src/state-acl.mjs`）。
 // 用**反斜杠**：这个值会原样进 JSON（控制台显示 + 手工命令里给用户复制），
 // 正斜杠在 Windows 上看着就别扭，而且和 JS 的 path.resolve 输出不一致。
 const STATE_DIR: &str = crate::legacy_path!(windows "qq-bridge\\state");
 
-/// 宽松主体：Authenticated Users / BUILTIN\Users / Everyone（按 SID，不受显示语言影响）。
-const PERMISSIVE_SIDS: [&str; 3] = ["*S-1-5-11", "*S-1-5-32-545", "*S-1-1-0"];
-
-/// 调 icacls，返回 (退出码, stdout+stderr)。
-fn icacls(args: &[&str]) -> (i32, String) {
-    match crate::subprocess::command_without_console("icacls").args(args).output() {
-        Ok(o) => (
-            o.status.code().unwrap_or(-1),
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            ),
-        ),
-        Err(e) => (-1, e.to_string()),
-    }
-}
-
-/// 是否还有**继承来的**权限 ACE。
-///
-/// **必须排除 `Mandatory Label` 那一行**：DSH 的沙箱会给工作区打 Low 完整性标记，
-/// 那行的 `(I)(OI)(CI)(NW)` 永远带 (I)。不排除的话"已收紧"会被判成"未收紧"，
-/// 于是每次启动都重跑一遍带破坏性的 icacls 命令（JS 里这个 bug 真实发生过）。
-fn has_inherited_permission_ace(out: &str) -> bool {
-    out.split(['\n', '\r'])
-        .filter(|line| !line.to_lowercase().contains("mandatory label"))
-        .any(|line| line.contains("(I)"))
-}
-
-/// 是否还有本机任意用户可读的宽松主体授权。
-fn has_permissive_trustee(out: &str) -> bool {
-    let lower = out.to_lowercase();
-    lower.contains("authenticated users") || lower.contains("builtin\\users") || lower.contains("everyone")
-}
-
 /// 目标路径的权限是否已收紧。
 fn is_hardened(target: &str) -> bool {
-    let (code, out) = icacls(&[target]);
-    code == 0 && !has_inherited_permission_ace(&out) && !has_permissive_trustee(&out)
+    crate::guarded_fs::is_directory_hardened(
+        std::path::Path::new(target),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    )
 }
 
 /// 给管理员的手工命令（控制台直接展示、可复制）。
 fn manual_dir_command(dir: &str) -> String {
-    let d = format!("\"{dir}\"");
-    [
-        format!("icacls {d} /T /C /Q /grant \"%USERNAME%:F\" /grant \"*S-1-5-18:F\" /grant \"*S-1-5-32-544:F\""),
-        format!("icacls {d} /Q /grant \"%USERNAME%:(OI)(CI)F\" /grant \"*S-1-5-18:(OI)(CI)F\" /grant \"*S-1-5-32-544:(OI)(CI)F\""),
-        format!("icacls {d} /inheritance:r /C /Q"),
-        format!("icacls {d} /remove:g \"*S-1-5-11\" \"*S-1-5-32-545\" \"*S-1-1-0\" /T /C /Q"),
-    ]
-    .join("\n             ")
+    crate::guarded_fs::manual_harden_command(std::path::Path::new(dir))
 }
 
 /// 收紧目录 ACL，返回 (ok, detail)。
-///
-/// Grant the operator, SYSTEM and Administrators access before removing inherited
-/// access. Otherwise an inherited-only DACL becomes empty and a failed recursive
-/// walk returns before the grants, leaving the runtime unreadable. Apply leaf
-/// grants recursively; apply (OI)(CI) only to the directory for future files.
 fn harden_dir(dir: &str) -> (bool, String) {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    if user.is_empty() {
-        return (false, "无法确定当前用户名（%USERNAME% 为空）".to_string());
-    }
-    let grant_leaf = format!("{user}:F");
-    let grant_leaf_inh = format!("{user}:(OI)(CI)F");
-    let steps: Vec<Vec<&str>> = vec![
-        vec![
-            dir, "/T", "/C", "/Q", "/grant", &grant_leaf, "/grant", "*S-1-5-18:F", "/grant",
-            "*S-1-5-32-544:F",
-        ],
-        vec![
-            dir, "/Q", "/grant", &grant_leaf_inh, "/grant", "*S-1-5-18:(OI)(CI)F", "/grant",
-            "*S-1-5-32-544:(OI)(CI)F",
-        ],
-        vec![dir, "/inheritance:r", "/C", "/Q"],
-        {
-            let mut v = vec![dir, "/remove:g"];
-            v.extend_from_slice(&PERMISSIVE_SIDS);
-            v.extend_from_slice(&["/T", "/C", "/Q"]);
-            v
-        },
-    ];
-    for args in steps {
-        let (code, out) = icacls(&args);
-        if code != 0 {
-            return (false, out);
-        }
-        // `/C` 会让 icacls 继续处理剩余文件、即使全失败退出码仍是 0，所以必须看输出
-        if out.to_lowercase().contains("access is denied") {
-            let tail: Vec<&str> = out.split('\n').filter(|s| !s.trim().is_empty()).rev().take(3).collect();
-            return (false, tail.into_iter().rev().collect::<Vec<_>>().join(" / "));
-        }
-    }
-    // 自检：属主必须仍能读到目录内容（防"把 DACL 清空"这种成功）
-    match std::fs::read_dir(dir) {
-        Ok(_) => (true, "icacls".to_string()),
-        Err(e) => (false, format!("收紧后目录已不可读，请检查 ACL（{e}）")),
+    match crate::guarded_fs::harden_directory_tree(
+        std::path::Path::new(dir),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    ) {
+        Ok(()) => (true, "native".to_string()),
+        Err(error) => (false, error),
     }
 }
 
@@ -6320,7 +5148,7 @@ fn handle_security_post(body: &str) -> Result<Value, (u16, String)> {
     }
     let security = Value::Object(next);
     file["security"] = security.clone();
-    write_json_atomic(CONFIG_PATH, &file).map_err(|e| (500, e))?;
+    crate::config_tx::write_config_json(&RuntimeContext::legacy(), &file).map_err(|e| (500, e))?;
     let intercept = security.get("interceptNotify").and_then(|v| v.as_bool());
     crate::safe_println!(
         "[console] 安全拦截通知已更新（interceptNotify={}）",
@@ -6737,268 +5565,336 @@ fn normalize_social_timing_post(body: &mut Value, current: &Value) {
 /// 为什么必须归一化：这些值直接决定唤醒/发送行为。
 /// 一个 `"0.3"` 字符串进到 `probability` 会让概率判断变成 `undefined`，
 /// 一个负数 sleepMs 会让 `setTimeout` 立刻触发 —— 静默把机器人变成话痨。
-fn handle_social_config_post(
+fn handle_social_config_post_tx(
     context: &RuntimeContext,
     body: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     // JS `readBody` comes first: invalid JSON is a 400 before anything is read or written.
     let mut body_v = parse_object_body(body)?;
-    let _gate = config_gate(context)?;
-    let prior_wake = has_wake_defaults(&body_v["wake"])
-        .then(|| context.load_config_requiring_settings()).transpose().map_err(|error| (503, error))?;
-    let mut file = if context.is_isolated() {
-        let text = read_text_for(context, CONFIG_PATH)
-            .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-        let parsed: Value = serde_json::from_str(&text)
-            .map_err(|_| (503, "runtime config is invalid".to_string()))?;
-        if !parsed.is_object() {
-            return Err((503, "runtime config is invalid".to_string()));
-        }
-        parsed
-    } else {
-        read_json(CONFIG_PATH).unwrap_or_else(|| json!({}))
-    };
-    // #177: the file as read, to find the registry settings this save changes (`settings::console_changes`).
-    let file_before = file.clone();
-    // The isolated writer removes registry defaults from the draft before saving.
-    let file_section = file.get("socialV2").filter(|v| v.is_object());
-    let effective_before = in_memory_social_v2(context, file_section);
-    let new_section = file_section.is_none();
-    let current = file_section
-        .cloned()
-        .unwrap_or_else(|| effective_social_v2(None));
-    let normalization_base = if new_section { &effective_before } else { &current };
-    normalize_social_timing_post(&mut body_v, normalization_base);
-    let mut merged = current.as_object().cloned().unwrap_or_default();
-    if let Some(b) = body_v.as_object() {
-        for (k, v) in b {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
-    let subs = ["tools", "wake", "reply", "send", "wait", "proactive", "sticker", "feedback", "context", "voice", "media"];
-    for name in subs {
-        if let Some(v) = body_v.get(name) {
-            if !v.is_object() {
-                let cur = current.get(name).cloned().unwrap_or_else(|| json!({}));
-                merged.insert(name.to_string(), cur);
+    crate::config_tx::commit_page_config(context, move |ctx| {
+        let prior_wake = has_wake_defaults(&body_v["wake"])
+            .then(|| ctx.load_config_requiring_settings())
+            .transpose()
+            .map_err(|error| (503, error))?;
+        let mut file = if ctx.is_isolated() {
+            let text = read_text_for(ctx, CONFIG_PATH)
+                .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+            let parsed: Value = serde_json::from_str(&text)
+                .map_err(|_| (503, "runtime config is invalid".to_string()))?;
+            if !parsed.is_object() {
+                return Err((503, "runtime config is invalid".to_string()));
+            }
+            parsed
+        } else {
+            read_json(CONFIG_PATH).unwrap_or_else(|| json!({}))
+        };
+        let file_before = file.clone();
+        let file_section = file.get("socialV2").filter(|v| v.is_object());
+        let effective_before = in_memory_social_v2(ctx, file_section);
+        let new_section = file_section.is_none();
+        let current = file_section
+            .cloned()
+            .unwrap_or_else(|| effective_social_v2(None));
+        let normalization_base = if new_section {
+            &effective_before
+        } else {
+            &current
+        };
+        normalize_social_timing_post(&mut body_v, normalization_base);
+        let mut merged = current.as_object().cloned().unwrap_or_default();
+        if let Some(b) = body_v.as_object() {
+            for (k, v) in b {
+                merged.insert(k.clone(), v.clone());
             }
         }
-    }
-    if let Some(v) = norm_num(body_v.as_object().unwrap_or(&Default::default()), Some(&current), "autoReplyCheckMs", true, 1000.0, None, 30000.0) {
-        merged.insert("autoReplyCheckMs".into(), v);
-    }
-    // tools：只接受布尔开关；缺省沿用当前值（**默认 false 的项不能被静默打开**）
-    if body_v.get("tools").and_then(js_object_like).is_some() {
-        let mut tools = merge_sub(&current, "tools", &body_v);
-        let effective = crate::settings::overlay(context, file_before.clone());
-        for (flag, setting) in crate::settings::tool_switches() {
-            let posted = body_v.pointer(&format!("/tools/{flag}")).and_then(Value::as_bool);
-            tools.insert(flag.to_string(), posted.map_or_else(|| setting.read(&effective), Value::Bool));
-        }
-        merged.insert("tools".into(), Value::Object(tools));
-    }
-    for name in ["voice", "media"] {
-        if body_v.get(name).and_then(Value::as_object).is_some() {
-            merged.insert(name.to_string(), Value::Object(merge_sub(&current, name, &body_v)));
-        }
-    }
-    // wake
-    if body_v.get("wake").and_then(js_object_like).is_some() {
-        let mut w = merge_sub(&current, "wake", &body_v);
-        let cur_wake = current.get("wake").cloned().unwrap_or_else(|| json!({}));
-        for k in ["sleepMinMs", "sleepMaxMs", "recommendedSleepMinMs", "recommendedSleepMaxMs"] {
-            if let Some(v) = norm_num(&w, Some(&cur_wake), k, true, 0.0, None, 0.0) {
-                w.insert(k.into(), v);
+        // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
+        let subs = [
+            "tools", "wake", "reply", "send", "wait", "proactive", "sticker", "feedback",
+            "context", "voice", "media",
+        ];
+        for name in subs {
+            if let Some(v) = body_v.get(name) {
+                if !v.is_object() {
+                    let cur = current.get(name).cloned().unwrap_or_else(|| json!({}));
+                    merged.insert(name.to_string(), cur);
+                }
             }
         }
-        for k in ["recommendedDefaultInfinite", "recommendedPoke", "recommendedAtMention", "recommendedNameMention", "recommendedQuestion"] {
-            if w.get(k).is_some() {
-                let b = w.get(k).and_then(|v| v.as_bool()) == Some(true);
-                w.insert(k.into(), json!(b));
+        let empty_obj = Default::default();
+        let body_obj = body_v.as_object().unwrap_or(&empty_obj);
+        if let Some(v) =
+            norm_num(body_obj, Some(&current), "autoReplyCheckMs", true, 1000.0, None, 30000.0)
+        {
+            merged.insert("autoReplyCheckMs".into(), v);
+        }
+        // tools：只接受布尔开关；缺省沿用当前值（**默认 false 的项不能被静默打开**）
+        if body_v.get("tools").and_then(js_object_like).is_some() {
+            let mut tools = merge_sub(&current, "tools", &body_v);
+            let effective = crate::settings::overlay(ctx, file_before.clone());
+            for (flag, setting) in crate::settings::tool_switches() {
+                let posted = body_v
+                    .pointer(&format!("/tools/{flag}"))
+                    .and_then(Value::as_bool);
+                tools.insert(
+                    flag.to_string(),
+                    posted.map_or_else(|| setting.read(&effective), Value::Bool),
+                );
+            }
+            merged.insert("tools".into(), Value::Object(tools));
+        }
+        for name in ["voice", "media"] {
+            if body_v.get(name).and_then(Value::as_object).is_some() {
+                merged.insert(
+                    name.to_string(),
+                    Value::Object(merge_sub(&current, name, &body_v)),
+                );
             }
         }
-        if let Some(v) = w.get("recommendedKeywords").cloned() {
-            let list: Vec<Value> = match v {
-                Value::Array(a) => a.iter().map(|x| json!(js_scalar(Some(x)))).filter(|x| !x.as_str().unwrap_or("").is_empty()).collect(),
-                Value::String(s) => s
-                    .split(|c: char| c == ',' || c == '，' || c.is_whitespace())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| json!(s))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            w.insert("recommendedKeywords".into(), json!(list));
+        // wake
+        if body_v.get("wake").and_then(js_object_like).is_some() {
+            let mut w = merge_sub(&current, "wake", &body_v);
+            let cur_wake = current.get("wake").cloned().unwrap_or_else(|| json!({}));
+            for k in [
+                "sleepMinMs",
+                "sleepMaxMs",
+                "recommendedSleepMinMs",
+                "recommendedSleepMaxMs",
+            ] {
+                if let Some(v) = norm_num(&w, Some(&cur_wake), k, true, 0.0, None, 0.0) {
+                    w.insert(k.into(), v);
+                }
+            }
+            for k in [
+                "recommendedDefaultInfinite",
+                "recommendedPoke",
+                "recommendedAtMention",
+                "recommendedNameMention",
+                "recommendedQuestion",
+            ] {
+                if w.get(k).is_some() {
+                    let b = w.get(k).and_then(|v| v.as_bool()) == Some(true);
+                    w.insert(k.into(), json!(b));
+                }
+            }
+            if let Some(v) = w.get("recommendedKeywords").cloned() {
+                let list: Vec<Value> = match v {
+                    Value::Array(a) => a
+                        .iter()
+                        .map(|x| json!(js_scalar(Some(x))))
+                        .filter(|x| !x.as_str().unwrap_or("").is_empty())
+                        .collect(),
+                    Value::String(s) => s
+                        .split(|c: char| c == ',' || c == '，' || c.is_whitespace())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| json!(s))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                w.insert("recommendedKeywords".into(), json!(list));
+            }
+            if w.get("defaultMode").and_then(|v| v.as_str()) != Some("active") {
+                w.insert("defaultMode".into(), json!("diving"));
+            }
+            if w.get("recommendedHint").is_some() {
+                let s = js_scalar(w.get("recommendedHint"));
+                w.insert("recommendedHint".into(), json!(s));
+            }
+            merged.insert("wake".into(), Value::Object(w));
         }
-        if w.get("defaultMode").and_then(|v| v.as_str()) != Some("active") {
-            w.insert("defaultMode".into(), json!("diving"));
+        // send
+        if body_v.get("send").and_then(js_object_like).is_some() {
+            let mut s = merge_sub(&current, "send", &body_v);
+            if s.get("recommendedHint").is_some() {
+                let t = js_scalar(s.get("recommendedHint"));
+                s.insert("recommendedHint".into(), json!(t));
+            }
+            merged.insert("send".into(), Value::Object(s));
         }
-        if w.get("recommendedHint").is_some() {
-            let s = js_scalar(w.get("recommendedHint"));
-            w.insert("recommendedHint".into(), json!(s));
+        if body_v.get("reply").is_some_and(Value::is_object) {
+            merged.insert(
+                "reply".into(),
+                Value::Object(merge_sub(&current, "reply", &body_v)),
+            );
         }
-        merged.insert("wake".into(), Value::Object(w));
-    }
-    // send
-    if body_v.get("send").and_then(js_object_like).is_some() {
-        let mut s = merge_sub(&current, "send", &body_v);
-        if s.get("recommendedHint").is_some() {
-            let t = js_scalar(s.get("recommendedHint"));
-            s.insert("recommendedHint".into(), json!(t));
+        // wait
+        if body_v.get("wait").and_then(js_object_like).is_some() {
+            let mut w = merge_sub(&current, "wait", &body_v);
+            let cur_wait = current.get("wait").cloned().unwrap_or_else(|| json!({}));
+            for k in ["defaultMs", "defaultQuietMs"] {
+                if let Some(v) = norm_num(&w, Some(&cur_wait), k, true, 0.0, None, 5000.0) {
+                    w.insert(k.into(), v);
+                }
+            }
+            merged.insert("wait".into(), Value::Object(w));
         }
-        merged.insert("send".into(), Value::Object(s));
-    }
-    if body_v.get("reply").is_some_and(Value::is_object) {
-        merged.insert("reply".into(), Value::Object(merge_sub(&current, "reply", &body_v)));
-    }
-    // wait
-    if body_v.get("wait").and_then(js_object_like).is_some() {
-        let mut w = merge_sub(&current, "wait", &body_v);
-        let cur_wait = current.get("wait").cloned().unwrap_or_else(|| json!({}));
-        for k in ["defaultMs", "defaultQuietMs"] {
-            if let Some(v) = norm_num(&w, Some(&cur_wait), k, true, 0.0, None, 5000.0) {
-                w.insert(k.into(), v);
+        // proactive
+        if body_v.get("proactive").is_some_and(Value::is_object) {
+            merged.insert(
+                "proactive".into(),
+                Value::Object(merge_sub(&current, "proactive", &body_v)),
+            );
+        }
+        // Preserve unknown sticker fields and merge the nested collection options.
+        if body_v.get("sticker").and_then(js_object_like).is_some() {
+            let mut sticker = merge_sub(&current, "sticker", &body_v);
+            if let Some(posted) = body_v.pointer("/sticker/collect").and_then(js_object_like) {
+                let mut collect = current
+                    .pointer("/sticker/collect")
+                    .and_then(js_object_like)
+                    .unwrap_or_default();
+                collect.extend(posted);
+                sticker.insert("collect".into(), Value::Object(collect));
+            } else if body_v.pointer("/sticker/collect").is_some() {
+                if let Some(collect) = current.pointer("/sticker/collect") {
+                    sticker.insert("collect".into(), collect.clone());
+                } else {
+                    sticker.remove("collect");
+                }
+            }
+            merged.insert("sticker".into(), Value::Object(sticker));
+        }
+        // feedback
+        if body_v.get("feedback").and_then(js_object_like).is_some() {
+            let mut f = merge_sub(&current, "feedback", &body_v);
+            let cur_f = current.get("feedback").cloned().unwrap_or_else(|| json!({}));
+            if let Some(v) = norm_num(&f, Some(&cur_f), "maxLength", true, 1.0, None, 500.0) {
+                f.insert("maxLength".into(), v);
+            }
+            if f.get("notifyOwnerOnError").is_some() {
+                let b = f.get("notifyOwnerOnError").and_then(|v| v.as_bool()) == Some(true);
+                f.insert("notifyOwnerOnError".into(), json!(b));
+            }
+            merged.insert("feedback".into(), Value::Object(f));
+        }
+        // context
+        if body_v.get("context").and_then(js_object_like).is_some() {
+            let mut c = merge_sub(&current, "context", &body_v);
+            let cur_c = current.get("context").cloned().unwrap_or_else(|| json!({}));
+            for k in ["recentLimit", "unreadLimit", "contextWindow"] {
+                if let Some(v) = norm_num(&c, Some(&cur_c), k, true, 1.0, None, 20.0) {
+                    c.insert(k.into(), v);
+                }
+            }
+            for (k, fallback, min, max) in [
+                ("wakeMessageLimit", 12.0, 1.0, 100.0),
+                ("wakeRecentLimit", 4.0, 0.0, 20.0),
+                ("wakeMaxChars", 6000.0, 500.0, 20000.0),
+                ("fullTextMaxChars", 4000.0, 200.0, 20000.0),
+                ("impressionPromptLimit", 10.0, 1.0, 50.0),
+                ("impressionMaxTraits", 10.0, 1.0, 20.0),
+                ("impressionMaxMembers", 50.0, 1.0, 500.0),
+            ] {
+                let n = c
+                    .get(k)
+                    .and_then(|v| match v {
+                        Value::Number(n) => n.as_f64(),
+                        Value::String(s) => s.trim().parse::<f64>().ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(fallback);
+                let v = if n.is_finite() {
+                    n.round().clamp(min, max)
+                } else {
+                    fallback
+                };
+                c.insert(k.into(), json!(v as i64));
+            }
+            if c.get("inlineWakeMessages").is_some() {
+                let b = c.get("inlineWakeMessages").and_then(|v| v.as_bool()) == Some(true);
+                c.insert("inlineWakeMessages".into(), json!(b));
+            }
+            merged.insert("context".into(), Value::Object(c));
+        }
+        for k in ["enabled", "provideRecommendations"] {
+            if merged.get(k).is_some() {
+                let b = merged.get(k).and_then(|v| v.as_bool()) == Some(true);
+                merged.insert(k.into(), json!(b));
             }
         }
-        merged.insert("wait".into(), Value::Object(w));
-    }
-    // proactive
-    if body_v.get("proactive").is_some_and(Value::is_object) {
-        merged.insert("proactive".into(), Value::Object(merge_sub(&current, "proactive", &body_v)));
-    }
-    // Preserve unknown sticker fields and merge the nested collection options.
-    if body_v.get("sticker").and_then(js_object_like).is_some() {
-        let mut sticker = merge_sub(&current, "sticker", &body_v);
-        if let Some(posted) = body_v.pointer("/sticker/collect").and_then(js_object_like) {
-            let mut collect = current.pointer("/sticker/collect").and_then(js_object_like).unwrap_or_default();
-            collect.extend(posted);
-            sticker.insert("collect".into(), Value::Object(collect));
-        } else if body_v.pointer("/sticker/collect").is_some() {
-            if let Some(collect) = current.pointer("/sticker/collect") {
-                sticker.insert("collect".into(), collect.clone());
-            } else {
-                sticker.remove("collect");
-            }
+        if merged.get("agentPreset").is_some() {
+            let s = js_scalar(merged.get("agentPreset"));
+            merged.insert("agentPreset".into(), json!(s));
         }
-        merged.insert("sticker".into(), Value::Object(sticker));
-    }
-    // feedback
-    if body_v.get("feedback").and_then(js_object_like).is_some() {
-        let mut f = merge_sub(&current, "feedback", &body_v);
-        let cur_f = current.get("feedback").cloned().unwrap_or_else(|| json!({}));
-        if let Some(v) = norm_num(&f, Some(&cur_f), "maxLength", true, 1.0, None, 500.0) {
-            f.insert("maxLength".into(), v);
+        let mut merged_v = Value::Object(merged);
+        voice_http::clamp_config_max_seconds(&mut merged_v);
+        file["socialV2"] = merged_v.clone();
+        if !ctx.is_isolated() {
+            crate::wake::validate_turn_settings(&file)
+                .map_err(|error| (400, error.to_string()))?;
         }
-        if f.get("notifyOwnerOnError").is_some() {
-            let b = f.get("notifyOwnerOnError").and_then(|v| v.as_bool()) == Some(true);
-            f.insert("notifyOwnerOnError".into(), json!(b));
-        }
-        merged.insert("feedback".into(), Value::Object(f));
-    }
-    // context
-    if body_v.get("context").and_then(js_object_like).is_some() {
-        let mut c = merge_sub(&current, "context", &body_v);
-        let cur_c = current.get("context").cloned().unwrap_or_else(|| json!({}));
-        for k in ["recentLimit", "unreadLimit", "contextWindow"] {
-            if let Some(v) = norm_num(&c, Some(&cur_c), k, true, 1.0, None, 20.0) {
-                c.insert(k.into(), v);
-            }
-        }
-        for (k, fallback, min, max) in [
-            ("wakeMessageLimit", 12.0, 1.0, 100.0),
-            ("wakeRecentLimit", 4.0, 0.0, 20.0),
-            ("wakeMaxChars", 6000.0, 500.0, 20000.0),
-            ("fullTextMaxChars", 4000.0, 200.0, 20000.0),
-            ("impressionPromptLimit", 10.0, 1.0, 50.0),
-            ("impressionMaxTraits", 10.0, 1.0, 20.0),
-            ("impressionMaxMembers", 50.0, 1.0, 500.0),
+        for setting in [
+            crate::settings::wake_timing::HARD_CAP,
+            crate::settings::wake_timing::CEILING,
         ] {
-            let n = c
-                .get(k)
-                .and_then(|v| match v {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.trim().parse::<f64>().ok(),
-                    _ => None,
-                })
-                .unwrap_or(fallback);
-            let v = if n.is_finite() { n.round().clamp(min, max) } else { fallback };
-            c.insert(k.into(), json!(v as i64));
+            let member = setting.pointer.rsplit('/').next().unwrap();
+            if body_v
+                .get("wake")
+                .and_then(|wake| wake.get(member))
+                .is_some_and(Value::is_null)
+            {
+                return Err((
+                    400,
+                    format!(
+                        "{} requires a number; use Reset on the settings page",
+                        setting.key
+                    ),
+                ));
+            }
         }
-        if c.get("inlineWakeMessages").is_some() {
-            let b = c.get("inlineWakeMessages").and_then(|v| v.as_bool()) == Some(true);
-            c.insert("inlineWakeMessages".into(), json!(b));
+        let mut carried = json!({ "socialV2": body_v.clone() });
+        if body_v
+            .pointer("/voice/maxSeconds")
+            .is_some_and(|value| !value.is_null())
+        {
+            carried["socialV2"]["voice"]["maxSeconds"] = merged_v["voice"]["maxSeconds"].clone();
         }
-        merged.insert("context".into(), Value::Object(c));
-    }
-    for k in ["enabled", "provideRecommendations"] {
-        if merged.get(k).is_some() {
-            let b = merged.get(k).and_then(|v| v.as_bool()) == Some(true);
-            merged.insert(k.into(), json!(b));
-        }
-    }
-    if merged.get("agentPreset").is_some() {
-        let s = js_scalar(merged.get("agentPreset"));
-        merged.insert("agentPreset".into(), json!(s));
-    }
-    let mut merged_v = Value::Object(merged);
-    voice_http::clamp_config_max_seconds(&mut merged_v);
-    file["socialV2"] = merged_v.clone();
-    if !context.is_isolated() {
-        crate::wake::validate_turn_settings(&file).map_err(|error| (400, error.to_string()))?;
-    }
-    for setting in [crate::settings::wake_timing::HARD_CAP, crate::settings::wake_timing::CEILING] {
-        let member = setting.pointer.rsplit('/').next().unwrap();
-        if body_v.get("wake").and_then(|wake| wake.get(member)).is_some_and(Value::is_null) {
-            return Err((400, format!("{} requires a number; use Reset on the settings page", setting.key)));
-        }
-    }
-    // #177: a registry setting this save changes goes through the settings store, under the configuration gate held
-    // above: validated before anything is written (400), stored and written back first (a store that cannot take it
-    // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
-    // save's own write puts every stored value into config.json (`write_selected_config_text`).
-    let mut carried = json!({ "socialV2": body_v.clone() });
-    if body_v.pointer("/voice/maxSeconds").is_some_and(|value| !value.is_null()) {
-        carried["socialV2"]["voice"]["maxSeconds"] = merged_v["voice"]["maxSeconds"].clone();
-    }
-    let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
-    if !settings_changes.is_empty() {
-        // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
-        // takes a change. The router's front check already refuses such a file before any handler runs; this check
-        // covers an edit that lands after it and before the configuration gate is taken. A save without a registry
-        // change runs no canonical check of its own.
-        raw_config_for_write(context)?;
-        note_config_before_request(context);
-    }
-    crate::settings::apply_changes(context, settings_changes, "administrator", "console")?;
-    if context.is_isolated() {
-        let current = raw_config_object(context)?;
-        crate::settings::keep_registry_values(&current, &mut file)
-            .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
-    }
-    write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
-    let mut effective = crate::settings::overlay(context, file);
-    crate::settings::resolve_live_batch(&mut effective);
-    for name in ["tools", "voice", "sticker", "media"] {
-        if body_v.get(name).and_then(js_object_like).is_some() {
-            merged_v[name] = effective["socialV2"][name].clone();
-        }
-    }
-    crate::safe_println!("[console] 二代仿真配置已更新");
-    if let Some(before) = &prior_wake {
-        reconcile_default_wake_configs(context, Some(before))
-            .map_err(|(status, error)| (status, format!("配置已保存，但沿用默认唤醒配置的会话未能同步：{error}")))?;
-    }
-    // JS answers `{ ...cfg.socialV2, ...merged }`: the effective section with the saved members on top.
-    let mut shown = effective_before;
-    if let (Some(shown), Some(saved)) = (shown.as_object_mut(), merged_v.as_object()) {
-        for (name, value) in saved {
-            shown.insert(name.clone(), value.clone());
-        }
-    }
-    if new_section {
-        shown = social_with_timing(shown);
-    }
-    Ok(json!({ "ok": true, "config": shown }))
+        let keep_error_fmt: fn(&str) -> (u16, String) = |key| {
+            (
+                400,
+                format!("socialV2 cannot hold {key}: a member on its path is not an object"),
+            )
+        };
+        Ok(crate::config_tx::PageConfigWrite {
+            file,
+            base_for_changes: file_before,
+            carried,
+            confirm: false,
+            check_canonical_before_store: true,
+            keep_stored_always: true,
+            prior_wake,
+            keep_error_fmt,
+            isolated_write_error_503: false,
+            wake_error_prefix: "配置已保存，但沿用默认唤醒配置的会话未能同步：",
+            finish: Box::new(move |finish_ctx, written| {
+                let mut effective = crate::settings::overlay(finish_ctx, written.clone());
+                crate::settings::resolve_live_batch(&mut effective);
+                for name in ["tools", "voice", "sticker", "media"] {
+                    if body_v.get(name).and_then(js_object_like).is_some() {
+                        merged_v[name] = effective["socialV2"][name].clone();
+                    }
+                }
+                crate::safe_println!("[console] 二代仿真配置已更新");
+                // JS answers `{ ...cfg.socialV2, ...merged }`: the effective section on top.
+                let mut shown = effective_before;
+                if let (Some(shown), Some(saved)) = (shown.as_object_mut(), merged_v.as_object()) {
+                    for (name, value) in saved {
+                        shown.insert(name.clone(), value.clone());
+                    }
+                }
+                if new_section {
+                    shown = social_with_timing(shown);
+                }
+                Ok(json!({ "ok": true, "config": shown }))
+            }),
+        })
+    })
+}
+
+#[cfg(test)]
+fn handle_social_config_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_social_config_post_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 
 fn has_wake_defaults(wake: &Value) -> bool {
@@ -7009,127 +5905,6 @@ fn has_wake_defaults(wake: &Value) -> bool {
     ].iter().any(|key| wake.get(*key).is_some())
 }
 
-/// Settings writers call this after releasing their configuration gate.
-pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    // An empty runtime has no plans to repair. Leave its lock file uncreated. Once
-    // there are conversations, read the current state and settings together under the gate.
-    if load_social_state_for(context)?["conversations"].as_object().is_none_or(|conversations| conversations.is_empty()) {
-        return context.load_config_requiring_settings().map(drop).map_err(|error| (503, error));
-    }
-    let _gate = config_gate(context)?;
-    reconcile_default_wake_configs(context, None)
-}
-
-/// The caller holds the social state/configuration gate. Older finite plans only stored a
-/// deadline, so a live configuration writer supplies the range in effect before its write.
-fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Value>) -> Result<(), (u16, String)> {
-    let cfg = context.load_config_requiring_settings().map_err(|error| (503, error))?;
-    let mut state = load_social_state_for(context)?;
-    let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) else { return Ok(()) };
-    let defaults = crate::wake::default_wake_plan(&cfg);
-    let target = crate::session::wake_config_from_json(Some(&defaults));
-    let batch = crate::settings::wake_timing::BATCH.integer(&cfg);
-    let range = crate::wake::default_sleep_range(&cfg);
-    let previous_range = before.map(crate::wake::default_sleep_range);
-    let mut changed = false;
-    for conversation in conversations.values_mut() {
-        let Some(plan) = conversation.get_mut("wakeConfig").filter(|w| w["confirmedBy"] == "default") else { continue };
-        let current = crate::session::wake_config_from_json(Some(plan));
-        let range_changed = plan.get("sleepRangeMs").or(previous_range.as_ref()).is_some_and(|old| old != &range);
-        if target.infinite && !current.infinite {
-            let fields = plan.as_object_mut().unwrap();
-            fields.remove("sleepUntil");
-            fields.remove("sleepRangeMs");
-        } else if !target.infinite && (current.infinite || range_changed) {
-            crate::wake::draw_default_sleep(plan, &cfg, now_ms(), rand01());
-            changed = true;
-        }
-        for (field, stale) in [
-            ("mode", current.mode_active != target.mode_active),
-            ("infinite", current.infinite != target.infinite),
-            ("batchWindowMs", current.batch_window_ms.unwrap_or(batch).max(1000) != batch),
-        ] {
-            if stale {
-                plan[field] = defaults[field].clone();
-                changed = true;
-            }
-        }
-        for (field, stale) in [
-            ("atMention", current.at_mention != target.at_mention),
-            ("nameMention", current.name_mention != target.name_mention),
-            ("question", current.question_boolean != target.question_boolean),
-            ("poke", current.poke != target.poke),
-            ("anyMessage", current.any_message != target.any_message),
-            ("probability", current.probability != target.probability),
-            ("speakerIds", !current.speaker_ids.is_empty() || !crate::wake::normalize_speaker_ids(plan["triggers"].get("speakerIds")).is_empty()),
-        ] {
-            if stale {
-                if !plan["triggers"].is_object() {
-                    plan["triggers"] = json!({});
-                }
-                plan["triggers"][field] = defaults["triggers"][field].clone();
-                changed = true;
-            }
-        }
-        changed |= reconcile_default_keywords(plan, &defaults["triggers"]["keywords"], before, current.keywords != target.keywords);
-    }
-    if changed {
-        write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
-    }
-    Ok(())
-}
-
-/// A no-action reset copies custom words into an otherwise inherited plan. Its recorded
-/// recommendation identifies which later edits should replace those words. Older plans
-/// without a source keep local words when there is no recommendation to replace them.
-fn reconcile_default_keywords(plan: &mut Value, recommended: &Value, before: Option<&Value>, stale: bool) -> bool {
-    let words = &plan["triggers"]["keywords"];
-    let copied_for = plan.get("customKeywordsFor");
-    let empty = recommended.as_array().is_none_or(Vec::is_empty);
-    let inherited = plan["inheritsKeywords"] == true
-        || before.and_then(|cfg| cfg.pointer("/socialV2/wake/recommendedKeywords")) == Some(words);
-    if copied_for == Some(recommended) {
-        return false;
-    }
-    if empty && copied_for.is_some() {
-        // Setting the former recommendation again after clearing it is a change.
-        plan["customKeywordsFor"] = recommended.clone();
-        return true;
-    }
-    if (empty && !inherited) || (!stale && copied_for.is_none()) {
-        return false;
-    }
-    if stale {
-        if !plan["triggers"].is_object() {
-            plan["triggers"] = json!({});
-        }
-        plan["triggers"]["keywords"] = recommended.clone();
-    }
-    let fields = plan.as_object_mut().unwrap();
-    fields.remove("customKeywordsFor");
-    if empty {
-        fields.remove("inheritsKeywords");
-    } else {
-        plan["inheritsKeywords"] = json!(true);
-    }
-    true
-}
-
-/// `POST /api/personas/wake-words/undo` (`console_persona.rs`, administrators only): under the persona
-/// route's authority (the social gate after a fresh credential check) reverts one logged wake-word
-/// change (`wake_words::undo`); a refusal writes nothing.
-pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    let key = body["conversation"]
-        .as_str()
-        .and_then(crate::initial_prompts::canonical_key)
-        .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
-    let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
-    let _authority = authority()?;
-    let mut state = load_social_state_for(context)?;
-    let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
-    write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
-    Ok(result)
-}
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
 /// 外层消息里的嵌套 id 只在上层读取时才被登记，之后 AI 要单独读它就靠这份记录。
 static SEEN_FORWARD_IDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
@@ -7154,14 +5929,21 @@ fn remember_forward_id(key: &str, id: &str) {
     }
 }
 
-fn forward_id_known(key: &str, id: &str, conv: Option<&Value>) -> bool {
-    for buf in ["recentMessages", "unread"] {
-        if let Some(arr) = conv.and_then(|c| c.get(buf)).and_then(|v| v.as_array()) {
+fn forward_id_known(key: &str, id: &str, conv: Option<&Conversation>) -> bool {
+    if let Some(c) = conv {
+        if let Some(arr) = c.field("recentMessages").and_then(|v| v.as_array()) {
             for m in arr {
                 if let Some(ids) = m.get("forwardIds").and_then(|v| v.as_array()) {
                     if ids.iter().any(|x| js_scalar(Some(x)) == id) {
                         return true;
                     }
+                }
+            }
+        }
+        for m in c.unread() {
+            if let Some(ids) = m.forward_ids() {
+                if ids.iter().any(|x| js_scalar(Some(x)) == id) {
+                    return true;
                 }
             }
         }
@@ -7221,11 +6003,10 @@ fn handle_forward_message(
     if !enabled {
         return Err((403, "工具未启用：qq_get_forward_msg".to_string()));
     }
-    let st = load_social_state_for(context)?;
     let storage_key = if context.is_isolated() { projection_storage_key(&key)? } else { key.clone() };
-    let conv = st.get("conversations").and_then(|c| c.get(&storage_key));
+    let conv = ConversationState::for_runtime(context).read(&storage_key)?;
     let scope_key = format!("{}|{}", context.runtime_root().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), storage_key);
-    if !forward_id_known(&scope_key, &id, conv) {
+    if !forward_id_known(&scope_key, &id, conv.as_ref()) {
         return Err((
             404,
             "该转发消息 id 不在当前会话可见范围内，拒绝读取".to_string(),
@@ -7381,22 +6162,31 @@ fn handle_images_message(
         }
     }
     // 找媒体：recentMessages 优先，再 unread（未读可能比最近窗口活得久）
-    let st = load_social_state_for(context)?;
     let storage_key = if context.is_isolated() { projection_storage_key(&key)? } else { key.clone() };
-    let conv = st.get("conversations").and_then(|c| c.get(&storage_key));
+    let conv = ConversationState::for_runtime(context).read(&storage_key)?;
     let mut media_list: Vec<Value> = Vec::new();
-    for buf in ["recentMessages", "unread"] {
-        if let Some(arr) = conv.and_then(|c| c.get(buf)).and_then(|v| v.as_array()) {
-            let hit = arr.iter().find(|m| {
-                m.get("messageId").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
-                    || m.get("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+    if let Some(arr) = conv.as_ref().and_then(|c| c.field("recentMessages")).and_then(|v| v.as_array()) {
+        let hit = arr.iter().find(|m| {
+            m.get("messageId").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+                || m.get("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+        });
+        if let Some(m) = hit {
+            if let Some(media) = m.get("media").and_then(|v| v.as_array()) {
+                if !media.is_empty() {
+                    media_list = media.clone();
+                }
+            }
+        }
+    }
+    if media_list.is_empty() {
+        if let Some(conv) = &conv {
+            let hit = conv.unread().iter().find(|m| {
+                m.message_id().map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+                    || m.field("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
             });
-            if let Some(m) = hit {
-                if let Some(media) = m.get("media").and_then(|v| v.as_array()) {
-                    if !media.is_empty() {
-                        media_list = media.clone();
-                        break;
-                    }
+            if let Some(media) = hit.and_then(|m| m.media()) {
+                if !media.is_empty() {
+                    media_list = media.to_vec();
                 }
             }
         }
@@ -7476,8 +6266,8 @@ where
         return Err((400, "key 和 messageId/seq 不能为空".to_string()));
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
-    let mut st = if context.is_isolated() {
-        social_projection_request_state(
+    let conv_opt = if context.is_isolated() {
+        social_projection_request_conv(
             context,
             cfg,
             &key,
@@ -7488,7 +6278,7 @@ where
         .0
     } else {
         let _is_agent = sticker_agent_allowed(context, cfg, &key, headers, "collectSticker", "qq_collect_sticker")?;
-        load_social_state_for(context)?
+        ConversationState::for_runtime(context).read(&key)?
     };
     let storage_key = if context.is_isolated() {
         projection_storage_key(&key)?
@@ -7514,7 +6304,7 @@ where
             .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
             .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
         context
-            .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+            .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
             .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     }
     let now = now_ms();
@@ -7522,12 +6312,11 @@ where
     let max_hour = crate::settings::COLLECT_HOUR.integer(cfg);
     let reservation = crate::turn_ledger::mint_id("sticker-collect-");
     if context.is_isolated() {
-        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::send_outbox::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
+        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::conversation_state::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
     } else {
-    let times: Vec<i64> = st
-        .get("conversations")
-        .and_then(|c| c.get(&storage_key))
-        .and_then(|c| c.get("stickerCollectTimes"))
+    let times: Vec<i64> = conv_opt
+        .as_ref()
+        .and_then(|c| c.field("stickerCollectTimes"))
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
         .unwrap_or_default();
@@ -7540,10 +6329,9 @@ where
     let mut retain_reservation = false;
     let result = (|| -> Result<Value, (u16, String)> {
     // 找消息
-    let found = st
-        .get("conversations")
-        .and_then(|c| c.get(&storage_key))
-        .and_then(|c| c.get("recentMessages"))
+    let found = conv_opt
+        .as_ref()
+        .and_then(|c| c.field("recentMessages"))
         .and_then(|m| m.as_array())
         .and_then(|arr| {
             arr.iter()
@@ -7696,19 +6484,20 @@ where
         .unwrap_or(Value::Null);
     // 记账
     if !context.is_isolated() {
-    if let Some(conv) = st.get_mut("conversations").and_then(|c| c.get_mut(&storage_key)) {
-        let arr = conv
-            .as_object_mut()
-            .map(|o| o.entry("stickerCollectTimes").or_insert(json!([])));
-        if let Some(a) = arr.and_then(|v| v.as_array_mut()) {
+        let _ = ConversationState::for_runtime(context).update_existing(&storage_key, |conv| {
+            let mut a = conv
+                .field("stickerCollectTimes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             a.push(json!(now));
             if a.len() > 500 {
                 let keep = a.len() - 500;
                 a.drain(0..keep);
             }
-        }
-    }
-    let _ = write_json_atomic(SOCIAL_STATE, &st);
+            conv.set_field("stickerCollectTimes", Value::Array(a));
+            Ok(())
+        });
     }
     crate::safe_println!("[console] 收藏表情 {key}: {emoji_id_new}");
     crate::activity::append(
@@ -7738,35 +6527,45 @@ fn handle_slang_add(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
     if content.is_empty() {
         return Err((400, "黑话内容不能为空".to_string()));
     }
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    if entries.iter().any(|e| e.get("content").and_then(|c| c.as_str()) == Some(content.as_str())) {
-        return Err((400, format!("黑话「{content}」已存在")));
-    }
-    let status = match req.get("status").and_then(|v| v.as_str()) {
-        Some("candidate") => "candidate",
-        _ => "confirmed",
-    };
-    let sources: Vec<Value> = req
-        .get("sources")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| !s.is_empty()).map(|s| json!(s)).collect())
-        .unwrap_or_default();
-    let draft = json!({
-        "content": content,
-        "meaning": req.get("meaning").cloned().unwrap_or(json!("")),
-        "usage": req.get("usage").cloned().unwrap_or(json!("")),
-        "example": req.get("example").cloned().unwrap_or(json!("")),
-        "risk": req.get("risk").cloned().unwrap_or(json!("")),
-        "sources": sources,
-        "status": status,
-        "source": "manual",
-        "count": 1,
-        "evidence": req.get("evidence").cloned().unwrap_or(json!([])),
-    });
-    let entry = crate::slang::normalize_entry(&draft);
-    entries.push(entry.clone());
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
+    let entry = crate::slang::mutate_entries(context, |entries| {
+        if entries
+            .iter()
+            .any(|e| e.get("content").and_then(|c| c.as_str()) == Some(content.as_str()))
+        {
+            return Err((400, format!("黑话「{content}」已存在")));
+        }
+        let status = match req.get("status").and_then(|v| v.as_str()) {
+            Some("candidate") => "candidate",
+            _ => "confirmed",
+        };
+        let sources: Vec<Value> = req
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| json!(s))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let draft = json!({
+            "content": content,
+            "meaning": req.get("meaning").cloned().unwrap_or(json!("")),
+            "usage": req.get("usage").cloned().unwrap_or(json!("")),
+            "example": req.get("example").cloned().unwrap_or(json!("")),
+            "risk": req.get("risk").cloned().unwrap_or(json!("")),
+            "sources": sources,
+            "status": status,
+            "source": "manual",
+            "count": 1,
+            "evidence": req.get("evidence").cloned().unwrap_or(json!([])),
+        });
+        let entry = crate::slang::normalize_entry(&draft);
+        entries.push(entry.clone());
+        Ok((true, entry))
+    })
+    .map_err(slang_mutate_error)?;
     crate::safe_println!("[console] 新增黑话「{content}」");
     Ok(json!({ "ok": true, "entry": entry }))
 }
@@ -7931,16 +6730,10 @@ fn handle_stickers_note(context: &RuntimeContext, body: &str) -> Result<Value, (
 fn handle_activity_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let paused = req.get("paused").and_then(|v| v.as_bool()) == Some(true);
-    if context.is_isolated() {
-        update_selected_social_state(context, |state| {
-            state["paused"] = json!(paused);
-            Ok(())
-        })?;
-    } else {
-        let mut state = load_social_state_for(context)?;
-        state["paused"] = json!(paused);
-        write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    }
+    ConversationState::for_runtime(context).update_document(|doc| {
+        doc.set_paused(paused);
+        Ok(())
+    })?;
     Ok(json!({ "ok": true, "paused": paused }))
 }
 /// `GET /api/preset/sim-prompt/backups`：列出某个预设的备份文件。
@@ -8013,306 +6806,35 @@ fn handle_sticker_alias(
 ///
 /// JS 要清十几张内存表（pending/queued/定时器/静默计数…），Rust 的控制台是**每次请求
 /// 读文件**、没有常驻内存，所以真正要落盘的只有两样：`sessions.json` 里的映射和
-/// `sessionPolicies`。剩下的（social-v2 的会话状态）单独处理。
-///
-/// JS 还会调 DSH 的 `stopSessionWork` + `archiveSession` 把旧会话停掉并归档 ——
-/// 那两步 Rust 暂时没做，所以在日志里明说"旧会话未归档"，
-/// 免得以后有人看到映射没了就以为 DSH 那边也干净了。
 fn handle_session_reset_for(
     context: &RuntimeContext,
     body: &str,
 ) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        return handle_session_reset_isolated(context, body);
-    }
-
-    // Keep the legacy process-wide behavior for callers without a runtime root.
-    let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let mut store = read_json(SESSIONS_FILE).unwrap_or_else(|| json!({}));
-    let sessions = store.get("sessions").cloned().unwrap_or_else(|| json!({}));
-    if key.is_empty() || sessions.get(&key).is_none() {
-        return Err((404, "会话不存在".to_string()));
-    }
-    let old_session = js_scalar(sessions.get(&key));
-    if let Some(obj) = store.get_mut("sessions").and_then(|s| s.as_object_mut()) {
-        obj.remove(&key);
-    }
-    // 权限元数据必须跟映射一起删，否则会永久残留在 sessions.json 里
-    if let Some(obj) = store.get_mut("sessionPolicies").and_then(|s| s.as_object_mut()) {
-        obj.remove(&key);
-    }
-    write_json_atomic(SESSIONS_FILE, &store).map_err(|e| (500, e))?;
-    // 二代会话状态也一并清掉（JS 里是 socialV2.conversations.delete(key)）
-    let mut v2 = load_social_state();
-    if let Some(obj) = v2.get_mut("conversations").and_then(|c| c.as_object_mut()) {
-        obj.remove(&key);
-    }
-    write_json_atomic(SOCIAL_STATE, &v2).map_err(|e| (500, e))?;
-    crate::safe_println!(
-        "[console] 已清除会话上下文 {key}（旧会话 {old_session}；注意：未调用 DSH 归档/停止）"
-    );
-    Ok(json!({ "ok": true, "key": key, "archived": old_session }))
-}
-
-fn handle_session_reset_isolated(
-    context: &RuntimeContext,
-    body: &str,
-) -> Result<Value, (u16, String)> {
-    let _interaction_gate = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    let req: Value = serde_json::from_str(body)
-        .map_err(|_| (400, "请求必须是 JSON 对象".to_string()))?;
-    if !req.is_object() {
-        return Err((400, "请求必须是 JSON 对象".to_string()));
-    }
-    let key = req.get("key").and_then(Value::as_str).unwrap_or("").to_string();
-
-    let sessions_text = context
-        .read_optional_text(RuntimeArea::Data, "sessions.json")
-        .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
-    let store = match sessions_text {
-        Some(text) => {
-            let value: Value = serde_json::from_str(&text)
-                .map_err(|_| (503, "runtime session data is invalid".to_string()))?;
-            if !value.is_object() {
-                return Err((503, "runtime session data is invalid".to_string()));
-            }
-            value
+    let key = if context.is_isolated() {
+        let req: Value = serde_json::from_str(body)
+            .map_err(|_| (400, "请求必须是 JSON 对象".to_string()))?;
+        if !req.is_object() {
+            return Err((400, "请求必须是 JSON 对象".to_string()));
         }
-        None => json!({}),
-    };
-    let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
-    // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
-    let mode = runtime_mode(context);
-    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key, &mode)
-        .map_err(|error| (503, error))?
-        .uses_dsh();
-    let mapped = match store.get("sessions") {
-        None => false,
-        Some(Value::Object(sessions)) => sessions.contains_key(&key),
-        Some(_) => return Err((503, "runtime session data is invalid".to_string())),
-    };
-    if key.is_empty() || (!mapped && !harness) {
-        return Err((404, "会话不存在".to_string()));
-    }
-    if store
-        .get("sessionPolicies")
-        .is_some_and(|policies| !policies.is_object())
-    {
-        return Err((503, "runtime session data is invalid".to_string()));
-    }
-
-    // Read and validate both selected files before changing either one. A missing social-state
-    // file or malformed session document must not turn this reset into a legacy-path operation.
-    let social_text = context
-        .read_optional_text(RuntimeArea::Data, "social-v2.json")
-        .map_err(|_| (503, "runtime data is unavailable".to_string()))?
-        .ok_or_else(|| (503, "runtime data is unavailable".to_string()))?;
-    let social: Value = serde_json::from_str(&social_text)
-        .map_err(|_| (503, "runtime data is invalid".to_string()))?;
-    if !social.is_object()
-        || social
-            .get("conversations")
-            .is_some_and(|conversations| !conversations.is_object())
-    {
-        return Err((503, "runtime data is invalid".to_string()));
-    }
-
-    // Preflight both write leaves before mutating either selected document. The two atomic
-    // replacements are not a cross-file transaction; an I/O failure during the second replace
-    // can still leave the first replacement committed and is reported explicitly below.
-    context
-        .resolve_path(RuntimeArea::Data, "sessions.json", PathIntent::WriteFile)
-        .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
-    context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
-        .map_err(|_| (503, "runtime data is unavailable".to_string()))?;
-
-    let old = crate::session_map::lookup(context, &key).map_err(|error| (503, error))?;
-    if old.is_none() && !harness {
-        return Err((404, "会话不存在".to_string()));
-    }
-    reset_selected_session_record(context, &key, old.as_deref(), None)
-        .map_err(|error| (500, error))?
-        .ok_or_else(|| (409, "会话已变化，重置未应用，请重试".to_string()))?;
-    let old_session = old.unwrap_or_default();
-
-
-    // Resolve inactive turns immediately; live harness turns retain settlement ownership.
-    // An uncertain live effect must stay available for administrator resolution.
-    // The mapping is already revoked, so a turn that cannot be settled (a busy finalization gate
-    // outlasting the retrying wait) must not skip the remaining turns or the DSH stop/archive:
-    // collect the failure and report it after the cleanup ran.
-    let mut deferred: Option<(u16, String)> = None;
-    if let Ok(records) = crate::turn_ledger::read_records(context) {
-        let (turns, _) = crate::turn_ledger::fold(&records);
-        for turn in turns.iter().filter(|t| {
-            t.key == key && (t.state.is_open() || t.state == crate::turn_ledger::State::Paused)
-        }) {
-            if turn.backend == "harness" {
-                if !crate::harness::resolve_reset(context, &turn.id)
-                    .map_err(|error| (500, format!("harness reset partially failed: {error}")))?
-                {
-                    // Generation revocation fences further dispatch. The live harness keeps
-                    // its running rows until the submitted handler has durably settled.
-                    continue;
-                }
-            }
-            // No hub lock is held here, so the recorder keeps its bounded retrying gate wait.
-            if let Err(error) = crate::turn_ledger::Recorder::attach(context, &turn.id, &key)
-                .end("cancelled", "session-reset") {
-                crate::safe_println!("[console] ⚠️ 重置时未能结算回合 {}：{error}", turn.id);
-                deferred.get_or_insert((500, format!("turn {} was not settled: {error}", turn.id)));
-            }
-        }
-    }
-    // DSH keeps queued prompts across a plain cancel, so clear the queue first, then cancel and
-    // archive. Failure leaves the mapping already revoked and is logged for the operator.
-    if mapped {
-        let _ = stop_and_archive_session(context, &cfg, &key, &old_session);
-    }
-    if let Some(error) = deferred {
-        return Err(error);
-    }
-
-    crate::safe_println!("[console] 已清除选定运行环境中的会话上下文 {key}（旧会话 {old_session}）");
-    Ok(json!({ "ok": true, "key": key, "archived": old_session }))
-}
-/// `POST /api/mode`：切模式（chat / closed-agent / reserved / reserved2）。
-///
-/// 落盘 `state/mode.json` 的是**内部拼写**（`simulation` 会写成 `reserved2`）：
-/// 下游所有判断都是 `== "reserved2"`，存规范名会让它们全部失效。
-///
-/// JS 还会把模式写穿到 DSH 设置（不写就会被它每 5 秒的轮询回滚）。
-/// Rust 侧暂时只写本地并如实回报 `dshSynced: false` —— 假装同步成功比不同步更糟。
-fn handle_mode_post(body: &str) -> Result<Value, (u16, String)> {
-    let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let raw = req.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let mode = match raw.to_ascii_lowercase().as_str() {
-        "chat" => "chat",
-        "closed-agent" => "closed-agent",
-        "reserved" => "reserved",
-        // simulation 是 reserved2 的规范名
-        "reserved2" | "simulation" => "reserved2",
-        _ => {
-            return Err((
-                400,
-                "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）"
-                    .to_string(),
-            ))
-        }
-    };
-    let existing = read_json(crate::legacy_path!("qq-bridge/state/mode.json")).unwrap_or_else(|| json!({}));
-    let preset = match req.get("closedAgentPreset") {
-        Some(v) => js_scalar(Some(v)),
-        None => existing
-            .get("closedAgentPreset")
-            .and_then(|v| v.as_str())
+        req.get("key")
+            .and_then(Value::as_str)
             .unwrap_or("")
-            .to_string(),
+            .to_string()
+    } else {
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        req.get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
     };
-    let next = json!({ "mode": mode, "closedAgentPreset": preset });
-    write_json_atomic(crate::legacy_path!("qq-bridge/state/mode.json"), &next).map_err(|e| (500, e))?;
-    // 写穿到 DSH 设置：不写的话，DSH 每 5 秒的轮询会把本地值覆盖回去
-    // （JS 注释里写过这个坑）。写穿用的是**内部拼写**，因为 DSH 里那份值会被读回来当下游判断用。
-    let dsh_synced = write_mode_to_dsh(mode).is_ok();
-    if !dsh_synced {
-        crate::safe_println!("[console] 模式写穿 DSH 失败；本次仅写本地，下次 DSH 轮询会覆盖回滚");
-    }
-    crate::safe_println!("[console] 模式已设置为 {mode}");
-    Ok(json!({
-        "ok": true,
-        "mode": mode,
-        "closedAgentPreset": preset,
-        "dshSynced": dsh_synced,
-    }))
+    social_state::reset_conversation(context, &key).map_err(SocialError::into_http)
 }
 
-/// `POST /api/mode` for a selected runtime: the mode lives in the runtime's own `mode.json`, which
-/// is what the running bridge reads before every message, so a successful answer means the bridge
-/// serves the new mode from its next message on. DSH write-through uses only the selected
-/// dependency and credentials; failure leaves the local change in place, as in frozen JS.
 fn handle_mode_post_for(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return handle_mode_post(body);
-    }
-    let _interaction_gate = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    handle_mode_post_locked(context, body, true)
-}
-
-fn handle_mode_post_locked(context: &RuntimeContext, body: &str, sync_dsh: bool) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let raw = req.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let Some(mode) = crate::config::normalize_mode(raw) else {
-        return Err((
-            400,
-            "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）".to_string(),
-        ));
-    };
-    let existing = match context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| (503, "runtime mode is unavailable".to_string()))?
-    {
-        Some(text) => serde_json::from_str::<Value>(&text).map_err(|_| (503, "runtime mode is invalid".to_string()))?,
-        None => json!({}),
-    };
-    let preset = match req.get("closedAgentPreset") {
-        Some(v) => js_scalar(Some(v)),
-        None => existing.get("closedAgentPreset").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    };
-    let changed = existing.get("mode").and_then(Value::as_str) != Some(mode)
-        || (mode == "closed-agent" && existing.get("closedAgentPreset").and_then(Value::as_str).unwrap_or("") != preset);
-    let revision = if changed { crate::turn_ledger::mint_id("mode-") } else { existing["revision"].as_str().unwrap_or("").to_string() };
-    if changed {
-        // Rotate before publishing the new mode; even an immediate round trip revokes old tools.
-        mutate_social_state_for(context, |state| {
-            if let Some(conversations) = state["conversations"].as_object_mut() {
-                for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-            }
-            Ok(())
-        })?;
-        // Queued ingress must stay invalid after a restart before the driver's next tick.
-        let journal = crate::inbound::Journal::open(context).map_err(|e| (503,e))?;
-        let keys = journal.replayable().map_err(|e| (503,e))?.into_iter().map(|e| e.event_key).collect::<Vec<_>>();
-        journal.mark_handled(&keys, now_ms()).map_err(|e| (503,e))?;
-        if existing["mode"] == "reserved" && mode != "reserved" {
-            crate::reserved::retire_mode_state(context).map_err(|e| (503, e))?;
-        }
-    }
-    // Frozen JS reconciles session policies on each actual mode transition. Revoke
-    // the captured mapping even when the operator switches away and back between ticks.
-    let mut retired = Vec::new();
-    if changed {
-        for (key, session) in crate::session_map::all(context).map_err(|e| (503, e))? {
-            if crate::session_map::retire_if(context, &key, &session).map_err(|e| (503, e))? {
-                retired.push((key, session));
-            }
-        }
-    }
-    let next = json!({ "mode": mode, "closedAgentPreset": preset, "revision":revision });
-    context
-        .write_atomic(RuntimeArea::Data, "mode.json", serde_json::to_string_pretty(&next).unwrap_or_default().as_bytes())
-        .map_err(|_| (503, "runtime mode is unavailable".to_string()))?;
-    let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
-    let dsh_synced = sync_dsh && dsh_rpc_for(context, &cfg)
-        .and_then(|rpc| rpc.call("settings.update", json!({"ns":"qq-mode","patch":{"mode":mode}})))
-        .is_ok();
-    if !retired.is_empty() {
-        for (key, session) in retired {
-            let _ = stop_and_archive_session(context, &cfg, &key, &session);
-        }
-    }
-    crate::safe_println!("[console] 选定运行环境的模式已设置为 {mode}");
-    Ok(json!({ "ok": true, "mode": mode, "closedAgentPreset": preset, "dshSynced": dsh_synced }))
-}
-
-/// Apply a DSH mode read only if no console mode write raced the settings request.
-pub(crate) fn apply_dsh_mode(context: &RuntimeContext, mode: &str, observed: Option<String>) -> Result<bool, String> {
-    let _interaction_gate = crate::closed_agent::lock(context)?;
-    let current = context.read_optional_text(RuntimeArea::Data, "mode.json").map_err(str::to_string)?;
-    if current != observed { return Ok(false); }
-    if runtime_mode(context) == mode { return Ok(true); }
-    handle_mode_post_locked(context, &json!({"mode":mode}).to_string(), false).map(|_| true).map_err(|(_, e)| e)
+    let raw = req.get("mode").and_then(Value::as_str).unwrap_or("");
+    let preset = req.get("closedAgentPreset");
+    social_state::set_mode(context, raw, preset, true).map_err(SocialError::into_http)
 }
 
 /// `GET /api/status` of a selected runtime reports what is stored there: the mode, the closed-agent
@@ -8322,7 +6844,10 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
         payload["mode"] = json!(mode);
     }
     if let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, "mode.json") {
-        if let Some(preset) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("closedAgentPreset").and_then(|p| p.as_str()).map(str::to_string)) {
+        if let Some(preset) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("closedAgentPreset").and_then(|p| p.as_str()).map(str::to_string))
+        {
             payload["closedAgentPreset"] = json!(preset);
         }
     }
@@ -8332,139 +6857,98 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
     }
 }
 
-/// 把模式写进 DSH 的 `qq-mode` 设置命名空间。
-fn write_mode_to_dsh(mode: &str) -> Result<(), String> {
-    let cfg = read_json(CONFIG_PATH).unwrap_or_else(|| json!({}));
-    let base = cfg
-        .get("dsh")
-        .and_then(|d| d.get("baseUrl"))
-        .and_then(|b| b.as_str())
-        .unwrap_or("http://127.0.0.1:3080");
-    let rpc = crate::dsh::Rpc::connect(base)?;
-    let v = match rpc.call(
-        "settings.update",
-        json!({ "ns": "qq-mode", "patch": { "mode": mode } }),
-    ) {
-        Ok(v) => v,
-        Err(e) if e.contains("401") => {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            rpc.call(
-                "settings.update",
-                json!({ "ns": "qq-mode", "patch": { "mode": mode } }),
-            )?
-        }
-        Err(e) => return Err(e),
-    };
-    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
-        return Err("settings.update 返回 ok=false".to_string());
-    }
-    Ok(())
-}
-
-/// A generated console token: 24 bytes of operating-system randomness as 48 hex characters (JS
-/// `crypto.randomBytes(24).toString('hex')`).
-pub(crate) fn generate_console_token() -> Result<String, String> {
-    generate_console_token_from(&mut |bytes: &mut [u8]| {
-        getrandom::getrandom(bytes).map_err(|e| format!("系统随机数不可用：{e}"))
-    })
-}
-
-/// The token made from exactly the bytes `fill` provides (the entropy source is the only input).
-pub(crate) fn generate_console_token_from(fill: &mut dyn FnMut(&mut [u8]) -> Result<(), String>) -> Result<String, String> {
-    let mut bytes = [0u8; 24];
-    fill(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `data/console-token` holds the console credential: written atomically, then private to the
-/// owner (JS writes it with mode 0600 inside the hardened state directory).
-pub(crate) fn write_console_token_file(context: &RuntimeContext, token: &str) -> Result<(), String> {
-    context.write_atomic(RuntimeArea::Data, "console-token", token.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = context
-            .resolve_path(RuntimeArea::Data, "console-token", PathIntent::ReadFile)
-            .map_err(str::to_string)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// `POST /api/console/token`：改控制台访问令牌（留空则随机生成）。
 ///
 /// Selected runtime (JS `bridge.js` 4311-4341): a manual token goes to `config.json` and to
 /// `data/console-token`; a generated one only to `data/console-token`, with `consoleToken: ""` in
 /// `config.json` (the runtime loader falls back to the file, `RuntimeContext::load_config`). The
-/// read-modify-write runs under the social-state gate. The token file is written first and put back
-/// if `config.json` cannot be written, so a failed request never leaves the operator without the
-/// token they hold. The legacy runtime writes the token to `config.json` and its state file.
-fn handle_console_token_post(
+/// Selected rotation keeps a durable digest-only intent through both publications. The legacy runtime
+/// writes the token to `config.json` and its state file.
+fn handle_console_token_post_tx(
     context: &RuntimeContext,
     body: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let provided = if context.is_isolated() {
         access::requested_console_token(body)?
     } else {
         let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        req.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+        req.get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
     };
     let generated = provided.is_empty();
     let new_token = if generated {
-        generate_console_token().map_err(|e| (500, e))?
+        crate::console_auth::generate_console_token()
+            .map_err(|e| crate::config_tx::CommitError::plain(500, e))?
     } else {
         provided
     };
     if new_token.len() < 16 {
-        return Err((400, "控制台访问令牌至少需要 16 位；留空可生成随机令牌".to_string()));
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "控制台访问令牌至少需要 16 位；留空可生成随机令牌",
+        ));
     }
     if new_token.len() > 128 {
-        return Err((400, "控制台访问令牌不能超过 128 位".to_string()));
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "控制台访问令牌不能超过 128 位",
+        ));
     }
-    if !new_token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err((400, "控制台访问令牌只能包含字母、数字、下划线或短横线".to_string()));
+    if !new_token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "控制台访问令牌只能包含字母、数字、下划线或短横线",
+        ));
     }
-    if context.is_isolated() {
-        let _gate = acquire_social_state_gate(context)?;
-        let mut cfg = read_json_for(context, CONFIG_PATH)
-            .ok_or((500, "读取 config.json 失败，已中止写入".to_string()))?;
-        let obj = cfg
-            .as_object_mut()
-            .ok_or((500, "config.json 结构异常，已中止写入".to_string()))?;
-        obj.insert("consoleToken".into(), json!(if generated { "" } else { new_token.as_str() }));
-        let previous = context
-            .read_optional_text(RuntimeArea::Data, "console-token")
-            .map_err(|e| (500, format!("读取令牌文件失败，已中止写入：{e}")))?;
-        write_console_token_file(context, &new_token).map_err(|e| (500, format!("写令牌失败：{e}")))?;
-        if let Err(error) = write_json_atomic_for(context, CONFIG_PATH, &cfg) {
-            let restored = match &previous {
-                Some(text) => write_console_token_file(context, text),
-                None => context.remove_file(RuntimeArea::Data, "console-token"),
-            };
-            let note = match restored {
-                Ok(()) => "，令牌未改变".to_string(),
-                Err(e) => format!("；恢复原令牌文件也失败：{e}"),
-            };
-            return Err((500, format!("写 config.json 失败：{error}{note}")));
-        }
+    let config_diff = if context.is_isolated() {
+        Some(crate::config_tx::rotate_console_token(
+            context,
+            &new_token,
+            !generated,
+        )?)
     } else {
-        let mut cfg = read_json_for(context, CONFIG_PATH)
-            .ok_or((500, "读取 config.json 失败，已中止写入".to_string()))?;
-        let obj = cfg
-            .as_object_mut()
-            .ok_or((500, "config.json 结构异常，已中止写入".to_string()))?;
+        let mut cfg = read_json_for(context, CONFIG_PATH).ok_or_else(|| {
+            crate::config_tx::CommitError::plain(500, "读取 config.json 失败，已中止写入")
+        })?;
+        let obj = cfg.as_object_mut().ok_or_else(|| {
+            crate::config_tx::CommitError::plain(500, "config.json 结构异常，已中止写入")
+        })?;
         // 旧路径：authorized() 只读 config，随机令牌也写 config，否则重启后全员 401。
         obj.insert("consoleToken".into(), json!(new_token.as_str()));
-        write_json_atomic_for(context, CONFIG_PATH, &cfg).map_err(|e| (500, e))?;
-        if let Some(dir) = std::path::Path::new(crate::legacy_path!("qq-bridge/state/console-token")).parent() {
+        let diff = crate::config_tx::write_config_json(context, &cfg)
+            .map_err(|e| crate::config_tx::CommitError::plain(500, e))?;
+        let legacy_token = crate::legacy_path!("qq-bridge/state/console-token");
+        if let Some(dir) = std::path::Path::new(legacy_token).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(crate::legacy_path!("qq-bridge/state/console-token"), &new_token)
-            .map_err(|e| (500, format!("写令牌失败：{e}")))?;
-    }
-    DESKTOP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    crate::safe_println!("[console] 访问令牌已{}（不记录完整值）", if generated { "重新生成" } else { "手动修改" });
-    Ok(json!({ "ok": true, "token": new_token, "generated": generated }))
+        std::fs::write(legacy_token, &new_token)
+            .map_err(|e| crate::config_tx::CommitError::plain(500, format!("写令牌失败：{e}")))?;
+        diff
+    };
+    crate::safe_println!(
+        "[console] 访问令牌已{}（不记录完整值）",
+        if generated { "重新生成" } else { "手动修改" }
+    );
+    Ok(crate::config_tx::CommitOutcome {
+        value: json!({ "ok": true, "token": new_token, "generated": generated }),
+        config_diff,
+    })
+}
+
+#[cfg(test)]
+fn handle_console_token_post(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<Value, (u16, String)> {
+    handle_console_token_post_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 /// `GET /api/socialV2/sticker-image`：取一张收藏表情的图片（base64 内联）。
 ///
@@ -8720,7 +7204,7 @@ fn handle_send_sticker(
             return Err((403, "工具未启用：qq_send_sticker".to_string()));
         }
     }
-    if current_mode() != "reserved2" {
+    if social_state::mode(&RuntimeContext::legacy()) != "reserved2" {
         return Err((403, "该接口仅 reserved2 模式可用".to_string()));
     }
     if token.is_empty() {
@@ -8927,11 +7411,10 @@ where
         }
     }
 
-    let social = load_social_state_for(context)?;
-    let conv = social
-        .get("conversations")
-        .and_then(|conversations| conversations.get(&storage_key))
+    let conv_typed = ConversationState::for_runtime(context)
+        .read(&storage_key)?
         .ok_or((404, format!("会话不存在：{key}")))?;
+    let conv = conv_typed.to_value();
     if conv.get("recentMessages").is_some_and(|value| !value.is_array()) {
         return Err((503, "selected runtime social state is invalid".to_string()));
     }
@@ -8939,12 +7422,12 @@ where
         .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
     context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+        .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
         .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     let now = now_ms();
     let max_minute = crate::settings::send::RATE_MIN.integer(cfg);
     let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
-    let epoch = crate::send_outbox::token_epoch(token);
+    let epoch = crate::conversation_state::token_epoch(token);
     let reservation = crate::turn_ledger::mint_id("sticker-send-");
     reserve_sticker_quota(context, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, max_minute, max_hour, Some(&epoch), "发送频率超限，请稍后再试")?;
     let mut retain_reservation = false;
@@ -9136,99 +7619,111 @@ where
 
     // The network-confirmed sticker send is a fact even if one selected store has become
     // unavailable or invalid. Try both independent deltas and report each unconfirmed store.
-    let social_update = update_selected_social_state(context, |fresh_state| {
-        let fresh_conv = fresh_state
-            .get_mut("conversations")
-            .and_then(|conversations| conversations.get_mut(&storage_key))
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        let fresh_conv = fresh_conv
-            .as_object_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        if fresh_conv
-            .get("sendTimes")
-            .is_some_and(|value| !value.is_array())
-            || fresh_conv
-                .get("recentMessages")
+    let social_update = if !context.is_isolated() {
+        Err((500, "selected runtime is required".to_string()))
+    } else {
+        ConversationState::for_runtime(context).update_document(|doc| {
+            let conv_typed = doc
+                .conversation(&storage_key)
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            let mut conv_val = conv_typed.to_value();
+            let fresh_conv = conv_val
+                .as_object_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            if fresh_conv
+                .get("sendTimes")
                 .is_some_and(|value| !value.is_array())
-            || fresh_conv
-                .get("wakeConfig")
-                .is_some_and(|value| !value.is_object())
-        {
-            return Err((503, "selected runtime social state is invalid".to_string()));
-        }
+                || fresh_conv
+                    .get("recentMessages")
+                    .is_some_and(|value| !value.is_array())
+                || fresh_conv
+                    .get("wakeConfig")
+                    .is_some_and(|value| !value.is_object())
+            {
+                return Err((503, "selected runtime social state is invalid".to_string()));
+            }
 
-        let recent_messages = fresh_conv
-            .entry("recentMessages".to_string())
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        let text = format!(
-            "[表情包:{}]",
-            entry_for_history
-                .get("desc")
-                .or_else(|| entry_for_history.get("localNote"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("表情包")
-        );
-        let message_id = response
-            .get("data")
-            .and_then(|data| data.get("message_id"))
-            .map(|value| js_scalar(Some(value)));
-        recent_messages.push(json!({
-            "messageId": message_id,
-            "replyToMessageId": actual_reply,
-            "replyToUserId": quoted["userId"],
-            "atUserId": at_user,
-            "sender": "我",
-            "text": text.chars().take(200).collect::<String>(),
-            "plain": text.chars().take(200).collect::<String>(),
-            "quoteTargetIsSelf": false,
-            "isOwner": true,
-            "ownerLabel": "我",
-            "isSelf": true,
-            "media": [],
-            "hasMedia": false,
-            "forwardIds": [],
-            "hasForward": false,
-            "sticker": {
-                "id": entry_for_history.get("id").cloned().unwrap_or(json!(sticker_id)),
-                "desc": entry_for_history.get("desc").cloned().unwrap_or(json!("")),
-                "localNote": entry_for_history.get("localNote").cloned().unwrap_or(json!("")),
-            },
-            "time": used_at,
-        }));
-        let recent_limit = cfg
-            .get("socialV2")
-            .and_then(|social| social.get("context"))
-            .and_then(|context| context.get("recentLimit"))
-            .and_then(Value::as_i64)
-            .filter(|limit| *limit > 0)
-            .unwrap_or(100) as usize;
-        if recent_messages.len() > recent_limit {
-            let excess = recent_messages.len() - recent_limit;
-            recent_messages.drain(0..excess);
-        }
-        fresh_conv.insert("lastAiReplyAt".to_string(), json!(now));
-        fresh_conv.insert("lastActionAt".to_string(), json!(now));
-        fresh_conv.insert("engagedAt".to_string(), json!(now));
-        let wake = fresh_conv
-            .entry("wakeConfig".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        wake.insert("noActionCount".to_string(), json!(0));
-        for field in [
-            "preSleepWaitSatisfiedAt",
-            "preSleepWaitObservedAt",
-            "preSleepWaitAccumMs",
-        ] {
-            fresh_conv.insert(field.to_string(), json!(0));
-        }
-        // The confirmed send consumes its quota slot in the same write as its history entry, so a
-        // settle failure can never turn a delivered sticker into an error response.
-        apply_sticker_settlement(fresh_state, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, true)
-    });
+            let recent_messages = fresh_conv
+                .entry("recentMessages".to_string())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            let text = format!(
+                "[表情包:{}]",
+                entry_for_history
+                    .get("desc")
+                    .or_else(|| entry_for_history.get("localNote"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("表情包")
+            );
+            let message_id = response
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .map(|value| js_scalar(Some(value)));
+            recent_messages.push(json!({
+                "messageId": message_id,
+                "replyToMessageId": actual_reply,
+                "replyToUserId": quoted["userId"],
+                "atUserId": at_user,
+                "sender": "我",
+                "text": text.chars().take(200).collect::<String>(),
+                "plain": text.chars().take(200).collect::<String>(),
+                "quoteTargetIsSelf": false,
+                "isOwner": true,
+                "ownerLabel": "我",
+                "isSelf": true,
+                "media": [],
+                "hasMedia": false,
+                "forwardIds": [],
+                "hasForward": false,
+                "sticker": {
+                    "id": entry_for_history.get("id").cloned().unwrap_or(json!(sticker_id)),
+                    "desc": entry_for_history.get("desc").cloned().unwrap_or(json!("")),
+                    "localNote": entry_for_history.get("localNote").cloned().unwrap_or(json!("")),
+                },
+                "time": used_at,
+            }));
+            let recent_limit = cfg
+                .get("socialV2")
+                .and_then(|social| social.get("context"))
+                .and_then(|context| context.get("recentLimit"))
+                .and_then(Value::as_i64)
+                .filter(|limit| *limit > 0)
+                .unwrap_or(100) as usize;
+            if recent_messages.len() > recent_limit {
+                let excess = recent_messages.len() - recent_limit;
+                recent_messages.drain(0..excess);
+            }
+            fresh_conv.insert("lastAiReplyAt".to_string(), json!(now));
+            fresh_conv.insert("lastActionAt".to_string(), json!(now));
+            fresh_conv.insert("engagedAt".to_string(), json!(now));
+            let wake = fresh_conv
+                .entry("wakeConfig".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            wake.insert("noActionCount".to_string(), json!(0));
+            for field in [
+                "preSleepWaitSatisfiedAt",
+                "preSleepWaitObservedAt",
+                "preSleepWaitAccumMs",
+            ] {
+                fresh_conv.insert(field.to_string(), json!(0));
+            }
+            let mut state_tmp = doc.clone().into_value();
+            if let Some(map) = state_tmp.get_mut("conversations").and_then(Value::as_object_mut) {
+                map.insert(storage_key.clone(), conv_val);
+            }
+            // The confirmed send consumes its quota slot in the same write as its history entry, so a
+            // settle failure can never turn a delivered sticker into an error response.
+            apply_sticker_settlement(&mut state_tmp, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, true)?;
+            if let Some(updated) = state_tmp.get("conversations").and_then(|c| c.get(&storage_key)).and_then(Conversation::from_value) {
+                doc.set_conversation(&storage_key, updated);
+            }
+            Ok(())
+        })
+    };
     quota_settled = true;
 
     let mut update_errors = Vec::new();
@@ -9443,475 +7938,83 @@ fn handle_stickers_remark(
 /// `gapMode=auto` 用随机间隔 —— 那条路径的 `delays` 两边**天生不同**，
 /// 对拍只比固定/按字数两种模式。
 const SEND_CANCELLED_MESSAGE: &str = "发送已取消：会话、模式或白名单已变化";
-static LEGACY_SOCIAL_SEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Read-modify-write of the social state for send bookkeeping. Isolated roots go through the
-/// selected state gate (one atomic update); the legacy path serializes in-process.
-pub(crate) fn mutate_social_state_for<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<T, (u16, String)> {
-    if context.is_isolated() {
-        return update_selected_social_state(context, update).map(|(_, value)| value);
-    }
-    let _guard = LEGACY_SOCIAL_SEND_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = load_social_state_for(context)?;
-    let value = update(&mut state)?;
-    write_social_state_for(context, &state).map_err(|error| (500, error))?;
-    Ok(value)
-}
 
 // ── ticket 10：会话令牌（回合代际）与回合账本的管理端视图 ───────────────────────────
 
-/// Persist one wait identity at the legacy turn boundary, before any backend attempts.
-pub(crate) fn begin_legacy_wait_turn(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["waitTurnId"] = json!(crate::turn_ledger::mint_id("wait-"));
-        Ok(())
-    }).map_err(|(_, error)| error)
-}
-
-pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, deadline: i64) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["waitTurnDeadlineAt"] = json!(deadline);
-        Ok(())
-    }).map_err(|(_, error)| error)
-}
-
-
-/// Fresh agent token (48 hex chars from two OS-seeded ids).
-pub(crate) fn fresh_agent_token() -> String {
-    format!("{}{}", crate::turn_ledger::mint_id(""), crate::turn_ledger::mint_id(""))
-}
-
-/// A conversation record as the JS bridge creates it lazily on first contact: default wake
-/// configuration (so the chat answers its first @ after a reset), empty message windows and a
-/// fresh agent token. The Rust inbound path never creates conversation records itself.
-pub(crate) fn new_conversation(context: &RuntimeContext) -> Value {
-    let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let random = u64::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0) as f64 / 4_294_967_296.0;
-    json!({
-        "wakeConfig": crate::wake::default_wake_config(&cfg, crate::turn_ledger::now_ms(), random),
-        "recentMessages": [], "unread": [], "lastWakeReason": "", "lastAiReplyAt": 0, "lastActionAt": 0,
-        "agentToken": fresh_agent_token(), "bootstrapSent": false, "wakeTimes": [], "sendTimes": [],
-    })
-}
-
-/// Journaled ingress reaches the same bounded recent/unread streams the public tools read.
-/// Replays after a crash between this write and dispatch keep their original sequence.
-pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, key: &str, event_key: &str, mut message: Value) -> Result<i64, String> {
-    mutate_social_state_for(context, |state| {
-        if state["conversations"].get(key).is_none() {
-            state["conversations"][key] = new_conversation(context);
-        }
-        let conv = &mut state["conversations"][key];
-        if let Some(seq) = conv["recentMessages"].as_array().and_then(|a| a.iter().find(|m| m["inboundKey"] == event_key)).and_then(|m| m["seq"].as_i64()) {
-            return Ok(seq);
-        }
-        let seq = conv["lastUnreadSeq"].as_i64().unwrap_or(0) + 1;
-        message["seq"] = json!(seq);
-        message["inboundKey"] = json!(event_key);
-        // A member with an impression speaking is the observed interaction the prompt reports.
-        if message["isSelf"] != true {
-            let name = if key.starts_with("private:") { None } else { message["sender"].as_str() };
-            crate::social_mem::note_member_seen(conv, message["userId"].as_str(), name, message["time"].as_i64().unwrap_or(0));
-        }
-        conv["lastUnreadSeq"] = json!(seq);
-        if message["quietNeutral"] != true {
-            conv["lastReplyIncomingAt"] = message["time"].clone();
-        } else if conv.get("lastReplyIncomingAt").is_none() {
-            // First neutral arrival after upgrading a conversation retains its earlier anchor.
-            conv["lastReplyIncomingAt"] = conv.get("lastIncomingAt").filter(|v|v.as_i64().is_some_and(|t|t>0))
-                .cloned().unwrap_or_else(||message["time"].clone());
-        }
-        let urgent = message["isOwner"] == true || message["atSelf"] == true;
-        if message["quietNeutral"] != true || urgent {
-            conv["lastReplyUrgent"] = json!(urgent);
-        }
-        conv["lastIncomingAt"] = message["time"].clone();
-        for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] { conv[field] = json!(0); }
-        for (field, setting, default) in [("recentMessages", "recentLimit", 100), ("unread", "unreadLimit", 30)] {
-            if !conv[field].is_array() { conv[field] = json!([]); }
-            let limit = cfg.pointer(&format!("/socialV2/context/{setting}")).and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(default) as usize;
-            let list = conv[field].as_array_mut().unwrap();
-            let mut copy = message.clone();
-            // The full text of a long message is stored once, in `recentMessages` (what message detail reads).
-            if field == "unread" { copy.as_object_mut().map(|m| m.remove("fullText")); }
-            list.push(copy);
-            if list.len() > limit { list.drain(..list.len() - limit); }
-        }
-        Ok(seq)
-    }).map_err(|(_, e)| e)
-}
-
-pub(crate) const WAKE_ACCESS_REFUSED: &str = "wake refused by current access settings";
-pub(crate) const WAKE_SUSPENDED: &str = "wake suspended by current settings";
-
-/// Claim wake bookkeeping before prompt construction. The deadline survives until a ledger turn owns it.
-/// `expected`: the token the queued wake was seen under; a different current token refuses the
-/// claim (`queued wake token invalidated`) before anything changes.
-pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: &str, now: i64, expected: Option<&str>) -> Result<(Value,String), String> {
-    mutate_social_state_for(context, |state| {
-        let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
-        if !inbound_admitted(&cfg, key) {
-            return Err((403, WAKE_ACCESS_REFUSED.to_string()));
-        }
-        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) {
-            return Err((403, WAKE_SUSPENDED.to_string()));
-        }
-        let conv = &mut state["conversations"][key];
-        let previous = conv.clone();
-        let token = conv["agentToken"].as_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
-        if expected.is_some_and(|expected| expected != token) {
-            return Err((409, "queued wake token invalidated".to_string()));
-        }
-        conv["wakeConfig"]["lastWakeAt"] = json!(now);
-        conv["wakeConfig"]["wakeCount"] = json!(previous["wakeConfig"]["wakeCount"].as_i64().unwrap_or(0)+1);
-        conv["lastWakeReason"] = json!(reason);
-        for field in ["preSleepWaitSatisfiedAt","preSleepWaitObservedAt","preSleepWaitAccumMs","engagedAt"] { conv[field] = json!(0); }
-        if !conv["wakeTimes"].is_array() { conv["wakeTimes"] = json!([]); }
-        let times = conv["wakeTimes"].as_array_mut().unwrap();
-        times.push(json!(now));
-        times.retain(|v|v.as_i64().is_some_and(|at| now-at < 3_600_000));
-        if times.len()>200 { times.drain(..times.len()-200); }
-        Ok((previous,token))
-    }).map_err(|(_,e)|e)
-}
-
-/// Called only after the turn and its wake claim are durable. Preserve newer tool configuration.
-pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "queued wake token invalidated".into())); }
-        if conv["wakeConfig"]["lastWakeAt"].as_i64() == Some(at)
-            && conv["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-            && conv["wakeConfig"]["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
-            conv["wakeConfig"]["sleepUntil"] = Value::Null;
-        }
-        Ok(())
-    }).map_err(|(_, e)| e)
-}
-
-pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,previous:&Value)->Result<(),String> {
-    mutate_social_state_for(context,|state| {
-        let conv=&mut state["conversations"][key];
-        if let Some(times)=conv["wakeTimes"].as_array_mut() { if let Some(i)=times.iter().rposition(|v|v.as_i64()==Some(at)) { times.remove(i); } }
-        if conv["wakeConfig"]["lastWakeAt"].as_i64()==Some(at) {
-            for field in ["lastWakeAt","wakeCount"] { conv["wakeConfig"][field]=previous["wakeConfig"][field].clone(); }
-            conv["lastWakeReason"]=previous["lastWakeReason"].clone();
-            if conv["wakeConfig"]["confirmedAt"]==previous["wakeConfig"]["confirmedAt"] { conv["wakeConfig"]["sleepUntil"]=previous["wakeConfig"]["sleepUntil"].clone(); }
-        }
-        Ok(())
-    }).map_err(|(_,e)|e)
-}
-
-/// Completion is separate from wake admission: reminders do not consume another wake.
-pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
-    mutate_social_state_for(context, |state| {
-        let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "completed turn token invalidated".into())); }
-        let stamp = conv["wakeConfig"]["confirmedAt"].clone();
-        let closed = stamp != *closing_seen && matches!(conv["wakeConfig"]["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
-        let now = crate::now_ms() as i64;
-        if let Some(started) = started {
-            let acted = conv["lastActionAt"].as_i64().unwrap_or(0) >= started || conv["lastAiReplyAt"].as_i64().unwrap_or(0) >= started;
-            let no_action = if acted { 0 } else { conv["wakeConfig"]["noActionCount"].as_u64().unwrap_or(0) + 1 };
-            conv["wakeConfig"]["noActionCount"] = json!(no_action);
-            let limit = crate::settings::wake_timing::NO_ACTION.integer(cfg) as u64;
-            if no_action >= limit {
-                let keywords = conv["wakeConfig"]["triggers"]["keywords"].clone();
-                let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
-                conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
-                let reset = &mut conv["wakeConfig"];
-                if keywords.as_array().is_some_and(|a| !a.is_empty()) && keywords != reset["triggers"]["keywords"] {
-                    reset.as_object_mut().unwrap().remove("inheritsKeywords");
-                    reset["customKeywordsFor"] = reset["triggers"]["keywords"].clone();
-                    reset["triggers"]["keywords"] = keywords;
-                }
-                if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
-                conv["bootstrapSent"] = json!(true);
-            }
-        }
-        let max = crate::settings::wake_timing::REMINDERS.integer(cfg) as u64;
-        if closed {
-            crate::wake::ensure_wakeable(&mut conv["wakeConfig"], cfg, now, rand01());
-        } else if u64::from(miss) >= max {
-            let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
-            conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
-            if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
-        }
-        Ok((!closed && u64::from(miss) < max, stamp))
-    }).map_err(|(_, e)| e)
-}
-
-/// A replaced DSH session starts without the operator's first-wake injection (JS `retireSession`).
-pub(crate) fn mark_conversation_unbootstrapped(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        if let Some(conversation) = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-        {
-            conversation.insert("bootstrapSent".to_string(), json!(false));
-        }
-        Ok(())
-    })
-    .map_err(|(_, message)| message)
-}
-
-/// The first wake of a reserved2 conversation is a `bootstrap` wake (JS `bootstrapSent`): it
-/// carries the operator's initial prompt. Returns true exactly once per conversation until a
-/// session reset or replacement clears the flag again. Nothing is claimed while the AI is paused,
-/// the second-generation mode is off, or the runtime is not in reserved2.
-pub(crate) fn claim_first_wake(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, String> {
-    if cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) == Some(false) {
-        return Ok(false);
-    }
-    if current_mode_for(context).map_err(|(_, m)| m)? != "reserved2" {
-        return Ok(false);
-    }
-    let pending = |state: &Value| -> bool {
-        state.get("paused").and_then(Value::as_bool) != Some(true)
-            && state
-                .get("conversations")
-                .and_then(|c| c.get(key))
-                .and_then(Value::as_object)
-                .is_some_and(|c| c.get("bootstrapSent").and_then(Value::as_bool) != Some(true))
-    };
-    // Read-only look first: the common case (already bootstrapped) must not rewrite the state.
-    if !pending(&load_social_state_for(context).map_err(|(_, m)| m)?) {
-        return Ok(false);
-    }
-    mutate_social_state_for(context, |state| {
-        if !pending(state) {
-            return Ok(false);
-        }
-        state["conversations"][key]["bootstrapSent"] = json!(true);
-        Ok(true)
-    })
-    .map_err(|(_, message)| message)
-}
-
-/// Role state (`current-role.json`) for the chat commands.
-pub(crate) fn chat_role_state(context: &RuntimeContext) -> Result<Value, String> {
-    read_role_state(context).map_err(|error| error.to_string())
-}
-
-/// Write `current-role.json` (`/role`, `/silent`, `/active`).
-pub(crate) fn chat_write_role_state(context: &RuntimeContext, role: Option<&str>, mode: &str) -> Result<(), String> {
-    write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": role, "mode": mode }))
-}
-
-/// The owner's `/reset`: the same reset the admin console performs. Harness conversations
-/// invalidate their generation without requiring a DSH session mapping.
-pub(crate) fn chat_reset_conversation(context: &RuntimeContext, key: &str) -> Result<(), (u16, String)> {
-    handle_session_reset_isolated(context, &json!({ "key": key }).to_string()).map(|_| ())
-}
-
-/// Publish the DSH owner override and retire sessions made under the previous policy.
-pub(crate) fn apply_closed_agent_owner(context: &RuntimeContext, owner: &Value) -> Result<(), String> {
-    let _interaction_gate = crate::closed_agent::lock(context)?;
-    let cfg = context.load_config().map_err(str::to_string)?;
-    let changed = runtime_mode(context) == "closed-agent" && cfg.get("ownerQQ") != Some(owner);
-    let policy = json!({"ownerQQ":owner});
-    let existing = context.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json").map_err(str::to_string)?
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if existing.as_ref() == Some(&policy) { return Ok(()); }
-    context.write_atomic(RuntimeArea::Data, "closed-agent-owner.json", policy.to_string().as_bytes())?;
-    if !changed { return Ok(()); }
-    mutate_social_state_for(context, |state| {
-        if let Some(conversations) = state["conversations"].as_object_mut() {
-            for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-        }
-        Ok(())
-    }).map_err(|(_, e)| e)?;
-    for (key, session) in crate::session_map::all(context)? {
-        if crate::session_map::retire_if(context, &key, &session)? {
-            let _ = stop_and_archive_session(context, &cfg, &key, &session);
-        }
-    }
-    Ok(())
-}
-
-/// Whether `key` is inside the configured allow-lists.
-/// Whether `key` may act in `mode` under `cfg` (closed-agent: only the owner's private chat;
-/// otherwise the allow/deny policy), the rule access reconciliation revokes by.
-pub(crate) fn access_allowed(cfg: &Value, mode: &str, key: &str) -> bool {
-    agent::mode_allowed(cfg, mode, key)
-}
-
-/// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
-/// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
-/// Reserved2 ingress, tick invalidation and dispatch, wake claims, turn validity, turn recovery and wake snapshots
-/// all decide by this rule; there is no allow-only check.
-pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
-    key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
-}
-
-pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
-    let limit = crate::settings::send::MAX_CHARS.integer(cfg).min(500) as usize;
-    key.starts_with("group:") && canonical_v2_key(key).as_deref() == Some(key)
-        && inbound_admitted(cfg, key)
-        && tool_enabled(cfg, "sendGroup")
-        && !message.is_empty() && message.encode_utf16().count() <= limit
-        && crate::pipeline::configured_outbound_violation(cfg, message, &[]).is_none()
-}
-
-#[cfg(test)]
-#[test]
-fn approved_group_requires_explicit_canonical_scope_and_bounded_preview() {
-    let allowed = json!({"allow":{"groups":[42]},"socialV2":{"send":{"maxMessageChars":900}}});
-    assert!(approved_group_allowed(&allowed, "group:42", &"🎨".repeat(250)));
-    assert!(!approved_group_allowed(&allowed, "group:42", &format!("{}x", "🎨".repeat(250))), "approved preview accepted a message beyond its fixed cap");
-    assert!(!approved_group_allowed(&allowed, "group:042", "hey"));
-    assert!(!approved_group_allowed(&allowed, "group:43", "hey"));
-    assert!(!approved_group_allowed(&allowed, "private:42", "hey"));
-    let denied = json!({"allow":{"groups":[42]},"deny":{"groups":[42]}});
-    assert!(!approved_group_allowed(&denied, "group:42", "hey"));
-    let off = json!({"allow":{"groups":[42]},"socialV2":{"tools":{"sendGroup":false}}});
-    assert!(!approved_group_allowed(&off, "group:42", "hey"));
-}
-
 /// Internal continuation. Only the live interaction passes the one-use owner decision.
 pub(crate) fn send_approved_group(
-    context: &RuntimeContext, key: &str, message: &str, turn: &str, authorized: &dyn Fn() -> bool,
+    context: &RuntimeContext,
+    key: &str,
+    message: &str,
+    turn: &str,
+    authorized: &dyn Fn() -> bool,
 ) -> Result<(u16, Value), (u16, String)> {
-    let cfg = context.load_config().map_err(|_| (503, "send settings unavailable".into()))?;
-    if !authorized() || !approved_group_allowed(&cfg, key, message) || silent_blocks_send(context, &cfg, key)? {
+    let cfg = context
+        .load_config()
+        .map_err(|_| (503, "send settings unavailable".into()))?;
+    if !authorized()
+        || !approved_group_allowed(&cfg, key, message)
+        || silent_blocks_send(context, &cfg, key)?
+    {
         return Err((403, "approved group send refused".into()));
     }
-    let (_, id_s, _) = agent::parse_key(key).ok_or((400, "invalid group".into()))?;
-    let token = crate::conversation_authority::ensure_or_rotate(context, key, false).map_err(|e| (503, e))?;
-    agent::execute_send(context, &cfg, &agent::SendCall {
-        key, kind: "group", id_s, token: &token, messages: vec![message.into()],
-        reply_ref: String::new(), at_user: None, gap_mode: "auto", body: &Value::Null,
-        flavor: agent::SendFlavor::Direct, policy: GuardPolicy::ApprovedGroup { turn, authorized }, resolved_quote: None,
-    })
-}
-
-/// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
-/// per-connection work (gap recovery, mute refresh, group cards).
-pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
-    social_policy_list(cfg, "allow", kind)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|id| inbound_admitted(cfg, &format!("{kind}:{id}")))
-        .collect()
+    let (_, id_s, _) = social_state::parse_key(key).ok_or((400, "invalid group".into()))?;
+    let token = social_state::ensure_or_rotate(context, key, false)
+        .map_err(|e| (503, e.to_string()))?;
+    agent::execute_send(
+        context,
+        &cfg,
+        &agent::SendCall {
+            key,
+            kind: "group",
+            id_s,
+            token: &token,
+            messages: vec![message.into()],
+            reply_ref: String::new(),
+            at_user: None,
+            gap_mode: "auto",
+            body: &Value::Null,
+            flavor: agent::SendFlavor::Direct,
+            policy: GuardPolicy::ApprovedGroup { turn, authorized },
+            resolved_quote: None,
+        },
+    )
 }
 
 /// #186: `POST /api/conversations/scope`, with its console log line (the handler itself prints nothing, so
 /// `her-cli conversation` keeps its stdout for the reply).
-fn conversation_scope_route(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    import_engine_choices(context)?;
-    let reply = access::conversation_scope(context, body)?;
-    let changed: Vec<&str> = reply["changed"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+fn conversation_scope_route_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
+    let imported = crate::config_tx::import_engine_choices(context)?;
+    let outcome = match access::conversation_scope_tx(context, body) {
+        Ok(outcome) => outcome,
+        Err(mut err) => {
+            err.config_diff = crate::config_tx::merge_diffs(imported, err.config_diff);
+            return Err(err);
+        }
+    };
+    let reply = outcome.value;
+    let changed: Vec<&str> = reply["changed"]
+        .as_array()
+        .map(|c| c.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     crate::safe_println!(
         "[console] conversation scope: {} {} ({}); live restart {}",
         reply["action"].as_str().unwrap_or(""),
         reply["conversation"].as_str().unwrap_or(""),
-        if changed.is_empty() { "no change".to_string() } else { changed.join(", ") },
+        if changed.is_empty() {
+            "no change".to_string()
+        } else {
+            changed.join(", ")
+        },
         reply["liveRestart"]["state"].as_str().unwrap_or("unknown")
     );
-    Ok(reply)
-}
-
-/// #186: `POST /api/conversations/scope` outside a console request (`her-cli conversation`): the same handler,
-/// gates and revocation; the console audit trail records only console requests. A short-lived caller waits for the
-/// background stop of every retired DSH session before it returns, so the process can exit.
-pub(crate) fn conversation_scope_change(context: &RuntimeContext, conversation: &str, action: &str) -> Result<Value, (u16, String)> {
-    conversation_scope_change_waiting(context, conversation, action, std::time::Duration::from_secs(10))
-}
-
-/// `conversation_scope_change` with its wait for background session stops bounded by `limit`.
-fn conversation_scope_change_waiting(
-    context: &RuntimeContext,
-    conversation: &str,
-    action: &str,
-    limit: std::time::Duration,
-) -> Result<Value, (u16, String)> {
-    // #154: `her-cli conversation` requires `--confirm`, which confirms a change of a security setting.
-    let body = json!({"conversation": conversation, "action": action, "confirm": true}).to_string();
-    import_engine_choices_outside_request(context)?;
-    let result = access::conversation_scope(context, &body);
-    // No request takes the write record here (`persist_snowluma_endpoint` does the same).
-    let _ = take_config_writes();
-    let stopped = access::wait_background_stops(limit);
-    result.map(|mut reply| {
-        if !stopped {
-            reply["sessionStops"] = json!("unfinished: check the retired sessions' tasks in DSH");
-        }
-        reply
+    Ok(crate::config_tx::CommitOutcome {
+        value: reply,
+        config_diff: crate::config_tx::merge_diffs(imported, outcome.config_diff),
     })
-}
-
-/// Shared session-reset mutation. Idle rotation preserves conversation data and refuses a changed
-/// message/wake/epoch under the social gate; explicit reset retains the existing fresh-record behavior.
-fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Option<&str>, guard: Option<&Value>) -> Result<Option<String>, String> {
-    mutate_social_state_for(context, |state| {
-        let previous = &state["conversations"][key];
-        if let Some(expected) = guard {
-            let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
-            if runtime_mode(context)!="reserved2" || state["paused"]==true || !inbound_admitted(&cfg,key)
-                || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
-                || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
-                return Ok(None);
-            }
-            let (turns,_)=crate::turn_ledger::fold(&crate::turn_ledger::read_records(context).map_err(|e|(503,e))?);
-            if crate::turn_ledger::blocking_turn(&turns,key).is_some() {return Ok(None);}
-        }
-        let mapped=crate::session_map::lookup(context,key).map_err(|e|(503,e))?;
-        let partial_rotation=guard.is_some() && old.is_some() && mapped.is_none()
-            && crate::session_map::unrevoked_rotation(context,key,previous["agentToken"].as_str().unwrap_or("")).map_err(|e|(503,e))?.as_deref()==old;
-        if mapped.as_deref()!=old && !partial_rotation {return Ok(None);}
-        crate::turn_ledger::record_reset(context,key).map_err(|e|(503,e))?;
-        crate::reserved::reset_conversation(context,key).map_err(|e|(503,e))?;
-        if !partial_rotation {
-            if let Some(old) = old {
-                if !crate::session_map::retire_if(context,key,old).map_err(|e|(503,e))? {return Ok(None);}
-            }
-        }
-        let mut replacement = if guard.is_some() {previous.clone()} else {new_conversation(context)};
-        if guard.is_some() {
-            replacement["agentToken"]=json!(fresh_agent_token());
-            replacement["bootstrapSent"]=json!(true);
-        } else {
-            preserve_reset_sticker_liabilities(previous,&mut replacement);
-        }
-        let token=replacement["agentToken"].as_str().unwrap_or("").to_string();
-        if !state["conversations"].is_object() {state["conversations"]=json!({});}
-        state["conversations"][key]=replacement;
-        Ok(Some(token))
-    }).map_err(|(_,e)|e)
-}
-
-pub(crate) fn rotate_idle_session(context: &RuntimeContext, key: &str, sid: &str, guard: &Value) -> Result<Option<String>, String> {
-    let _interaction_gate=crate::closed_agent::lock(context)?;
-    reset_selected_session_record(context,key,Some(sid),Some(guard))
-}
-
-/// Stop and archive retired DSH work with the existing bounded reset deadline.
-pub(crate) fn stop_and_archive_session(context: &RuntimeContext, cfg: &Value, key: &str, session_id: &str) -> Result<(), String> {
-    let rpc = dsh_rpc_for(context, cfg)?;
-    let session = session_id.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stopped = crate::dsh::stop_session_work(&rpc, &session);
-        let archived = crate::dsh::archive_session(&rpc, &session);
-        let _ = tx.send(stopped.map(|_| ()).and(archived));
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            crate::safe_println!("[console] ⚠️ 停止/归档旧会话失败 {key} -> {session_id}：{error}；请在 DSH 检查旧任务");
-            Err(error)
-        }
-        Err(_) => {
-            crate::safe_println!("[console] ⚠️ 停止/归档旧会话超时 {key} -> {session_id}；请在 DSH 检查旧任务");
-            Err("停止旧会话超时".to_string())
-        }
-    }
 }
 
 /// `GET /api/turns`：回合账本的管理端视图——输入、DSH 回合、工具和发送结果的关联，
@@ -9969,37 +8072,15 @@ pub(crate) fn handle_turns_resolve(context: &RuntimeContext, body: &str) -> Resu
 }
 
 /// Whether the conversation's current agent token is the one this batch was created under.
-fn conversation_matches_epoch(conversation: &Value, epoch: &str) -> bool {
-    epoch.is_empty()
-        || conversation
-        .get("agentToken")
-        .and_then(Value::as_str)
-        .is_some_and(|token| !token.is_empty() && crate::send_outbox::token_epoch(token) == epoch)
+fn conversation_matches_epoch(conversation: &Conversation, epoch: &str) -> bool {
+    conversation.matches_generation(epoch)
 }
 
 // Reset revokes pending operations but must not erase their possible remote effects.
-// Marking each ID also prevents an administrative collection (which has no agent token)
-// from submitting after reset while allowing an already submitted operation to settle.
-fn preserve_reset_sticker_liabilities(previous: &Value, replacement: &mut Value) {
-    // Settled history is not kept (JS deletes the whole record); only operations that may still
-    // reach, or already reached, the gateway keep their liability.
-    for field in ["stickerSendProtected", "stickerSendPending", "stickerCollectPending"] {
-        if let Some(value) = previous.get(field) {
-            replacement[field] = value.clone();
-        }
-    }
-    for field in ["stickerSendPending", "stickerCollectPending"] {
-        if let Some(entries) = replacement.get_mut(field).and_then(Value::as_array_mut) {
-            for entry in entries {
-                if let Some(object) = entry.as_object_mut() { object.insert("revoked".to_string(), json!(true)); }
-            }
-        }
-    }
-}
 
 fn require_sticker_reservation(context: &RuntimeContext, key: &str, field: &str, id: &str) -> Result<(), (u16, String)> {
-    let state = load_social_state_for(context).map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
-    let owned = state.get("conversations").and_then(|c| c.get(key)).and_then(|c| c.get(field))
+    let conv = ConversationState::for_runtime(context).read(key).map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
+    let owned = conv.as_ref().and_then(|c| c.field(field))
         .and_then(Value::as_array).is_some_and(|entries| entries.iter().any(|entry|
             entry.get("id").and_then(Value::as_str) == Some(id)
                 && entry.get("revoked").and_then(Value::as_bool) != Some(true)));
@@ -10022,10 +8103,11 @@ fn sticker_pending_counts(fields: &serde_json::Map<String, Value>, field: &str, 
 
 /// `limit_message` is the JS 429 text of the calling route (send and collect differ).
 fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str, pending_field: &str, id: &str, now: i64, max_min: i64, max_hour: i64, epoch: Option<&str>, limit_message: &str) -> Result<(), (u16, String)> {
-    mutate_social_state_for(context, |state| {
-        let conv = state.get_mut("conversations").and_then(|c| c.get_mut(key)).ok_or((404, format!("会话不存在：{key}")))?;
-        if epoch.is_some_and(|epoch| !conversation_matches_epoch(conv, epoch)) { return Err((403, "agent token 无效".to_string())); }
-        let fields = conv.as_object_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let conv_typed = doc.conversation(key).ok_or((404, format!("会话不存在：{key}")))?;
+        if epoch.is_some_and(|epoch| !conversation_matches_epoch(&conv_typed, epoch)) { return Err((403, "agent token 无效".to_string())); }
+        let mut conv_val = conv_typed.to_value();
+        let fields = conv_val.as_object_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
         purge_abandoned_sticker_reservations(fields, pending_field);
         let pending = sticker_pending_counts(fields, pending_field, now)?;
         let times = fields.entry(times_field.to_string()).or_insert_with(|| json!([])).as_array().ok_or((503, "selected runtime social state is invalid".to_string()))?;
@@ -10035,6 +8117,7 @@ fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str,
         let pending = fields.entry(pending_field.to_string()).or_insert_with(|| json!([])).as_array_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
         pending.retain(|entry| entry.get("time").and_then(Value::as_i64).is_some_and(|time| now.saturating_sub(time) < 3_600_000));
         pending.push(json!({"id": id, "time": now}));
+        doc.set_conversation(key, Conversation::from_value(&conv_val).unwrap_or(conv_typed));
         Ok(())
     })
 }
@@ -10042,7 +8125,14 @@ fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str,
 fn settle_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str, pending_field: &str, id: &str, fallback_time: i64, retain: bool) -> Result<(), (u16, String)> {
     #[cfg(test)]
     STICKER_SETTLE_FAULT_HOOK.with(|hook| match hook.borrow_mut().as_mut() { Some(hook) => hook(retain), None => Ok(()) })?;
-    mutate_social_state_for(context, |state| apply_sticker_settlement(state, key, times_field, pending_field, id, fallback_time, retain))
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let mut state = doc.clone().into_value();
+        apply_sticker_settlement(&mut state, key, times_field, pending_field, id, fallback_time, retain)?;
+        if let Some(conv) = state.get("conversations").and_then(|c| c.get(key)).and_then(Conversation::from_value) {
+            doc.set_conversation(key, conv);
+        }
+        Ok(())
+    })
 }
 
 /// Moves one identified pending entry into the settled arrays (`retain`) or drops it (release).
@@ -10118,14 +8208,14 @@ fn settle_sticker_quota_best_effort(context: &RuntimeContext, key: &str, times_f
 fn collect_sticker_guard(context: &RuntimeContext, _cfg: &Value, key: &str, token: Option<&str>) -> Result<(), (u16, String)> {
     let cancelled = || (409, SEND_CANCELLED_MESSAGE.to_string());
     let cfg = context.load_config().map_err(|_| cancelled())?;
-    let state = load_social_state_for(context).map_err(|_| cancelled())?;
+    let doc = ConversationState::for_runtime(context).read_document().map_err(|_| cancelled())?;
     if !crate::sticker::enabled(&cfg)
         || !crate::settings::COLLECT_ENABLED.switch(&cfg) { return Err(cancelled()); }
     if let Some(token) = token {
-        if state.get("paused").and_then(Value::as_bool) == Some(true)
+        if doc.paused()
             || cfg.get("socialV2").and_then(|v| v.get("enabled")).and_then(Value::as_bool) == Some(false)
             || current_mode_for(context).map_err(|_| cancelled())? != "reserved2" { return Err(cancelled()); }
-        if social_projection_agent_denial(&state, &cfg, key, token, "collectSticker", "qq_collect_sticker").is_some() { return Err(cancelled()); }
+        if social_projection_agent_denial_doc(&doc, &cfg, key, token, "collectSticker", "qq_collect_sticker").is_some() { return Err(cancelled()); }
     }
     Ok(())
 }
@@ -10193,15 +8283,13 @@ fn reserve_send_quota(
     let max_min = crate::settings::send::RATE_MIN.integer(cfg);
     let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
     let n = count as i64;
-    mutate_social_state_for(context, |state| {
-        let conv = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .ok_or((404, format!("会话不存在：{key}")))?;
-        if !conversation_matches_epoch(conv, epoch) {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let conv_typed = doc.conversation(key).ok_or((404, format!("会话不存在：{key}")))?;
+        if !conversation_matches_epoch(&conv_typed, epoch) {
             return Err((403, "agent token 无效".to_string()));
         }
-        let fields = conv
+        let mut conv_val = conv_typed.to_value();
+        let fields = conv_val
             .as_object_mut()
             .ok_or((503, "selected runtime social state is invalid".to_string()))?;
         if context.is_isolated()
@@ -10233,6 +8321,7 @@ fn reserve_send_quota(
             let keep = times.len() - 500;
             times.drain(0..keep);
         }
+        doc.set_conversation(key, Conversation::from_value(&conv_val).unwrap_or(conv_typed));
         Ok(())
     })
 }
@@ -10260,9 +8349,11 @@ fn release_reserved_times(conv: &mut Value, now: i64, count: usize) {
 
 /// Give back reservations for a send refused before any OneBot request.
 fn release_send_quota(context: &RuntimeContext, key: &str, now: i64, count: usize) {
-    let _ = mutate_social_state_for(context, |state| {
-        if let Some(conv) = state.get_mut("conversations").and_then(|c| c.get_mut(key)) {
-            release_reserved_times(conv, now, count);
+    let _ = ConversationState::for_runtime(context).update_existing(key, |conv_typed| {
+        let mut conv_val = conv_typed.to_value();
+        release_reserved_times(&mut conv_val, now, count);
+        if let Some(updated) = Conversation::from_value(&conv_val) {
+            *conv_typed = updated;
         }
         Ok(())
     });
@@ -10292,21 +8383,17 @@ fn finish_send_batch(
         .filter(|v| *v > 0)
         .unwrap_or(100) as usize;
     let console_token = context.effective_console_token(cfg);
-    mutate_social_state_for(context, |state| {
-        let Some(conv) = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-        else {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let Some(conv_typed) = doc.conversation(key) else {
             return Err((404, format!("会话不存在：{key}")));
         };
+        let mut conv_value = conv_typed.to_value();
         if context.is_isolated()
-            && (conv.get("sendTimes").is_some_and(|v| !v.is_array())
-                || conv.get("wakeConfig").is_some_and(|v| !v.is_object()))
+            && (conv_value.get("sendTimes").is_some_and(|v| !v.is_array())
+                || conv_value.get("wakeConfig").is_some_and(|v| !v.is_object()))
         {
             return Err((503, "selected runtime social state is invalid".to_string()));
         }
-        let mut conv_value = Value::Object(std::mem::take(conv));
         release_reserved_times(&mut conv_value, now, release);
         if !sent_texts.is_empty() {
             let mut targeting = targeting.cloned().unwrap_or(Value::Null);
@@ -10319,7 +8406,7 @@ fn finish_send_batch(
                     targeting["replyToUserId"] = user.clone();
                 }
             }
-            let tokens: Vec<String> = [console_token.clone(), conv_value.get("agentToken").and_then(Value::as_str).unwrap_or("").to_string()]
+            let tokens: Vec<String> = [console_token.clone(), conv_typed.token().unwrap_or("").to_string()]
                 .into_iter()
                 .filter(|t| !t.is_empty())
                 .collect();
@@ -10363,8 +8450,8 @@ fn finish_send_batch(
                 wake.insert("noActionCount".to_string(), json!(0));
             }
         }
-        if let Value::Object(fields) = conv_value {
-            *conv = fields;
+        if let Some(updated) = Conversation::from_value(&conv_value) {
+            doc.set_conversation(key, updated);
         }
         Ok(())
     })
@@ -10396,21 +8483,22 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
     } else {
         cfg
     };
-    let state = load_social_state_for(context).map_err(|_| cancelled())?;
-    let conv = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .ok_or_else(cancelled)?;
-    if state.get("paused").and_then(Value::as_bool) == Some(true)
+    let doc = ConversationState::for_runtime(context).read_document().map_err(|_| cancelled())?;
+    let conv = doc.conversation(key).ok_or_else(cancelled)?;
+    if doc.paused()
         || cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) == Some(false)
         || !(if tool_flag == "sendVoice" { voice_http::send_voice_tool_enabled(cfg) } else { tool_enabled(cfg, tool_flag) })
-        || !conversation_matches_epoch(conv, epoch) {
+        || !conversation_matches_epoch(&conv, epoch) {
         return Err(cancelled());
     }
     let mode = current_mode_for(context).map_err(|_| cancelled())?;
     let allowed = match policy {
-        GuardPolicy::ApprovedGroup { authorized, .. } => mode == "closed-agent" && key.starts_with("group:")
-            && inbound_admitted(cfg, key) && authorized(),
+        GuardPolicy::ApprovedGroup { authorized, .. } => {
+            mode == "closed-agent"
+                && key.starts_with("group:")
+                && crate::social_state::inbound_admitted(cfg, key)
+                && authorized()
+        }
         _ => (mode == "reserved2" || (matches!(policy, GuardPolicy::Reserved2OrClosedAgent) && mode == "closed-agent"))
             && agent::mode_allowed(cfg, &mode, key),
     };
@@ -10427,10 +8515,8 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
 }
 
 /// Silent mode blocks every non-owner send (JS `shouldBlockSilentReply`).
-pub(crate) fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, (u16, String)> {
-    let role = read_role_state(context).map_err(|_| (503, "runtime role state is unavailable".to_string()))?;
-    let owner_key = format!("private:{}", cfg.get("ownerQQ").and_then(Value::as_i64).unwrap_or(0));
-    Ok(role.get("mode").and_then(Value::as_str) == Some("silent") && key != owner_key)
+fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, (u16, String)> {
+    social_state::silent_blocks_send(context, cfg, key).map_err(SocialError::into_http)
 }
 
 #[cfg(test)]
@@ -10503,8 +8589,8 @@ fn run_send_items(
     }
     for (pos, item) in plan.iter().enumerate() {
         if report.stop.is_none() {
-            let baseline = if pos==0 {initial.clone()} else {match load_social_state_for(context) {
-                Ok(state) => state["conversations"][key].clone(),
+            let baseline = if pos==0 {initial.clone()} else {match ConversationState::for_runtime(context).read(key) {
+                Ok(conv) => conv.map(|c| c.to_value()).unwrap_or(Value::Null),
                 Err(stop) => { report.stop = Some(stop); Value::Null }
             }};
             if pos > 0 {
@@ -10646,9 +8732,10 @@ fn resume_send_batch(
     token: &str,
     batch_id: &str,
 ) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{fold_batch, progress_json, read_records, token_epoch, ItemState};
+    use crate::conversation_state::token_epoch;
+    use crate::send_outbox::{fold_batch, progress_json, read_records, ItemState};
     let epoch = token_epoch(token);
-    let initial = load_social_state_for(context)?["conversations"][key].clone();
+    let initial = ConversationState::for_runtime(context).read(key)?.map(|c| c.to_value()).unwrap_or(Value::Null);
     // One runner per batch: a concurrent resume (or the original send still running) would
     // otherwise read the same pending item and send it twice.
     let recorded = crate::recorded_send::Recorded::resume(context, now_ms, batch_id)
@@ -10814,7 +8901,6 @@ fn send_message_inner(
     cfg: &Value,
     context: &RuntimeContext,
 ) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{append_record, token_epoch};
     let b: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let resume_batch = b
@@ -11219,62 +9305,7 @@ pub(crate) fn reply_text_of(ob: crate::onebot::OneBot, kind: &str, conv_id: &str
 /// TD-1 之后账本是两份（JS + Rust），**两份都要清** —— 只清一份同样会表现为
 /// "点了重置还是老数字"（另一份的记录还在）。
 fn handle_tokens_reset(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        // Resolve both destinations before opening either. This catches an invalid second path
-        // before open_locked_file's create=true behavior can leave a new first ledger behind.
-        let js_path = context
-            .resolve_path(RuntimeArea::Data, "token-usage.jsonl", PathIntent::WriteFile)
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        let rust_path = context
-            .resolve_path(RuntimeArea::Data, "token-usage-rust.jsonl", PathIntent::WriteFile)
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        let exists = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err((500, "重置失败：所选用量账本不可用".to_string())),
-        };
-        let js_exists = exists(&js_path)?;
-        let rust_exists = exists(&rust_path)?;
-
-        // If one ledger is missing, lock the existing one first. A busy existing file then
-        // cannot cause the missing sibling to be created as a side effect of a failed reset.
-        // When both are missing, the first successful open may create an empty file before the
-        // second open fails; this helper is intentionally create-capable for JS reset parity.
-        let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
-            let rust = context
-                .open_locked_file(RuntimeArea::Data, "token-usage-rust.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            let js = context
-                .open_locked_file(RuntimeArea::Data, "token-usage.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            (js, rust)
-        } else {
-            let js = context
-                .open_locked_file(RuntimeArea::Data, "token-usage.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            let rust = context
-                .open_locked_file(RuntimeArea::Data, "token-usage-rust.jsonl")
-                .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-            (js, rust)
-        };
-        js_ledger
-            .set_len(0)
-            .and_then(|_| js_ledger.sync_all())
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-        rust_ledger
-            .set_len(0)
-            .and_then(|_| rust_ledger.sync_all())
-            .map_err(|_| (500, "重置失败：所选用量账本不可用".to_string()))?;
-    } else {
-        for path in crate::ledger::LEDGER_FILES {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-                .map_err(|e| (500, format!("重置失败 {path}：{e}")))?;
-        }
-    }
+    crate::ledger::LedgerStorage::reset(context).map_err(|error| (500, error))?;
     crate::safe_println!("[console] token 账本已重置（JS + Rust 两份）");
     Ok(json!({ "ok": true }))
 }
@@ -11454,13 +9485,13 @@ fn handle_role_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
             if !file_exists_for(context, &role_file_path(&name)) {
                 return Err((400, format!("角色「{name}」不存在（roles/{name}.md）")));
             }
-            write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": name, "mode": mode }))
-                .map_err(|e| (500, e))?;
+            social_state::write_role_state(context, Some(&name), &mode)
+                .map_err(|e| (500, e.to_string()))?;
             Ok(json!({ "ok": true, "role": name }))
         }
         None => {
-            write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": Value::Null, "mode": mode }))
-                .map_err(|e| (500, e))?;
+            social_state::write_role_state(context, None, &mode)
+                .map_err(|e| (500, e.to_string()))?;
             Ok(json!({ "ok": true, "role": Value::Null }))
         }
     }
@@ -11470,14 +9501,13 @@ fn handle_role_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
 fn handle_role_mode_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let req = parse_role_management_body(context, body)?;
     let rs = read_role_state(context).map_err(|e| (503, e.to_string()))?;
-    let role = rs.get("role").cloned().unwrap_or(Value::Null);
+    let role = rs.get("role").and_then(Value::as_str);
     let mode = if req.get("mode").and_then(|v| v.as_str()) == Some("silent") {
         "silent"
     } else {
         "active"
     };
-    write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": role, "mode": mode }))
-        .map_err(|e| (500, e))?;
+    social_state::write_role_state(context, role, mode).map_err(|e| (500, e.to_string()))?;
     Ok(json!({ "ok": true, "roleMode": mode }))
 }
 
@@ -11548,7 +9578,11 @@ fn handle_tool_log_clear(context: &RuntimeContext) -> Result<Value, (u16, String
 ///   · `limit`   可选，最多送多少条消息进模型；
 ///   · `force`   可选，跳过冷却（默认遵守 `extractCooldownMs`）；
 ///   · `dryRun`  可选，只数窗口、不调模型（回归脚本用，避免真花钱）。
-fn handle_slang_extract(body: &str, cfg: &Value) -> Result<Value, (u16, String)> {
+fn handle_slang_extract(
+    context: &RuntimeContext,
+    body: &str,
+    cfg: &Value,
+) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = req
         .get("key")
@@ -11569,27 +9603,44 @@ fn handle_slang_extract(body: &str, cfg: &Value) -> Result<Value, (u16, String)>
     let dry_run = req.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
     let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(crate::slang_learn::extract_now(
-        cfg, &key, limit, dry_run, force,
+        context, cfg, &key, limit, dry_run, force,
     ))
 }
 
 /// `/api/slang`：黑话词条表。
 fn slang_config_defaults(config: &Value) -> Value {
-    let mut result = json!({"enabled": true, "extractMinMessages": 10, "extractCooldownMs": 300000,
-        "inferenceThresholds": [2,4,8], "injectMax": 8, "learnerPreset": "qq-chat",
-        "workspaceTitle": "QQ 黑话学习", "autoResearch": true,
-        "learnerBackend": "dsh", "learnerFallbackDsh": false});
+    let mut result = json!({
+        "enabled": true,
+        "extractMinMessages": 10,
+        "extractCooldownMs": 300000,
+        "inferenceThresholds": [2, 4, 8],
+        "injectMax": 8,
+        "autoResearch": true,
+        "learnerFallbackDsh": false,
+    });
     if let Some(fields) = config.as_object() {
-        for (key, value) in fields { result[key] = value.clone(); }
+        for (key, value) in fields {
+            if matches!(
+                key.as_str(),
+                "learnerPreset" | "workspaceTitle" | "learnerBackend"
+            ) {
+                continue;
+            }
+            result[key] = value.clone();
+        }
     }
     result
 }
 
 fn handle_slang(context: &RuntimeContext, cfg: &Value, status: &str) -> Value {
-    let loaded = crate::slang::load_entries_checked_for_runtime(context);
+    let loaded = crate::slang::read_entries_locked(context);
     let writable = loaded.is_ok();
-    let entries: Vec<Value> = loaded.unwrap_or_default().into_iter()
-        .filter(|entry| status.is_empty() || entry.get("status").and_then(Value::as_str) == Some(status))
+    let entries: Vec<Value> = loaded
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            status.is_empty() || entry.get("status").and_then(Value::as_str) == Some(status)
+        })
         .collect();
     let slang_cfg = slang_config_defaults(cfg.get("slang").unwrap_or(&Value::Null));
     json!({
@@ -11601,6 +9652,13 @@ fn handle_slang(context: &RuntimeContext, cfg: &Value, status: &str) -> Value {
 
 fn slang_store_error(error: String) -> (u16, String) {
     (503, format!("黑话库不可用：{error}"))
+}
+
+fn slang_mutate_error(error: crate::slang::MutateError<(u16, String)>) -> (u16, String) {
+    match error {
+        crate::slang::MutateError::Store(msg) => slang_store_error(msg),
+        crate::slang::MutateError::Action(err) => err,
+    }
 }
 
 fn slang_rate_root(context: &RuntimeContext) -> String {
@@ -11619,12 +9677,14 @@ fn slang_research(context: &RuntimeContext, cfg: &Value, body: &str) -> Result<V
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let requested: Vec<String> = req.get("ids").and_then(Value::as_array)
         .map(|ids| ids.iter().map(js_string).collect()).unwrap_or_default();
-    let _store = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    let ids: Vec<String> = entries.iter().filter(|entry| entry.get("status").and_then(Value::as_str) == Some("candidate"))
+    let entries = crate::slang::read_entries_locked(context).map_err(slang_store_error)?;
+    let ids: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(Value::as_str) == Some("candidate"))
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .filter(|id| requested.is_empty() || requested.iter().any(|want| want == id))
-        .map(str::to_string).collect();
+        .map(str::to_string)
+        .collect();
     if ids.is_empty() { return Err((400, "没有可研究的候选黑话".to_string())); }
     let count = ids.len();
     crate::slang_learn::queue_research(context, cfg, ids).map_err(slang_store_error)?;
@@ -11644,8 +9704,7 @@ fn slang_submit(
     if !crate::slang_learn::enabled(cfg) {
         return Err((403, "黑话学习已关闭（slang.enabled=false）".to_string()));
     }
-    let state = load_social_state_for(context)?;
-    let tokens = social_tokens(&state);
+    let tokens = crate::conversation_state::read_active_tokens(context)?;
     let content = crate::social_mem::redact_tokens(&agent::body_text(&req, "content"), &tokens).trim().to_string();
     let evidence_text = crate::social_mem::redact_tokens(&agent::body_text(&req, "context"), &tokens).trim().to_string();
     if content.is_empty() { return Err((400, "content 不能为空".to_string())); }
@@ -11663,36 +9722,77 @@ fn slang_submit(
     times.push(now);
     drop(table);
 
-    let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-    let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-    if let Some(existing) = entries.iter().find(|e| e.get("content").and_then(Value::as_str) == Some(content.as_str())) {
-        match existing.get("status").and_then(Value::as_str) {
-            Some("confirmed") => return Ok(json!({"ok": true, "duplicate": true, "status": "confirmed", "entry": crate::slang::public_entry(existing)})),
-            Some("rejected") => return Err((403, "该词已被管理员拒绝，如需重新收录请联系管理员".to_string())),
-            _ => {}
-        }
+    enum SubmitOutcome {
+        ConfirmedDuplicate(Value),
+        Changed { created: bool, entry: Value },
     }
-    let evidence = if evidence_text.is_empty() { vec![] } else {
-        vec![json!({"key": key, "sender": "AI提交", "text": evidence_text.chars().take(200).collect::<String>(), "time": now})]
+    let outcome = crate::slang::mutate_entries(context, |entries| {
+        if let Some(existing) = entries
+            .iter()
+            .find(|e| e.get("content").and_then(Value::as_str) == Some(content.as_str()))
+        {
+            match existing.get("status").and_then(Value::as_str) {
+                Some("confirmed") => {
+                    return Ok((false, SubmitOutcome::ConfirmedDuplicate(existing.clone())));
+                }
+                Some("rejected") => {
+                    return Err((
+                        403,
+                        "该词已被管理员拒绝，如需重新收录请联系管理员".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let evidence = if evidence_text.is_empty() {
+            vec![]
+        } else {
+            vec![json!({
+                "key": key,
+                "sender": "AI提交",
+                "text": evidence_text.chars().take(200).collect::<String>(),
+                "time": now,
+            })]
+        };
+        let (created, entry) = crate::slang_learn::upsert_entry(entries, &content, "", evidence);
+        let entry = entry.ok_or((400, "content 不能为空".to_string()))?;
+        Ok((true, SubmitOutcome::Changed { created, entry }))
+    })
+    .map_err(slang_mutate_error)?;
+    let (created, entry) = match outcome {
+        SubmitOutcome::ConfirmedDuplicate(existing) => {
+            return Ok(json!({
+                "ok": true,
+                "duplicate": true,
+                "status": "confirmed",
+                "entry": crate::slang::public_entry(&existing),
+            }));
+        }
+        SubmitOutcome::Changed { created, entry } => (created, entry),
     };
-    let (created, entry) = crate::slang_learn::upsert_entry(&mut entries, &content, "", evidence);
-    let entry = entry.ok_or((400, "content 不能为空".to_string()))?;
-    crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
     if cfg.pointer("/slang/autoResearch") != Some(&json!(false))
         && (created || crate::slang_learn::research_threshold_reached(cfg, &entry))
     {
         if let Some(id) = entry.get("id").and_then(Value::as_str) {
-            crate::slang_learn::queue_research(context, cfg, vec![id.to_string()]).map_err(slang_store_error)?;
+            crate::slang_learn::queue_research(context, cfg, vec![id.to_string()])
+                .map_err(slang_store_error)?;
         }
     }
     if created {
+        let suffix = if evidence_text.is_empty() { "" } else { "（附语境）" };
         crate::activity::append(
             context,
-            &format!("{key} [reserved2] AI 提交黑话候选：{content}{}", if evidence_text.is_empty() { "" } else { "（附语境）" }),
+            &format!("{key} [reserved2] AI 提交黑话候选：{content}{suffix}"),
         );
         Ok(json!({"ok": true, "entry": crate::slang::public_entry(&entry)}))
+    } else {
+        Ok(json!({
+            "ok": true,
+            "duplicate": true,
+            "status": "candidate",
+            "entry": crate::slang::public_entry(&entry),
+        }))
     }
-    else { Ok(json!({"ok": true, "duplicate": true, "status": "candidate", "entry": crate::slang::public_entry(&entry)})) }
 }
 
 fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &str) -> Option<Result<Value, (u16, String)>> {
@@ -11703,46 +9803,78 @@ fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &
         ("POST", [id, "confirm" | "reject"]) if !id.is_empty() => (*id, parts[1]),
         _ => return None,
     };
-    Some((|| {
-        let _gate = crate::slang::store_gate(context).map_err(slang_store_error)?;
-        let mut entries = crate::slang::load_entries_checked_for_runtime(context).map_err(slang_store_error)?;
-        let idx = entries.iter().position(|e| e.get("id").and_then(Value::as_str) == Some(id))
-            .ok_or((404, "黑话不存在".to_string()))?;
-        if action == "delete" {
-            let removed = entries.remove(idx);
-            crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-            return Ok(json!({"ok": true, "removed": removed}));
-        }
-        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let mut entry = entries[idx].clone();
-        if action == "patch" || action == "confirm" {
-            for field in ["meaning", "usage", "example", "risk"] {
-                if req.get(field).is_some() { entry[field] = json!(agent::body_text(&req, field)); }
+    Some(
+        crate::slang::mutate_entries(context, |entries| {
+            let idx = entries
+                .iter()
+                .position(|e| e.get("id").and_then(Value::as_str) == Some(id))
+                .ok_or((404, "黑话不存在".to_string()))?;
+            if action == "delete" {
+                let removed = entries.remove(idx);
+                return Ok((true, json!({"ok": true, "removed": removed})));
             }
-            if let Some(value) = req.get("sources") {
-                let sources: Vec<Value> = value.as_array().map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).take(10).map(|s| json!(s)).collect()).unwrap_or_default();
-                entry["sources"] = json!(sources);
-            }
-        }
-        if action == "patch" {
-            if req.get("content").is_some() {
-                let content = agent::body_text(&req, "content");
-                if entries.iter().enumerate().any(|(n, e)| n != idx && e.get("content").and_then(Value::as_str) == Some(content.as_str())) {
-                    return Err((400, format!("黑话「{content}」已存在")));
+            let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+            let mut entry = entries[idx].clone();
+            if action == "patch" || action == "confirm" {
+                for field in ["meaning", "usage", "example", "risk"] {
+                    if req.get(field).is_some() {
+                        entry[field] = json!(agent::body_text(&req, field));
+                    }
                 }
-                entry["content"] = json!(content);
+                if let Some(value) = req.get("sources") {
+                    let sources: Vec<Value> = value
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(js_string)
+                                .filter(|s| !s.is_empty())
+                                .take(10)
+                                .map(|s| json!(s))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    entry["sources"] = json!(sources);
+                }
             }
-            if let Some(status) = req.get("status").and_then(Value::as_str).filter(|s| SLANG_STATUSES.contains(s)) { entry["status"] = json!(status); }
-            if entry.get("content").and_then(Value::as_str).unwrap_or("").is_empty() { return Err((400, "黑话内容不能为空".to_string())); }
-        } else if action == "confirm" {
-            if entry.get("meaning").and_then(Value::as_str).unwrap_or("").is_empty() { return Err((400, "请先填写含义再确认，否则不会注入 AI 上下文".to_string())); }
-            entry["status"] = json!("confirmed");
-        } else { entry["status"] = json!("rejected"); }
-        entry["updatedAt"] = json!(crate::sticker::now_iso());
-        entries[idx] = entry.clone();
-        crate::slang::save_entries_for_runtime(context, &entries).map_err(slang_store_error)?;
-        Ok(json!({"ok": true, "entry": entry}))
-    })())
+            if action == "patch" {
+                if req.get("content").is_some() {
+                    let content = agent::body_text(&req, "content");
+                    let dup = entries.iter().enumerate().any(|(n, e)| {
+                        n != idx
+                            && e.get("content").and_then(Value::as_str) == Some(content.as_str())
+                    });
+                    if dup {
+                        return Err((400, format!("黑话「{content}」已存在")));
+                    }
+                    entry["content"] = json!(content);
+                }
+                if let Some(status) = req
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .filter(|s| SLANG_STATUSES.contains(s))
+                {
+                    entry["status"] = json!(status);
+                }
+                if entry.get("content").and_then(Value::as_str).unwrap_or("").is_empty() {
+                    return Err((400, "黑话内容不能为空".to_string()));
+                }
+            } else if action == "confirm" {
+                if entry.get("meaning").and_then(Value::as_str).unwrap_or("").is_empty() {
+                    return Err((
+                        400,
+                        "请先填写含义再确认，否则不会注入 AI 上下文".to_string(),
+                    ));
+                }
+                entry["status"] = json!("confirmed");
+            } else {
+                entry["status"] = json!("rejected");
+            }
+            entry["updatedAt"] = json!(crate::sticker::now_iso());
+            entries[idx] = entry.clone();
+            Ok((true, json!({"ok": true, "entry": entry})))
+        })
+        .map_err(slang_mutate_error),
+    )
 }
 
 /// `/api/socialV2/config`：二代仿真的全部可调参数。
@@ -11794,7 +9926,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "recommendedNameMention": true,
             "recommendedQuestion": true,
             "recommendedPoke": true,
-            "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
+            "recommendedHint": "潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
         },
         "send": {
             "recommendedHint": "普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。"
@@ -11904,7 +10036,7 @@ fn isolated_request_preflight(req: &Request, context: &RuntimeContext) -> Result
     }
     let required_file = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/status") | ("GET", "/api/socialV2/state") => {
-            Some((RuntimeArea::Data, "social-v2.json".to_string()))
+            Some((RuntimeArea::Data, crate::conversation_state::FILE.to_string()))
         }
         ("GET", "/api/sessions") => Some((RuntimeArea::Data, "sessions.json".to_string())),
         _ => None,
@@ -11929,215 +10061,90 @@ fn isolated_request_preflight(req: &Request, context: &RuntimeContext) -> Result
     Ok(())
 }
 
-/// TD-2：`key` 是否落在 `allow.groups` / `allow.private` 里。
-///
-/// 配置里的号码**两种写法都见过**（`allow.groups` 是数字、`allow.private` 是字符串），
-/// 所以不能只按一种类型比 —— 按 `canonical_v2_key` 归一后，字符串比字符串、数字比数字。
-/// 格式不合法（不是 `group:数字` / `private:数字`）一律算「不在白名单」。
-fn key_in_allowlist(cfg: &Value, key: &str) -> bool {
-    let Some(canonical) = canonical_v2_key(key) else {
-        return false;
-    };
-    let (kind, id) = canonical
-        .split_once(':')
-        .expect("canonical_v2_key 保证带冒号");
-    let field = if kind == "group" { "groups" } else { "private" };
-    let Some(list) = cfg
-        .get("allow")
-        .and_then(|a| a.get(field))
-        .and_then(|v| v.as_array())
-    else {
-        return false;
-    };
-    let want: i64 = id.parse().unwrap_or(0);
-    list.iter().any(|x| match x {
-        Value::String(s) => s.trim() == id,
-        Value::Number(n) => n.as_i64() == Some(want),
-        _ => false,
-    })
+#[cfg(test)]
+fn route(req: &Request, cfg: &Value) -> (u16, String, String) {
+    let context = RuntimeContext::legacy();
+    let response = front::handle_http_request(None, req, cfg, &context, DEFAULT_PORT);
+    (response.status, response.content_type, response.body)
 }
 
 #[cfg(test)]
-fn route(req: &Request, cfg: &Value) -> (u16, String, String) {
-    route_with_context(req, cfg, &RuntimeContext::legacy())
+fn route_test(req: &Request, cfg: &Value, context: &RuntimeContext) -> (u16, String, String) {
+    if !context.is_isolated() {
+        return route(req, cfg);
+    }
+    let port = context.console_port().unwrap_or(DEFAULT_PORT);
+    let mut req = req.clone();
+    req.headers.entry("host".to_string()).or_insert_with(|| crate::console_auth::canonical_host(port));
+    if req.method != "GET" {
+        req.headers.entry("content-type".to_string()).or_insert_with(|| "application/json".to_string());
+    }
+    let response = front::handle_http_request(None, &req, cfg, context, port);
+    (response.status, response.content_type, response.body)
 }
 
-/// Protect the JS-owned pending approval/question view from agent credentials.
-/// Keep this check independent of social-v2 state, mode, and pause settings.
+#[cfg(test)]
 fn pending_agent_denial(req: &Request) -> Option<(u16, String)> {
-    if req.method != "GET" || req.path != "/api/pending" {
-        return None;
-    }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        Some((403, "agent token 不能为空".to_string()))
-    } else {
-        Some((403, "该接口仅控制台可用".to_string()))
-    }
-}
-/// `/api/pending` is a console-only administration view, independent of query keys.
-fn pending_admin_agent_gate_route(req: &Request) -> bool {
-    req.method == "GET" && req.path == "/api/pending"
-}
-
-/// Restore the JS agent-token policy for the two tool-log administration routes.
-///
-/// This is intentionally scoped to these exact route/method pairs. The remaining
-/// global agent-token middleware is still a separate migration task.
-fn tool_log_agent_denial(
-    req: &Request,
-    cfg: &Value,
-    context: &RuntimeContext,
-) -> Option<(u16, String)> {
+    let policy = front::route_policy(&req.method, &req.path);
     if !matches!(
-        (req.method.as_str(), req.path.as_str()),
-        ("GET", "/api/socialV2/tool-log")
-            | ("POST", "/api/socialV2/tool-log/clear")
+        policy,
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::PendingAdminOnly,
+            ..
+        })
     ) {
         return None;
     }
-
-    let token = req.headers.get("x-agent-token")?;
-    // bridge.js rejects an explicitly empty header before pause/config/mode checks.
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Some((
-            403,
-            "当前已暂停，不允许执行 v2 工具".to_string(),
-        ));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => return Some((status, message)),
-    }
-
-    Some((403, "该接口仅控制台可用".to_string()))
+    front::policy_agent_denial(policy, req, &Value::Null, &RuntimeContext::legacy())
 }
 
-fn v1_sticker_admin_path(path: &str) -> bool {
-    path == "/api/stickers" || path.starts_with("/api/stickers/")
+#[cfg(test)]
+fn pending_admin_agent_gate_route(req: &Request) -> bool {
+    matches!(
+        front::route_policy(&req.method, &req.path),
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::PendingAdminOnly,
+            ..
+        })
+    )
 }
 
+#[cfg(test)]
 fn social_agent_policy_route(req: &Request) -> bool {
-    agent::is_agent_policy_route(req)
-        || v1_sticker_admin_path(&req.path)
-        || req.path == "/api/socialV2/config"
-        || req.path == "/api/socialV2/activity"
-        || matches!(
-            (req.method.as_str(), req.path.as_str()),
-            ("GET", "/api/socialV2/memory")
-                | ("POST", "/api/socialV2/memory-append")
-                | ("POST", "/api/socialV2/memory-update")
-                | ("POST", "/api/socialV2/memory-remove")
-                | ("POST", "/api/socialV2/memory-clear")
-                | ("GET", "/api/socialV2/state")
-                | ("GET", "/api/socialV2/states")
-                | ("GET", "/api/socialV2/unread")
-                | ("GET", "/api/socialV2/prompt")
-                | ("GET", "/api/socialV2/slang/query")
-                | ("POST", "/api/socialV2/slang/submit")
-                | ("GET", "/api/socialV2/recent")
-                | ("GET", "/api/socialV2/my-recent")
-                | ("GET", "/api/socialV2/active-members")
-                | ("GET", "/api/socialV2/self-image")
-                | ("GET", "/api/images/message")
-                | ("GET", "/api/socialV2/forward-message")
-                | ("POST", "/api/socialV2/forward-media")
-                | ("POST", "/api/socialV2/send-message")
-                | ("GET", "/api/socialV2/sticker-list")
-                | ("POST", "/api/socialV2/sticker-list")
-                | ("GET", "/api/socialV2/sticker-image")
-                | ("POST", "/api/socialV2/sticker-note")
-                | ("POST", "/api/socialV2/sticker-remark")
-                | ("POST", "/api/socialV2/send-sticker")
-                | ("POST", "/api/socialV2/collect-sticker")
-                | ("GET", "/api/stickers")
-                | ("POST", "/api/stickers/sync")
-                | ("POST", "/api/stickers/note")
-                | ("POST", "/api/stickers/remark")
-        )
+    matches!(
+        front::route_policy(&req.method, &req.path),
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::V1StickerAdmin
+                | front::AgentPolicy::V2AdminOnly
+                | front::AgentPolicy::V2AgentAllowed,
+            ..
+        })
+    )
 }
 
-/// Restore the JS global agent-token gates for selected social config, inline-memory,
-/// and projection handlers. Per-session token, allow-list and tool checks happen
-/// after each route's required-key validation.
+#[cfg(test)]
 fn social_agent_policy_denial(
     req: &Request,
     cfg: &Value,
     context: &RuntimeContext,
 ) -> Option<(u16, String)> {
-    if !social_agent_policy_route(req) {
+    let policy = front::route_policy(&req.method, &req.path);
+    if !matches!(
+        policy,
+        Some(front::RoutePolicy {
+            agent: front::AgentPolicy::V1StickerAdmin
+                | front::AgentPolicy::V2AdminOnly
+                | front::AgentPolicy::V2AgentAllowed,
+            ..
+        })
+    ) {
         return None;
     }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-    // Frozen JS treats V1 sticker administration separately from all V2 state/mode gates.
-    if v1_sticker_admin_path(&req.path) {
-        return Some((403, "该接口仅控制台可用".to_string()));
-    }
-
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Some((
-            403,
-            "当前已暂停，不允许执行 v2 工具".to_string(),
-        ));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => return Some((status, message)),
-    }
-
-    if matches!(
-        (req.method.as_str(), req.path.as_str()),
-        ("GET", "/api/socialV2/states")
-    )
-        || req.path == "/api/socialV2/config"
-        || req.path == "/api/socialV2/activity"
-    {
-        return Some((403, "该接口仅控制台可用".to_string()));
-    }
-    None
+    front::policy_agent_denial(policy, req, cfg, context)
 }
 
-fn social_projection_agent_denial(
-    state: &Value,
+fn social_projection_agent_denial_doc(
+    doc: &SocialDocument,
     cfg: &Value,
     key: &str,
     token: &str,
@@ -12147,7 +10154,7 @@ fn social_projection_agent_denial(
     if token.is_empty() {
         return Some((403, "agent token 不能为空".to_string()));
     }
-    if !agent_token_matches_state(state, key, token) {
+    if !agent_token_matches_doc(doc, key, token) {
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_projection_session_allowed(cfg, key) {
@@ -12159,9 +10166,55 @@ fn social_projection_agent_denial(
     None
 }
 
+#[cfg(test)]
+fn social_projection_agent_denial(
+    state: &Value,
+    cfg: &Value,
+    key: &str,
+    token: &str,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Option<(u16, String)> {
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name)
+}
+
 /// Load one selected social-state snapshot and authorize an optional agent token
 /// against that same snapshot. Mutating projection handlers reuse this state so
 /// a stale token check cannot authorize a later selected-root write.
+fn social_projection_request_doc(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    agent_token: Option<&str>,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Result<(SocialDocument, bool), (u16, String)> {
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    if let Some(token) = agent_token {
+        if let Some(denial) =
+            social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name)
+        {
+            return Err(denial);
+        }
+    }
+    Ok((doc, agent_token.is_some()))
+}
+
+fn social_projection_request_conv(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    agent_token: Option<&str>,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Result<(Option<Conversation>, bool), (u16, String)> {
+    let (doc, is_agent) =
+        social_projection_request_doc(context, cfg, key, agent_token, tool_flag, tool_name)?;
+    let storage_key = projection_storage_key(key)?;
+    Ok((doc.conversation(&storage_key), is_agent))
+}
+
 fn social_projection_request_state(
     context: &RuntimeContext,
     cfg: &Value,
@@ -12170,15 +10223,9 @@ fn social_projection_request_state(
     tool_flag: &str,
     tool_name: &str,
 ) -> Result<(Value, bool), (u16, String)> {
-    let state = load_social_state_for(context)?;
-    if let Some(token) = agent_token {
-        if let Some(denial) =
-            social_projection_agent_denial(&state, cfg, key, token, tool_flag, tool_name)
-        {
-            return Err(denial);
-        }
-    }
-    Ok((state, agent_token.is_some()))
+    let (doc, is_agent) =
+        social_projection_request_doc(context, cfg, key, agent_token, tool_flag, tool_name)?;
+    Ok((doc.into_value(), is_agent))
 }
 
 fn sticker_agent_allowed(
@@ -12193,8 +10240,8 @@ fn sticker_agent_allowed(
         return Ok(false);
     };
     if context.is_isolated() {
-        let state = load_social_state_for(context)?;
-        if let Some(denial) = social_projection_agent_denial(&state, cfg, key, token, tool_flag, tool_name) {
+        let doc = ConversationState::for_runtime(context).read_document()?;
+        if let Some(denial) = social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name) {
             return Err(denial);
         }
         return Ok(true);
@@ -12220,9 +10267,7 @@ fn sticker_agent_allowed(
     Ok(true)
 }
 
-/// Apply the frozen global v2 gates to agent-authenticated send-message calls.
-/// Keep this scoped to one exact method/path pair; per-session token, allowlist,
-/// and sendMessage-tool checks remain in `handle_send_message`.
+#[cfg(test)]
 fn send_message_global_agent_denial(
     req: &Request,
     cfg: &Value,
@@ -12231,33 +10276,7 @@ fn send_message_global_agent_denial(
     if req.method != "POST" || req.path != "/api/socialV2/send-message" {
         return None;
     }
-    let token = req.headers.get("x-agent-token")?;
-    if token.is_empty() {
-        return Some((403, "agent token 不能为空".to_string()));
-    }
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
-        Err((status, message)) => return Some((status, message)),
-    };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
-    }
-    if cfg
-        .get("socialV2")
-        .and_then(|social| social.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return Some((
-            403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-        ));
-    }
-    match current_mode_for(context) {
-        Ok(mode) if mode == "reserved2" => None,
-        Ok(_) => Some((403, "该接口仅 reserved2 模式可用".to_string())),
-        Err((status, message)) => Some((status, message)),
-    }
+    front::policy_agent_denial(front::route_policy(&req.method, &req.path), req, cfg, context)
 }
 
 
@@ -12273,12 +10292,34 @@ fn json_result(result: Result<Value, (u16, String)>) -> (u16, String, String) {
     }
 }
 
-fn route_with_context(
-    req: &Request,
-    cfg: &Value,
-    context: &RuntimeContext,
+fn json_tx_result(
+    caller: &mut front::VerifiedCaller,
+    result: Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError>,
 ) -> (u16, String, String) {
-    if !context.supports_console_request(&req.method, &req.path) {
+    match result {
+        Ok(outcome) => {
+            caller.record_config_diff(outcome.config_diff);
+            (
+                200,
+                "application/json; charset=utf-8".to_string(),
+                outcome.value.to_string(),
+            )
+        }
+        Err(error) => {
+            caller.record_config_diff(error.config_diff);
+            (
+                error.status,
+                "application/json; charset=utf-8".to_string(),
+                json!({ "ok": false, "error": error.message }).to_string(),
+            )
+        }
+    }
+}
+
+fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16, String, String) {
+    let context = &caller.context;
+    let cfg = &caller.config;
+    if !front::supports_request(context, &req.method, &req.path) {
         return (
             503,
             "application/json; charset=utf-8".to_string(),
@@ -12289,16 +10330,17 @@ fn route_with_context(
             .to_string(),
         );
     }
-    // `/api/health` 是唯一免鉴权的 API 探针：它是自重启时"新进程起来了吗"的探针。
-    // 探针手里没有令牌（也不该为了探活去读令牌），所以这里放行；
-    // 只回 pid/端口；隔离模式附加路径选择状态和依赖名称，不附路径或 URL。
-    // 图标是独立的静态 no-op 例外，稍后在配置加载与鉴权前直接返回 204。
     if req.path == "/api/health" && req.method == "GET" {
         let mut payload = json!({
             "ok": true,
             "pid": std::process::id(),
             "port": context.console_port().unwrap_or(*CONSOLE_PORT.get().unwrap_or(&DEFAULT_PORT)),
         });
+        if crate::restore::recovery_pending(context) {
+            payload["ok"] = json!(false);
+            payload["administratorReady"] = json!(false);
+            payload["recoveryReason"] = json!(crate::restore::RECOVERY_REASON);
+        }
         let runtime = context.health_metadata();
         if !runtime.is_null() {
             payload["runtime"] = runtime;
@@ -12309,156 +10351,50 @@ fn route_with_context(
             payload.to_string(),
         );
     }
-    // Browsers fetch these two icons without a console token. The legacy endpoint is a no-op
-    // (204); keep that behavior before configuration loading and authorization in both modes.
     if req.method == "GET" && matches!(req.path.as_str(), "/favicon.ico" | "/apple-touch-icon.png") {
         return (204, String::new(), String::new());
     }
-    let runtime_config = if context.is_isolated() {
-        match context.load_config() {
-            Ok(config) => Some(config),
-            Err(_) => {
-                return (
-                    503,
-                    "application/json; charset=utf-8".to_string(),
-                    json!({ "ok": false, "error": "runtime config is unavailable" }).to_string(),
-                );
-            }
-        }
-    } else {
-        None
-    };
-    let cfg = runtime_config.as_ref().unwrap_or(cfg);
     if context.is_isolated() {
         if let Err(error) = crate::reserved::refresh_console_config(context, cfg) {
             return (503, "application/json; charset=utf-8".to_string(),
                 json!({"ok":false,"error":error}).to_string());
         }
     }
-    // Frozen JS checks console auth before dispatching memory routes. Nonempty agent
-    // credentials remain the memory-route exception and are checked by the handler's ACL.
     let memory_route = req.path.starts_with("/api/memory/");
-    let memory_agent_call = memory_route
-        && req
-            .headers
-            .get("x-agent-token")
-            .map(|token| !token.is_empty())
-            .unwrap_or(false);
-    if memory_route && !authorized_in(context, req, cfg) && !memory_agent_call {
+    let memory_agent_call = front::memory_agent_call(req);
+    if memory_route && !caller.is_admitted() && !memory_agent_call {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
             json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
         );
     }
-    // TD-2：会话级端点（memory-* / mark-read / wake-config / initial-prompt /
-    // session-reset / wait，以及其余带 key 的端点）统一前置检查 ——
-    // 只认 console token 不看目标会话，等于「拿到控制台令牌就能操作任意会话」。
-    // 一处拦掉：带 key 且 key 不在 allow.groups / allow.private → 403；
-    // 不带 key 的请求原样放行（key 是可选的那些端点行为不变）。
-    //
-    // 放在 `/api/memory/*` 分发**之前**：那条路有自己的一套鉴权（按会话的 agent token），
-    // 不经过下面的 authorized()，所以检查必须比它更早。
-    // 但先看「请求手里有没有凭据」再判 403：否则匿名调用者能用 401/403 的差别
-    // 探测某个群号在不在白名单里。没凭据的请求继续走原来的鉴权分支。
-    let has_credential = authorized_in(context, req, cfg)
-        || req
-            .headers
-            .get("x-agent-token")
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false);
-    // Inline social-v2 agent requests apply their JS-compatible session check
-    // after ordinary console authentication; the generic preflight has a
-    // different message and would otherwise shadow that route contract.
-    // These agent-owned views apply their own JS-compatible policy after console auth.
-    let has_agent_header = req.headers.contains_key("x-agent-token");
-    let defer_agent_allowlist = memory_agent_call
-        || (has_agent_header
-            && (social_agent_policy_route(req) || pending_admin_agent_gate_route(req)));
-    let defer_send_message_agent_allowlist = (req.method == "POST"
-        && req.path == "/api/socialV2/send-message"
-        && has_agent_header)
-        || agent::is_send_route(req)
-        // Selected manual wake and read authorization answer with the JS key/mode texts.
-        || (context.is_isolated()
-            && req.method == "POST"
-            && matches!(req.path.as_str(), "/api/socialV2/wake" | "/api/authorize/read"));
-    if has_credential && !defer_agent_allowlist && !defer_send_message_agent_allowlist {
-        if let Some(key) = request_session_key(req) {
-            let closed_owner_reset = context.is_isolated()
-                && req.method == "POST" && req.path == "/api/session/reset"
-                && runtime_mode(context) == "closed-agent" && crate::chat::is_owner_key(cfg, &key);
-            if !key_in_allowlist(cfg, &key) && !closed_owner_reset {
-                return (
-                    403,
-                    "application/json; charset=utf-8".to_string(),
-                    json!({"ok": false, "error": format!("会话不在允许范围内：{key}")}).to_string(),
-                );
-            }
-        }
+    if let Some(reply) = front::enforce_key_preflight(req, cfg, context, caller) {
+        return reply;
     }
-    // `/api/memory/*` 是前缀分发（10 个动作），必须在精确匹配之前处理
-    if req.path.starts_with("/api/memory/") {
+    if memory_route {
         let action = req.path.trim_start_matches("/api/memory/").to_string();
-        return match handle_memory_action(&action, &req.headers, &req.query, &req.body, cfg, context) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        };
-    }    // `/` 也要求令牌：管理台页面里带着会话，裸访问给 401 是 JS 的既有行为。
-    if !authorized_in(context, req, cfg) {
+        let memory = std::mem::take(&mut caller.memory);
+        let browser_acl = caller.browser_acl.take();
+        let res = crate::memory_actions::handle_http_tx(
+            &action,
+            req,
+            cfg,
+            context,
+            memory,
+            browser_acl,
+        );
+        return json_tx_result(caller, res);
+    }
+    if !caller.is_admitted() {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
             json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
         );
     }
-    if req.method == "GET" && req.path == "/api/qq/login" {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state is restricted to administrators"}).to_string());
-        }
-        if !context.is_isolated() {
-            return (503, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state requires a selected runtime"}).to_string());
-        }
-        return (200, "application/json; charset=utf-8".into(), crate::qq_login::probe(context, cfg).to_string());
-    }
-    if let Some((status, message)) = agent::agent_global_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = tool_log_agent_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = pending_agent_denial(req) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = send_message_global_agent_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = social_agent_policy_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
+    if let Some(reply) = front::enforce_agent_denials(req, cfg, context, caller) {
+        return reply;
     }
     if let Err((status, message)) = isolated_request_preflight(req, context) {
         return (
@@ -12467,38 +10403,31 @@ fn route_with_context(
             json!({ "ok": false, "error": message }).to_string(),
         );
     }
-    if bounded_post_body_too_large(req) {
+    if front::bounded_post_body_too_large(req) {
         return (
             413,
             "application/json; charset=utf-8".to_string(),
             json!({ "ok": false, "error": BODY_TOO_LARGE_ERROR }).to_string(),
         );
     }
-    if context.is_isolated() && req.method == "POST" && req.path == "/api/restart" {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"restart is restricted to administrators"}).to_string());
+    if req.method == "GET" && req.path == "/api/qq/login" {
+        if !context.is_isolated() {
+            return (503, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state requires a selected runtime"}).to_string());
         }
+        return (200, "application/json; charset=utf-8".into(), crate::qq_login::probe(context, cfg).to_string());
+    }
+    if context.is_isolated() && req.method == "POST" && req.path == "/api/restart" {
         let _gate = match acquire_social_state_gate(context) {
             Ok(gate) => gate,
             Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
-        let current = match context.load_config() {
-            Ok(current) => current,
-            Err(_) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"configuration unavailable"}).to_string()),
-        };
-        if !authorized_in(context, req, &current) {
-            return (401, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"console credential was revoked"}).to_string());
-        }
-        return match crate::supervisor::queue_console_restart(context, &req.body, &context.effective_console_token(&current)) {
+        return match crate::supervisor::queue_console_restart(context, &req.body) {
             Ok(result) => (202, "application/json; charset=utf-8".to_string(), result.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
     }
 
     if context.is_isolated() && matches!(req.path.as_str(), "/api/dependencies" | "/api/dependencies/check" | "/api/dependencies/approve") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"dependency upgrades are restricted to administrators"}).to_string());
-        }
         let result = (|| -> Result<Value,(u16,String)> {
             let cfg = selected_config_for_handler(context)?;
             match (req.method.as_str(),req.path.as_str()) {
@@ -12511,7 +10440,6 @@ fn route_with_context(
                     let version=body["version"].as_str().ok_or((400,"displayed version is required".into()))?;
                     let _gate=config_gate(context)?;
                     let latest=selected_config_for_handler(context)?;
-                    if !authorized_in(context,req,&latest) {return Err((401,"console credential was revoked".into()));}
                     crate::supervisor_dependencies::upgrades::approve(context,&latest,name,version).map_err(|e|(409,e))
                 },
                 _=>Err((405,"method not allowed".into())),
@@ -12523,100 +10451,114 @@ fn route_with_context(
         };
     }
 
-    if context.is_isolated() && matches!(req.path.as_str(),"/api/releases"|"/api/releases/settings"|"/api/releases/approve") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403,"application/json; charset=utf-8".into(),json!({"ok":false,"error":"release settings are restricted to administrators"}).to_string());
+    if context.is_isolated()
+        && matches!(
+            req.path.as_str(),
+            "/api/releases" | "/api/releases/settings" | "/api/releases/approve"
+        )
+    {
+        if (req.method.as_str(), req.path.as_str()) == ("POST", "/api/releases/settings") {
+            let res = handle_release_settings_post_tx(context, req);
+            return json_tx_result(caller, res);
         }
-        let result=match(req.method.as_str(),req.path.as_str()) {
-            ("GET","/api/releases")=>selected_config_for_handler(context).and_then(|cfg|crate::release::status(context,&cfg).map_err(|error|(503,error))),
-            ("GET","/api/releases/settings")=>selected_config_for_handler(context).and_then(|cfg|crate::release::settings(&cfg).map(|settings|json!({"ok":true,"settings":settings})).map_err(|error|(400,error))),
-            ("POST","/api/releases/settings")=>handle_release_settings_post(context,req),
-            ("POST","/api/releases/approve")=>handle_release_approve(context,req),
-            _=>Err((405,"method not allowed".into())),
+        let result = match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/api/releases") => selected_config_for_handler(context)
+                .and_then(|cfg| crate::release::status(context, &cfg).map_err(|e| (503, e))),
+            ("GET", "/api/releases/settings") => {
+                selected_config_for_handler(context).and_then(|cfg| {
+                    crate::release::settings(&cfg)
+                        .map(|settings| json!({"ok":true,"settings":settings}))
+                        .map_err(|error| (400, error))
+                })
+            }
+            ("POST", "/api/releases/approve") => handle_release_approve(context, req),
+            _ => Err((405, "method not allowed".into())),
         };
-        return match result {
-            Ok(value)=>(200,"application/json; charset=utf-8".into(),value.to_string()),
-            Err((status,message))=>(status,"application/json; charset=utf-8".into(),json!({"ok":false,"error":message}).to_string()),
-        };
+        return json_result(result);
     }
-    if context.is_isolated() && matches!(req.path.as_str(), "/api/backups/settings" | "/api/backups" | "/api/backups/restore/preview" | "/api/backups/restore") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"backup settings are restricted to administrators"}).to_string());
+    if context.is_isolated()
+        && matches!(
+            req.path.as_str(),
+            "/api/backups/settings"
+                | "/api/backups"
+                | "/api/backups/restore/preview"
+                | "/api/backups/restore"
+        )
+    {
+        if (req.method.as_str(), req.path.as_str()) == ("POST", "/api/backups/settings") {
+            let res = handle_backup_settings_post_tx(context, req);
+            return json_tx_result(caller, res);
         }
         let result = match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/api/backups") => handle_backup_list(context),
             ("GET", "/api/backups/settings") => handle_backup_settings_get(context),
-            ("POST", "/api/backups/restore/preview" | "/api/backups/restore") => handle_backup_restore(context, req),
-            ("POST", "/api/backups/settings") => handle_backup_settings_post(context, req),
+            ("POST", "/api/backups/restore/preview" | "/api/backups/restore") => {
+                handle_backup_restore(context, req)
+            }
             _ => Err((405, "method not allowed".into())),
         };
         return match result {
-            Ok(value) => (if value["queued"] == true {202} else {200}, "application/json; charset=utf-8".to_string(), value.to_string()),
-            Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
+            Ok(value) => (
+                if value["queued"] == true { 202 } else { 200 },
+                "application/json; charset=utf-8".to_string(),
+                value.to_string(),
+            ),
+            Err((status, message)) => (
+                status,
+                "application/json; charset=utf-8".to_string(),
+                json!({"ok": false, "error": message}).to_string(),
+            ),
         };
     }
+    let admin_required = || {
+        (
+            403,
+            "application/json; charset=utf-8".to_string(),
+            json!({"ok": false, "error": "this route is restricted to administrators"}).to_string(),
+        )
+    };
+    if inspector::is_route(&req.path) {
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        return inspector::route(admin_caller, cfg, req);
+    }
     if crate::console_settings::is_route(&req.path) {
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
         if !context.is_isolated() {
-            return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"settings require a selected runtime"}).to_string());
+            return (
+                503,
+                "application/json; charset=utf-8".to_string(),
+                json!({"ok": false, "error": "settings require a selected runtime"}).to_string(),
+            );
         }
-        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
-        // A set commits under the configuration gate after a fresh credential check, like persona writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
-            let gate = config_gate(context)?;
-            let latest = selected_config_for_handler(context)?;
-            if !authorized_in(context, req, &latest) {
-                return Err((401, "console credential was revoked".into()));
-            }
-            Ok(gate)
-        };
-        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        let (status, content_type, body, diff) = crate::console_settings::route(
+            admin_caller,
+            &req.method,
+            &req.path,
+            &req.query,
+            &req.body,
+        );
+        caller.record_config_diff(diff);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
-        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
-        // Writes commit under the configuration gate after a fresh credential check, like release
-        // approval: a credential revoked while this request waited never writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
-            let gate = config_gate(context)?;
-            let latest = selected_config_for_handler(context)?;
-            if !authorized_in(context, req, &latest) {
-                return Err((401, "console credential was revoked".into()));
-            }
-            Ok(gate)
-        };
-        let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        let (status, content_type, body) = crate::console_persona::route(admin_caller, &req.method, &req.path, &req.query, &req.body);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
-        return schedule_routes::route(context, cfg, req);
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        return schedule_routes::route(admin_caller, cfg, req);
     }
-    if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
-        // Hold the configuration gate until the lifecycle mutation commits. A credential
-        // accepted at the front may have been revoked while another writer held this gate.
-        let _lifecycle_authority = if req.method == "POST" && req.path == "/api/tasks/lifecycle"
-            && !req.headers.contains_key("x-agent-token") && !req.headers.contains_key("x-agent-call") {
-            let gate = match acquire_social_state_gate(context) {
-                Ok(gate) => gate,
-                Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
-            };
-            let current = match context.load_config() {
-                Ok(current) => current,
-                Err(_) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"configuration unavailable"}).to_string()),
-            };
-            if !authorized_in(context, req, &current) {
-                return (401, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"console credential was revoked"}).to_string());
-            }
-            Some(gate)
-        } else { None };
+    if context.is_isolated() && (req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
         let api = match crate::supervisor::task_api(context, cfg) {
             Ok(api) => api,
             Err(error) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":error}).to_string()),
         };
         let request = crate::console_tasks::TaskRequest {
             method: &req.method, path: &req.path, query: &req.query, body: &req.body,
-            agent_call: req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call"),
         };
-        if let Some(response) = crate::console_tasks::route(&api, &request) {
+        if let Some(response) = crate::console_tasks::route(admin_caller, &api, &request) {
             return (response.status, response.content_type.to_string(), response.body);
         }
     }
@@ -12631,7 +10573,7 @@ fn route_with_context(
         }
     };
     let role_management_body = role_management_body.as_deref().unwrap_or(&req.body);
-    if let Some((status, value)) = agent::route(req, cfg, context) {
+    if let Some((status, value)) = agent::route(caller, req) {
         return (status, "application/json; charset=utf-8".to_string(), value.to_string());
     }
 
@@ -12645,17 +10587,6 @@ fn route_with_context(
     }
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => match read_text_for(context, CONSOLE_HTML) {
-            Ok(mut html) => {
-                if context.is_isolated() { html.push_str(crate::release::BANNER); }
-                (200, "text/html; charset=utf-8".to_string(), html)
-            },
-            Err(_) => (
-                500,
-                "text/plain; charset=utf-8".to_string(),
-                "控制台页面缺失：qq-bridge/public/console.html".to_string(),
-            ),
-        },
         // 审计：看最近改了什么、怎么撤回。
         ("GET", "/api/audit/recent") => {
             let limit = req
@@ -12692,14 +10623,10 @@ fn route_with_context(
                 .to_string(),
             )
         }
-        ("POST", "/api/session-models") => match handle_session_models_post(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/session-models") => {
+            let res = handle_session_models_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         // 候选链：整条链读写（T3 后端）。GET 可选 key，用于看某会话实际生效的链。
         ("GET", "/api/model-chain") => {
             // 和 session-models 一样重新读文件：写完后立刻 GET 必须看到新值。
@@ -12728,22 +10655,14 @@ fn route_with_context(
                 handle_model_chain_get(&fresh, key.as_deref()).to_string(),
             )
         }
-        ("POST", "/api/model-chain") => match handle_model_chain_post(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
-        ("POST", "/api/audit/undo") => match audit_undo(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/model-chain") => {
+            let res = handle_model_chain_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
+        ("POST", "/api/audit/undo") => {
+            let res = audit_undo_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         ("GET", "/api/status") => {
             let payload = if context.is_isolated() {
                 match context.read_social_state() {
@@ -12763,7 +10682,7 @@ fn route_with_context(
             } else {
                 handle_status(cfg)
             };
-            (200, "application/json; charset=utf-8".to_string(), agent::finish_status(req, context, cfg, payload).to_string())
+            (200, "application/json; charset=utf-8".to_string(), agent::finish_status(caller, payload).to_string())
         }
         ("GET", "/api/socialV2/state") => {
             let key = req
@@ -12853,14 +10772,10 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         },
-        ("POST", "/api/roles/limit") => match handle_roles_limit(context, role_management_body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/roles/limit") => {
+            let res = handle_roles_limit_tx(context, role_management_body);
+            json_tx_result(caller, res)
+        }
         ("POST", "/api/socialV2/memory-append") => match handle_memory_append(
             context,
             &req.body,
@@ -12945,14 +10860,10 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         },
-        ("POST", "/api/slang/config") => match handle_slang_config(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/slang/config") => {
+            let res = handle_slang_config_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         // S1：手工触发一次抽取。同步返回摘要；dryRun 只数窗口不调模型。
         ("POST", "/api/slang/extract") if context.is_isolated() => {
             if !crate::slang_learn::enabled(cfg) {
@@ -12966,7 +10877,7 @@ fn route_with_context(
                 Err(error) => (503, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
             }
         }
-        ("POST", "/api/slang/extract") => match handle_slang_extract(&req.body, cfg) {
+        ("POST", "/api/slang/extract") => match handle_slang_extract(context, &req.body, cfg) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
                 code,
@@ -13076,7 +10987,7 @@ fn route_with_context(
             if let Err((status, message)) = sticker_agent_allowed(context, cfg, &key, &req.headers, "slangQuery", "qq_slang_query") {
                 return (status, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": message}).to_string());
             }
-            let entries = match crate::slang::load_entries_checked_for_runtime(context) {
+            let entries = match crate::slang::read_entries_locked(context) {
                 Ok(entries) => entries,
                 Err(error) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
             };
@@ -13110,7 +11021,7 @@ fn route_with_context(
             }
             // JS is `Number(x) || 10`: zero and invalid values fall back to 10.
             let limit = js_query_number_or(req.query.get("limit").map(String::as_str), 10.0);
-            let result = social_projection_request_state(
+            let result = social_projection_request_doc(
                 context,
                 cfg,
                 &key,
@@ -13118,11 +11029,10 @@ fn route_with_context(
                 "getMyRecent",
                 "qq_get_my_recent_messages",
             )
-            .and_then(|(mut state, _)| {
+            .and_then(|(doc, _)| {
                 let storage_key = projection_storage_key(&key)?;
-                agent::attach_state_receipts(context, &mut state, &storage_key);
                 Ok(projection_response_key(
-                    handle_my_recent_from_state(&state, &storage_key, limit as i64),
+                    handle_my_recent_from_doc(context, &doc, &storage_key, limit as i64),
                     &key,
                 ))
             });
@@ -13149,7 +11059,7 @@ fn route_with_context(
                 );
             }
             let limit = js_query_number_or(req.query.get("limit").map(String::as_str), 10.0);
-            let result = social_projection_request_state(
+            let result = social_projection_request_doc(
                 context,
                 cfg,
                 &key,
@@ -13157,10 +11067,10 @@ fn route_with_context(
                 "getActiveMembers",
                 "qq_get_active_members",
             )
-            .and_then(|(state, _)| {
+            .and_then(|(doc, _)| {
                 let storage_key = projection_storage_key(&key)?;
                 Ok(projection_response_key(
-                    handle_active_members_from_state(&state, &storage_key, limit as i64),
+                    handle_active_members_from_doc(&doc, &storage_key, limit as i64),
                     &key,
                 ))
             });
@@ -13476,14 +11386,10 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         },
-        ("POST", "/api/dsh/effort") => match handle_dsh_effort(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/dsh/effort") => {
+            let res = handle_dsh_effort_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         ("GET", "/api/socialV2/sticker-image") => {
             match handle_sticker_image(context, &req.query, &req.headers, cfg) {
                 Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
@@ -13552,19 +11458,30 @@ fn route_with_context(
             Ok(v)=>(200,"application/json; charset=utf-8".into(),v.to_string()),
             Err((code,msg))=>(code,"application/json; charset=utf-8".into(),json!({"ok":false,"error":msg}).to_string()),
         },
-        ("POST", "/api/social") => match handle_social_v1_config(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
-        ("GET", "/api/security") if context.is_isolated() => (200, "application/json; charset=utf-8".to_string(), access::security_get(context, cfg).to_string()),
-        ("POST", "/api/security") if context.is_isolated() => json_result(access::security_post(context, &req.body)),
-        ("POST", "/api/authorize/read") if context.is_isolated() => json_result(access::authorize_read(context, cfg, &req.body)),
-        ("POST", "/api/whitelist") if context.is_isolated() => json_result(access::whitelist_post(context, &req.body)),
-        ("POST", "/api/conversations/scope") if context.is_isolated() => json_result(conversation_scope_route(context, &req.body)),
+        ("POST", "/api/social") => {
+            let res = handle_social_v1_config_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
+        ("GET", "/api/security") if context.is_isolated() => (
+            200,
+            "application/json; charset=utf-8".to_string(),
+            access::security_get(context, cfg).to_string(),
+        ),
+        ("POST", "/api/security") if context.is_isolated() => {
+            let res = access::security_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
+        ("POST", "/api/authorize/read") if context.is_isolated() => {
+            json_result(access::authorize_read(context, cfg, &req.body))
+        }
+        ("POST", "/api/whitelist") if context.is_isolated() => {
+            let res = access::whitelist_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
+        ("POST", "/api/conversations/scope") if context.is_isolated() => {
+            let res = conversation_scope_route_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         ("GET", "/api/whitelist") if context.is_isolated() => json_result(Ok(access::whitelist_get(context, cfg))),
         ("POST", "/api/socialV2/reset") if context.is_isolated() => json_result(access::social_v2_reset(context)),
         ("POST", "/api/socialV2/wake") if context.is_isolated() => json_result(access::social_v2_wake(context, cfg, &req.body)),
@@ -13601,14 +11518,10 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         },
-        ("POST", "/api/socialV2/config") => match handle_social_config_post(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/socialV2/config") => {
+            let res = handle_social_config_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         ("GET", "/api/socialV2/forward-message") => match handle_forward_message(context, &req.query, &req.headers, cfg) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
@@ -13711,14 +11624,10 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         },
-        ("POST", "/api/console/token") => match handle_console_token_post(context, &req.body) {
-            Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
-            Err((code, msg)) => (
-                code,
-                "application/json; charset=utf-8".to_string(),
-                json!({ "ok": false, "error": msg }).to_string(),
-            ),
-        },
+        ("POST", "/api/console/token") => {
+            let res = handle_console_token_post_tx(context, &req.body);
+            json_tx_result(caller, res)
+        }
         ("POST", "/api/stickers/sync") => match handle_stickers_sync(context, cfg) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
@@ -13886,129 +11795,36 @@ fn route_with_context(
     }
 }
 
-fn handle_conn(mut stream: TcpStream, cfg: Value, context: RuntimeContext) {
+fn handle_conn(
+    mut stream: TcpStream, cfg: Value, context: RuntimeContext, startup: std::sync::Arc<std::sync::Mutex<bool>>,
+) {
     let req = match read_request(&mut stream) {
         Ok(req) => req,
         Err(RequestReadError::Invalid) => return,
     };
     let port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
-    let (status, ctype, body) = if req.path == "/api/desktop/sign-in" {
-        desktop_sign_in(&stream, &req, &context, port)
-    } else {
-        serve_request(&req, &cfg, &context, port)
-    };
-    respond(&mut stream, status, &ctype, &body);
-}
-
-/// This route requires transport identity as well as the protected credential.
-/// It is deliberately outside the string-only router: no synthetic Request can
-/// supply a PID or claim a TCP peer. Session secrets never enter the audit trail.
-fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16) -> (u16, String, String) {
-    // Capture before reading either credential: a concurrent successful rotation revokes
-    // even an issuance that finishes later with a previously validated file.
-    let generation = DESKTOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    let reply = |status, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
-    if let Some((status, value)) = access::host_denial(req, port) { return reply(status, value); }
-    if req.method != "POST" { return reply(405, json!({"ok":false,"error":"method not allowed"})); }
-    if !context.is_isolated() { return reply(403, json!({"ok":false,"error":"desktop sign-in requires a selected runtime"})); }
-    let Ok(cfg) = context.load_config() else { return reply(503, json!({"ok":false,"error":"runtime config is unavailable"})); };
-    let Ok(expected) = crate::desktop::console_token(context) else { return reply(403, json!({"ok":false,"error":"protected console token file is unavailable"})); };
-    let supplied = req.query.get("token").or_else(|| req.headers.get("x-console-token"));
-    if expected.is_empty() || !supplied.is_some_and(|token| token_eq(token, &expected)) {
-        return reply(401, json!({"ok":false,"error":"console credential is required"}));
-    }
-    if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-        return reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"}));
-    }
-    if let Some((status, value)) = access::cross_site_denial(req, port) { return reply(status, value); }
-    #[cfg(windows)]
-    let same_user = crate::process_identity::tcp_peer_user(stream)
-        .and_then(|peer| crate::process_identity::current_user().map(|own| {
-            // Seam 1 may simulate a different peer SID without creating users.
-            // The fixture only intersects real authority; it cannot grant it.
-            #[cfg(debug_assertions)]
-            let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
-                .map(|sid| sid.eq_ignore_ascii_case(&peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
-                .unwrap_or(true);
-            #[cfg(not(debug_assertions))]
-            let fixture_matches = true;
-            peer == own && fixture_matches
-        }))
-        .unwrap_or(false);
-    #[cfg(not(windows))]
-    let same_user = { let _ = stream; false };
-    if !same_user { return reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"})); }
-    match issue_desktop_session(&context.effective_console_token(&cfg), generation) {
-        Ok(session) => reply(200, json!({"ok":true,"session":session})),
-        Err(_) => reply(503, json!({"ok":false,"error":"desktop session is unavailable"})),
-    }
-}
-
-/// One request through the console front, the router and the audit trail.
-fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> (u16, String, String) {
-    let json_reply = |status: u16, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
-    // Selected runtime: the frozen JS console front (Host before credentials, then the JSON
-    // content type and same-origin checks for writes that carry a credential).
-    let mut administrator = false;
-    if context.is_isolated() {
-        if let Some((status, value)) = access::host_denial(req, port) {
-            return json_reply(status, value);
-        }
-        if let Ok(current) = context.load_config() {
-            let memory_agent_call = req.path.starts_with("/api/memory/")
-                && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty());
-            let credential = authorized_in(context, req, &current);
-            if credential || memory_agent_call {
-                if let Some((status, value)) = access::cross_site_denial(req, port) {
-                    return json_reply(status, value);
-                }
-            }
-            // Read probes that use POST (the read authorization and the live bridge's wake
-            // snapshot) change nothing and are not administrator actions.
-            administrator = credential
-                && !req.headers.contains_key("x-agent-token")
-                && !req.headers.contains_key("x-agent-call")
-                && !matches!(req.path.as_str(), "/api/authorize/read" | "/api/socialV2/wake-snapshot");
-        }
-    }
-    // 写操作审计（PLAN-V3 P0）。
-    //
-    // 对应 Cordis 的「时间可组合性」：组件改动过的共享状态，必须能完整撤回。
-    // 我们的做法是**请求前后对配置文件做快照对比**，不碰 58 个 handler ——
-    // 改动量小、覆盖面全，新增端点自动被审计。
-    //
-    // 只审计人改的配置文件。`social-v2.json` 这类运行时状态每条消息都在变，
-    // 审计它会刷爆日志，而且"撤销一条群消息"不是有意义的操作。
-    let task_log_read = req.method == "GET" && req.path.starts_with("/api/tasks/runs/") && req.path.ends_with("/log");
-    let audit = (req.method != "GET" && req.path.starts_with("/api/")) || (context.is_isolated() && task_log_read);
-    let before = if audit && !task_log_read {
-        match audit_snapshot(context) {
-            Ok(snapshot) => snapshot,
-            Err(message) => return json_reply(503, json!({ "ok": false, "error": message })),
-        }
-    } else {
-        Vec::new()
-    };
-    take_config_writes();
-    let (status, ctype, mut body) = route_with_context(req, cfg, context);
-    let config_writes = take_config_writes();
-    // Selected runtime: every administrator write is recorded with its actual result, including
-    // refusals and their reason, so the console history shows what happened and why.
-    let record_admin = audit && administrator;
-    if audit && ((200..300).contains(&status) || record_admin) {
-        if let Err(error) = audit_write(context, req, status, &body, record_admin, &before, config_writes) {
-            crate::safe_println!("[console] ⚠️ 审计记录写入失败（{} {}，状态 {status}）：{error}", req.method, req.path);
-            // The change keeps its result; the response says that it has no audit record (and
-            // so no undo).
-            if context.is_isolated() {
-                if let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&body) {
-                    reply.insert("audit".into(), json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}));
-                    body = Value::Object(reply).to_string();
+    if context.is_isolated() && !crate::restore::recovery_pending(&context) {
+        if let Ok(mut ready) = startup.lock() {
+            if !*ready {
+                if let Ok(Some(current)) = selected_startup_config(&context) {
+                    initialize_console(&context, &current);
+                    *ready = true;
                 }
             }
         }
     }
-    (status, ctype, body)
+    let response = front::handle_http_request(Some(&stream), &req, &cfg, &context, port);
+    respond(&mut stream, response);
+}
+
+#[cfg(test)]
+fn serve_request(
+    req: &Request,
+    cfg: &Value,
+    context: &RuntimeContext,
+    port: u16,
+) -> front::ConsoleResponse {
+    front::handle_http_request(None, req, cfg, context, port)
 }
 
 /// Test seam: one administrator request (console token, JSON body, loopback Host) through
@@ -14031,7 +11847,7 @@ fn test_request(context: &RuntimeContext, method: &str, path: &str, body: Option
     let mut headers = HashMap::new();
     headers.insert("x-console-token".to_string(), context.effective_console_token(&cfg));
     if let Some(token) = agent_token { headers.insert("x-agent-token".into(), token.into()); }
-    headers.insert("host".to_string(), format!("127.0.0.1:{port}"));
+    headers.insert("host".to_string(), crate::console_auth::canonical_host(port));
     headers.insert("content-type".to_string(), "application/json".to_string());
     let (path, query) = match path.split_once('?') {
         Some((path, query)) => (path, query),
@@ -14050,13 +11866,13 @@ fn test_request(context: &RuntimeContext, method: &str, path: &str, body: Option
         body: body.map(Value::to_string).unwrap_or_default(),
         body_too_large: false,
     };
-    let (status, _, text) = serve_request(&req, &cfg, context, port);
-    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    let response = serve_request(&req, &cfg, context, port);
+    (response.status, serde_json::from_str(&response.body).unwrap_or(Value::Null))
 }
 
 // ── 写操作审计 ────────────────────────────────────────────────────────────────
 
-const AUDIT_FILES: [&str; 2] = [
+pub(crate) const AUDIT_FILES: [&str; 2] = [
     crate::legacy_path!("qq-bridge/config.json"),
     crate::legacy_path!("qq-bridge/state/role-map.json"),
 ];
@@ -14064,24 +11880,11 @@ const AUDIT_LOG: &str = crate::legacy_path!("logs/audit.jsonl");
 const AUDIT_BLOB_DIR: &str = crate::legacy_path!("logs/audit-blobs");
 
 /// 当前可审计文件的内容快照。
-fn isolated_audit_file(file: &str) -> Option<(RuntimeArea, &'static str)> {
+pub(crate) fn isolated_audit_file(file: &str) -> Option<(RuntimeArea, &'static str)> {
     match file {
         "config/config.json" => Some((RuntimeArea::Config, "config.json")),
         "data/role-map.json" => Some((RuntimeArea::Data, "role-map.json")),
         _ => None,
-    }
-}
-
-fn audit_write_file(context: &RuntimeContext, file: &str, contents: &str) -> Result<(), String> {
-    if context.is_isolated() {
-        let (area, relative) = isolated_audit_file(file)
-            .ok_or_else(|| format!("拒绝写入未声明的审计文件：{file}"))?;
-        if area == RuntimeArea::Config && relative == "config.json" {
-            return write_selected_config_text(context, contents);
-        }
-        context.write_atomic(area, relative, contents.as_bytes())
-    } else {
-        std::fs::write(file, contents).map_err(|e| e.to_string())
     }
 }
 
@@ -14108,14 +11911,14 @@ fn audit_snapshot(context: &RuntimeContext) -> Result<Vec<(String, String)>, Str
         .collect())
 }
 
-/// The digest of a configuration with every registry member removed (`settings::registry_free`); None when the text
-/// is not JSON.
-fn config_registry_free_sha(text: &str) -> Option<String> {
+/// The digest of a configuration with every registry member removed (`settings::registry_free`);
+/// None when the text is not JSON.
+pub(crate) fn config_registry_free_sha(text: &str) -> Option<String> {
     let document: Value = serde_json::from_str(text).ok()?;
     Some(sha256_hex(&crate::settings::registry_free(&document).to_string()))
 }
 
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, s.as_bytes());
     sha2::Digest::finalize(h).iter().map(|b| format!("{b:02x}")).collect()
@@ -14125,60 +11928,87 @@ fn sha256_hex(s: &str) -> String {
 ///
 /// 存储放在 `config.json` 的 `sessions` 段（**不放在 social-v2.json**）：
 /// 前者是人改的配置、会被审计和回滚；后者是运行时状态，每轮都在变。
-fn handle_session_models_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    let req: Value = serde_json::from_str(body).map_err(|e| (400, format!("请求体不是合法 JSON：{e}")))?;
-    let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if key.is_empty() {
-        return Err((400, "需要 key（形如 group:7002）".to_string()));
-    }
-    let _gate = config_gate(context)?;
-    let mut file = read_json_for(context, CONFIG_PATH).ok_or((500, "读不到 config.json".to_string()))?;
-
-    let clear = req.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-    if clear {
-        if let Some(s) = file.get_mut("sessions").and_then(|v| v.as_object_mut()) {
-            s.remove(&key);
-            if s.is_empty() {
-                if let Some(obj) = file.as_object_mut() {
-                    obj.remove("sessions");
-                }
-            }
-        }
-        write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
-        return Ok(json!({ "ok": true, "key": key, "cleared": true }));
-    }
-
-    let model = req.get("model").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if model.is_empty() {
-        return Err((400, "需要 model（或用 clear:true 清除）".to_string()));
-    }
-    let provider = req.get("provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let effort = req
-        .get("reasoningEffort")
+fn handle_session_models_post_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
+    let req: Value =
+        serde_json::from_str(body).map_err(|e| (400, format!("请求体不是合法 JSON：{e}")))?;
+    let key = req
+        .get("key")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    // 档位词汇随 provider 不同：DeepSeek 只认 low/high/max，Anthropic 风格认 medium。
-    // 这里不做跨 provider 校验（那需要模型目录），只拒绝明显非法的值。
-    const EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
-    if !effort.is_empty() && !EFFORTS.contains(&effort.as_str()) {
-        return Err((400, "reasoningEffort 只能是 low/medium/high/max".to_string()));
+    if key.is_empty() {
+        return Err(crate::config_tx::CommitError::plain(
+            400,
+            "需要 key（形如 group:7002）",
+        ));
     }
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::RawObject,
+        move |file| {
+            let clear = req.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            if clear {
+                if let Some(s) = file.get_mut("sessions").and_then(|v| v.as_object_mut()) {
+                    s.remove(&key);
+                    if s.is_empty() {
+                        if let Some(obj) = file.as_object_mut() {
+                            obj.remove("sessions");
+                        }
+                    }
+                }
+                return Ok(json!({ "ok": true, "key": key, "cleared": true }));
+            }
 
-    let mut entry = json!({ "model": model });
-    if !provider.is_empty() {
-        entry["provider"] = json!(provider);
-    }
-    if !effort.is_empty() {
-        entry["reasoningEffort"] = json!(effort);
-    }
-    let obj = file.as_object_mut().ok_or((500, "config.json 不是对象".to_string()))?;
-    let sessions = obj.entry("sessions").or_insert_with(|| json!({}));
-    let sessions = sessions.as_object_mut().ok_or((500, "sessions 不是对象".to_string()))?;
-    sessions.insert(key.clone(), entry.clone());
-    write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
-    Ok(json!({ "ok": true, "key": key, "entry": entry }))
+            let model = req
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if model.is_empty() {
+                return Err((400, "需要 model（或用 clear:true 清除）".to_string()));
+            }
+            let provider = req
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let effort = req
+                .get("reasoningEffort")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // 档位词汇随 provider 不同：DeepSeek 只认 low/high/max，Anthropic 风格认 medium。
+            // 这里不做跨 provider 校验（那需要模型目录），只拒绝明显非法的值。
+            const EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+            if !effort.is_empty() && !EFFORTS.contains(&effort.as_str()) {
+                return Err((400, "reasoningEffort 只能是 low/medium/high/max".to_string()));
+            }
+
+            let mut entry = json!({ "model": model });
+            if !provider.is_empty() {
+                entry["provider"] = json!(provider);
+            }
+            if !effort.is_empty() {
+                entry["reasoningEffort"] = json!(effort);
+            }
+            let obj = file
+                .as_object_mut()
+                .ok_or((500, "config.json 不是对象".to_string()))?;
+            let sessions = obj.entry("sessions").or_insert_with(|| json!({}));
+            let sessions = sessions
+                .as_object_mut()
+                .ok_or((500, "sessions 不是对象".to_string()))?;
+            sessions.insert(key.clone(), entry.clone());
+            Ok(json!({ "ok": true, "key": key, "entry": entry }))
+        },
+    )
 }
 
 /// 候选链档位（与 session-models 保持同一套词汇）。
@@ -14304,8 +12134,11 @@ fn parse_chain_edits(req: &Value) -> Result<Vec<ChainEdit>, (u16, String)> {
 ///   b) `{chain:[...]}`       → chain[0] 写 dsh 主候选，chain[1..] 写 dsh.fallbacks
 ///   c) `{key, clear:true}`   → 删除 `sessions[key]`
 ///
-/// 写文件一律走 `write_json_atomic_for`，isolated mode 绑定到当前 RuntimeContext。
-fn handle_model_chain_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+/// 写文件一律走 `config_tx`，isolated mode 绑定到当前 RuntimeContext。
+fn handle_model_chain_post_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
     let req: Value =
         serde_json::from_str(body).map_err(|e| (400, format!("请求体不是合法 JSON：{e}")))?;
     let key = req
@@ -14315,116 +12148,123 @@ fn handle_model_chain_post(context: &RuntimeContext, body: &str) -> Result<Value
         .trim()
         .to_string();
     let clear = req.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-    let _gate = config_gate(context)?;
-    // Selected runtime: the raw file is modified; defaults (the global effort) come from the
-    // effective view.
-    let effective = selected_config_for_handler(context)?;
-    let mut file = if context.is_isolated() { raw_config_for_write(context)? } else { effective.clone() };
+    crate::config_tx::commit_config_edit(
+        context,
+        crate::config_tx::ConfigBase::Canonical,
+        move |file| {
+            // Selected runtime: the raw file is modified; defaults (the global effort) come from
+            // the effective view.
+            let effective = selected_config_for_handler(context)?;
 
-    if clear {
-        if key.is_empty() {
-            return Err((
-                400,
-                "clear 需要 key（形如 group:7002）".to_string(),
-            ));
-        }
-        if let Some(s) = file.get_mut("sessions").and_then(|v| v.as_object_mut()) {
-            s.remove(&key);
-            if s.is_empty() {
-                if let Some(obj) = file.as_object_mut() {
-                    obj.remove("sessions");
+            if clear {
+                if key.is_empty() {
+                    return Err((400, "clear 需要 key（形如 group:7002）".to_string()));
                 }
+                if let Some(s) = file.get_mut("sessions").and_then(|v| v.as_object_mut()) {
+                    s.remove(&key);
+                    if s.is_empty() {
+                        if let Some(obj) = file.as_object_mut() {
+                            obj.remove("sessions");
+                        }
+                    }
+                }
+                return Ok(json!({ "ok": true, "key": key, "cleared": true }));
             }
-        }
-        write_json_atomic_for(context, CONFIG_PATH, &file)
-            .map_err(|error| config_write_error(context, error))?;
-        return Ok(json!({ "ok": true, "key": key, "cleared": true }));
-    }
 
-    let chain = parse_chain_edits(&req)?;
+            let chain = parse_chain_edits(&req)?;
 
-    // 空 effort 的语义统一为"沿用全局默认"，所以先把全局默认档位取出来。
-    let global_effort = effective
-        .pointer("/dsh/reasoningEffort")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+            // 空 effort 的语义统一为"沿用全局默认"，所以先把全局默认档位取出来。
+            let global_effort = effective
+                .pointer("/dsh/reasoningEffort")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
 
-    if !key.is_empty() {
-        let first = &chain[0];
-        let mut entry = json!({
-            "provider": first.provider,
-            "model": first.model,
-        });
-        let effort = if first.effort.is_empty() {
-            global_effort
-        } else {
-            first.effort.clone()
-        };
-        if !effort.is_empty() {
-            entry["reasoningEffort"] = json!(effort);
-        }
-        let obj = file
-            .as_object_mut()
-            .ok_or((500, "config.json 不是对象".to_string()))?;
-        let sessions = obj.entry("sessions").or_insert_with(|| json!({}));
-        let sessions = sessions
-            .as_object_mut()
-            .ok_or((500, "sessions 不是对象".to_string()))?;
-        sessions.insert(key.clone(), entry.clone());
-        write_json_atomic_for(context, CONFIG_PATH, &file)
-            .map_err(|error| config_write_error(context, error))?;
-        return Ok(json!({
-            "ok": true,
-            "key": key,
-            "entry": entry,
-            "note": "会话覆盖只替换主候选，fallbacks 仍用全局",
-        }));
-    }
-
-    // 全局链：主候选 + fallbacks。整体覆盖，不做局部合并——
-    // "整条链覆盖写"是 UI 的语义，否则删掉一个 fallback 永远删不掉。
-    let primary = &chain[0];
-    let fallbacks: Vec<Value> = chain[1..]
-        .iter()
-        .map(|c| {
-            let mut f = json!({ "provider": c.provider, "model": c.model });
-            if !c.effort.is_empty() {
-                f["reasoningEffort"] = json!(c.effort);
+            if !key.is_empty() {
+                let first = &chain[0];
+                let mut entry = json!({
+                    "provider": first.provider,
+                    "model": first.model,
+                });
+                let effort = if first.effort.is_empty() {
+                    global_effort
+                } else {
+                    first.effort.clone()
+                };
+                if !effort.is_empty() {
+                    entry["reasoningEffort"] = json!(effort);
+                }
+                let obj = file
+                    .as_object_mut()
+                    .ok_or((500, "config.json 不是对象".to_string()))?;
+                let sessions = obj.entry("sessions").or_insert_with(|| json!({}));
+                let sessions = sessions
+                    .as_object_mut()
+                    .ok_or((500, "sessions 不是对象".to_string()))?;
+                sessions.insert(key.clone(), entry.clone());
+                return Ok(json!({
+                    "ok": true,
+                    "key": key,
+                    "entry": entry,
+                    "note": "会话覆盖只替换主候选，fallbacks 仍用全局",
+                }));
             }
-            f
-        })
-        .collect();
-    let obj = file
-        .as_object_mut()
-        .ok_or((500, "config.json 不是对象".to_string()))?;
-    let dsh = obj.entry("dsh").or_insert_with(|| json!({}));
-    let dsh = dsh
-        .as_object_mut()
-        .ok_or((500, "dsh 不是对象".to_string()))?;
-    dsh.insert("provider".to_string(), json!(primary.provider));
-    dsh.insert("model".to_string(), json!(primary.model));
-    if !primary.effort.is_empty() {
-        dsh.insert("reasoningEffort".to_string(), json!(primary.effort));
-    }
-    dsh.insert("fallbacks".to_string(), Value::Array(fallbacks));
-    write_json_atomic_for(context, CONFIG_PATH, &file)
-        .map_err(|error| config_write_error(context, error))?;
-    Ok(json!({
-        "ok": true,
-        "key": Value::Null,
-        "global": {
-            "provider": primary.provider,
-            "model": primary.model,
-            "reasoningEffort": if primary.effort.is_empty() { Value::Null } else { json!(primary.effort) },
+
+            // 全局链：主候选 + fallbacks。整体覆盖，不做局部合并——
+            // "整条链覆盖写"是 UI 的语义，否则删掉一个 fallback 永远删不掉。
+            let primary = &chain[0];
+            let fallbacks: Vec<Value> = chain[1..]
+                .iter()
+                .map(|c| {
+                    let mut f = json!({ "provider": c.provider, "model": c.model });
+                    if !c.effort.is_empty() {
+                        f["reasoningEffort"] = json!(c.effort);
+                    }
+                    f
+                })
+                .collect();
+            let obj = file
+                .as_object_mut()
+                .ok_or((500, "config.json 不是对象".to_string()))?;
+            let dsh = obj.entry("dsh").or_insert_with(|| json!({}));
+            let dsh = dsh
+                .as_object_mut()
+                .ok_or((500, "dsh 不是对象".to_string()))?;
+            dsh.insert("provider".to_string(), json!(primary.provider));
+            dsh.insert("model".to_string(), json!(primary.model));
+            if !primary.effort.is_empty() {
+                dsh.insert("reasoningEffort".to_string(), json!(primary.effort));
+            }
+            dsh.insert("fallbacks".to_string(), Value::Array(fallbacks));
+            let reasoning_effort = if primary.effort.is_empty() {
+                Value::Null
+            } else {
+                json!(primary.effort)
+            };
+            Ok(json!({
+                "ok": true,
+                "key": Value::Null,
+                "global": {
+                    "provider": primary.provider,
+                    "model": primary.model,
+                    "reasoningEffort": reasoning_effort,
+                },
+                "fallbacks": chain.len().saturating_sub(1),
+            }))
         },
-        "fallbacks": chain.len().saturating_sub(1),
-    }))
+    )
+}
+
+#[cfg(test)]
+fn handle_model_chain_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    handle_model_chain_post_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 
 /// 最近 N 条审计（新的在前）。
-fn audit_recent(context: &RuntimeContext, limit: usize) -> Result<Vec<Value>, String> {
+pub(crate) fn audit_recent(context: &RuntimeContext, limit: usize) -> Result<Vec<Value>, String> {
     let text = if context.is_isolated() {
         context
             .read_optional_text(RuntimeArea::Data, "audit/audit.jsonl")
@@ -14461,7 +12301,7 @@ fn audit_backup_allowed(backup: &str) -> bool {
     normalized.len() > prefix.len() && normalized.starts_with(&prefix)
 }
 
-fn audit_backup_allowed_for(context: &RuntimeContext, backup: &str) -> bool {
+pub(crate) fn audit_backup_allowed_for(context: &RuntimeContext, backup: &str) -> bool {
     if !context.is_isolated() {
         return audit_backup_allowed(backup);
     }
@@ -14479,208 +12319,19 @@ fn audit_backup_allowed_for(context: &RuntimeContext, backup: &str) -> bool {
         .is_ok()
 }
 
-/// 撤销一条审计：把 blob 里的旧内容写回原文件。
-///
-/// 边界：只恢复 `AUDIT_FILES` 里声明过的文件，审计行里指到别处的路径一律拒绝
-/// （否则这条端点就成了"任意文件写入"）。
+/// 撤销一条审计：委托 `config_tx::commit_audit_undo`。
+fn audit_undo_tx(
+    context: &RuntimeContext,
+    body: &str,
+) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
+    crate::config_tx::commit_audit_undo(context, body)
+}
+
+#[cfg(test)]
 fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if id.is_empty() {
-        return Err((400, "需要 id".to_string()));
-    }
-    // #154: an undo that restores a security setting needs `"confirm": true`, as any change of one does.
-    let confirm = crate::settings::confirm_field(&req)?;
-    let entry = audit_recent(context, 500)
-        .map_err(|e| (503, e))?
-        .into_iter()
-        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
-        .ok_or((404, format!("找不到审计记录 {id}")))?;
-
-    let files = entry.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    if context.is_isolated() {
-        // A console-token record holds the previous credential: undoing it would bring back a token
-        // the operator replaced (possibly because it leaked).
-        if entry.get("path").and_then(Value::as_str) == Some("/api/console/token") {
-            return Err((409, "控制台访问令牌的修改不能撤销（会恢复被替换的旧令牌）；如需更换请重新设置令牌".to_string()));
-        }
-        if files.is_empty() {
-            return Err((409, format!("审计记录 {id} 没有改动文件，没有可恢复的内容")));
-        }
-        // Validate every selected backup before the first restore write. This prevents a
-        // malformed later entry from leaving an earlier file partially restored. The
-        // subsequent per-file atomic replacements are still not a multi-file transaction.
-        let mut pending = Vec::with_capacity(files.len());
-        for f in &files {
-            let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
-            let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
-            if !["config/config.json", "data/role-map.json"].contains(&file) {
-                return Err((400, format!("拒绝恢复未声明的文件：{file}")));
-            }
-            if !audit_backup_allowed_for(context, backup) {
-                return Err((400, format!("拒绝恢复 audit-blobs 之外的文件：{backup}")));
-            }
-            let old = context
-                .read_text(RuntimeArea::Data, backup)
-                .map_err(|e| (500, format!("读备份失败 {backup}: {e}")))?;
-            let parsed = serde_json::from_str::<Value>(&old)
-                .map_err(|_| (500, format!("备份内容不是合法 JSON，拒绝写入：{backup}")))?;
-            // A configuration the runtime cannot load would also leave the access reconciliation
-            // without its "after" side: refuse it before writing anything.
-            if file == "config/config.json"
-                && (!parsed.is_object() || crate::config::canonical_config(&parsed).is_err())
-            {
-                return Err((500, format!("备份不是可加载的运行配置，拒绝写入：{backup}")));
-            }
-            pending.push((file.to_string(), old));
-        }
-        // Access changes are serialized with closed-agent receipts and mode changes; the config
-        // read-modify-write (stale check and restore) runs under the social-state gate.
-        let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-        access::finish_pending_before_change(context, &interaction)?;
-        // Registry settings whose backup value differed from the current file's (`settings::keep_registry_values`).
-        let mut settings_kept: Vec<&'static str> = Vec::new();
-        let mut wake_error = None;
-        let (config_before, restored, planned) = {
-            let _gate = acquire_social_state_gate(context)?;
-            // Safe undo: only the state this record produced may be replaced. A later change of the
-            // same file would be silently lost, so the operator must undo that one first.
-            for (f, (file, _)) in files.iter().zip(&pending) {
-                let (area, relative) = isolated_audit_file(file).expect("declared file checked above");
-                let current = context
-                    .read_optional_text(area, relative)
-                    .map_err(|_| (503, "selected runtime audit target is unavailable".to_string()))?
-                    .unwrap_or_default();
-                // A configuration record that has `afterRegistryFreeSha` ignores registry members, which the settings
-                // store owns; any other record compares the raw file.
-                let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
-                    Some(expected) if file == "config/config.json" => config_registry_free_sha(&current).as_deref() == Some(expected),
-                    _ => f.get("afterSha").and_then(Value::as_str) == Some(sha256_hex(&current).as_str()),
-                };
-                if !unchanged {
-                    return Err((409, format!("{file} 在这条审计记录之后又被修改过，撤销会覆盖之后的变更；请先撤销更新的记录")));
-                }
-            }
-            let config_before = context
-                .load_config()
-                .map_err(|e| (503, format!("读取当前配置失败，未撤销：{e}")))?;
-            let mut restored = Vec::with_capacity(pending.len());
-            // #192: the restored configuration's effective policy and its pending revocation, recorded before its write.
-            let mut planned: Option<(Value, Option<String>, Option<String>)> = None;
-            // #192: `config.json` as found before its restore, to tell a failed write that published from one that did not.
-            let mut unchanged_config = Value::Null;
-            for (file, old) in pending {
-                // Undo never changes the console credential: the restored configuration keeps the
-                // current `consoleToken` (backups hold a redacted one).
-                let mut wake_changed = false;
-                let text = if file == "config/config.json" {
-                    let current = raw_config_for_write(context).map_err(|(_, e)| (503, format!("读取当前配置失败，未撤销：{e}")))?;
-                    let mut restored_config: Value = serde_json::from_str(&old).map_err(|_| (500, "备份内容不是合法 JSON".to_string()))?;
-                    match (current.get("consoleToken"), restored_config.as_object_mut()) {
-                        (Some(token), Some(object)) => {
-                            object.insert("consoleToken".into(), token.clone());
-                        }
-                        (None, Some(object)) => {
-                            object.remove("consoleToken");
-                        }
-                        _ => {}
-                    }
-                    // #154: the security settings the backup holds (allow and deny lists, owner, outbound guard
-                    // switches) are restored through the settings store after the revocation below is recorded, and
-                    // need `"confirm": true`; every other registry setting changes and undoes through the settings
-                    // store only, so the restored configuration keeps its current value.
-                    let security = crate::settings::security_restore(context, &current, &restored_config)?;
-                    let restoring: Vec<&crate::settings::Setting> = security.iter().map(|(setting, _)| *setting).collect();
-                    crate::settings::check_confirmation(confirm, &restoring)?;
-                    let previewed: Vec<_> = security.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
-                    settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
-                        |key| (409, format!("the backup cannot keep the current value of {key}; nothing was undone")),
-                    )?;
-                    settings_kept.retain(|key| !crate::settings::find(key).is_some_and(|setting| setting.confirmed()));
-                    // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
-                    let (after, load_error) = match context.effective_config_with(&restored_config, &previewed) {
-                        Ok(after) => (after, None),
-                        Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
-                    };
-                    let stored = !security.is_empty();
-                    if stored {
-                        note_config_before_request(context);
-                    }
-                    let change = access::begin_access_change(context, &config_before, &after, "audit-undo")?;
-                    access::store_access_changes(context, security, &previewed, &change, "audit-undo")?;
-                    // The store's write-back changed registry members: the restored file keeps them as they are now.
-                    access::keep_stored_members(context, &mut restored_config)?;
-                    wake_changed = current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
-                    let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
-                    planned = Some((after, load_error, change));
-                    // Once the store holds the change, a failed file write keeps the pending revocation.
-                    unchanged_config = if stored { Value::Null } else { access::config_snapshot(context) };
-                    text
-                } else {
-                    old
-                };
-                if let Err(error) = audit_write_file(context, &file, &text) {
-                    let mut message = format!("写回失败 {file}: {error}");
-                    if let Some((_, _, change)) = planned.as_ref().filter(|_| file == "config/config.json") {
-                        message.push_str(&access::settle_failed_write(context, &unchanged_config, change));
-                    }
-                    return Err((500, message));
-                }
-                if wake_changed {
-                    wake_error = reconcile_default_wake_configs(context, Some(&config_before)).err();
-                }
-                restored.push(file);
-            }
-            (config_before, restored, planned)
-        };
-        // Restoring a narrower configuration revokes like any other access change; restoring a
-        // wider one grants a new epoch only (nothing invalidated earlier comes back). If the
-        // restored configuration cannot be read, everything the old one allowed is revoked.
-        let (after, load_error, change) = match planned {
-            Some(planned) => planned,
-            None => match context.load_config() {
-                Ok(after) => (after, None, None),
-                Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}")), None),
-            },
-        };
-        let (revoked, mut failures) = access::finish_access_change(context, &interaction, &config_before, &after, "audit-undo", change);
-        drop(interaction);
-        failures.extend(load_error);
-        if !failures.is_empty() {
-            return Err((500, format!("已恢复 {}，但立即撤销未完成：{}", restored.join("、"), failures.join("；"))));
-        }
-        if let Some((status, error)) = wake_error {
-            return Err((status, format!("configuration restored but inherited wake plans could not be refreshed: {error}")));
-        }
-        return Ok(json!({ "ok": true, "id": id, "restored": restored, "revoked": revoked, "settingsKept": settings_kept }));
-    }
-
-    let mut restored: Vec<String> = Vec::new();
-    for f in files {
-        let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
-        let allowed_files: &[&str] = &AUDIT_FILES;
-        if !allowed_files.contains(&file) {
-            return Err((400, format!("拒绝恢复未声明的文件：{file}")));
-        }
-        if !audit_backup_allowed_for(context, backup) {
-            return Err((400, format!("拒绝恢复 audit-blobs 之外的文件：{backup}")));
-        }
-        let old = std::fs::read_to_string(backup)
-            .map_err(|e| (500, format!("读备份失败 {backup}: {e}")))?;
-        // 先校验备份是合法 JSON，避免把损坏内容写回去
-        let backup_cfg: Value = serde_json::from_str(&old)
-            .map_err(|_| (500, format!("备份内容不是合法 JSON，拒绝写入：{backup}")))?;
-        let before = (file == CONFIG_PATH).then(|| context.load_config_requiring_settings())
-            .transpose().map_err(|error| (503, error))?;
-        audit_write_file(context, file, &old)
-            .map_err(|e| (500, format!("写回失败 {file}: {e}")))?;
-        if let Some(before) = before.filter(|cfg| cfg["socialV2"]["wake"] != backup_cfg["socialV2"]["wake"]) {
-            reconcile_default_wake_configs(context, Some(&before))?;
-        }
-        restored.push(file.to_string());
-    }
-    Ok(json!({ "ok": true, "id": id, "restored": restored }))
+    audit_undo_tx(context, body)
+        .map(|outcome| outcome.value)
+        .map_err(crate::config_tx::CommitError::into_http)
 }
 
 /// The configuration text with a non-empty `consoleToken` replaced by a marker. A configuration
@@ -14710,7 +12361,7 @@ fn audit_write(
     response: &str,
     administrator: bool,
     before: &[(String, String)],
-    config_writes: Option<(Result<String, String>, String)>,
+    config_diff: Option<crate::config_tx::ConfigDiff>,
 ) -> Result<(), String> {
     let after = if req.method == "GET" { Vec::new() } else { audit_snapshot(context)? };
     static AUDIT_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -14722,14 +12373,13 @@ fn audit_write(
         format!("{}-{}", now_ms(), std::process::id())
     };
     let mut changed: Vec<Value> = Vec::new();
-    // Selected runtime: `config.json` changes come from the writer's own record, taken under the
-    // config gate (a concurrent request's change is never attributed to this one); the request
+    // Selected runtime: `config.json` changes come from `config_tx`'s committed diff, taken under
+    // the config gate (a concurrent request's change is never attributed to this one); the request
     // snapshots cover the other audited files.
     let mut pairs: Vec<(String, String, String)> = Vec::new();
     if context.is_isolated() {
-        if let Some((before_text, after_text)) = config_writes {
-            let before_text = before_text?;
-            pairs.push(("config/config.json".to_string(), before_text, after_text));
+        if let Some(diff) = config_diff {
+            pairs.push(("config/config.json".to_string(), diff.before, diff.after));
         }
     }
     for (path, old) in before {
@@ -14826,26 +12476,7 @@ fn audit_write(
 /// Before serving requests, finish any pending settings write-back and repair stale inherited wake
 /// defaults. A busy gate, read error or write error is reported so the next console start can retry.
 fn finish_settings_write_back(context: &RuntimeContext) {
-    if !context.is_isolated() {
-        return;
-    }
-    if crate::settings::has_stored_values(context) {
-        let result = config_gate(context)
-            .and_then(|_gate| crate::settings::write_back(context).map_err(|error| (503, error)));
-        match result {
-            Ok(blocked) if blocked.is_empty() => {}
-            Ok(blocked) => crate::safe_println!(
-                "[console] ⚠️ config.json cannot hold the stored settings {} (a non-object is on the way)",
-                blocked.join(", ")
-            ),
-            Err((_, error)) => crate::safe_println!(
-                "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
-            ),
-        }
-    }
-    if let Err((_, error)) = refresh_default_wake_configs(context) {
-        crate::safe_println!("[console] inherited wake plans could not be refreshed: {error}");
-    }
+    crate::config_tx::finish_startup_write_back(context);
 }
 
 /// 起服务。`port=0` 时用默认 3101。
@@ -14886,17 +12517,56 @@ pub fn serve_with_context(
         }
     };
     let _ = CONSOLE_PORT.set(port);
-    crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
-    access::harden_selected_state_dir(&context);
-    if let Err((_, error)) = import_engine_choices_outside_request(&context) {
+    crate::safe_println!("[console] Rust 控制台已启动：{}", if context.is_isolated() { crate::console_auth::canonical_origin(port) } else { format!("http://127.0.0.1:{port}") });
+    let mut initialized = false;
+    if context.is_isolated() {
+        if let Some(cfg) = selected_startup_config(&context)? {
+            initialize_console(&context, &cfg);
+            initialized = true;
+        }
+    } else {
+        initialize_console(&context, cfg);
+    }
+    let startup = std::sync::Arc::new(std::sync::Mutex::new(initialized));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let cfg = cfg.clone();
+                let context = context.clone();
+                let startup = startup.clone();
+                std::thread::spawn(move || handle_conn(s, cfg, context, startup));
+            }
+            Err(e) => crate::safe_println!("[console] 接受连接失败：{e}"),
+        }
+    }
+    Ok(())
+}
+
+fn selected_startup_config(context: &RuntimeContext) -> Result<Option<Value>, String> {
+    let _gate = config_gate(context).map_err(|(_, e)| e)?;
+    if crate::restore::recovery_pending(context) { return Ok(None); }
+    let cfg = context.load_config().map_err(str::to_owned)?;
+    if crate::console_auth::ensure_credentials_ready(context).is_ok() {
+        if crate::console_auth::start_browser_clock(context).is_err() {
+            crate::safe_eprintln!("[console] browser session state is unavailable");
+        }
+        Ok(Some(cfg))
+    } else {
+        Ok(None)
+    }
+}
+
+fn initialize_console(context: &RuntimeContext, cfg: &Value) {
+    access::harden_selected_state_dir(context);
+    if let Err(error) = crate::config_tx::import_engine_choices(context) {
         crate::safe_println!("[console] conversation engine import: {error}");
     }
     // Before the start stamp of config.json is noted: the write-back may change the file.
-    finish_settings_write_back(&context);
-    access::note_config_start(&context);
+    finish_settings_write_back(context);
+    access::note_config_start(context);
     // #192: an access change cut off between its configuration write and its revocation is finished before the
     // console answers any request.
-    match access::finish_pending_revocations(&context) {
+    match social_state::finish_pending_revocations(context) {
         Ok((revoked, failures)) => {
             if !revoked.is_empty() {
                 crate::safe_println!("[console] finished the revocation an earlier access change left pending: {}", revoked.join(","));
@@ -14920,17 +12590,6 @@ pub fn serve_with_context(
             }
         });
     }
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let cfg = cfg.clone();
-                let context = context.clone();
-                std::thread::spawn(move || handle_conn(s, cfg, context));
-            }
-            Err(e) => crate::safe_println!("[console] 接受连接失败：{e}"),
-        }
-    }
-    Ok(())
 }
 
 /// 读配置（供 CLI 入口用）。
@@ -14939,8 +12598,13 @@ pub fn load_config() -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use front::{
+        authorized, bounded_post_body_too_large, BrowserCookie, ConsoleResponse, AFTER_ADMISSION,
+        FRONT_READ_HOOK,
+    };
+    use crate::conversation_state::{SOCIAL_STATE_GATE, SOCIAL_STATE_GATE_WAIT};
 
     #[test]
     fn quoted_voice_is_shown_to_the_model_as_the_voice_label() {
@@ -14989,7 +12653,7 @@ mod tests {
         assert!(v["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
     }
 
-    fn req(method: &str, path: &str, token: Option<&str>) -> Request {
+    pub(super) fn req(method: &str, path: &str, token: Option<&str>) -> Request {
         let mut headers = HashMap::new();
         if let Some(t) = token {
             headers.insert("x-console-token".to_string(), t.to_string());
@@ -15002,6 +12666,622 @@ mod tests {
             body: String::new(),
             body_too_large: false,
         }
+    }
+
+    const BROWSER_FIXTURE_TOKEN: &str = "fixture-browser-admin-machine-token";
+    const BROWSER_FIXTURE_PORT: u16 = 3999;
+
+    fn browser_fixture(label: &str) -> (FixtureRoot, RuntimeContext, String, [u8; 32], i64) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use sha2::{Digest as _, Sha256};
+        let (root, context) = fixture_runtime(label, BROWSER_FIXTURE_TOKEN);
+        let id = [83; 32];
+        let digest: [u8; 32] = Sha256::digest(id).into();
+        let prior = crate::parity_clock::now_ms() - 1_000;
+        crate::console_auth::seed_browser_session(
+            &context,
+            BROWSER_FIXTURE_PORT,
+            BROWSER_FIXTURE_TOKEN,
+            digest,
+            prior,
+        )
+        .unwrap();
+        context.browser_anchors.0.lock().unwrap().insert(digest, (prior, std::time::Instant::now() - std::time::Duration::from_secs(1)));
+        let cookie = format!("her_browser_{}_{}={}", BROWSER_FIXTURE_PORT, URL_SAFE_NO_PAD.encode(digest), URL_SAFE_NO_PAD.encode(id));
+        (root, context, cookie, digest, prior)
+    }
+
+    fn browser_request(method: &str, path: &str, cookie: &str, body: Option<Value>) -> Request {
+        let mut request = req(method, path, None);
+        request.headers.extend([
+            ("host".into(), crate::console_auth::canonical_host(BROWSER_FIXTURE_PORT)),
+            ("origin".into(), crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT)),
+            ("sec-fetch-site".into(), "same-origin".into()),
+            ("content-type".into(), "application/json; charset=utf-8".into()),
+            ("cookie".into(), cookie.into()),
+        ]);
+        request.body = body.map(|value| value.to_string()).unwrap_or_default();
+        request
+    }
+
+    fn browser_reply(context: &RuntimeContext, req: &Request) -> ConsoleResponse {
+        serve_request(req, &json!({}), context, BROWSER_FIXTURE_PORT)
+    }
+
+    fn browser_last_used(root: &FixtureRoot, digest: [u8; 32]) -> i64 {
+        crate::settings::StoreProbe::at(&root.0).open().query_row(
+            "SELECT last_used_ms FROM console_browser_sessions WHERE id_digest=?",
+            [digest.as_slice()], |row| row.get(0),
+        ).unwrap()
+    }
+
+    #[test]
+    fn browser_admission_cannot_be_granted_by_router_retry() {
+        let (root, context, cookie, digest, last) = browser_fixture("front read unavailable");
+        let mut request = browser_request("POST", "/api/settings/set", &cookie, Some(json!({"setting":"reply.wakeQuietMs","value":4000})));
+        request.headers.insert("origin".into(), "http://localhost:3999".into());
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        FRONT_READ_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            observed.set(observed.get() + 1);
+            observed.get() == 1
+        })));
+        let result = browser_reply(&context, &request);
+        FRONT_READ_HOOK.with(|hook| hook.borrow_mut().take());
+        assert_eq!(result.status, 503, "a front failure must refuse the request before later reads");
+        assert_eq!(count.get(), 1);
+        assert!(result.cookies.is_empty());
+        assert_eq!(browser_last_used(&root, digest), last);
+        assert!(!root.0.join("data/audit/audit.jsonl").exists());
+        assert_eq!(crate::settings::StoreProbe::at(&root.0).audit_count(), 0);
+    }
+
+    #[test]
+    fn browser_writes_require_exact_origin() {
+        let (root, context, cookie, digest, last) = browser_fixture("browser exact origin");
+        let mut request = browser_request("POST", "/api/settings/set", &cookie, Some(json!({"setting":"reply.wakeQuietMs","value":4000})));
+        request.headers.insert("origin".into(), "http://localhost:3999".into());
+        let result = browser_reply(&context, &request);
+        assert_eq!(result.status, 403, "alias origins must refuse browser writes");
+        assert!(result.cookies.is_empty());
+        assert_eq!(browser_last_used(&root, digest), last);
+    }
+
+    #[test]
+    fn cookie_memory_acl_get_never_mutates_or_touches_session() {
+        let (root, context, cookie, digest, last) = browser_fixture("browser memory method");
+        let list = || {
+            let (_, value) = admin_request(&context, "GET", "/api/memory/acl", None);
+            // The ACL list is compared independently of the session database.
+            value["acl"].clone()
+        };
+        let baseline = list();
+        assert!(baseline.is_array());
+        for action in ["grant", "revoke"] {
+            let fields = json!({"action":action,"readerType":"session","readerId":"private:7001","readType":"*","readId":"*"});
+            let mut query = browser_request("GET", "/api/memory/acl", &cookie, None);
+            query.query.insert("action".into(), action.into());
+            assert_eq!(browser_reply(&context, &query).status, 400, "cookie GET ACL query must be refused");
+            let request = browser_request("GET", "/api/memory/acl", &cookie, Some(fields.clone()));
+            assert_eq!(browser_reply(&context, &request).status, 405, "cookie GET ACL body must be refused");
+            let mut post = browser_request("POST", "/api/memory/acl", &cookie, Some(fields));
+            post.headers.remove("origin");
+            assert_eq!(browser_reply(&context, &post).status, 403, "ACL POST must require Origin");
+            post.headers.insert("origin".into(), "http://localhost:3999".into());
+            assert_eq!(browser_reply(&context, &post).status, 403, "ACL POST must require the exact origin");
+            post.headers.insert("origin".into(), crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT));
+            post.headers.insert("content-type".into(), "text/application/json".into());
+            assert_eq!(browser_reply(&context, &post).status, 415, "ACL POST must require a JSON media type");
+            assert_eq!(list(), baseline);
+            assert_eq!(browser_last_used(&root, digest), last);
+        }
+        for action in ["grant", "revoke"] {
+            let fields = json!({"action":action,"readerType":"session","readerId":"private:7001","readType":"*","readId":"*"});
+            let request = browser_request("POST", "/api/memory/acl", &cookie, Some(fields));
+            assert_eq!(browser_reply(&context, &request).status, 200);
+        }
+        assert_eq!(list(), baseline);
+    }
+
+    #[test]
+    fn browser_authority_rechecked_at_each_writer_gate() {
+        let writes = [
+            ("/api/settings/set", json!({"setting":"reply.wakeQuietMs","value":4000})),
+            ("/api/whitelist", json!({"confirm":true,"allow":{"groups":[7001]}})),
+            ("/api/security", json!({"confirm":true,"outboundGuard":false})),
+            ("/api/security", json!({"rehardenStateDir":true})),
+            ("/api/console/token", json!({"token":"fixture-chosen-console-token"})),
+            ("/api/memory/acl", json!({"action":"grant","readerId":"private:7001"})),
+            ("/api/schedule/system:backup/pause", json!({"confirm":true})),
+        ];
+        for (path, body) in writes {
+            let (root, context, cookie, _, _) = browser_fixture("browser revoked at gate");
+            let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+            let context_for_cut = context.clone();
+            AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let _gate = config_gate(&context_for_cut).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context_for_cut).unwrap();
+            })));
+            let writer = if body["rehardenStateDir"] == true { "hardening" } else { "settings or mutation" };
+            let request = browser_request("POST", path, &cookie, Some(body));
+            let result = browser_reply(&context, &request);
+            assert_eq!(result.status, 401, "{path} must recheck the admitted proof at its writer gate ({writer})");
+            assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before);
+            assert!(!root.0.join("data/console-token").exists());
+            assert!(!root.0.join("data/schedule.json").exists());
+            assert_eq!(crate::settings::StoreProbe::at(&root.0).audit_count(), 0);
+        }
+    }
+
+    #[test]
+    fn rotation_revokes_every_browser_even_when_token_is_reused() {
+        let (_root, context, cookie, _, _) = browser_fixture("browser same token rotation");
+        let request = browser_request("GET", "/api/status", &cookie, None);
+        assert_eq!(browser_reply(&context, &request).status, 200);
+        let (status, _) = admin_request(&context, "POST", "/api/console/token", Some(&json!({"token":BROWSER_FIXTURE_TOKEN})));
+        assert_eq!(status, 200);
+        assert_eq!(browser_reply(&context, &request).status, 401, "same-value rotation must end every old session");
+        let alternate = "fixture-other-machine-token";
+        for token in [alternate, BROWSER_FIXTURE_TOKEN] {
+            let (status, _) = admin_request(&context, "POST", "/api/console/token", Some(&json!({"token":token})));
+            assert_eq!(status, 200);
+        }
+        assert_eq!(browser_reply(&context, &request).status, 401, "returning to an old token must never restore its sessions");
+    }
+
+    #[test]
+    fn scheduled_http_run_cannot_start_after_revocation() {
+        for path in ["/api/schedule/system:backup/run", "/api/tasks/backup/run"] {
+            let (root, context, cookie, _, _) = browser_fixture("browser revoked after task claim");
+            let (entered, before_start) = std::sync::mpsc::channel();
+            let (release, revoked) = std::sync::mpsc::channel();
+            let revoked = std::sync::Mutex::new(revoked);
+            crate::supervisor::TASK_ADMISSION_TEST.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = entered.send(());
+                let _ = revoked.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            })));
+            let request = browser_request("POST", path, &cookie, Some(json!({"confirm":true,"requestId":"fixture-browser-task"})));
+            let response = browser_reply(&context, &request);
+            assert_eq!(response.status, 202, "{path}: {}", response.body);
+            let receipt: Value = serde_json::from_str(&response.body).unwrap();
+            let run = receipt["runId"].as_str().unwrap();
+            before_start.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            {
+                let _gate = config_gate(&context).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context).unwrap();
+            }
+            release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completed = loop {
+                let (_, value) = admin_request(&context, "GET", &format!("/api/tasks/runs/{run}"), None);
+                if value["run"]["endedAt"].is_i64() { break value; }
+                assert!(std::time::Instant::now() < deadline, "task did not reach a terminal receipt: {value}");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            };
+            assert_eq!(completed["run"]["state"], "cancelled", "revoked HTTP task must be cancelled before running");
+            assert!(completed["run"]["startedAt"].is_null());
+            assert!(!root.0.join("data/backups").exists());
+        }
+    }
+
+    fn cookie_pair(response: &ConsoleResponse) -> String {
+        response
+            .cookies
+            .iter()
+            .filter_map(|cookie| match cookie {
+                BrowserCookie::Renew { .. } => {
+                    let header = cookie.header();
+                    assert!(header.contains("HttpOnly"));
+                    assert!(header.contains("SameSite=Strict"));
+                    assert!(header.contains("Path=/"));
+                    assert!(header.contains("Max-Age=604800"));
+                    header.split(';').next().map(str::to_string)
+                }
+                BrowserCookie::Delete { .. }
+                | BrowserCookie::LegacyPage { .. }
+                | BrowserCookie::LegacyPageDelete { .. } => None,
+            })
+            .next()
+            .expect("expected a Renew browser cookie")
+    }
+
+    fn post_browser_auth(path: &str, cookie: Option<&str>, body: Value) -> Request {
+        browser_request("POST", path, cookie.unwrap_or(""), Some(body))
+    }
+
+    #[test]
+    fn auth_first_run_sets_password_issues_cookie_and_rejects_second_attempt() {
+        let (root, context) = fixture_runtime("auth first-run route", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let config_before = std::fs::read(root.0.join("config/config.json")).unwrap();
+
+        let status_before = browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None));
+        assert_eq!(status_before.status, 200);
+        let status_json: Value = serde_json::from_str(&status_before.body).unwrap();
+        assert_eq!(status_json["passwordSet"], false);
+        assert_eq!(status_json["authenticated"], false);
+
+        let bad_token = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": "wrong-token", "password": "初始管理员密码1"}),
+            ),
+        );
+        assert_eq!(bad_token.status, 401);
+
+        let short_pw = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": "shortpw"}),
+            ),
+        );
+        assert_eq!(short_pw.status, 400);
+
+        let secret_pw = "初始管理员密码-first-run";
+        let ok = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": secret_pw}),
+            ),
+        );
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        let cookie = cookie_pair(&ok);
+
+        assert_eq!(
+            browser_reply(&context, &browser_request("GET", "/api/status", &cookie, None)).status,
+            200
+        );
+        let status_after: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", &cookie, None)).body,
+        )
+        .unwrap();
+        assert_eq!(status_after["passwordSet"], true);
+        assert_eq!(status_after["authenticated"], true);
+        assert_eq!(status_after["authKind"], "browser");
+
+        let second = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": "另一个密码1234"}),
+            ),
+        );
+        assert_eq!(second.status, 409);
+
+        assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), config_before);
+        let history = probe.audit_rows();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["old"], "\"(hidden)\"");
+        assert_eq!(history[0]["new"], "\"(hidden)\"");
+        assert!(!history[0].to_string().contains(secret_pw));
+    }
+
+    #[test]
+    fn auth_login_logout_and_agent_isolation() {
+        let (root, context) = fixture_runtime("auth login logout", BROWSER_FIXTURE_TOKEN);
+        let pw = "测试登录密码-99";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            serde_json::to_vec(&json!({"conversations":{"private:7001":{"agentToken":"agent-tok-1"}}})).unwrap(),
+        )
+        .unwrap();
+
+        let mut cross = post_browser_auth("/api/auth/login", None, json!({"password": pw}));
+        cross.headers.insert("origin".into(), "http://localhost:3999".into());
+        assert_eq!(browser_reply(&context, &cross).status, 403);
+
+        let login1 = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(login1.status, 200, "{}", login1.body);
+        let cookie1 = cookie_pair(&login1);
+
+        let login2 = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(login2.status, 200, "{}", login2.body);
+        let cookie2 = cookie_pair(&login2);
+
+        for (method, path) in [
+            ("GET", "/api/auth/status"),
+            ("POST", "/api/auth/login"),
+            ("POST", "/api/auth/first-run"),
+            ("POST", "/api/auth/logout"),
+            ("POST", "/api/auth/change-password"),
+            ("GET", "/api/auth/sessions"),
+            ("POST", "/api/auth/sessions/revoke"),
+        ] {
+            let mut agent_req = browser_request(method, path, &cookie1, Some(json!({})));
+            agent_req.headers.insert("x-agent-token".into(), "agent-tok-1".into());
+            assert_eq!(browser_reply(&context, &agent_req).status, 403, "agent denied on {method} {path}");
+        }
+
+        let logout = browser_reply(&context, &post_browser_auth("/api/auth/logout", Some(&cookie1), json!({})));
+        assert_eq!(logout.status, 200);
+        assert!(logout.cookies.iter().any(|c| matches!(c, BrowserCookie::Delete { .. })));
+
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 200);
+    }
+
+    #[test]
+    fn auth_login_throttle_backs_off_after_five_failures_and_clears_on_success_or_reset() {
+        let (root, context) = fixture_runtime("auth throttle backoff", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let pw = "正确登录密码-42";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        assert_eq!(crate::console_auth::throttle_delay_ms(4), 0);
+        assert_eq!(crate::console_auth::throttle_delay_ms(5), 60_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(6), 120_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(7), 240_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(8), 480_000);
+        assert_eq!(crate::console_auth::throttle_delay_ms(9), crate::console_auth::THROTTLE_MAX_MS);
+        assert_eq!(
+            crate::console_auth::throttle_delay_ms(12),
+            crate::console_auth::THROTTLE_MAX_MS
+        );
+
+        for attempt in 1..=4 {
+            let resp = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+            assert_eq!(resp.status, 401);
+            let body: Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["consecutiveFailures"], attempt);
+            assert_eq!(body["retryAfterMs"], 0);
+        }
+
+        let fifth = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+        assert_eq!(fifth.status, 401);
+        let fifth_json: Value = serde_json::from_str(&fifth.body).unwrap();
+        assert_eq!(fifth_json["consecutiveFailures"], 5);
+        assert_eq!(fifth_json["retryAfterMs"], 60_000);
+        assert_eq!(fifth_json["retryAfterSeconds"], 60);
+
+        let throttled = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(throttled.status, 429, "valid password during throttle must still wait: {}", throttled.body);
+        let throttled_json: Value = serde_json::from_str(&throttled.body).unwrap();
+        assert_eq!(throttled_json["consecutiveFailures"], 5);
+        assert!(throttled_json["retryAfterMs"].as_i64().unwrap() > 0);
+
+        let far_future = crate::parity_clock::now_ms() + 3_600_000;
+        probe.edit(&format!("UPDATE console_auth_state SET deadline_ms={far_future} WHERE id=1;"));
+        let status_clamped: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert!(
+            status_clamped["retryAfterMs"].as_i64().unwrap()
+                <= crate::console_auth::THROTTLE_MAX_MS
+        );
+
+        probe.edit("UPDATE console_auth_state SET deadline_ms=1 WHERE id=1;");
+        let sixth = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+        assert_eq!(sixth.status, 401);
+        let sixth_json: Value = serde_json::from_str(&sixth.body).unwrap();
+        assert_eq!(sixth_json["consecutiveFailures"], 6);
+        assert_eq!(sixth_json["retryAfterMs"], 120_000);
+
+        probe.edit("UPDATE console_auth_state SET deadline_ms=1 WHERE id=1;");
+        let success = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(success.status, 200, "{}", success.body);
+        let after_ok: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert_eq!(after_ok["consecutiveFailures"], 0);
+        assert_eq!(after_ok["retryAfterMs"], 0);
+
+        let cookie = cookie_pair(&success);
+        let far_future_reset = crate::parity_clock::now_ms() + 3_600_000;
+        probe.edit(&format!("UPDATE console_auth_state SET consecutive_failures=5, deadline_ms={far_future_reset} WHERE id=1;"));
+        {
+            let _gate = config_gate(&context).unwrap();
+            crate::console_auth::reset_administrator_password(&context).unwrap();
+        }
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie, None)).status, 401);
+        let after_reset: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert_eq!(after_reset["passwordSet"], false);
+        assert_eq!(after_reset["consecutiveFailures"], 0);
+        assert_eq!(after_reset["retryAfterMs"], 0);
+    }
+
+    #[test]
+    fn auth_login_clamps_clock_rollback_throttle_in_store_and_ignores_stale_cookie() {
+        let (root, context) = fixture_runtime("auth rollback clamp and stale cookie", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let pw = "回拨夹紧密码-88";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        let initial_login = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(initial_login.status, 200);
+        let stale_cookie = cookie_pair(&initial_login);
+        {
+            let _gate = config_gate(&context).unwrap();
+            crate::console_auth::revoke_browser_sessions(&context).unwrap();
+        }
+        let relogin = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/login", Some(&stale_cookie), json!({"password": pw})),
+        );
+        assert_eq!(relogin.status, 200, "revoked prior cookie must not block valid password login: {}", relogin.body);
+        let fresh_cookie = cookie_pair(&relogin);
+        assert_ne!(fresh_cookie, stale_cookie);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &fresh_cookie, None)).status, 200);
+
+        let rollback_deadline = crate::parity_clock::now_ms() + 2 * 60 * 60 * 1000;
+        probe.edit(&format!("UPDATE console_auth_state SET consecutive_failures=5, deadline_ms={rollback_deadline} WHERE id=1;"));
+
+        let throttled = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(throttled.status, 429, "{}", throttled.body);
+        let throttled_json: Value = serde_json::from_str(&throttled.body).unwrap();
+        assert!(
+            throttled_json["retryAfterMs"].as_i64().unwrap()
+                <= crate::console_auth::THROTTLE_MAX_MS
+        );
+
+        let clamped_deadline: i64 = probe
+            .open()
+            .query_row("SELECT deadline_ms FROM console_auth_state WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            clamped_deadline
+                <= crate::parity_clock::now_ms() + crate::console_auth::THROTTLE_MAX_MS,
+            "stored rollback deadline {clamped_deadline} must be clamped within 15 minutes"
+        );
+
+        let past_fifteen_min = clamped_deadline - crate::console_auth::THROTTLE_MAX_MS - 1;
+        probe.edit(&format!("UPDATE console_auth_state SET deadline_ms={past_fifteen_min} WHERE id=1;"));
+        let recovered = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(recovered.status, 200, "login must succeed once 15-minute clamped window elapses: {}", recovered.body);
+        let _ = cookie_pair(&recovered);
+    }
+
+    #[test]
+    fn auth_change_password_returns_401_when_session_revoked_under_gate() {
+        let (_root, context) = fixture_runtime("auth change password revoked", BROWSER_FIXTURE_TOKEN);
+        let old_pw = "改密撤销测试-1";
+        let new_pw = "改密撤销测试-2";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, old_pw, "administrator").unwrap();
+        let cookie = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+
+        let context_for_cut = context.clone();
+        AFTER_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _gate = config_gate(&context_for_cut).unwrap();
+                crate::console_auth::revoke_browser_sessions(&context_for_cut).unwrap();
+            }));
+        });
+        let revoked = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie),
+                json!({"currentPassword": old_pw, "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(revoked.status, 401, "revoked proof at writer gate must return 401: {}", revoked.body);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))).status, 200);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": new_pw}))).status, 401);
+    }
+
+    #[test]
+    fn auth_change_password_rotates_current_session_and_ends_others() {
+        let (root, context) = fixture_runtime("auth change password", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let old_pw = "原始密码-alpha";
+        let new_pw = "更新密码-omega";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, old_pw, "administrator").unwrap();
+
+        let cookie1 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+        let cookie2 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+
+        let wrong = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie1),
+                json!({"currentPassword": "wrong-current-password", "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(wrong.status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 200);
+
+        let changed = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie1),
+                json!({"currentPassword": old_pw, "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(changed.status, 200, "{}", changed.body);
+        assert!(changed.cookies.iter().any(|c| matches!(c, BrowserCookie::Delete { .. })));
+        let rotated_cookie = cookie_pair(&changed);
+        assert_ne!(rotated_cookie, cookie1);
+
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &rotated_cookie, None)).status, 200);
+
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))).status, 401);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": new_pw}))).status, 200);
+
+        let rows = probe.audit_rows();
+        let last = rows.last().unwrap();
+        assert_eq!(last["source"], "change-password");
+        assert_eq!(last["old"], "\"(hidden)\"");
+        assert_eq!(last["new"], "\"(hidden)\"");
+        assert!(!last.to_string().contains(old_pw) && !last.to_string().contains(new_pw));
+    }
+
+    #[test]
+    fn auth_sessions_list_and_revoke_single_or_others() {
+        let (_root, context) = fixture_runtime("auth sessions manage", BROWSER_FIXTURE_TOKEN);
+        let pw = "会话管理密码-77";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        let cookie1 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+        let cookie2 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+        let cookie3 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+
+        let listed = browser_reply(&context, &browser_request("GET", "/api/auth/sessions", &cookie1, None));
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        let sessions: Value = serde_json::from_str(&listed.body).unwrap();
+        let items = sessions["sessions"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items.iter().filter(|item| item["current"] == true).count(), 1);
+        let other_id = items
+            .iter()
+            .find(|item| item["current"] == false)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let revoke_one = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/sessions/revoke", Some(&cookie1), json!({"id": other_id})),
+        );
+        assert_eq!(revoke_one.status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&revoke_one.body).unwrap()["revoked"], 1);
+
+        let revoke_others = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/sessions/revoke", Some(&cookie1), json!({"others": true})),
+        );
+        assert_eq!(revoke_others.status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie3, None)).status, 401);
+
+        {
+            let _gate = config_gate(&context).unwrap();
+            let origin = crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT);
+            let digest = crate::console_auth::credential_digest(BROWSER_FIXTURE_TOKEN);
+            for _ in 0..crate::console_auth::MAX_BROWSER_SESSIONS {
+                crate::console_auth::issue_browser_session(&context, &origin, digest).unwrap();
+            }
+        }
+        let newest = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(newest.status, 200);
+        let newest_cookie = cookie_pair(&newest);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        let capped: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/sessions", &newest_cookie, None)).body,
+        )
+        .unwrap();
+        assert_eq!(
+            capped["sessions"].as_array().unwrap().len(),
+            crate::console_auth::MAX_BROWSER_SESSIONS
+        );
     }
 
     fn cfg() -> Value {
@@ -15075,7 +13355,7 @@ mod tests {
 
     use crate::runtime::tests::{runtime_fixture, FixtureRoot};
 
-    fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
+    pub(super) fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
         fixture_runtime_with_dsh(label, token, "http://127.0.0.1:49101")
     }
 
@@ -15304,7 +13584,7 @@ mod tests {
         let after = load_social_state_for(&context).unwrap()["conversations"][HF94_KEY].clone();
         assert_eq!(after["wakeConfig"], before["wakeConfig"], "window end keeps the wake config");
         assert_eq!(after["unread"].as_array().unwrap().len(), chatter.len(), "offered chatter is not acknowledged");
-        assert!(crate::wake::pre_sleep_remaining(&after, &config, now_ms()).is_none(), "closing tools are not refused after the window");
+        assert!(crate::wake::pre_sleep_remaining(&after, &config, HF94_KEY, now_ms()).is_none(), "closing tools are not refused after the window");
     }
 
     /// Review fix 1(b): an engaged wait that uses the last slot ends the turn as a clean sleep.
@@ -16170,9 +14450,9 @@ mod tests {
         record_reserved2_incoming(&context, &config, HF94_KEY, "late-after-cap",
             json!({"text":"new question","time":now_ms(),"isSelf":false})).unwrap();
         let (status, blocked) = agent::wake_config(&context, &config, &headers, &closing);
-        assert_eq!(status, 200, "exhausted closure must have a bounded re-wake escape: {blocked}");
-        assert_eq!(blocked["wakeConfig"]["infinite"], false);
-        assert_eq!(blocked["wakeConfig"]["sleepUntil"], crate::sticker::iso_at(now_ms()+30_000));
+        assert_eq!(status, 200, "exhausted turns may configure closure without another observation: {blocked}");
+        assert_eq!(blocked["wakeConfig"]["infinite"], true);
+        assert!(blocked["wakeConfig"]["sleepUntil"].is_null());
         assert_eq!(blocked["nextAction"], "end_turn");
         assert!(!blocked.to_string().contains("qq_wait_for_messages(timeoutMs="), "exhausted turns must not be instructed to wait again: {blocked}");
         turn.end("completed", "hf94").unwrap();
@@ -16197,7 +14477,7 @@ mod tests {
     }
 
     #[test]
-    fn hf123_exhausted_wait_names_exact_exit_and_allows_short_rewake_closure() {
+    fn hf123_exhausted_wait_names_exact_exit_and_preserves_wake_policy() {
         const HF94_KEY: &str = "group:94104";
         for tool in ["mark_read", "wake_config"] {
             let (_root, context, config, headers) = hf94_wait_fixture_for_key(HF94_KEY, json!({"minMs":100,"maxPerTurn":1}));
@@ -16218,9 +14498,8 @@ mod tests {
                 else { agent::wake_config(&context, &config, &headers, &closing) };
             assert_eq!(status, 200, "{tool}: {result}");
             assert_eq!(result["nextAction"], "end_turn");
-            assert_eq!(result["wakeConfig"]["infinite"], false);
-            let until = result["wakeConfig"]["sleepUntil"].as_str().unwrap();
-            assert_eq!(until, crate::sticker::iso_at(now_ms()+30_000));
+            assert_eq!(result["wakeConfig"]["infinite"], true);
+            assert!(result["wakeConfig"]["sleepUntil"].is_null());
             let state = load_social_state_for(&context).unwrap();
             assert_eq!(state["conversations"][HF94_KEY]["unread"].as_array().unwrap().len(), 1, "unoffered messages are not acknowledged");
         }
@@ -16260,7 +14539,7 @@ mod tests {
         assert_eq!(handle_wait_post(&reopened, &config, &headers, &request).unwrap()["waitCallsUsed"], 4,
             "closeout must not replenish the exhausted fallback budget");
         let before = load_social_state_for(&reopened).unwrap();
-        begin_legacy_wait_turn(&reopened, HF94_KEY).unwrap();
+        crate::social_state::begin_legacy_wait_turn(&reopened, HF94_KEY).unwrap();
         let mut after = load_social_state_for(&reopened).unwrap();
         assert!(!after["conversations"][HF94_KEY]["waitTurnId"].as_str().unwrap().is_empty());
         after["conversations"][HF94_KEY].as_object_mut().unwrap().remove("waitTurnId");
@@ -16835,8 +15114,18 @@ mod tests {
 
     #[test]
     fn ticket219_core_console_guards_credential_paths() {
-        let action = include_str!("console.rs").split_once("pub(crate) fn settings_action(").unwrap().1.split_once("/// `/api/tokens/by-provider`").unwrap().0;
-        assert!(action.contains("if setting_is_secret(&path) {") && action.contains("context.is_isolated() && !setting_is_secret(&path)"), "console credential path guard is missing");
+        let action = include_str!("config_tx.rs")
+            .split_once("pub(crate) fn settings_action(")
+            .unwrap()
+            .1
+            .split_once("/// Chat settings transaction")
+            .unwrap()
+            .0;
+        assert!(
+            action.contains("if setting_is_secret(&path) {")
+                && action.contains("context.is_isolated() && !setting_is_secret(&path)"),
+            "console credential path guard is missing"
+        );
     }
 
     #[test]
@@ -16851,8 +15140,8 @@ mod tests {
                 Some(value) => config["webSearch"]["apiKey"] = json!(value),
                 None => { config["webSearch"].as_object_mut().unwrap().remove("apiKey"); }
             }
-            let written = write_selected_config_text(&context, &config.to_string());
-            let _ = take_config_writes();
+            let written =
+                crate::config_tx::write_selected_config_text(&context, &config.to_string());
             assert!(written.is_ok(), "console rejected a change to the legacy search literal");
             let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(raw.pointer("/webSearch/apiKey").and_then(Value::as_str), expected, "console restored the legacy search literal");
@@ -16866,8 +15155,7 @@ mod tests {
         let current = std::fs::read_to_string(&path).unwrap();
         assert!(!current.contains("\"backup\""));
         let text = format!("\u{feff}{}\n", current.replace("fixture-model", "fixture-model-bom"));
-        let written = write_selected_config_text(&context, &text);
-        let _ = take_config_writes();
+        let written = crate::config_tx::write_selected_config_text(&context, &text);
         written.expect("a BOM-prefixed config without backup settings must be writable");
         assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "written byte-for-byte");
         assert_eq!(context.load_config().unwrap()["dsh"]["model"], "fixture-model-bom");
@@ -16883,7 +15171,7 @@ mod tests {
         let mut config: Value = serde_json::from_slice(&context.read_file(RuntimeArea::Config, "config.json").unwrap()).unwrap();
         config["socialV2"] = json!({"wake": {"batchWindowMs": 6000}});
         context.write_atomic(RuntimeArea::Config, "config.json", config.to_string().as_bytes()).unwrap();
-        refresh_default_wake_configs(&context).unwrap();
+        crate::config_tx::refresh_default_wake_configs(&context).unwrap();
         let state = context.read_social_state().unwrap();
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["batchWindowMs"], 6000, "refreshed from the request, not from the config under the gate");
     }
@@ -17145,7 +15433,7 @@ mod tests {
                 let Ok((stream, _)) = listener.accept() else {
                     break;
                 };
-                handle_conn(stream, cfg.clone(), context.clone());
+                handle_conn(stream, cfg.clone(), context.clone(), std::sync::Arc::new(std::sync::Mutex::new(true)));
             }
         });
         (port, server)
@@ -17638,6 +15926,19 @@ mod tests {
         agent_token: Option<&str>,
         body: Option<&str>,
     ) -> (u16, Value) {
+        let host = format!("127.0.0.1:{port}");
+        http_json_with_host(port, &host, method, path, token, agent_token, body)
+    }
+
+    fn http_json_with_host(
+        port: u16,
+        host: &str,
+        method: &str,
+        path: &str,
+        token: &str,
+        agent_token: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, Value) {
         let body = body.unwrap_or("");
         let agent_header = agent_token
             .map(|value| format!("x-agent-token: {value}\r\n"))
@@ -17647,7 +15948,7 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-console-token: {token}\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-console-token: {token}\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.as_bytes().len()
         );
         stream.write_all(request.as_bytes()).unwrap();
@@ -17689,7 +15990,7 @@ mod tests {
                     Err(error) => return Err(format!("accept console fixture request: {error}")),
                 }
             };
-            handle_conn(stream, cfg, context);
+            handle_conn(stream, cfg, context, std::sync::Arc::new(std::sync::Mutex::new(true)));
             Ok(())
         });
         (port, server)
@@ -18094,7 +16395,7 @@ mod tests {
         let legacy_token = legacy_cfg["consoleToken"].as_str().unwrap().to_string();
         let mut legacy_create = req("POST", "/api/roles/create", Some(&legacy_token));
         legacy_create.body = "null".to_string();
-        let (status, _, body) = route_with_context(&legacy_create, &legacy_cfg, &legacy);
+        let (status, _, body) = route_test(&legacy_create, &legacy_cfg, &legacy);
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             (status, response["error"].as_str()),
@@ -18103,7 +16404,7 @@ mod tests {
         );
 
         legacy_create.body = " \r\n\t".to_string();
-        let (status, _, body) = route_with_context(&legacy_create, &legacy_cfg, &legacy);
+        let (status, _, body) = route_test(&legacy_create, &legacy_cfg, &legacy);
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, 400);
         assert_eq!(
@@ -20627,7 +18928,7 @@ mod tests {
             "stickerSendPending":[{"id":"send", "time":now}],
             "stickerCollectPending":[{"id":"collect", "time":now}, {"id":"other", "time":now}]});
         let mut replacement = new_conversation(&context);
-        preserve_reset_sticker_liabilities(&previous, &mut replacement);
+        crate::social_state::preserve_reset_sticker_liabilities(&previous, &mut replacement);
         context.write_atomic(RuntimeArea::Data, "social-v2.json", serde_json::to_vec(&json!({"conversations":{(key):replacement}})).unwrap().as_slice()).unwrap();
         assert!(require_sticker_reservation(&context, key, "stickerSendPending", "send").is_err());
         assert!(require_sticker_reservation(&context, key, "stickerCollectPending", "collect").is_err());
@@ -22388,7 +20689,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(
             status, 401,
             "invalid query auth must reject before the memory handler's agent-token denial: {body}"
@@ -22431,7 +20732,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(
             status, 401,
             "missing console auth must reject before the memory handler's agent-token denial: {body}"
@@ -22473,7 +20774,7 @@ mod tests {
             "fixture-invalid-memory-agent".to_string(),
         );
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 403, "the nonempty agent header reaches the memory handler");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -22510,7 +20811,7 @@ mod tests {
             );
             assert!(!request.headers.contains_key("x-console-token"));
 
-            let (status, _, body) = route_with_context(&request, &config, &context);
+            let (status, _, body) = route_test(&request, &config, &context);
             assert_eq!(status, 403, "memory agent denial for {key}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -22551,7 +20852,7 @@ mod tests {
         request.headers.insert("x-agent-token".to_string(), agent_token.to_string());
         assert!(!request.headers.contains_key("x-console-token"));
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(result["count"], 0);
@@ -22574,7 +20875,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -22850,13 +21151,7 @@ mod tests {
         let (root_b, _context_b) = fixture_runtime("票据 03 静态资源 B", token_b);
 
         for (root, marker, agent) in [(&root_a, "selected-a", agent_a), (&root_b, "selected-b", agent_b)] {
-            std::fs::create_dir_all(root.0.join("resources/public")).unwrap();
             std::fs::create_dir_all(root.0.join("resources/audio/nested")).unwrap();
-            std::fs::write(
-                root.0.join("resources/public/console.html"),
-                format!("<!doctype html><title>{marker}</title>"),
-            )
-            .unwrap();
             std::fs::write(
                 root.0.join(format!("resources/audio/{marker}.mp3")),
                 b"mp3",
@@ -22904,13 +21199,23 @@ mod tests {
         let (port_a, server_a) = start_http_fixture(context_a, 10);
         let (port_b, server_b) = start_http_fixture(context_b, 9);
 
-        let (page_a_status, page_a) = http_json(port_a, "GET", "/", token_a, None);
-        let (page_b_status, page_b) = http_json(port_b, "GET", "/", token_b, None);
+        let host_a = crate::console_auth::canonical_host(port_a);
+        let host_b = crate::console_auth::canonical_host(port_b);
+        let (page_a_status, page_a) = http_json_with_host(port_a, &host_a, "GET", "/", token_a, None, None);
+        let (page_b_status, page_b) = http_json_with_host(port_b, &host_b, "GET", "/", token_b, None, None);
         assert_eq!(page_a_status, 200, "selected A page should be served: {page_a}");
         assert_eq!(page_b_status, 200, "selected B page should be served: {page_b}");
-        assert!(page_a["raw"].as_str().unwrap().contains("selected-a"));
+        assert!(page_a["raw"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("<!doctype html>"));
         assert!(!page_a["raw"].as_str().unwrap().contains("selected-b"));
-        assert!(page_b["raw"].as_str().unwrap().contains("selected-b"));
+        assert!(page_b["raw"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("<!doctype html>"));
         assert!(!page_b["raw"].as_str().unwrap().contains("selected-a"));
 
         assert_eq!(http_status_without_token(port_a, "/favicon.ico"), 204);
@@ -23085,6 +21390,111 @@ mod tests {
         assert_eq!(after["sendDelayMs"], json!(1234), "the acknowledged settings change survives");
         assert_eq!(after["slang"]["injectMax"], json!(5));
         drop(root);
+    }
+
+    #[test]
+    fn slang_config_ignores_retired_dsh_fields_and_preserves_legacy_load() {
+        let (root, context) = fixture_runtime("slang-legacy-config", "token-slang-cfg");
+        let config_path = root.0.join("config/config.json");
+        let mut stored: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        stored["slang"] = json!({
+            "injectMax": 6,
+            "learnerPreset": "qq-chat",
+            "workspaceTitle": "QQ 黑话学习",
+            "learnerBackend": "dsh"
+        });
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+        let reloaded = context.load_config().unwrap();
+        let view = handle_slang(&context, &reloaded, "");
+        assert_eq!(view["config"]["injectMax"], json!(6));
+        for retired in ["learnerPreset", "workspaceTitle", "learnerBackend"] {
+            assert!(
+                view["config"].get(retired).is_none(),
+                "GET /api/slang must omit retired field {retired}"
+            );
+        }
+
+        let updated = handle_slang_config(
+            &context,
+            &json!({
+                "injectMax": 9,
+                "learnerPreset": "custom-preset",
+                "workspaceTitle": "Custom Title",
+                "learnerBackend": "custom-backend"
+            })
+            .to_string(),
+        )
+        .expect("legacy keys in request should be safely ignored");
+        assert_eq!(updated["ok"], json!(true));
+        assert_eq!(updated["config"]["injectMax"], json!(9));
+        for retired in ["learnerPreset", "workspaceTitle", "learnerBackend"] {
+            assert!(
+                updated["config"].get(retired).is_none(),
+                "POST /api/slang/config must omit retired field {retired}"
+            );
+        }
+        let persisted = context.load_config().unwrap();
+        assert_eq!(persisted["slang"]["injectMax"], json!(9));
+        assert_eq!(persisted["slang"]["learnerBackend"], json!("dsh"));
+        drop(root);
+    }
+
+    #[test]
+    fn handle_slang_extract_requires_runtime_context_and_isolates_state() {
+        let (_root_a, ctx_a) = fixture_runtime("slang-extract-a", "token-extract-a");
+        let (_root_b, ctx_b) = fixture_runtime("slang-extract-b", "token-extract-b");
+        let c = cfg();
+        let learner_a = crate::slang_learn::SlangLearning::new(&ctx_a);
+        assert!(learner_a.feed_window("group:7002", "Alice", "yyds"));
+        let body = json!({ "key": "group:7002", "dryRun": true }).to_string();
+
+        let res_a = handle_slang_extract(&ctx_a, &body, &c).unwrap();
+        let res_b = handle_slang_extract(&ctx_b, &body, &c).unwrap();
+        assert_eq!(res_a["ok"], json!(true));
+        assert_eq!(res_a["messages"], json!(1));
+        assert_eq!(res_b["ok"], json!(true));
+        assert_eq!(res_b["messages"], json!(0));
+    }
+
+    #[test]
+    fn slang_handlers_use_internalized_store_locking() {
+        let (_root, context) = fixture_runtime("slang-internal-lock", "token-slang-lock");
+        let cfg = context.load_config().unwrap();
+        let added = handle_slang_add(
+            &context,
+            &json!({
+                "content": "yyds",
+                "meaning": "永远的神",
+                "status": "candidate"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let id = added["entry"]["id"].as_str().unwrap().to_string();
+        let confirmed = handle_slang_batch_confirm(
+            &context,
+            &json!({ "ids": [id.clone()] }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(confirmed["confirmedCount"], json!(1));
+
+        let patched = slang_item_action(
+            &context,
+            "PATCH",
+            &id,
+            &json!({ "usage": "夸人常用" }).to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(patched["entry"]["usage"], json!("夸人常用"));
+
+        let listed = handle_slang(&context, &cfg, "confirmed");
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+
+        let cleared = handle_slang_clear(&context, &json!({}).to_string()).unwrap();
+        assert_eq!(cleared["removedCount"], json!(1));
+        assert!(crate::slang::read_entries_locked(&context).unwrap().is_empty());
     }
 
     #[test]
@@ -23366,10 +21776,39 @@ mod tests {
 
     #[test]
     fn token_compare_is_length_safe() {
-        assert!(token_eq("abc", "abc"));
-        assert!(!token_eq("abc", "abd"));
-        assert!(!token_eq("abc", "abcd"));
-        assert!(!token_eq("", "a"));
+        assert!(credential_eq("abc", "abc"));
+        assert!(!credential_eq("abc", "abd"));
+        assert!(!credential_eq("abc", "abcd"));
+        assert!(!credential_eq("", "a"));
+    }
+
+    #[test]
+    fn console_credentials_require_nonempty_values() {
+        let (root, context) = fixture_runtime("console credentials missing", "fixture-raw-machine-proof");
+        let configured = json!({"consoleToken": "fixture-raw-machine-proof"});
+        let empty = json!({"consoleToken": ""});
+        let presented = req("GET", "/", Some("fixture-raw-machine-proof"));
+        let missing = req("GET", "/", Some(""));
+        assert!(authorized(&presented, &configured));
+        assert!(memory_console_authority(&presented.headers, &configured, &context));
+        assert!(front::token_supplied(&presented, "fixture-raw-machine-proof"));
+
+        let file = root.0.join("data/console-token");
+        for contents in [Some(""), None] {
+            match contents {
+                Some(text) => std::fs::write(&file, text).unwrap(),
+                None => std::fs::remove_file(&file).unwrap(),
+            }
+            let expected = context.effective_console_token(&empty);
+            assert!(expected.is_empty());
+            assert!(!authorized_in(&context, &missing, &empty), "selected raw auth must refuse missing proof");
+            assert!(!memory_console_authority(&missing.headers, &empty, &context), "empty memory header grants no authority");
+            assert!(
+                !front::token_supplied(&missing, &expected),
+                "desktop file proof requires two nonempty values"
+            );
+        }
+        assert!(!authorized(&missing, &empty), "legacy raw auth must refuse two empty credentials");
     }
 
     #[test]
@@ -23831,7 +22270,7 @@ mod tests {
             })
             .to_string();
             let (status, _, body) =
-                route_with_context(&request, &c, &RuntimeContext::legacy());
+                route_test(&request, &c, &RuntimeContext::legacy());
             assert_eq!(status, 401, "console auth must precede agent gates and allowlist checks");
             assert!(body.contains("未授权"));
         }
@@ -24762,7 +23201,9 @@ mod tests {
         for (path, body) in writes {
             let mut request = req("POST", path, Some(OLD));
             request.body = body.to_string();
-            let (status, _, response) = schedule_routes::route(&context, &front, &request);
+            let mut admitted = context.clone();
+            admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(OLD) });
+            let (status, _, response) = schedule_routes::route(front::AdminCaller::new(&admitted), &front, &request);
             assert_eq!(status, 401, "{path}: {response}");
         }
         assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
@@ -24770,7 +23211,9 @@ mod tests {
 
         let mut request = req("POST", "/api/schedule/system:backup/pause", Some(NEW));
         request.body = json!({"confirm": true}).to_string();
-        let (status, _, response) = schedule_routes::route(&context, &context.load_config().unwrap(), &request);
+        let mut admitted = context.clone();
+        admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(NEW) });
+        let (status, _, response) = schedule_routes::route(front::AdminCaller::new(&admitted), &context.load_config().unwrap(), &request);
         assert_eq!(status, 200, "{response}");
         assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
     }
@@ -25032,7 +23475,7 @@ mod tests {
                     first_release_rx
                         .recv_timeout(Duration::from_secs(2))
                         .expect("test must release the first state transaction");
-                    conversation["firstWriter"] = json!("committed");
+                    conversation.set_field("firstWriter", json!("committed"));
                     Ok(json!({ "ok": true }))
                 },
             );
@@ -25057,7 +23500,7 @@ mod tests {
                 "fixture_second_writer",
                 |conversation, _, _| {
                     second_entered_tx.send(()).unwrap();
-                    conversation["secondWriter"] = json!("committed");
+                    conversation.set_field("secondWriter", json!("committed"));
                     Ok(json!({ "ok": true }))
                 },
             );
@@ -26105,7 +24548,7 @@ mod tests {
         assert!(pending_admin_agent_gate_route(&request));
 
         request.headers.insert("x-agent-token".to_string(), String::new());
-        let (empty_status, _, empty_body) = route_with_context(&request, &cfg, &context);
+        let (empty_status, _, empty_body) = route_test(&request, &cfg, &context);
         assert_eq!(empty_status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&empty_body).unwrap()["error"],
@@ -26116,7 +24559,7 @@ mod tests {
             "x-agent-token".to_string(),
             "synthetic-agent".to_string(),
         );
-        let (agent_status, _, agent_body) = route_with_context(&request, &cfg, &context);
+        let (agent_status, _, agent_body) = route_test(&request, &cfg, &context);
         assert_eq!(agent_status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&agent_body).unwrap()["error"],
@@ -26128,7 +24571,7 @@ mod tests {
             "wrong-synthetic-console-token".to_string(),
         );
         let (wrong_console_status, _, wrong_console_body) =
-            route_with_context(&request, &cfg, &context);
+            route_test(&request, &cfg, &context);
         assert_eq!(
             wrong_console_status,
             401,
@@ -26141,7 +24584,7 @@ mod tests {
 
         request.headers.remove("x-console-token");
         let (unauthorized_status, _, unauthorized_body) =
-            route_with_context(&request, &cfg, &context);
+            route_test(&request, &cfg, &context);
         assert_eq!(
             unauthorized_status,
             401,
@@ -26390,7 +24833,7 @@ mod tests {
                 body_too_large: false,
             };
             assert!(social_agent_policy_route(&request));
-            let (status, _, body) = route_with_context(&request, &cfg, &context);
+            let (status, _, body) = route_test(&request, &cfg, &context);
             assert_eq!(status, 401, "console auth must precede query allowlist and sticker policy");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -27055,6 +25498,7 @@ mod tests {
     }
 
     mod memory_ticket17_tests { include!("memory_ticket17_tests.rs"); }
+    mod memory_ticket24_tests { include!("memory_ticket24_tests.rs"); }
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }

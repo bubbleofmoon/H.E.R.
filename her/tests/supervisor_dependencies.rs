@@ -244,6 +244,9 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         std::fs::write(folder.join("client-key"), "synthetic-relay-secret-80").unwrap();
         std::fs::write(folder.join("auth/login.json"), "synthetic-private-login").unwrap();
         std::fs::write(folder.join("mode"), mode).unwrap();
+        if mode == "scripted" {
+            std::fs::File::create(folder.join("probe-responses")).unwrap();
+        }
         let reservation = crate::support::ports::reserve();
         let port = reservation.port();
         std::fs::write(
@@ -390,6 +393,42 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+    fn relay_health(&self) -> Value {
+        let output = self
+            .command(&self.cli)
+            .args(["lifecycle", "assert-running", "--runtime-root"])
+            .arg(&self.root)
+            .output()
+            .unwrap();
+        let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+        verdict["parts"]["relay"].clone()
+    }
+    fn script_relay_probes(
+        &self,
+        folder: &std::path::Path,
+        statuses: &[u16],
+        mut after_probe: impl FnMut(usize),
+    ) {
+        let probes = folder.join("probes");
+        self.wait(|| count_lines(&probes) >= 1);
+        for (index, status) in statuses.iter().enumerate() {
+            reply_to_relay_probe(folder, status);
+            // The next request establishes that the prior pass has checkpointed its result.
+            self.wait(|| count_lines(&probes) >= index + 2);
+            after_probe(index + 1);
+        }
+    }
+    fn relay_refusal_log(&self) -> PathBuf {
+        self.root.join("data/logs/dependency-relay.err.log")
+    }
+    fn enable_alerts(&mut self) {
+        self.config["ownerQQ"] = json!(42);
+        std::fs::write(
+            self.root.join("config/config.json"),
+            self.config.to_string(),
+        )
+        .unwrap();
+    }
     fn fake_config(&self, folder: &str, field: &str, value: Value) {
         let path = self.root.join(folder).join("fixture.json");
         let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -433,6 +472,19 @@ impl Drop for Fixture {
     }
 }
 
+fn count_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).unwrap_or_default().lines().count()
+}
+
+fn reply_to_relay_probe(folder: &std::path::Path, response: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut responses = std::fs::OpenOptions::new()
+        .append(true)
+        .open(folder.join("probe-responses"))
+        .unwrap();
+    writeln!(responses, "{response}").unwrap();
+}
+
 #[cfg(feature = "parity-clock")]
 impl Fixture {
     fn clock(&self, now: i64) {
@@ -440,6 +492,34 @@ impl Fixture {
         let path = self.root.join("data/lifecycle/dependency-clock");
         std::fs::write(path.with_extension("tmp"), now.to_string()).unwrap();
         std::fs::rename(path.with_extension("tmp"), path).unwrap();
+    }
+    fn dependency_pause(&self, point: &str) {
+        let path = self.root.join("data/lifecycle/dependency-reconcile-pause");
+        std::fs::write(path.with_extension("tmp"), point).unwrap();
+        std::fs::rename(path.with_extension("tmp"), path).unwrap();
+    }
+    fn wait_dependency_pause(&self, point: &str) {
+        let path = self
+            .root
+            .join("data/lifecycle/dependency-reconcile-reached");
+        self.wait(|| std::fs::read_to_string(&path).is_ok_and(|value| value == point));
+    }
+    fn hold_dependency_gate(&self, name: &str) -> std::fs::File {
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join("data/lifecycle").join(name))
+            .unwrap();
+        gate.lock().unwrap();
+        gate
+    }
+    fn connect_dependency(&self, port: u16) -> std::io::Result<std::net::TcpStream> {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(50),
+        )
     }
     fn attempts(&self, folder: &str) -> usize {
         std::fs::read_to_string(self.root.join(folder).join("attempts"))
@@ -453,13 +533,13 @@ impl Fixture {
             .lines()
             .count()
     }
-    fn enable_alerts(&mut self) {
-        self.config["ownerQQ"] = json!(42);
-        std::fs::write(
-            self.root.join("config/config.json"),
-            self.config.to_string(),
-        )
-        .unwrap();
+    fn assert_one_relay_notice(&self) {
+        let reason = "relay models health request was refused";
+        let alerts = std::fs::read_to_string(self.root.join("snow/alerts")).unwrap_or_default();
+        assert_eq!(
+            alerts.lines().filter(|line| line.contains(reason)).count(),
+            1
+        );
     }
     fn crash_dsh(&self) {
         let instance = serde_json::from_value::<process_identity::ProcessIdentity>(
@@ -2363,12 +2443,10 @@ fn resolved_foreign_npx_entries_are_preserved_and_refused_only_on_the_selected_p
 }
 
 #[cfg(windows)]
-#[test]
-fn native_dependency_actions_serialize_with_the_runtime_mutex() {
-    let mut fixture = Fixture::new();
+fn hold_dependency_mutex(fixture: &Fixture, seconds: u32) -> Owned {
     let script = fixture.root.join("hold-mutex.ps1");
     std::fs::write(&script,r#"
-param($Root)
+param($Root, [int]$Seconds)
 $ErrorActionPreference='Stop'
 $sha=[Security.Cryptography.SHA256]::Create()
 try {$key=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Root).ToLowerInvariant()))).Replace('-','')}
@@ -2378,20 +2456,29 @@ $acquired=$mutex.WaitOne(0)
 if(-not $acquired){throw 'fixture mutex already held'}
 try {
  [IO.File]::WriteAllText((Join-Path $Root 'mutex-ready'),'ready')
- Start-Sleep -Seconds 4
+ Start-Sleep -Seconds $Seconds
 } finally {$mutex.ReleaseMutex();$mutex.Dispose()}
 "#).unwrap();
-    let mut holder = Owned::new(
+    let holder = Owned::new(
         hidden("powershell.exe")
             .args(["-NoProfile", "-File"])
             .arg(script)
             .arg(&fixture.root)
+            .arg(seconds.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
     fixture.wait(|| fixture.root.join("mutex-ready").exists());
+    holder
+}
+
+#[cfg(windows)]
+#[test]
+fn native_dependency_actions_serialize_with_the_runtime_mutex() {
+    let mut fixture = Fixture::new();
+    let mut holder = hold_dependency_mutex(&fixture, 4);
     fixture.start();
     fixture.wait(|| {
         std::fs::read_to_string(fixture.root.join("supervise.err"))
@@ -2704,6 +2791,442 @@ fn relay_readiness_gates_dsh_and_shared_health_without_exposing_secrets() {
             );
         }
     }
+}
+
+#[test]
+fn relay_reconciler_and_shared_health_use_the_same_probe_budget() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("slow");
+    fixture.start();
+    // The fourth request starts after three full reconciler probes have completed.
+    fixture.wait(|| count_lines(&folder.join("probes")) >= 4);
+    assert_eq!(
+        fixture.states()["relay"]["ready"],
+        true,
+        "reconciler must accept a relay response after a brief first-read stall"
+    );
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+    assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    assert_eq!(fixture.relay_health()["verdict"], "pass");
+
+    // The same probes must time out before a response that would fit the CLI's outer budget.
+    std::fs::write(folder.join("mode"), "late").unwrap();
+    assert_eq!(fixture.relay_health()["verdict"], "fail");
+    fixture.wait_for(Duration::from_secs(25), || {
+        fixture.states()["relay"]["state"] == "refused"
+    });
+    assert_eq!(
+        fixture.states()["relay"]["reason"],
+        "relay health response failed or timed out"
+    );
+}
+
+#[test]
+fn relay_alerts_only_on_the_third_consecutive_failed_probe() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    let reason = "relay models health request was refused";
+    let alerts = fixture.root.join("snow/alerts");
+    let relay_alerts = || {
+        std::fs::read_to_string(&alerts)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(reason))
+            .count()
+    };
+
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 503, 503, 503], |completed| {
+        let state = &fixture.states()["relay"];
+        assert_eq!(state["ready"], true);
+        if completed < 4 {
+            assert_ne!(
+                state["state"], "refused",
+                "the reconciler must wait for three failed relay probes"
+            );
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+            assert_eq!(relay_alerts(), 0);
+        } else {
+            assert_eq!(state["state"], "refused");
+            assert_eq!(state["reason"], reason);
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+            if completed == 4 {
+                fixture.wait(|| relay_alerts() == 1);
+            }
+            assert_eq!(relay_alerts(), 1);
+            // The notice limiter could also suppress a duplicate send. Count attempts too.
+            let log = std::fs::read_to_string(fixture.root.join("supervise.err")).unwrap();
+            assert_eq!(log.matches(&format!("[dependencies] {reason}")).count(), 1);
+        }
+    });
+}
+
+#[test]
+fn a_successful_relay_probe_resets_the_failure_streak() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 200, 503, 503], |completed| {
+        assert_ne!(
+            fixture.states()["relay"]["state"],
+            "refused",
+            "a success must reset the failed-probe streak (after probe {completed})"
+        );
+        assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+        assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    });
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_third_probe_failure_at_hang_threshold_alerts_before_backoff() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let probes = folder.join("probes");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| count_lines(&probes) == 1);
+    reply_to_relay_probe(&folder, "200 offline");
+    fixture.wait(|| {
+        let states = fixture.states();
+        let relay = &states["relay"];
+        offline.exists() && relay["ready"] == true && relay["refusalSince"] == epoch
+    });
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| count_lines(&probes) == 2);
+
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+    for failure in 1..=2 {
+        let now = epoch + failure * 1_000;
+        fixture.clock(now);
+        reply_to_relay_probe(&folder, "503 offline");
+        fixture.wait(|| fixture.states()["relay"]["timerAt"] == now);
+        assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+        fixture.clock(now + 1);
+        // The fixture closes before replying, so this later pass sees a refused connect.
+        fixture.wait(|| fixture.states()["relay"]["timerAt"] == now + 1);
+        if failure == 1 {
+            std::fs::remove_file(&offline).unwrap();
+            fixture.wait(|| count_lines(&probes) == 3);
+        }
+    }
+
+    fixture.clock(epoch + 119_999);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 119_999);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches
+    );
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| count_lines(&probes) == 4);
+
+    fixture.dependency_pause("relay before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    reply_to_relay_probe(&folder, "503 offline");
+    fixture.wait_dependency_pause("relay before-stop-lock");
+    assert_eq!(fixture.states()["relay"]["state"], "refused");
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+    assert_eq!(
+        fixture.alerts(),
+        1,
+        "the third failed probe must reach the administrator before backoff"
+    );
+    assert!(std::fs::read_to_string(fixture.root.join("snow/alerts"))
+        .unwrap()
+        .contains("relay models health request was refused"));
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture
+        .wait(|| process_identity::check_identity(&original) == process_identity::Liveness::Gone);
+    assert_eq!(fixture.states()["relay"]["restartAt"], epoch + 125_000);
+
+    // The replacement fails its first probe without any intervening successful probe.
+    std::fs::write(folder.join("probe-responses"), "503\n").unwrap();
+    std::fs::remove_file(offline).unwrap();
+    fixture.clock(epoch + 125_000);
+    fixture.wait(|| count_lines(&probes) == 6);
+    let relay = &fixture.states()["relay"];
+    assert_ne!(relay["identity"], json!(original));
+    assert_eq!(relay["relayProbeFailures"], 1);
+    assert_eq!(relay["state"], "started");
+    assert_eq!(fixture.alerts(), 1);
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_exit_after_third_failure_delivers_one_refusal() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+    let relay = serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    // Hold the completed third response until the fixture process is observably gone.
+    fixture.dependency_pause("relay after-failed-probe");
+    reply_to_relay_probe(&folder, "503 exit");
+    fixture.wait_dependency_pause("relay after-failed-probe");
+    fixture.wait(|| process_identity::check_identity(&relay) == process_identity::Liveness::Gone);
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture.clock(epoch + 1);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 1);
+    assert_eq!(
+        count_lines(&fixture.relay_refusal_log()),
+        1,
+        "the third failure must be logged even if the relay exits"
+    );
+    fixture.assert_one_relay_notice();
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn busy_gate_then_closed_relay_delivers_one_refusal() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+
+    let gate = fixture.hold_dependency_gate("lifecycle.lock");
+    fixture.clock(epoch + 120_000);
+    reply_to_relay_probe(&folder, "503 offline");
+    fixture.wait(|| {
+        let journal = fixture.root.join("data/lifecycle/relay-probe-refusal.json");
+        std::fs::read(journal)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|record| {
+                record["observation"]["state"] == "refused"
+                    && record["notices"][0]["reason"] == "relay models health request was refused"
+                    && record["notices"][0]["status"] == "pending"
+            })
+    });
+    assert!(folder.join("offline").exists());
+    // Keep the gate past a full five-second checkpoint attempt. The next observation
+    // will be TCP refusal, so it cannot recreate the lost HTTP failure.
+    std::thread::sleep(Duration::from_secs(6));
+    fixture.supervisor.take();
+    drop(gate);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture.clock(epoch + 120_001);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 120_001);
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+    fixture.assert_one_relay_notice();
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn supervisor_restart_discards_the_relay_streak_after_launch_gate_contention() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let probes = folder.join("probes");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+    let relay = fixture.states()["relay"].clone();
+    assert_eq!(relay["relayProbeFailures"], 2);
+    fixture.supervisor.take();
+
+    // Supply the slot for the old supervisor's interrupted request.
+    reply_to_relay_probe(&folder, 200);
+    fixture.clock(epoch + 60_001);
+    #[cfg(windows)]
+    let (gate, busy) = (
+        hold_dependency_mutex(&fixture, 30),
+        "a start operation for this runtime is already running",
+    );
+    #[cfg(not(windows))]
+    let (gate, busy) = (
+        fixture.hold_dependency_gate("dependencies.lock"),
+        "gate is busy",
+    );
+    fixture.start();
+    fixture.wait(|| fixture.states()["configuration"]["reason"] == busy);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    fixture.dependency_pause("relay before-probe");
+    drop(gate);
+    fixture.wait_dependency_pause("relay before-probe");
+    let output = fixture
+        .command(&fixture.cli)
+        .args(["lifecycle", "set", "running", "--confirm", "--runtime-root"])
+        .arg(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    reply_to_relay_probe(&folder, 503);
+    fixture.dependency_pause("");
+    fixture.wait(|| count_lines(&probes) == 6);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    reply_to_relay_probe(&folder, 503);
+    fixture.wait(|| count_lines(&probes) == 7);
+    let restarted = &fixture.states()["relay"];
+    assert_eq!(restarted["identity"], relay["identity"]);
+    assert_eq!(restarted["relayProbeFailures"], 1);
+    assert_eq!(restarted["state"], "adopted");
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+    let alerts = std::fs::read_to_string(fixture.root.join("snow/alerts")).unwrap_or_default();
+    assert!(!alerts.contains("relay models health request was refused"));
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn snowluma_reopened_before_the_locked_stop_survives() {
+    let mut fixture = Fixture::new();
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.healthy();
+    let hang = fixture.root.join("snow/hang");
+    let hung = fixture.root.join("snow/hung");
+    std::fs::write(&hang, "").unwrap();
+    fixture.wait(|| hung.exists() && fixture.states()["snowluma"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["snowluma"]["identity"].clone()).unwrap();
+
+    fixture.dependency_pause("snowluma before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    fixture.wait_dependency_pause("snowluma before-stop-lock");
+    std::fs::remove_file(&hang).unwrap();
+    fixture.wait(|| fixture.connect_dependency(fixture.ports[0]).is_ok());
+    fixture.dependency_pause("");
+
+    fixture.wait(|| fixture.states()["snowluma"]["timerAt"] == epoch + 120_000);
+    assert_ne!(
+        fixture.states()["snowluma"]["state"],
+        "backoff",
+        "the locked decision must preserve a listening SnowLuma"
+    );
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches,
+        "the locked decision must preserve a listening SnowLuma"
+    );
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_that_listens_during_lifecycle_gate_contention_survives() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("ready");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    std::fs::write(&offline, "").unwrap();
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    fixture.dependency_pause("relay before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    fixture.wait_dependency_pause("relay before-stop-lock");
+    let gate = fixture.hold_dependency_gate("lifecycle.lock");
+    fixture.dependency_pause("");
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| folder.join("listening").exists());
+    drop(gate);
+
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 120_000);
+    assert_ne!(
+        fixture.states()["relay"]["state"],
+        "backoff",
+        "the locked decision must preserve a listening relay"
+    );
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches,
+        "the locked decision must preserve a listening relay"
+    );
+}
+
+#[cfg(all(feature = "parity-clock", target_os = "linux"))]
+#[test]
+fn relay_connect_timeout_starts_the_hang_timer_without_a_probe_failure() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("connect-timeout");
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(folder.join("fixture.json")).unwrap()).unwrap();
+    let port = config["port"].as_u64().unwrap() as u16;
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.dependency_pause("relay before-probe");
+    fixture.start();
+    fixture.wait_dependency_pause("relay before-probe");
+    fixture.wait(|| folder.join("connect-timeout-ready").exists());
+    // Linux admits two connections to a backlog of one while accept is paused.
+    let _queued = [
+        fixture.connect_dependency(port).unwrap(),
+        fixture.connect_dependency(port).unwrap(),
+    ];
+    assert_eq!(
+        fixture.connect_dependency(port).unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch);
+    let state = &fixture.states()["relay"];
+    assert_eq!(
+        state["refusalSince"], epoch,
+        "connect timeout must start the hang timer"
+    );
+    assert!(state["relayProbeFailures"].is_null());
+    assert_eq!(count_lines(&folder.join("probes")), 0);
+    let health = fixture.relay_health();
+    assert_eq!(health["verdict"], "fail");
+    assert_eq!(health["reason"], "relay health connection failed");
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_restarts_after_two_minutes_of_tcp_refusal() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("ready");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    std::fs::write(&offline, "").unwrap();
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    fixture.clock(epoch + 119_999);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 119_999);
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches
+    );
+    assert!(fixture.states()["relay"]["relayProbeFailures"].is_null());
+    assert_eq!(count_lines(&folder.join("attempts")), 1);
+    fixture.clock(epoch + 120_000);
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture
+        .wait(|| process_identity::check_identity(&original) == process_identity::Liveness::Gone);
+    assert_eq!(fixture.states()["relay"]["restartAt"], epoch + 125_000);
+    std::fs::remove_file(offline).unwrap();
+    fixture.clock(epoch + 125_000);
+    fixture.wait(|| count_lines(&folder.join("attempts")) == 2);
+    fixture.wait(|| {
+        let states = fixture.states();
+        states["relay"]["state"] == "started" && states["relay"]["ready"] == true
+    });
+    assert_ne!(fixture.states()["relay"]["identity"], json!(original));
 }
 
 #[test]
@@ -3020,7 +3543,7 @@ http.createServer((req,res)=>{{
 "#)).unwrap();
     std::fs::write(
         f.root.join("dsh-feed.json"),
-        json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}).to_string(),
+        json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}).to_string(),
     )
     .unwrap();
     std::fs::write(f.root.join("snow-feed.json"), "[]").unwrap();
@@ -3034,6 +3557,39 @@ http.createServer((req,res)=>{{
     );
     f.wait(|| f.root.join("feed-ready").exists());
     (process, format!("http://127.0.0.1:{port}/"))
+}
+
+#[test]
+fn approval_refuses_a_dsh_candidate_without_contract_coverage() {
+    let mut f = Fixture::new();
+    let (_feed, url) = upgrade_feed(&f);
+    dsh_upgrade(&mut f, &url, true);
+    let version = "0.3.0";
+    std::fs::write(
+        f.root.join("dsh-feed.json"),
+        json!({"dist-tags":{"latest":version},"versions":{(version):{}}}).to_string(),
+    )
+    .unwrap();
+    f.console = Some(f.spawn_her(&["--console-serve", "--console-port", &f.ports[2].to_string()]));
+    f.wait(|| std::net::TcpStream::connect(("127.0.0.1", f.ports[2])).is_ok());
+    let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
+    assert_eq!(code, 200, "{checked}");
+    assert_eq!(checked["dependencies"]["dsh"]["available"], version);
+    let (code, result) = dependency_api(
+        &f,
+        "POST",
+        "/api/dependencies/approve",
+        json!({"confirm":true,"name":"dsh","version":version}),
+        false,
+    );
+    assert_eq!(
+        (code, result["error"].as_str()),
+        (409, Some("DSH version 0.3.0 has no credential contract coverage")),
+        "approval must refuse a discovered DSH candidate without contract coverage: {result}"
+    );
+    let (_, status) = dependency_api(&f, "GET", "/api/dependencies", Value::Null, false);
+    assert!(status["approval"].is_null(), "{status}");
+    assert!(!f.root.join("npm-installs").exists());
 }
 
 #[test]
@@ -3079,18 +3635,18 @@ fn dependency_discovery_reports_sources_and_never_installs_under_any_policy() {
             if policy == "off" {
                 Value::Null
             } else {
-                json!("0.3.0")
+                json!("0.2.1-rc.5")
             }
         );
         let identity = f.states()["dsh"]["identity"].clone();
         std::thread::sleep(Duration::from_millis(1200));
         assert_eq!(f.states()["dsh"]["identity"], identity);
-        assert!(!f.root.join("deps/dsh/0.3.0").exists());
+        assert!(!f.root.join("deps/dsh/0.2.1-rc.5").exists());
         let (code, _) = dependency_api(
             &f,
             "POST",
             "/api/dependencies/approve",
-            json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+            json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
             true,
         );
         assert!(code == 401 || code == 403);
@@ -3264,7 +3820,7 @@ fn snowluma_upgrade_health_failure_restores_pin_process_and_alerts_administrator
 }
 
 fn dsh_upgrade(f: &mut Fixture, url: &str, healthy: bool) -> PathBuf {
-    let destination = f.root.join("deps/dsh/0.3.0");
+    let destination = f.root.join("deps/dsh/0.2.1-rc.5");
     f.config["dependencies"]["directory"] = json!(f.root.join("deps"));
     f.config["dependencies"]["dsh"]["version"] = json!("0.2.1-rc.2");
     f.config["dependencies"]["snowluma"]["feedUrl"] = json!(format!("{url}snow"));
@@ -3322,12 +3878,12 @@ fn dsh_upgrade_needs_approval_even_under_auto_and_retains_the_old_install() {
     assert!(!f.root.join("npm-installs").exists());
     assert!(!destination.exists());
     let previous = f.states()["dsh"]["identity"].clone();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     await_upgrade(&f, "succeeded");
     f.healthy();
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
-    assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.3.0");
+    assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5");
     assert!(cfg["dependencies"]["dsh"]["script"].is_null());
     assert!(f.root.join("dsh/index.mjs").exists());
     assert!(destination
@@ -3346,7 +3902,7 @@ fn dsh_upgrade_health_failure_restores_pin_process_and_alerts_administrator() {
     let destination = dsh_upgrade(&mut f, &url, false);
     f.start();
     f.healthy();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     let result = await_upgrade(&f, "rolled-back");
     assert_eq!(result["result"]["rollback"], "succeeded");
     f.healthy();
@@ -3380,13 +3936,13 @@ fn dependency_metadata_failures_never_leave_an_approvable_candidate() {
         let _ = std::fs::remove_file(f.root.join("feed-mode"));
         std::fs::write(
             f.root.join("dsh-feed.json"),
-            json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}).to_string(),
+            json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}).to_string(),
         )
         .unwrap();
         let (code, available) =
             dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
         assert_eq!(code, 200, "{available}");
-        assert_eq!(available["dependencies"]["dsh"]["available"], "0.3.0");
+        assert_eq!(available["dependencies"]["dsh"]["available"], "0.2.1-rc.5");
         match failure {
             "empty" => std::fs::write(f.root.join("dsh-feed.json"), "").unwrap(),
             "malformed" => std::fs::write(
@@ -3412,13 +3968,13 @@ fn dependency_metadata_failures_never_leave_an_approvable_candidate() {
                 &f,
                 "POST",
                 "/api/dependencies/approve",
-                json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+                json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
                 false
             )
             .0,
             409
         );
-        assert!(!f.root.join("deps/dsh/0.3.0").exists());
+        assert!(!f.root.join("deps/dsh/0.2.1-rc.5").exists());
     }
 }
 
@@ -3531,7 +4087,7 @@ fn approved_upgrade_finishes_while_an_independent_metadata_refresh_is_stalled() 
     f.healthy();
     let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
     assert_eq!(code, 200, "{checked}");
-    assert_eq!(checked["dependencies"]["dsh"]["available"], "0.3.0");
+    assert_eq!(checked["dependencies"]["dsh"]["available"], "0.2.1-rc.5");
     let before = std::fs::read_to_string(f.root.join("feed-requests"))
         .unwrap()
         .lines()
@@ -3555,7 +4111,7 @@ fn approved_upgrade_finishes_while_an_independent_metadata_refresh_is_stalled() 
             &f,
             "POST",
             "/api/dependencies/approve",
-            json!({"confirm":true,"name":"dsh","version":"0.3.0"}),
+            json!({"confirm":true,"name":"dsh","version":"0.2.1-rc.5"}),
             false,
         );
         assert_eq!(code, 200, "{result}");
@@ -3652,7 +4208,7 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
         f.healthy();
         let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
         std::fs::write(&control, point).unwrap();
-        approve_upgrade(&f, "dsh", "0.3.0");
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
         f.wait(|| {
             std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
                 .ok()
@@ -3678,7 +4234,7 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
             serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap())
                 .unwrap();
         if healthy {
-            assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.3.0");
+            assert_eq!(cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5");
             assert_eq!(f.states()["dsh"]["identity"], candidate);
             continue;
         }
@@ -3699,6 +4255,90 @@ fn interrupted_dependency_upgrade_recovers_pin_process_and_failure_notice() {
 
 #[cfg(feature = "parity-clock")]
 #[test]
+fn recovery_retires_an_unlisted_dsh_candidate_and_checks_the_rollback_pin() {
+    for previous_is_listed in [true, false] {
+        let mut f = Fixture::new();
+        let (_feed, url) = upgrade_feed(&f);
+        let destination = dsh_upgrade(&mut f, &url, true);
+        f.start();
+        f.healthy();
+        let lifecycle = f.root.join("data/lifecycle");
+        let control = lifecycle.join("dependency-upgrade-pause");
+        std::fs::write(&control, "candidate-started").unwrap();
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
+        f.wait(|| {
+            std::fs::read_to_string(lifecycle.join("dependency-upgrade-reached"))
+                .ok()
+                .as_deref()
+                == Some("candidate-started")
+        });
+        let candidate: process_identity::ProcessIdentity =
+            serde_json::from_value(f.states()["dsh"]["identity"].clone()).unwrap();
+        f.supervisor.take();
+        std::fs::remove_file(control).unwrap();
+
+        // Model a transaction started before the version gate was installed.
+        let config_path = f.root.join("config/config.json");
+        let journal_path = lifecycle.join("dependency-upgrades.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        let mut journal: Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let package = destination.join("node_modules/@deepseek-ai/dsh");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(package.join("package.json")).unwrap()).unwrap();
+        manifest["version"] = json!("0.3.0");
+        std::fs::write(package.join("package.json"), manifest.to_string()).unwrap();
+        cfg["update"]["policy"] = json!("off");
+        cfg["dependencies"]["dsh"]["version"] = json!("0.3.0");
+        cfg["dependencies"]["dsh"]["script"] = json!(package.join("index.mjs"));
+        journal["transaction"]["candidate"]["version"] = json!("0.3.0");
+        journal["transaction"]["next"] = cfg["dependencies"]["dsh"].clone();
+        if !previous_is_listed {
+            manifest["version"] = json!("0.3.1");
+            std::fs::write(f.root.join("dsh/package.json"), manifest.to_string()).unwrap();
+            journal["transaction"]["previous"]["version"] = json!("0.3.1");
+            journal["transaction"]["candidate"]["current"] = json!("0.3.1");
+        }
+        let previous = journal["transaction"]["previous"].clone();
+        std::fs::write(&config_path, cfg.to_string()).unwrap();
+        std::fs::write(&journal_path, journal.to_string()).unwrap();
+        f.start();
+        let read_journal = || {
+            serde_json::from_slice::<Value>(&std::fs::read(&journal_path).unwrap()).unwrap()
+        };
+        f.wait(|| read_journal()["result"]["status"] != "running");
+        let journal = read_journal();
+        assert_eq!(
+            journal["result"]["reason"],
+            "DSH version 0.3.0 has no credential contract coverage",
+            "recovery must refuse to accept an unlisted running DSH candidate: {journal}"
+        );
+        assert_eq!(
+            journal["result"]["rollback"],
+            if previous_is_listed {
+                "succeeded"
+            } else {
+                "pin-restored"
+            },
+            "rollback must restore an unlisted pin without restarting it: {journal}"
+        );
+        assert!(journal["transaction"].is_null(), "{journal}");
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(cfg["dependencies"]["dsh"], previous);
+        assert!(matches!(
+            process_identity::check_identity(&candidate),
+            process_identity::Liveness::Gone | process_identity::Liveness::Mismatch(_)
+        ));
+        if previous_is_listed {
+            f.healthy();
+        } else {
+            f.wait(|| f.states()["dsh"]["state"] == "refused");
+        }
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
 fn dependency_upgrade_rollback_obeys_changed_desired_revision_during_candidate_startup() {
     for desired in ["running", "stopped", "maintenance"] {
         let mut f = Fixture::new();
@@ -3711,7 +4351,7 @@ fn dependency_upgrade_rollback_obeys_changed_desired_revision_during_candidate_s
             serde_json::from_value(f.states()["dsh"]["identity"].clone()).unwrap();
         let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
         std::fs::write(&control, "candidate-started").unwrap();
-        approve_upgrade(&f, "dsh", "0.3.0");
+        approve_upgrade(&f, "dsh", "0.2.1-rc.5");
         f.wait(|| {
             std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
                 .ok()
@@ -3886,7 +4526,7 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
     f.healthy();
     let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
     std::fs::write(&control, "candidate-started").unwrap();
-    approve_upgrade(&f, "dsh", "0.3.0");
+    approve_upgrade(&f, "dsh", "0.2.1-rc.5");
     f.wait(|| {
         std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
             .ok()
@@ -3911,7 +4551,7 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
     assert_eq!(
-        cfg["dependencies"]["dsh"]["version"], "0.3.0",
+        cfg["dependencies"]["dsh"]["version"], "0.2.1-rc.5",
         "unproven retirement must preserve the candidate pin"
     );
     assert_eq!(

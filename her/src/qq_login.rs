@@ -199,7 +199,7 @@ fn webui_processes(context: &RuntimeContext, cfg: &Value) -> Option<Vec<Value>> 
         .trim_end_matches('/');
     // Reuse the strict endpoint validator: explicit port, literal loopback HTTP,
     // no URL credentials, path, query or redirect. There is no guessed endpoint.
-    crate::onebot::OneBot::try_new_url(endpoint, String::new()).ok()?;
+    let parsed_endpoint = crate::loopback_http::LoopbackEndpoint::parse(endpoint).ok()?;
     let token = context
         .read_optional_text(RuntimeArea::Data, "snowluma-webui-token")
         .ok()??;
@@ -207,19 +207,29 @@ fn webui_processes(context: &RuntimeContext, cfg: &Value) -> Option<Vec<Value>> 
     if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_control) {
         return None;
     }
-    let reply = crate::qq_tools::http_request(
-        endpoint.strip_prefix("http://")?,
-        "GET",
-        "/api/processes",
-        &[("Authorization".into(), format!("Bearer {token}"))],
-        None,
-        Duration::from_secs(1),
+    let auth = format!("Bearer {token}");
+    let reply = crate::loopback_http::request(
+        &crate::loopback_http::TcpTransport,
+        &parsed_endpoint,
+        &crate::loopback_http::HttpRequest {
+            method: "GET",
+            path: "/api/processes",
+            headers: &[("Authorization", auth.as_str())],
+            body: None,
+        },
+        crate::loopback_http::Deadlines::with_shared_transmit(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        crate::loopback_http::ResponseLimits::new(1024 * 1024),
     )
     .ok()?;
-    if reply.status != 200 || reply.body.len() > 1024 * 1024 {
+    if reply.status != 200 {
         return None;
     }
-    let body: Value = serde_json::from_slice(&reply.body).ok()?;
+    let (body, _) = reply
+        .parse_json::<Value>(crate::loopback_http::JsonSurrogates::Strict)
+        .ok()?;
     body["list"].as_array().cloned()
 }
 

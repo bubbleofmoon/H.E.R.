@@ -4,10 +4,12 @@
 #![allow(dead_code)]
 
 pub mod gateway;
+pub mod http_mock;
 #[path = "../../src/install_root.rs"]
 pub mod install_root;
 pub mod ports;
 pub mod runtime;
+pub mod wait;
 
 #[allow(unused_imports)]
 pub use gateway::FakeGateway;

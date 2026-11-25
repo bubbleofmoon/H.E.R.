@@ -3,6 +3,20 @@
 use super::*;
 use std::io::{Read, Write};
 
+pub(super) enum ProbeError {
+    Connect(std::io::ErrorKind),
+    Request(String),
+}
+
+impl ProbeError {
+    pub(super) fn reason(self) -> String {
+        match self {
+            Self::Connect(_) => "relay health connection failed".into(),
+            Self::Request(reason) => reason,
+        }
+    }
+}
+
 pub(super) struct Settings {
     pub arguments: Vec<String>,
     pub folder: PathBuf,
@@ -152,7 +166,23 @@ impl Settings {
         Ok(())
     }
 
-    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), String> {
+    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), ProbeError> {
+        let connect_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(ProbeError::Connect(std::io::ErrorKind::TimedOut))?;
+        let stream = std::net::TcpStream::connect_timeout(&endpoint, connect_timeout)
+            .map_err(|err| ProbeError::Connect(err.kind()))?;
+        self.probe_connected(stream, endpoint, deadline)
+            .map_err(ProbeError::Request)
+    }
+
+    fn probe_connected(
+        &self,
+        mut stream: std::net::TcpStream,
+        endpoint: SocketAddr,
+        deadline: Instant,
+    ) -> Result<(), String> {
         let key = self.key()?;
         let remaining = || {
             deadline
@@ -160,105 +190,118 @@ impl Settings {
                 .filter(|d| !d.is_zero())
                 .ok_or("relay health request timed out")
         };
-        let mut stream = std::net::TcpStream::connect_timeout(&endpoint, remaining()?)
-            .map_err(|_| "relay health connection failed")?;
-        stream
-            .set_write_timeout(Some(remaining()?))
-            .map_err(|_| "relay health timeout is unavailable")?;
-        write!(stream, "GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "relay health request failed")?;
-        // Only status is needed. Never retain a response body (including credential echoes),
-        // follow redirects, or let a peer extend the absolute deadline by dribbling bytes.
-        let mut line = Vec::new();
-        for _ in 0..512 {
+        let request = format!("GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n");
+        let mut pending = request.as_bytes();
+        while !pending.is_empty() {
+            stream
+                .set_write_timeout(Some(remaining()?))
+                .map_err(|_| "relay health timeout is unavailable")?;
+            match stream.write(pending) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) | Ok(0) => return Err("relay health request failed".into()),
+                Ok(count) => pending = &pending[count..],
+            }
+        }
+        read_probe_status(|buffer| loop {
             stream
                 .set_read_timeout(Some(remaining()?))
                 .map_err(|_| "relay health timeout is unavailable")?;
-            let mut byte = [0];
-            stream
-                .read_exact(&mut byte)
-                .map_err(|_| "relay health response failed or timed out")?;
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                let status = std::str::from_utf8(&line).ok().and_then(|line| {
+            match stream.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err("relay health response failed or timed out"),
+                Ok(count) => {
+                    remaining()?;
+                    return Ok(count);
+                }
+            }
+        })
+        .map_err(str::to_string)
+    }
+}
+
+/// Only inspect the bounded status line, even when a read includes headers or body bytes.
+fn read_probe_status(
+    mut read_chunk: impl FnMut(&mut [u8]) -> Result<usize, &'static str>,
+) -> Result<(), &'static str> {
+    let mut line = [0; 512];
+    let mut used = 0;
+    while used < line.len() {
+        let count = read_chunk(&mut line[used..])?;
+        if count == 0 {
+            return Err("relay health response failed or timed out");
+        }
+        let end = used + count;
+        if let Some(newline) = line[used..end].iter().position(|&byte| byte == b'\n') {
+            let status = std::str::from_utf8(&line[..used + newline + 1])
+                .ok()
+                .and_then(|line| {
                     let mut fields = line.split_whitespace();
                     matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1"))
                         .then(|| fields.next())
                         .flatten()
                 });
-                return if status == Some("200") {
-                    Ok(())
-                } else {
-                    Err("relay models health request was refused".into())
-                };
-            }
+            return if status == Some("200") {
+                Ok(())
+            } else {
+                Err("relay models health request was refused")
+            };
         }
-        Err("relay health response is invalid".into())
+        used = end;
+    }
+    Err("relay health response is invalid")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn relay_reads_a_buffered_status_line_at_the_byte_limit() {
+        let mut status = String::from("HTTP/1.1 200 ");
+        status.extend(std::iter::repeat_n('x', 511 - status.len()));
+        status.push('\n');
+        let mut response = std::io::Cursor::new(status.as_bytes());
+        let mut reads = 0;
+        assert_eq!(
+            read_probe_status(|buffer| {
+                reads += 1;
+                Ok(response.read(buffer).unwrap())
+            }),
+            Ok(())
+        );
+        assert_eq!(reads, 1, "read a complete status line in one chunk");
+
+        status.insert(511, 'x');
+        let mut response = std::io::Cursor::new(status.as_bytes());
+        assert_eq!(
+            read_probe_status(|buffer| Ok(response.read(buffer).unwrap())),
+            Err("relay health response is invalid")
+        );
+    }
+
+    #[test]
+    fn relay_assembles_split_status_and_ignores_bytes_after_the_line() {
+        let mut chunks = [&b"HTTP/1.1 2"[..], &b"00 OK\r\n\xff"[..]].into_iter();
+        assert_eq!(
+            read_probe_status(|buffer| {
+                let chunk = chunks
+                    .next()
+                    .expect("status line should already be complete");
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }),
+            Ok(())
+        );
     }
 }
 
-/// Why one relay entry could not be made private.
-#[derive(Debug)]
-pub(super) enum Unprotected {
-    /// The OS reported the entry missing (`vanished`); `protect` decides whether it really is
-    /// gone. The diagnostic is kept for the refusal when it is not.
-    Missing(String),
-    /// Any other failure.
-    Refused(String),
-}
-
-impl From<Unprotected> for String {
-    fn from(failure: Unprotected) -> Self {
-        match failure {
-            Unprotected::Missing(reason) | Unprotected::Refused(reason) => reason,
-        }
-    }
-}
-
-/// Whether an I/O error reports the entry itself missing: Win32 ERROR_FILE_NOT_FOUND (2) or
-/// ERROR_PATH_NOT_FOUND (3), Unix ENOENT. Every other error is a refusal.
-fn vanished(error: &std::io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        error
-            .raw_os_error()
-            .and_then(|code| u32::try_from(code).ok())
-            .is_some_and(win32_vanished)
-    }
-    #[cfg(not(windows))]
-    {
-        error.kind() == std::io::ErrorKind::NotFound
-    }
-}
+use crate::guarded_fs::{
+    ensure_entry_private, sanitized_path as shown, vanished, AclError, AclPolicy, RestrictOutcome,
+};
 
 /// Whether `path` itself is now reported missing.
 fn gone(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|error| vanished(&error))
-}
-
-/// Characters that hide or reorder displayed text: control characters, the Unicode bidirectional
-/// controls (Bidi_Control, which includes U+061C), line and paragraph separators, zero-width
-/// characters and the byte-order mark.
-fn formatting(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061c}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{2029}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-        )
-}
-
-/// A path as diagnostics show it. Such characters become `?`, so an entry name cannot add lines
-/// to a log or notice or reorder its text.
-fn shown(path: &Path) -> String {
-    let text = path.display().to_string();
-    text.chars()
-        .map(|c| if formatting(c) { '?' } else { c })
-        .collect()
 }
 
 /// A sweep diagnostic naming the path that failed, as the ACL diagnostics do.
@@ -315,12 +358,35 @@ fn ancestors_checked(
     Ok(true)
 }
 
+const DELETE_PENDING_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const DELETE_PENDING_RETRY_STEP: Duration = Duration::from_millis(5);
+
+/// Whether an I/O error is Windows `ERROR_ACCESS_DENIED` (5) or `ERROR_DELETE_PENDING` (303),
+/// which `symlink_metadata` can return while an open handle keeps a deleted file delete-pending.
+fn is_windows_delete_pending_denial(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING};
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            .is_some_and(|code| code == ERROR_ACCESS_DENIED || code == ERROR_DELETE_PENDING)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Checks one entry before its permissions change: outside any protected root, no redirected
 /// part, a regular file or directory, and on Unix owned by this account with one link.
 /// `Ok(None)` when a listed entry vanished: the OS reports the entry itself missing, also after a
 /// guard failed, an ancestor reported missing or the ownership check failed (Unix: the entry was
-/// unlinked as its metadata was read) because the entry was removed meanwhile. Any other
-/// read failure refuses. The version folder itself (`listed == false`) must exist.
+/// unlinked as its metadata was read) because the entry was removed meanwhile. On Windows, a
+/// listed entry returning `ERROR_ACCESS_DENIED` (delete-pending while open handles close) retries
+/// briefly up to 250 ms before failing closed. Any other read failure refuses. The version folder
+/// itself (`listed == false`) must exist.
 fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, String> {
     inspect_with(path, listed, &|entry| std::fs::symlink_metadata(entry))
 }
@@ -332,14 +398,51 @@ fn inspect_with(
     listed: bool,
     stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<Option<std::fs::Metadata>, String> {
-    if crate::install_root::check_runtime(path, false).is_err() {
-        return if listed && gone(path) {
-            Ok(None)
-        } else {
-            Err(named("relay path is protected", path))
-        };
+    inspect_with_guard(
+        path,
+        listed,
+        &|entry| crate::install_root::check_runtime(entry, false),
+        stat,
+    )
+}
+
+fn inspect_with_guard(
+    path: &Path,
+    listed: bool,
+    guard: &dyn Fn(&Path) -> Result<(), String>,
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Option<std::fs::Metadata>, String> {
+    if let Err(mut error) = guard(path) {
+        let deadline = Instant::now() + DELETE_PENDING_RETRY_BUDGET;
+        loop {
+            if listed && gone(path) {
+                return Ok(None);
+            }
+            if !listed
+                || !cfg!(windows)
+                || !error.starts_with("guard path cannot be ")
+                || Instant::now() >= deadline
+            {
+                return Err(named("relay path is protected", path));
+            }
+            std::thread::sleep(DELETE_PENDING_RETRY_STEP);
+            match guard(path) {
+                Ok(()) => break,
+                Err(next) => error = next,
+            }
+        }
     }
-    let meta = match stat(path) {
+    let mut result = stat(path);
+    if listed && result.as_ref().is_err_and(is_windows_delete_pending_denial) {
+        let deadline = Instant::now() + DELETE_PENDING_RETRY_BUDGET;
+        while result.as_ref().is_err_and(is_windows_delete_pending_denial)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(DELETE_PENDING_RETRY_STEP);
+            result = stat(path);
+        }
+    }
+    let meta = match result {
         Ok(meta) => meta,
         Err(error) if listed && vanished(&error) => return Ok(None),
         Err(error) => {
@@ -376,34 +479,56 @@ fn inspect_with(
     Ok(Some(meta))
 }
 
-/// Makes one entry private with `private`. `Ok(false)` when a listed entry vanished: the OS
-/// reported it missing and a fresh inspection finds it gone. A missing report for an entry that
-/// still exists (a child that vanished while a directory's ACL propagated) is retried once, with
-/// the fresh inspection, so a replacement link is refused. Any other failure refuses, even for an
-/// entry that is gone by then; the version folder (`listed == false`) is never skipped.
-fn protect(
+/// Makes one entry private with `private`. `Ok(None)` when a listed entry vanished: the OS
+/// reported it missing (or on Windows `CreateFileW` failed with `Win32 error 5`, which also occurs
+/// while a deleted entry is delete-pending) and a fresh inspection finds it gone. A missing report
+/// for an entry that still exists (a child that vanished while a directory's ACL propagated) is
+/// retried once, with the fresh inspection, so a replacement link is refused; a `CreateFileW`
+/// access denial for an entry that still exists refuses immediately. Any other failure refuses,
+/// even for an entry that is gone by then; the version folder (`listed == false`) is never skipped.
+fn protect_entry(
     path: &Path,
-    meta: std::fs::Metadata,
+    expected_dir: bool,
     listed: bool,
-    mut private: impl FnMut(&Path, &std::fs::Metadata) -> Result<(), Unprotected>,
-) -> Result<bool, String> {
-    let mut meta = meta;
+    mut private: impl FnMut(&Path, bool) -> Result<RestrictOutcome, AclError>,
+) -> Result<Option<RestrictOutcome>, String> {
+    let mut expected_dir = expected_dir;
     let mut retried = false;
     loop {
-        let reason = match private(path, &meta) {
-            Ok(()) => return Ok(true),
-            Err(Unprotected::Refused(reason)) => return Err(reason),
-            Err(Unprotected::Missing(reason)) => reason,
+        let (reason, retry_if_present) = match private(path, expected_dir) {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(AclError::Refused(reason))
+                if listed
+                    && cfg!(windows)
+                    && reason.ends_with(": CreateFileW failed (Win32 error 5)") =>
+            {
+                (reason, false)
+            }
+            Err(AclError::Refused(reason)) => return Err(reason),
+            Err(AclError::Missing(reason)) => (reason, true),
         };
         match inspect(path, listed)? {
-            None => return Ok(false),
-            Some(_) if retried => return Err(reason),
+            None => return Ok(None),
+            Some(_) if !retry_if_present || retried => return Err(reason),
             Some(fresh) => {
-                meta = fresh;
+                expected_dir = fresh.is_dir();
                 retried = true;
             }
         }
     }
+}
+
+#[cfg(all(test, unix))]
+fn protect(
+    path: &Path,
+    meta: std::fs::Metadata,
+    listed: bool,
+    mut private: impl FnMut(&Path, &std::fs::Metadata) -> Result<(), AclError>,
+) -> Result<bool, String> {
+    protect_entry(path, meta.is_dir(), listed, |p, _| {
+        private(p, &meta).map(|()| RestrictOutcome::Hardened)
+    })
+    .map(|outcome| outcome.is_some())
 }
 
 /// Restrict the entire version tree, so config and future login files are protected too.
@@ -427,12 +552,38 @@ enum Seam {
     Hardening,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct SweepStats {
+    skipped: usize,
+    hardened: usize,
+    already_private: usize,
+}
+
 /// `restrict` with its test seams.
 fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, String> {
+    let (skipped, _, _) = sweep_inner(folder, seam)?;
+    Ok(skipped)
+}
+
+#[cfg(test)]
+fn sweep_stats(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<SweepStats, String> {
+    let (skipped, hardened, already_private) = sweep_inner(folder, seam)?;
+    Ok(SweepStats {
+        skipped,
+        hardened,
+        already_private,
+    })
+}
+
+fn sweep_inner(
+    folder: &Path,
+    seam: &mut dyn FnMut(Seam, &Path),
+) -> Result<(usize, usize, usize), String> {
     fn collect(
         path: &Path,
         listed: bool,
-        entries: &mut Vec<(PathBuf, std::fs::Metadata, bool)>,
+        entries: &mut Vec<(PathBuf, bool, bool)>,
         skipped: &mut usize,
         seam: &mut dyn FnMut(Seam, &Path),
     ) -> Result<(), String> {
@@ -460,7 +611,7 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
             for child in children {
                 let child = match child {
                     Ok(child) => child.path(),
-                    // The directory went away while it was listed; `protect` counts it below.
+                    // The directory went away while it was listed; `protect_entry` counts it below.
                     Err(error) if listed && vanished(&error) => break,
                     Err(error) => {
                         return Err(failure(
@@ -475,344 +626,26 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
                 collect(&child, true, entries, skipped, seam)?;
             }
         }
-        entries.push((path.to_path_buf(), meta, listed));
+        entries.push((path.to_path_buf(), meta.is_dir(), listed));
         Ok(())
     }
     let mut entries = Vec::new();
     let mut skipped = 0;
+    let mut hardened = 0;
+    let mut already_private = 0;
     collect(folder, false, &mut entries, &mut skipped, seam)?;
     seam(Seam::Hardening, folder);
     // Parent first closes external access before processing its children.
-    for (path, meta, listed) in entries.into_iter().rev() {
-        if !protect(&path, meta, listed, super::os::private)? {
-            skipped += 1;
+    for (path, is_dir, listed) in entries.into_iter().rev() {
+        match protect_entry(&path, is_dir, listed, |p, dir| {
+            ensure_entry_private(p, Some(dir), AclPolicy::OwnerOnly)
+        })? {
+            None => skipped += 1,
+            Some(RestrictOutcome::Hardened) => hardened += 1,
+            Some(RestrictOutcome::AlreadyPrivate) => already_private += 1,
         }
     }
-    Ok(skipped)
-}
-
-#[cfg(unix)]
-pub(super) fn unix_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if meta.is_dir() {
-        0o700
-    } else {
-        (meta.permissions().mode() & 0o700) | 0o600
-    };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
-        let reason = failure(
-            "relay private permissions could not be applied",
-            path,
-            "set_permissions",
-            &error,
-        );
-        if vanished(&error) {
-            Unprotected::Missing(reason)
-        } else {
-            Unprotected::Refused(reason)
-        }
-    })
-}
-
-#[cfg(windows)]
-fn credential_sids(path: &Path, settings: bool) -> Result<Vec<Vec<u8>>, Unprotected> {
-    use windows_sys::Win32::Security::{
-        CreateWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
-    };
-
-    let user = identity::current_user().map_err(|error| {
-        Unprotected::Refused(format!(
-            "relay private ACL {}: process token SID: {error}",
-            shown(path)
-        ))
-    })?;
-    let mut sids = vec![user];
-    if settings {
-        for kind in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
-            let mut buffer = [0u32; 17];
-            let mut size = std::mem::size_of_val(&buffer) as u32;
-            // SAFETY: aligned writable SECURITY_MAX_SID_SIZE storage and a valid size pointer.
-            if unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) } == 0 {
-                return Err(Unprotected::Refused(windows_acl_error(
-                    path, "CreateWellKnownSid", std::io::Error::last_os_error().raw_os_error().unwrap_or_default() as u32,
-                )));
-            }
-            // SAFETY: the native call initialized this many bytes in the retained buffer.
-            let sid = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size as usize) };
-            if !sids.iter().any(|known| known.as_slice() == sid) {
-                sids.push(sid.to_vec());
-            }
-        }
-    }
-    Ok(sids)
-}
-
-#[cfg(windows)]
-fn private_acl<T>(
-    path: &Path,
-    directory: bool,
-    settings: bool,
-    use_acl: impl FnOnce(*mut windows_sys::Win32::Security::ACL, &[Vec<u8>]) -> T,
-) -> Result<T, Unprotected> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let mut sids = credential_sids(path, settings)?;
-    let entries: Vec<_> = sids.iter_mut().map(|sid| EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: if directory {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-        } else {
-            0
-        },
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.as_mut_ptr().cast(),
-        },
-    }).collect();
-    let mut acl = std::ptr::null_mut();
-    // SAFETY: the SID allocations and entries stay live. A null old ACL creates only these grants.
-    let result = unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), std::ptr::null(), &mut acl) };
-    if result != 0 {
-        return Err(Unprotected::Refused(windows_acl_error(path, "SetEntriesInAclW", result)));
-    }
-    let value = use_acl(acl, &sids);
-    // SAFETY: SetEntriesInAclW allocated acl with LocalAlloc.
-    unsafe { LocalFree(acl.cast()) };
-    Ok(value)
-}
-
-#[cfg(windows)]
-pub(super) fn windows_create_credential(path: &Path, settings: bool) -> std::io::Result<std::fs::File> {
-    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::{
-        InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ};
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    private_acl(path, false, settings, |acl, _| {
-        let mut descriptor = std::mem::MaybeUninit::<SECURITY_DESCRIPTOR>::uninit();
-        let ptr = descriptor.as_mut_ptr().cast();
-        // SAFETY: the absolute security descriptor has aligned storage and the ACL outlives CreateFileW.
-        if unsafe { InitializeSecurityDescriptor(ptr, 1) } == 0
-            || unsafe { SetSecurityDescriptorDacl(ptr, 1, acl, 0) } == 0
-            || unsafe { SetSecurityDescriptorControl(ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: ptr,
-            bInheritHandle: 0,
-        };
-        // SAFETY: path is NUL-terminated, attrs and its descriptor live through the call.
-        let handle = unsafe {
-            CreateFileW(wide.as_ptr(), GENERIC_WRITE, FILE_SHARE_READ, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: CreateFileW returned a valid owned handle, transferred to File once.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
-    }).map_err(|error| std::io::Error::other(String::from(error)))?
-}
-
-#[cfg(windows)]
-pub(super) fn windows_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    windows_protect(path, meta.is_dir(), false)
-}
-
-#[cfg(windows)]
-pub(super) fn windows_private_settings(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    if !meta.is_file() {
-        return Err(Unprotected::Refused("settings ACL requires a regular file".into()));
-    }
-    windows_protect(path, false, true)
-}
-
-#[cfg(windows)]
-fn windows_protect(path: &Path, directory: bool, settings: bool) -> Result<(), Unprotected> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
-    private_acl(path, directory, settings, |acl, sids| {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: NUL-terminated path and retained ACL; PROTECTED disables parent inheritance.
-        // Only WRITE_DAC is required: do not set the owner or request ownership privileges.
-        let result = unsafe {
-            SetNamedSecurityInfoW(
-                wide.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                acl,
-                std::ptr::null(),
-            )
-        };
-        if result != 0 {
-            return Err(windows_unprotected(path, "SetNamedSecurityInfoW", result));
-        }
-        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
-        windows_verify_grants(path, directory, &sids)
-    })?
-}
-
-#[cfg(windows)]
-fn windows_acl_error(path: &Path, step: &str, code: u32) -> String {
-    format!(
-        "relay private ACL {}: {step} failed (Win32 error {code})",
-        shown(path)
-    )
-}
-
-/// Win32 ERROR_FILE_NOT_FOUND (2) and ERROR_PATH_NOT_FOUND (3).
-#[cfg(windows)]
-fn win32_vanished(code: u32) -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
-}
-
-/// A failed native step on `path`: `Missing` when Windows reports the entry missing.
-#[cfg(windows)]
-fn windows_unprotected(path: &Path, step: &str, code: u32) -> Unprotected {
-    let reason = windows_acl_error(path, step, code);
-    if win32_vanished(code) {
-        Unprotected::Missing(reason)
-    } else {
-        Unprotected::Refused(reason)
-    }
-}
-
-#[cfg(all(test, windows))]
-pub(super) fn credential_file_is_private(path: &Path, settings: bool) -> bool {
-    credential_sids(path, settings).is_ok_and(|sids| {
-        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
-        windows_verify_grants(path, false, &sids).is_ok()
-    })
-}
-
-#[cfg(all(test, windows))]
-fn windows_verify_private(path: &Path, directory: bool, user: &[u8]) -> Result<(), Unprotected> {
-    windows_verify_grants(path, directory, &[user])
-}
-
-#[cfg(windows)]
-fn windows_verify_grants(path: &Path, directory: bool, sids: &[&[u8]]) -> Result<(), Unprotected> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        GetAce, GetSecurityDescriptorControl, IsValidAcl, ACCESS_ALLOWED_ACE, ACE_HEADER,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, OBJECT_INHERIT_ACE,
-        SE_DACL_PROTECTED,
-    };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut descriptor = std::ptr::null_mut();
-    let mut acl = std::ptr::null_mut();
-    // SAFETY: terminated path and initialized out-pointers. ACL storage belongs to descriptor.
-    let result = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut acl,
-            std::ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if result != 0 {
-        return Err(windows_unprotected(
-            path,
-            "GetNamedSecurityInfoW (verify)",
-            result,
-        ));
-    }
-    let invalid = |reason| {
-        format!(
-            "relay private ACL {}: verify failed: {reason}",
-            shown(path)
-        )
-    };
-    // Keep every verification return inside the closure so the descriptor is always freed.
-    let verified = (|| {
-        let mut control = 0;
-        let mut revision = 0;
-        // SAFETY: descriptor was returned successfully and remains allocated below.
-        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
-            return Err(windows_acl_error(
-                path,
-                "GetSecurityDescriptorControl (verify)",
-                unsafe { GetLastError() },
-            ));
-        }
-        if control & SE_DACL_PROTECTED == 0 {
-            return Err(invalid(
-                "DACL is not protected; parent inheritance is enabled",
-            ));
-        }
-        // SAFETY: a non-null ACL belongs to the retained security descriptor.
-        if acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
-            return Err(invalid("DACL is missing or invalid"));
-        }
-        // SAFETY: IsValidAcl checked the header and ACE bounds.
-        if usize::from(unsafe { (*acl).AceCount }) != sids.len() {
-            return Err(invalid("DACL contains an unexpected number of grants"));
-        }
-        let flags = if directory {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-        } else {
-            0
-        };
-        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-        let mut remaining = sids.to_vec();
-        for index in 0..sids.len() {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: valid ACL, in-range ACE index and initialized output pointer.
-            if unsafe { GetAce(acl, index as u32, &mut ace) } == 0 {
-                return Err(windows_acl_error(path, "GetAce (verify)", unsafe { GetLastError() }));
-            }
-            // SAFETY: GetAce returned a validated ACE header within the retained ACL.
-            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-            if u32::from(header.AceFlags) & INHERITED_ACE != 0
-                || header.AceType != 0
-                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
-            {
-                return Err(invalid("DACL contains an unexpected ACE type or flags"));
-            }
-            let bytes = usize::from(header.AceSize) - sid_offset;
-            // SAFETY: the allowed ACE's fixed fields and SID bytes fit in the checked ACL bounds.
-            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-            let sid = unsafe { std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), bytes) };
-            let Some(found) = remaining.iter().position(|expected| *expected == sid) else {
-                return Err(invalid("DACL contains a repeated or unexpected SID"));
-            };
-            remaining.swap_remove(found);
-            if allowed.Mask != FILE_ALL_ACCESS || u32::from(header.AceFlags) != flags {
-                return Err(invalid("ACE has incorrect access or inheritance flags"));
-            }
-        }
-        Ok(())
-    })();
-    // SAFETY: GetNamedSecurityInfoW allocated descriptor with LocalAlloc.
-    unsafe { LocalFree(descriptor) };
-    verified.map_err(Unprotected::Refused)
+    Ok((skipped, hardened, already_private))
 }
 
 #[cfg(all(test, windows))]
@@ -845,7 +678,11 @@ mod native_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            if std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            } else {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
         }
     }
 
@@ -908,21 +745,6 @@ mod native_tests {
     }
 
     #[test]
-    fn ticket219_private_credential_creation_allows_read_sharing() {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-        let fixture = Fixture::new();
-        let path = fixture.0.join("capture.out");
-        let _writer = windows_create_credential(&path, false).unwrap();
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&path);
-        assert!(reader.is_ok(), "credential creation refused a concurrent reader");
-    }
-
-    #[test]
     fn relay_preparation_protects_existing_files_and_future_login_tokens() {
         let fixture = Fixture::new();
         let login = fixture.0.join("login");
@@ -948,8 +770,8 @@ mod native_tests {
         let refresh = login.join("refresh.json");
         std::fs::write(&refresh, b"synthetic refreshed token").unwrap();
         assert_dacl(&refresh, false, 16); // Only the HER ACE, inherited from the private directory.
-        let Err(Unprotected::Refused(error)) =
-            windows_verify_private(&refresh, false, &identity::current_user().unwrap())
+        let Err(AclError::Refused(error)) =
+            crate::guarded_fs::verify_path_exact_acl(&refresh, false, AclPolicy::OwnerOnly)
         else {
             panic!("an inherited DACL must be refused");
         };
@@ -965,44 +787,6 @@ mod native_tests {
         assert_dacl(&refresh, true, 0);
         assert_dacl(&later_dir, true, 3);
         assert_dacl(&later_token, true, 0);
-    }
-
-    #[test]
-    fn relay_acl_failure_identifies_file_step_and_win32_code() {
-        let fixture = Fixture::new();
-        let meta = std::fs::metadata(&fixture.0).unwrap();
-        // A missing entry is reported as missing, with the whole diagnostic kept for a refusal.
-        for (missing, code) in [
-            (fixture.0.join("missing.key"), "Win32 error 2"), // ERROR_FILE_NOT_FOUND
-            (fixture.0.join("gone").join("missing.key"), "Win32 error 3"), // ERROR_PATH_NOT_FOUND
-        ] {
-            let Err(Unprotected::Missing(error)) = windows_private(&missing, &meta) else {
-                panic!("a missing entry must be reported as missing");
-            };
-            assert!(error.contains("SetNamedSecurityInfoW"), "{error}");
-            assert!(error.contains(code), "{error}");
-            assert!(error.contains(&missing.display().to_string()), "{error}");
-        }
-        // Any other failure is a refusal: '<' is not a valid character in a Windows file name.
-        let invalid = fixture.0.join("invalid<name.key");
-        let Err(Unprotected::Refused(error)) = windows_private(&invalid, &meta) else {
-            panic!("an invalid name must be refused");
-        };
-        assert!(error.contains("SetNamedSecurityInfoW"), "{error}");
-        assert!(error.contains("Win32 error"), "{error}");
-        assert!(error.contains(&invalid.display().to_string()), "{error}");
-    }
-
-    #[test]
-    fn only_file_and_path_not_found_count_as_vanished() {
-        assert!(win32_vanished(2)); // ERROR_FILE_NOT_FOUND
-        assert!(win32_vanished(3)); // ERROR_PATH_NOT_FOUND
-        for code in [0, 5, 32, 123] {
-            assert!(!win32_vanished(code), "Win32 error {code}");
-        }
-        assert!(vanished(&std::io::Error::from_raw_os_error(2)));
-        assert!(vanished(&std::io::Error::from_raw_os_error(3)));
-        assert!(!vanished(&std::io::Error::from_raw_os_error(5)));
     }
 
     /// The version folder with `logs/` holding two synthetic request-log parts.
@@ -1082,20 +866,33 @@ mod native_tests {
 
     #[test]
     fn relay_acl_verification_refuses_a_protected_foreign_sid_grant() {
+        let fixture = Fixture::new();
+        restrict(&fixture.0).unwrap();
+        let file = fixture.0.join("synthetic.key");
+        std::fs::write(&file, b"synthetic fixture").unwrap();
+        // A protected DACL alone is insufficient: this grants Everyone access to fake data.
+        apply_everyone_dacl(&file);
+        let Err(AclError::Refused(error)) =
+            crate::guarded_fs::verify_path_exact_acl(&file, false, AclPolicy::OwnerOnly)
+        else {
+            panic!("a foreign SID grant must be refused");
+        };
+        assert!(error.contains("SID"), "{error}");
+        assert!(error.contains("verify failed"), "{error}");
+        // Restore the ordinary preparation contract, and prove that it is accepted again.
+        restrict(&fixture.0).unwrap();
+        assert_dacl(&file, true, 0);
+    }
+
+    fn apply_everyone_dacl(path: &Path) {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
         };
         use windows_sys::Win32::Security::{
             GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
         };
-
-        let fixture = Fixture::new();
-        restrict(&fixture.0).unwrap();
-        let file = fixture.0.join("synthetic.key");
-        std::fs::write(&file, b"synthetic fixture").unwrap();
-        // A protected DACL alone is insufficient: this grants Everyone access to fake data.
         let sddl: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
-        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut descriptor = Descriptor(std::ptr::null_mut());
         // SAFETY: terminated SDDL/path, valid output pointers, retained descriptor owns ACL.
         unsafe {
@@ -1129,16 +926,494 @@ mod native_tests {
                 0
             );
         }
-        let Err(Unprotected::Refused(error)) =
-            windows_verify_private(&file, false, &identity::current_user().unwrap())
-        else {
-            panic!("a foreign SID grant must be refused");
+    }
+
+    #[test]
+    fn steady_state_second_sweep_skips_already_private_entries() {
+        let fixture = Fixture::new();
+        let logs = fixture.0.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let config = fixture.0.join("config.yaml");
+        let key = fixture.0.join("client.key");
+        std::fs::write(&config, b"synthetic config").unwrap();
+        std::fs::write(&key, b"synthetic key").unwrap();
+
+        let first = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            first,
+            SweepStats {
+                skipped: 0,
+                hardened: 4,
+                already_private: 0,
+            }
+        );
+
+        let second = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            second,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 4,
+            }
+        );
+
+        let part = logs.join("request-log-parts-request-body-9");
+        std::fs::write(&part, b"synthetic body").unwrap();
+        apply_everyone_dacl(&config);
+
+        let third = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            third,
+            SweepStats {
+                skipped: 0,
+                hardened: 2,
+                already_private: 3,
+            }
+        );
+        assert_dacl(&part, true, 0);
+        assert_dacl(&config, true, 0);
+
+        let fourth = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            fourth,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn junction_replacing_entry_between_seams_refuses_without_touching_target() {
+        for target_seam in [Seam::Hardening, Seam::Listed] {
+            let fixture = Fixture::new();
+            let logs = fixture.0.join("logs");
+            let session = logs.join("session");
+            std::fs::create_dir_all(&session).unwrap();
+            let outside = Fixture::new();
+            std::fs::write(outside.0.join("secret.txt"), b"outside").unwrap();
+            apply_everyone_dacl(&outside.0);
+            assert!(!crate::guarded_fs::is_directory_hardened(
+                &outside.0,
+                AclPolicy::OwnerOnly
+            ));
+
+            let result = sweep(&fixture.0, &mut |seam, path| {
+                let hit = match target_seam {
+                    Seam::Hardening => seam == Seam::Hardening,
+                    Seam::Listed => seam == Seam::Listed && path == session.as_path(),
+                    Seam::Inspected => false,
+                };
+                if hit {
+                    std::fs::remove_dir(&session).unwrap();
+                    let output = crate::subprocess::command_without_console("cmd.exe")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(&session)
+                        .arg(&outside.0)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                }
+            });
+            assert!(result.is_err(), "{target_seam:?}: {result:?}");
+            assert!(
+                !crate::guarded_fs::is_directory_hardened(&outside.0, AclPolicy::OwnerOnly),
+                "{target_seam:?}: outside target DACL was modified"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_native_part_creation_inherits_her_ace_and_open_handles_race_cleanly() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        assert!(error.contains("SID"), "{error}");
-        assert!(error.contains("verify failed"), "{error}");
-        // Restore the ordinary preparation contract, and prove that it is accepted again.
+
+        let fixture = Fixture::new();
+        let requests = fixture.0.join("requests");
+        std::fs::create_dir(&requests).unwrap();
         restrict(&fixture.0).unwrap();
-        assert_dacl(&file, true, 0);
+        assert_dacl(&fixture.0, true, 3);
+        assert_dacl(&requests, true, 3);
+
+        // A part created in place immediately inherits ONLY the HER-only ACE without waiting for
+        // a sweep, and remains sweepable while open writer and reader handles are held.
+        let part0 = requests.join("request-log-parts-request-body-0");
+        let mut writer = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&part0)
+            .unwrap();
+        writer.write_all(b"synthetic request body").unwrap();
+        assert_dacl(&part0, false, 16);
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&part0)
+            .unwrap();
+        restrict(&fixture.0).unwrap();
+        assert_dacl(&part0, true, 0);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(&part0).unwrap();
+
+        // Race active read/write/delete-shared part handles and rotation/deletion against sweeps.
+        struct WorkerGuard {
+            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = self.handle.take() {
+                    if std::thread::panicking() {
+                        let _ = handle.join();
+                    } else {
+                        handle.join().unwrap();
+                    }
+                }
+            }
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker = WorkerGuard {
+            done: done.clone(),
+            handle: Some({
+                let requests = requests.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut previous: Option<PathBuf> = None;
+                    for i in 1..=120usize {
+                        if done.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let part = requests.join(format!("request-log-parts-request-body-{i}"));
+                        let share = if i % 2 == 0 {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE
+                        } else {
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                        };
+                        let mut w = std::fs::OpenOptions::new()
+                            .create_new(true)
+                            .read(true)
+                            .write(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        w.write_all(b"synthetic request body").unwrap();
+                        let r = std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(share)
+                            .open(&part)
+                            .unwrap();
+                        if i % 2 == 1 {
+                            // Delete while read/write/delete-shared handles remain open.
+                            std::fs::remove_file(&part).unwrap();
+                            drop(r);
+                            drop(w);
+                        } else {
+                            drop(r);
+                            drop(w);
+                            if let Some(old) = previous.take() {
+                                std::fs::remove_file(&old).unwrap();
+                            }
+                            previous = Some(part);
+                        }
+                    }
+                    if let Some(old) = previous.take() {
+                        std::fs::remove_file(&old).unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            }),
+        };
+
+        let mut sweeps = 0usize;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) || sweeps < 40 {
+            restrict(&fixture.0).unwrap();
+            sweeps += 1;
+        }
+        if let Some(handle) = worker.handle.take() {
+            handle.join().unwrap();
+        }
+        restrict(&fixture.0).unwrap();
+    }
+
+    #[test]
+    fn listed_entry_with_transient_access_denied_then_not_found_is_skipped() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|entry| {
+            assert_eq!(entry, part.as_path());
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n <= 2 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Err(std::io::Error::from_raw_os_error(2))
+            }
+        });
+        assert_eq!(result.map(|found| found.is_some()), Ok(false));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn listed_entry_with_transient_access_denied_then_present_continues_inspection() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|entry| {
+            if entry == part.as_path() {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n <= 2 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+            }
+            std::fs::symlink_metadata(entry)
+        });
+        assert_eq!(result.map(|found| found.is_some()), Ok(true));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn listed_entry_with_persistent_access_denied_fails_closed() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert!(
+            calls.get() > 1,
+            "expected bounded retries before failing closed, got {}",
+            calls.get()
+        );
+    }
+
+    #[test]
+    fn listed_entry_with_access_denied_then_other_error_fails_with_last_error() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n == 1 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Err(std::io::Error::from_raw_os_error(32))
+            }
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(32),
+            ))
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn unlisted_entry_with_access_denied_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, false, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_with_synthetic_permission_denied_without_os_code_fails_immediately() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-1");
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&part, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission denied",
+            ))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &part,
+                "symlink_metadata",
+                &std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic permission denied",
+                ),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_guard_failure_with_transient_access_denied_recovers() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let stat_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                let n = guard_calls.get() + 1;
+                guard_calls.set(n);
+                if n <= 2 {
+                    Err("guard path cannot be inspected: permission denied".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &|_| {
+                stat_calls.set(stat_calls.get() + 1);
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+        );
+        assert_eq!(result.map(|found| found.is_some()), Ok(false));
+        assert_eq!(guard_calls.get(), 3);
+        assert_eq!(stat_calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_guard_failure_with_persistent_access_denied_fails_closed() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-2");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                guard_calls.set(guard_calls.get() + 1);
+                Err("guard path cannot be inspected: permission denied".into())
+            },
+            &|_| Err(std::io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(named("relay path is protected", &part))
+        );
+        assert!(
+            guard_calls.get() > 1,
+            "expected bounded retries before failing closed, got {}",
+            guard_calls.get()
+        );
+    }
+
+    #[test]
+    fn listed_entry_protected_root_guard_failure_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-guard-3");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+        let result = inspect_with_guard(
+            &part,
+            true,
+            &|_| {
+                guard_calls.set(guard_calls.get() + 1);
+                Err("development runtime root is under the production install root".into())
+            },
+            &|_| Err(std::io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(named("relay path is protected", &part))
+        );
+        assert_eq!(guard_calls.get(), 1);
+    }
+
+    #[test]
+    fn protect_entry_skips_listed_create_file_access_denied_when_entry_vanished() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-1");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, true, |p, _| {
+            calls += 1;
+            std::fs::remove_file(p).unwrap();
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Ok(None));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn protect_entry_refuses_listed_create_file_access_denied_when_entry_still_exists() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-2");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, true, |_, _| {
+            calls += 1;
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Err(reason));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn protect_entry_refuses_unlisted_create_file_access_denied_even_if_vanished() {
+        let fixture = Fixture::new();
+        let part = fixture.0.join("request-log-parts-request-body-protect-3");
+        std::fs::write(&part, b"synthetic fixture").unwrap();
+        let reason = format!(
+            "private ACL {}: CreateFileW failed (Win32 error 5)",
+            shown(&part)
+        );
+        let mut calls = 0usize;
+        let result = protect_entry(&part, false, false, |p, _| {
+            calls += 1;
+            std::fs::remove_file(p).unwrap();
+            Err(AclError::Refused(reason.clone()))
+        });
+        assert_eq!(result, Err(reason));
+        assert_eq!(calls, 1);
     }
 }
 
@@ -1213,8 +1488,8 @@ mod unix_tests {
         (path, meta)
     }
 
-    fn missing() -> Unprotected {
-        Unprotected::Missing("synthetic missing".into())
+    fn missing() -> AclError {
+        AclError::Missing("synthetic missing".into())
     }
 
     #[test]
@@ -1494,7 +1769,7 @@ mod unix_tests {
         let result = protect(&path, meta, true, |entry, _| {
             calls += 1;
             std::fs::remove_file(entry).unwrap();
-            Err(Unprotected::Refused("synthetic refusal".into()))
+            Err(AclError::Refused("synthetic refusal".into()))
         });
         assert_eq!(result, Err("synthetic refusal".to_string()));
         assert_eq!(calls, 1);
@@ -1578,15 +1853,15 @@ mod unix_tests {
         let meta = std::fs::symlink_metadata(&file).unwrap();
         // Without search permission on the directory, the file's mode cannot be changed.
         set_mode(&dir, 0o600);
-        let result = unix_private(&file, &meta);
+        let result = crate::guarded_fs::restrict_entry(&file, &meta, AclPolicy::OwnerOnly);
         set_mode(&dir, 0o700);
-        let Err(Unprotected::Refused(error)) = result else {
+        let Err(AclError::Refused(error)) = result else {
             panic!("a denied permission change must be refused");
         };
         assert_eq!(
             error,
             format!(
-                "relay private permissions could not be applied: {}: set_permissions failed (errno {})",
+                "private permissions could not be applied: {}: set_permissions failed (errno {})",
                 file.display(),
                 libc::EACCES
             )
@@ -1658,5 +1933,164 @@ mod unix_tests {
         assert!(other <= 300, "{other}");
         assert_eq!(restrict(&fixture.0), Ok(0));
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn steady_state_second_sweep_skips_already_private_entries() {
+        let fixture = Fixture::new();
+        let logs = fixture.0.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let config = fixture.0.join("config.yaml");
+        let key = fixture.0.join("client.key");
+        let bin = fixture.0.join("relay-bin");
+        std::fs::write(&config, b"synthetic config").unwrap();
+        std::fs::write(&key, b"synthetic key").unwrap();
+        std::fs::write(&bin, b"synthetic bin").unwrap();
+        set_mode(&config, 0o644);
+        set_mode(&key, 0o644);
+        set_mode(&bin, 0o755);
+
+        let first = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            first,
+            SweepStats {
+                skipped: 0,
+                hardened: 5,
+                already_private: 0,
+            }
+        );
+        assert_eq!(mode(&bin), 0o700);
+
+        let second = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            second,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 5,
+            }
+        );
+
+        set_mode(&config, 0o644);
+        let part = logs.join("request-log-parts-request-body-9");
+        std::fs::write(&part, b"synthetic body").unwrap();
+        set_mode(&part, 0o644);
+
+        let third = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            third,
+            SweepStats {
+                skipped: 0,
+                hardened: 2,
+                already_private: 4,
+            }
+        );
+        assert_eq!(mode(&config), 0o600);
+        assert_eq!(mode(&part), 0o600);
+
+        let fourth = sweep_stats(&fixture.0, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            fourth,
+            SweepStats {
+                skipped: 0,
+                hardened: 0,
+                already_private: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn symlink_replacing_entry_between_seams_refuses_without_touching_target() {
+        for target_seam in [Seam::Hardening, Seam::Listed] {
+            let fixture = Fixture::new();
+            let (_, part, _) = request_log_parts(&fixture);
+            let outside = Fixture::new();
+            let target = outside.0.join("foreign");
+            std::fs::write(&target, b"synthetic").unwrap();
+            set_mode(&target, 0o644);
+
+            let result = sweep(&fixture.0, &mut |seam, path| {
+                let hit = match target_seam {
+                    Seam::Hardening => seam == Seam::Hardening,
+                    Seam::Listed => seam == Seam::Listed && path == part.as_path(),
+                    Seam::Inspected => false,
+                };
+                if hit {
+                    std::fs::remove_file(&part).unwrap();
+                    std::os::unix::fs::symlink(&target, &part).unwrap();
+                }
+            });
+            assert!(result.is_err(), "{target_seam:?}: {result:?}");
+            assert_eq!(mode(&target), 0o644, "{target_seam:?}");
+        }
+    }
+
+    #[test]
+    fn listed_entry_with_errno_5_on_unix_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unlisted_entry_with_errno_5_on_unix_fails_immediately_without_retry() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, false, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::from_raw_os_error(5),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn listed_entry_with_synthetic_permission_denied_without_os_code_fails_immediately() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let calls = std::cell::Cell::new(0usize);
+        let result = inspect_with(&path, true, &|_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission denied",
+            ))
+        });
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err(failure(
+                "relay path is unavailable",
+                &path,
+                "symlink_metadata",
+                &std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic permission denied",
+                ),
+            ))
+        );
+        assert_eq!(calls.get(), 1);
     }
 }

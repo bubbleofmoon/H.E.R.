@@ -379,7 +379,13 @@ fn tasks_list_shows_the_registry_with_next_runs() {
     assert_eq!(code, 0, "{err}");
     let tasks = list["tasks"].as_array().unwrap();
     let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["watchdog", "memory-digest", "memory-digest-check", "backup", "upstream-check", "console-restart"]);
+    assert_eq!(
+        ids,
+        [
+            "watchdog", "memory-digest", "memory-digest-check", "backup", "upstream-check",
+            "console-restart", "memory-backup", "memory-restore-test",
+        ]
+    );
     let now = list["now"].as_i64().unwrap();
     let watchdog = &tasks[0];
     let next = watchdog["nextRunAt"].as_i64().unwrap();

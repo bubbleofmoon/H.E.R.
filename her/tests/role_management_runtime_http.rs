@@ -1485,10 +1485,9 @@ fn role_management_rejects_invalid_selected_state_before_mutations() {
         .unwrap_or_else(|error| panic!("create data-area reparse fixture: {error}"));
     let junction = DirectoryReparsePoint(data_a.clone());
 
-    // A GET first loads the selected config, which since ticket 13 (8b5646a5) also reads
-    // `data/mode.json` for the closed-agent owner overlay; a reparse-point data area therefore fails
-    // the request closed (503) before the role route runs. POSTs are refused earlier, at the audit
-    // target check.
+    // GET and POST both load the selected config in the console front before routing or audit
+    // (`docs/agents/social-state.md`), reading `data/mode.json` for the closed-agent owner overlay;
+    // a reparse-point data area therefore fails closed with `503 "runtime config is unavailable"`.
     let list_response = http_request(port_a, "GET", "/api/roles", Some(token_a), None)
         .expect("GET selected A roles through data-area reparse fixture");
     assert_http_error(
@@ -1510,7 +1509,7 @@ fn role_management_rejects_invalid_selected_state_before_mutations() {
         assert_http_error(
             response,
             503,
-            "selected runtime audit target is unavailable",
+            "runtime config is unavailable",
             &format!("POST {path} through selected data reparse point"),
         );
         assert_eq!(

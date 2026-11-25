@@ -113,13 +113,13 @@ class PushHook(unittest.TestCase):
                               capture_output=True, text=True, encoding='utf-8', env=env)
         return proc.returncode, scrub((proc.stdout or '') + (proc.stderr or ''))
 
-    def push(self, *lines, extra=None):
+    def push(self, *lines, extra=None, remote='origin', remote_url='https://example.invalid/guard.git'):
         """Run the hook exactly as git does: repository as cwd, ref lines on stdin; `extra` overrides variables."""
         env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
         env.update(extra or {})
-        proc = subprocess.run([BASH, str(HOOK), 'origin', 'https://example.invalid/guard.git'],
+        proc = subprocess.run([BASH, str(HOOK), remote, remote_url],
                               cwd=self.repo, input='\n'.join(lines) + '\n',
                               capture_output=True, text=True, encoding='utf-8', env=env)
         return proc.returncode, scrub((proc.stdout or '') + (proc.stderr or ''))
@@ -365,6 +365,100 @@ class PushHook(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
         self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    def setup_remote_main(self, url='https://example.invalid/guard.git'):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base on remote main')
+        if url is not None:
+            self.git('config', 'remote.origin.url', url)
+        self.git('update-ref', 'refs/remotes/origin/main', base)
+        return base
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_branch_descending_from_remote_main_scans_only_added_commits(self):
+        self.setup_remote_main()
+        self.git('checkout', '-qb', 'her/work')
+        self.write('docs/b.md', 'clean new file\n')
+        self.commit('new branch commit')
+        code, out = self.push(self.ref('her/work'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings', out)
+        self.assertIn('1 commits, 0 whole trees, 1 blobs', out)
+        self.assertIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_branch_descending_from_remote_main_refuses_dirty_blob_and_dirty_message(self):
+        base = self.setup_remote_main()
+        self.git('checkout', '-qb', 'her/dirty-blob', base)
+        self.write('docs/d.md', DIRTY)
+        self.commit('add dirty file')
+        self.git('rm', '-q', 'docs/d.md')
+        self.commit('remove dirty file')
+        code, out = self.push(self.ref('her/dirty-blob'))
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('2 commits, 0 whole trees', out)
+        self.assertNotIn('123456' + '789', out)
+
+        self.git('checkout', '-qb', 'her/dirty-msg', base)
+        self.write('docs/c.md', 'clean file\n')
+        sha = self.commit('release note ' + '987654' + '321')
+        code, out = self.push(self.ref('her/dirty-msg'))
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the commit and tag messages this push publishes', out)
+        self.assertIn(f'digit commit {sha[:12]}:', out)
+        self.assertNotIn('987654' + '321', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_branch_with_mismatched_remote_url_keeps_whole_tree_scan(self):
+        self.setup_remote_main(url='https://example.invalid/other.git')
+        self.git('checkout', '-qb', 'her/work')
+        self.write('docs/b.md', 'clean new file\n')
+        self.commit('new branch commit')
+        code, out = self.push(self.ref('her/work'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_branch_not_descending_from_remote_main_keeps_whole_tree_scan(self):
+        self.setup_remote_main()
+        self.git('checkout', '-q', '--orphan', 'her/orphan')
+        self.git('rm', '-qf', 'docs/a.md')
+        self.write('docs/b.md', 'clean orphan\n')
+        self.commit('orphan commit')
+        code, out = self.push(self.ref('her/orphan'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_branch_pushurl_and_non_remote_name_checks(self):
+        self.setup_remote_main()
+        self.git('checkout', '-qb', 'her/work')
+        self.write('docs/b.md', 'clean new file\n')
+        self.commit('new branch commit')
+        # A path/URL passed as remote name must never be treated as a configured remote.
+        code, out = self.push(self.ref('her/work'), remote='https://example.invalid/guard.git')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        # When pushurl is configured, it overrides url: mismatch falls back, match takes fast path.
+        self.git('config', 'remote.origin.pushurl', 'https://example.invalid/other-push.git')
+        code, out = self.push(self.ref('her/work'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.git('config', '--add', 'remote.origin.pushurl', 'https://example.invalid/guard.git')
+        code, out = self.push(self.ref('her/work'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('1 commits, 0 whole trees, 1 blobs', out)
+        self.assertIn('Public scan (history): 0 findings (none); 0 revisions', out)
 
     @REQUIRES_SCANNER
     @REQUIRES_BASH

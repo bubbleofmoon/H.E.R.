@@ -10,32 +10,15 @@ use std::time::{Duration, Instant};
 
 #[path = "supervisor_relay.rs"]
 mod relay;
-
-#[cfg(all(test, windows))]
-pub(crate) fn credential_file_is_private(path: &std::path::Path, settings: bool) -> bool {
-    relay::credential_file_is_private(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn create_credential_file(path: &std::path::Path, settings: bool) -> std::io::Result<std::fs::File> {
-    relay::windows_create_credential(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn restrict_credential_path(path: &std::path::Path, metadata: &std::fs::Metadata, settings: bool) -> Result<(), String> {
-    if settings {
-        relay::windows_private_settings(path, metadata)
-    } else {
-        relay::windows_private(path, metadata)
-    }
-    .map_err(String::from)
-}
 #[path = "dependency_upgrade.rs"]
 pub(crate) mod upgrades;
 
 const STATUS: &str = "lifecycle/dependencies.json";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NPM_INSTALL_LIMIT: Duration = Duration::from_secs(600);
+const RELAY_REFUSAL: &str = "lifecycle/relay-probe-refusal.json";
+const RELAY_PROBE_BUDGET: Duration = Duration::from_secs(3);
+const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 3;
 
 /// A dependency's pinned version from runtime config: `None` when unpinned. A pin is one exact
 /// release version (`1.14.22`, `0.2.1-rc.2`); ranges, tags and build metadata are refused.
@@ -70,6 +53,28 @@ pub fn pinned_version(cfg: &Value, name: &str) -> Result<Option<String>, String>
             }
         )),
     }
+}
+
+fn require_dsh_contract(version: &str) -> Result<(), String> {
+    if include_str!("../dsh-contract-versions.txt")
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .any(|(listed, _)| listed == version)
+    {
+        Ok(())
+    } else {
+        Err(format!("DSH version {version} has no credential contract coverage"))
+    }
+}
+
+/// Validate a pin for startup or health judgment. Process retirement uses the configured
+/// identity even when the pin is no longer eligible to run.
+pub(crate) fn runnable_pin(cfg: &Value, name: &str) -> Result<Option<String>, String> {
+    let version = pinned_version(cfg, name)?;
+    if let ("dsh", Some(version)) = (name, version.as_deref()) {
+        require_dsh_contract(version)?;
+    }
+    Ok(version)
 }
 
 struct Clock {
@@ -118,6 +123,9 @@ fn remember(states: &mut Value, name: &str, state: &str, found: &ProcessIdentity
         states[name]["refusalSince"] = Value::Null;
         states[name]["startedAt"] = json!(now);
         states[name]["ready"] = json!(false);
+        if name == "relay" {
+            states[name]["relayProbeFailures"] = Value::Null;
+        }
     }
     states[name]["state"] = json!(state);
     states[name]["identity"] = json!(found);
@@ -132,6 +140,9 @@ fn backoff_ms(step: u64) -> i64 {
 }
 
 fn restore_timers(states: &mut Value, name: &str, now: i64) {
+    if name == "relay" {
+        states[name]["relayProbeFailures"] = Value::Null;
+    }
     // Preserve bounded durations from the last observation, not the previous process's
     // wall-clock anchor. Downtime cannot prove continuous health or refusal.
     let observed = states[name]["timerAt"].as_i64().unwrap_or(now);
@@ -623,12 +634,14 @@ pub(crate) fn probe_relay(
     cfg: &Value,
     deadline: Instant,
 ) -> Result<(), String> {
+    let deadline = deadline.min(Instant::now() + RELAY_PROBE_BUDGET);
     let dependency = configuration(context, cfg, "relay")?;
     dependency
         .relay
         .as_ref()
         .ok_or("relay configuration is unavailable")?
         .probe(dependency.endpoint, deadline)
+        .map_err(relay::ProbeError::reason)
 }
 
 fn npx_cache(path: &Path) -> bool {
@@ -887,6 +900,7 @@ fn prepare(
     name: &'static str,
     states: &mut Value,
 ) -> Result<Option<Dependency>, String> {
+    runnable_pin(cfg, name)?;
     let mut dependency = configuration(context, cfg, name)?;
     if let Some(settings) = &dependency.relay {
         relay::restrict(&settings.folder)?;
@@ -1407,22 +1421,171 @@ fn listening(dependency: &Dependency) -> Result<bool, String> {
     }
 }
 
-fn check_port(states: &mut Value, dependency: &Dependency) -> Result<bool, String> {
-    let result = listening(dependency).and_then(|listening| {
-        if listening {
-            if let Some(settings) = &dependency.relay {
-                settings.probe(
-                    dependency.endpoint,
-                    Instant::now() + Duration::from_millis(500),
-                )?;
+enum PortHealth {
+    Ready,
+    TcpRefusal,
+    ProbeFailed(Option<String>),
+}
+
+fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth, String> {
+    let Some(settings) = &dependency.relay else {
+        return listening(dependency).map(|listening| {
+            if listening {
+                PortHealth::Ready
+            } else {
+                PortHealth::TcpRefusal
+            }
+        });
+    };
+    classify_relay_probe(
+        states,
+        settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET),
+    )
+}
+
+fn classify_relay_probe(
+    states: &mut Value,
+    result: Result<(), relay::ProbeError>,
+) -> Result<PortHealth, String> {
+    let state = &mut states["relay"];
+    match result {
+        Ok(()) => {
+            state["relayProbeFailures"] = Value::Null;
+            Ok(PortHealth::Ready)
+        }
+        Err(relay::ProbeError::Connect(
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut,
+        )) => Ok(PortHealth::TcpRefusal),
+        Err(relay::ProbeError::Connect(_)) => {
+            Err("relay: selected port observation is unknown; no process changed".into())
+        }
+        Err(relay::ProbeError::Request(reason)) => {
+            let failures = state["relayProbeFailures"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(RELAY_PROBE_FAILURE_THRESHOLD);
+            state["relayProbeFailures"] = json!(failures);
+            Ok(PortHealth::ProbeFailed(
+                (failures >= RELAY_PROBE_FAILURE_THRESHOLD).then_some(reason),
+            ))
+        }
+    }
+}
+
+// Only the dependency worker holding the launch gate reads or writes this file.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct RelayRefusals {
+    observation: Option<Value>,
+    notices: Vec<Value>,
+}
+
+impl RelayRefusals {
+    fn read(context: &RuntimeContext) -> Result<Self, String> {
+        match context
+            .read_optional_text(RuntimeArea::Data, RELAY_REFUSAL)
+            .map_err(str::to_string)?
+        {
+            Some(text) => {
+                serde_json::from_str(&text).map_err(|_| "invalid pending relay refusal".into())
+            }
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn save(&self, context: &RuntimeContext) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        context.write_atomic(RuntimeArea::Data, RELAY_REFUSAL, &bytes)
+    }
+
+    // Delivery is independent of the lifecycle gate. A busy gate can delay publication of
+    // the dependency snapshot without discarding a completed send or a known pre-send refusal.
+    fn deliver(&mut self, context: &RuntimeContext, cfg: &Value) {
+        if let Err(error) = self.try_deliver(context, cfg) {
+            crate::safe_eprintln!("[dependencies] pending relay refusal: {error}");
+        }
+    }
+
+    fn try_deliver(&mut self, context: &RuntimeContext, cfg: &Value) -> Result<(), String> {
+        let mut index = 0;
+        let mut gateway_available = true;
+        while index < self.notices.len() {
+            let mut notice = self.notices[index].clone();
+            let mut save = |next: &Value| -> Result<(), String> {
+                self.notices[index] = next.clone();
+                self.save(context)
+            };
+            log_relay_notice(context, &mut notice, &mut save)?;
+            if gateway_available {
+                deliver_notice(context, cfg, &mut notice, save)?;
+            }
+            if notice["status"] == "pending" {
+                gateway_available = false;
+                index += 1;
+            } else {
+                self.notices.remove(index);
+                self.save(context)?;
             }
         }
-        Ok(listening)
-    });
-    if result.is_err() {
-        states[dependency.name]["refusalSince"] = Value::Null;
+        Ok(())
     }
-    result
+}
+
+// The launch gate serializes this write-ahead record. A busy lifecycle gate or a new
+// desired revision can postpone its transfer to the dependency snapshot.
+fn stage_relay_refusal(
+    context: &RuntimeContext,
+    states: &mut Value,
+    reason: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let relay = &mut states["relay"];
+    if relay["fingerprint"] == reason {
+        relay["state"] = json!("refused");
+        relay["reason"] = json!(reason);
+        return Ok(false);
+    }
+    dependency_pause(context, "relay", "after-failed-probe")?;
+    let pending = json!({"state":"refused", "reason":reason, "identity":relay["identity"],
+        "refusalSince":relay["refusalSince"], "timerAt":now});
+    let mut refusals = RelayRefusals::read(context)?;
+    refusals.observation = Some(pending);
+    refusals
+        .notices
+        .push(json!({"state":"refused", "reason":reason, "status":"pending", "key":"relay"}));
+    refusals.save(context)?;
+    Ok(true)
+}
+
+// Only parity fixtures can pause reconciliation to synchronize with a disposable dependency.
+fn dependency_pause(context: &RuntimeContext, name: &str, stage: &str) -> Result<(), String> {
+    #[cfg(feature = "parity-clock")]
+    if std::env::var_os("HER_TEST_DEPENDENCY_CLOCK").is_some() {
+        let point = format!("{name} {stage}");
+        let control = "lifecycle/dependency-reconcile-pause";
+        let paused = || {
+            context
+                .read_optional_text(RuntimeArea::Data, control)
+                .map_err(str::to_string)
+                .map(|value| value.as_deref() == Some(point.as_str()))
+        };
+        if paused()? {
+            context.write_atomic(
+                RuntimeArea::Data,
+                "lifecycle/dependency-reconcile-reached",
+                point.as_bytes(),
+            )?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while paused()? {
+                if Instant::now() >= deadline {
+                    return Err("dependency reconcile fixture pause timed out".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let _ = (context, name, stage);
+    Ok(())
 }
 
 fn stop_hung(
@@ -1457,7 +1620,23 @@ fn stop_hung(
             dependency.name
         ));
     }
-    if check_port(states, dependency)? {
+    // Only refusal of the configured address authorizes a stop. A listening relay
+    // also has to answer the authenticated recheck before DSH may start.
+    if listening(dependency)? {
+        if let Some(settings) = &dependency.relay {
+            let recheck = settings.probe(
+                dependency.endpoint,
+                Instant::now() + Duration::from_millis(500),
+            );
+            match classify_relay_probe(states, recheck)? {
+                PortHealth::Ready => {}
+                PortHealth::ProbeFailed(Some(reason)) => {
+                    stage_relay_refusal(context, states, &reason, clock.now(context))?;
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
         healthy(states, dependency.name, clock.now(context));
         return Ok(true);
     }
@@ -1566,7 +1745,7 @@ pub fn start(context: RuntimeContext) {
     upgrades::start(context.clone());
     std::thread::spawn(move || {
         let clock = Clock::new();
-        let mut fresh = true;
+        let mut restored = std::collections::BTreeSet::new();
         loop {
             let recovered = match upgrades::apply_pending(&context) {
                 Ok(idle) => idle,
@@ -1575,12 +1754,11 @@ pub fn start(context: RuntimeContext) {
             if wanted(&context) {
                 let blocked = if recovered { Ok(None) } else { upgrades::blocked(&context) };
                 if let Ok(blocked) = blocked {
-                    reconcile(&context, &clock, fresh, blocked);
-                    fresh = false;
+                    reconcile(&context, &clock, &mut restored, blocked);
                 }
             } else {
                 // Resume by re-adopting survivors and restoring timers from observed time.
-                fresh = true;
+                restored.clear();
             }
             std::thread::sleep(Duration::from_millis(if cfg!(feature = "parity-clock") {
                 100
@@ -1593,6 +1771,7 @@ pub fn start(context: RuntimeContext) {
 
 fn reconcile_one(
     context: &RuntimeContext,
+    cfg: &Value,
     dependency: &Dependency,
     states: &mut Value,
     clock: &Clock,
@@ -1652,7 +1831,9 @@ fn reconcile_one(
             "{name} identity changed during monitoring; left alone"
         ));
     }
-    if check_port(states, dependency)? {
+    dependency_pause(context, name, "before-probe")?;
+    let port = check_port(states, dependency)?;
+    if matches!(port, PortHealth::Ready) {
         healthy(states, name, clock.now(context));
         return Ok(true);
     }
@@ -1660,8 +1841,23 @@ fn reconcile_one(
     let since = states[name]["refusalSince"].as_i64().unwrap_or(now);
     states[name]["refusalSince"] = json!(since);
     states[name]["healthySince"] = Value::Null;
-    if now.saturating_sub(since) >= 120_000 {
+    let hung = now.saturating_sub(since) >= 120_000;
+    if let PortHealth::ProbeFailed(Some(reason)) = &port {
+        if stage_relay_refusal(context, states, reason, now)? && hung {
+            // Publish the refusal before the locked recheck can change the state to backoff.
+            let previous = states.clone();
+            if !checkpoint(context, cfg, states, name, None, desired, &previous)? {
+                return Ok(false);
+            }
+            RelayRefusals::read(context)?.deliver(context, cfg);
+        }
+    }
+    if hung {
+        dependency_pause(context, name, "before-stop-lock")?;
         return stop_hung(context, dependency, &found, states, clock, desired);
+    }
+    if matches!(port, PortHealth::ProbeFailed(_)) {
+        return Ok(false);
     }
     if states[name]["ready"] != true
         && now.saturating_sub(states[name]["startedAt"].as_i64().unwrap_or(now)) >= 90_000
@@ -1683,7 +1879,7 @@ fn checkpoint(
     error: Option<&str>,
     desired: &lifecycle::DesiredRead,
     previous: &Value,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let path = context
         .resolve_path(
             RuntimeArea::Data,
@@ -1694,7 +1890,31 @@ fn checkpoint(
     let _desired_gate = lifecycle::lock_with_wait(&path, Duration::from_secs(5))?;
     // A stop may have published newer dependency state after this pass read it.
     if !same_desired(context, desired) {
-        return Ok(());
+        return Ok(false);
+    }
+    let mut refusals = if name == "relay" {
+        RelayRefusals::read(context)?
+    } else {
+        RelayRefusals::default()
+    };
+    let observation = refusals.observation.take();
+    if let Some(record) = &observation {
+        let relay = &mut states["relay"];
+        relay["pendingProbeRefusal"] = json!({"state":record["state"], "reason":record["reason"]});
+        relay["fingerprint"] = record["reason"].clone();
+        if relay["identity"] == record["identity"]
+            && !matches!(relay["state"].as_str(), Some("backoff" | "stopped"))
+        {
+            for field in ["state", "reason", "refusalSince", "timerAt"] {
+                relay[field] = record[field].clone();
+            }
+            relay["relayProbeFailures"] = json!(RELAY_PROBE_FAILURE_THRESHOLD);
+            relay["healthySince"] = Value::Null;
+        }
+    } else if name == "relay" && refusals.notices.is_empty() {
+        if let Some(relay) = states["relay"].as_object_mut() {
+            relay.remove("pendingProbeRefusal");
+        }
     }
     let mut pending_created = false;
     let notice = if states[name]["state"] == "backoff" {
@@ -1715,7 +1935,7 @@ fn checkpoint(
         } else {
             None
         }
-    } else if let Some(reason) = error {
+    } else if let Some(reason) = error.filter(|_| observation.is_none()) {
         states[name]["state"] = json!("refused");
         states[name]["reason"] = json!(reason);
         states[name]["healthySince"] = Value::Null;
@@ -1738,35 +1958,41 @@ fn checkpoint(
     if states != previous {
         publish(context, states)?;
     }
+    if observation.is_some() {
+        refusals.save(context)?;
+    }
     if pending_created {
-        record_outage_notice(
+        record_notice(
             context,
-            states,
-            name,
+            &states[name]["outageNotice"],
             crate::run_record::Outcome::Failed,
             "pending administrator notice; awaiting SnowLuma",
         );
     }
-    deliver_outage_notice(context, cfg, states, name)?;
+    if states[name]["outageNotice"]["status"] == "pending" {
+        let mut outage = states[name]["outageNotice"].clone();
+        deliver_notice(context, cfg, &mut outage, |notice| {
+            states[name]["outageNotice"] = notice.clone();
+            publish(context, states)
+        })?;
+    }
     if let Some((key, reason)) = notice {
         alert(context, cfg, &key, &reason);
     }
-    Ok(())
+    Ok(true)
 }
 
-fn record_outage_notice(
+fn record_notice(
     context: &RuntimeContext,
-    states: &Value,
-    name: &str,
+    notice: &Value,
     outcome: crate::run_record::Outcome,
     delivery: &str,
 ) {
-    let notice = &states[name]["outageNotice"];
     crate::recovery_log::record(
         context,
         crate::run_record::Trigger::Timer,
         crate::run_record::Component::Alert,
-        &format!("dependency-{}", notice["key"].as_str().unwrap_or(name)),
+        &format!("dependency-{}", notice["key"].as_str().unwrap_or("outage")),
         outcome,
         &format!(
             "{}; {delivery}",
@@ -1775,13 +2001,13 @@ fn record_outage_notice(
     );
 }
 
-fn deliver_outage_notice(
+fn deliver_notice(
     context: &RuntimeContext,
     cfg: &Value,
-    states: &mut Value,
-    name: &str,
+    notice: &mut Value,
+    mut save: impl FnMut(&Value) -> Result<(), String>,
 ) -> Result<(), String> {
-    if states[name]["outageNotice"]["status"] != "pending" {
+    if notice["status"] != "pending" {
         // An interrupted attempt has an unknown outcome and must never be repeated.
         return Ok(());
     }
@@ -1795,9 +2021,7 @@ fn deliver_outage_notice(
         return Ok(());
     }
     let ob = crate::console::media_onebot(context, cfg)?;
-    let key = states[name]["outageNotice"]["key"]
-        .as_str()
-        .ok_or("invalid outage notice")?;
+    let key = notice["key"].as_str().ok_or("invalid outage notice")?;
     let scope = context
         .runtime_root()
         .ok_or("outage notice requires selected runtime")?
@@ -1813,14 +2037,12 @@ fn deliver_outage_notice(
     {
         return Ok(());
     }
-    let reason = states[name]["outageNotice"]["reason"]
-        .as_str()
-        .ok_or("invalid outage notice")?;
+    let reason = notice["reason"].as_str().ok_or("invalid outage notice")?;
     let body =
         crate::admin_alert::prepare_body(reason, |text| crate::activity::redact(context, text));
     // A replacement after this checkpoint cannot distinguish an unsent request from a lost reply.
-    states[name]["outageNotice"]["status"] = json!("attempting");
-    publish(context, states)?;
+    notice["status"] = json!("attempting");
+    save(notice)?;
     let (status, outcome, detail) =
         match ob.send_one_outcome(&crate::onebot::Target::Private(owner), &body, None, None) {
             Ok(_) => (
@@ -1839,9 +2061,65 @@ fn deliver_outage_notice(
                 "delivery outcome unknown; never retried",
             ),
         };
-    states[name]["outageNotice"]["status"] = json!(status);
-    publish(context, states)?;
-    record_outage_notice(context, states, name, outcome, detail);
+    notice["status"] = json!(status);
+    save(notice)?;
+    record_notice(context, notice, outcome, detail);
+    Ok(())
+}
+
+// Persist the append offset first. After an interrupted acknowledgment only the tail
+// from that offset can contain this receipt, even if the supervisor has been replaced.
+fn log_relay_notice(
+    context: &RuntimeContext,
+    notice: &mut Value,
+    mut save: impl FnMut(&Value) -> Result<(), String>,
+) -> Result<(), String> {
+    if notice["logged"] == true {
+        return Ok(());
+    }
+    use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+    let path = context
+        .resolve_path(
+            RuntimeArea::Data,
+            "logs/dependency-relay.err.log",
+            PathIntent::WriteFile,
+        )
+        .map_err(str::to_string)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| format!("relay refusal log unavailable: {error}"))?;
+    if notice["logOffset"].is_null() {
+        notice["logOffset"] = json!(file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?);
+        notice["logAt"] = json!(crate::parity_clock::now_ms());
+        save(notice)?;
+    }
+    let reason = notice["reason"]
+        .as_str()
+        .ok_or("missing relay refusal reason")?;
+    let line = format!("[{}] refused: {reason}", notice["logAt"]);
+    file.seek(SeekFrom::Start(
+        notice["logOffset"]
+            .as_u64()
+            .ok_or("invalid refusal log offset")?,
+    ))
+    .map_err(|e| e.to_string())?;
+    let mut written = false;
+    for existing in BufReader::new(&file).lines() {
+        if existing.map_err(|e| e.to_string())? == line {
+            written = true;
+            break;
+        }
+    }
+    if !written {
+        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+        file.sync_data().map_err(|e| e.to_string())?;
+        crate::safe_eprintln!("[dependencies] {reason}");
+    }
+    notice["logged"] = json!(true);
+    save(notice)?;
     Ok(())
 }
 
@@ -1866,7 +2144,12 @@ pub(crate) fn outage_notices(context: &RuntimeContext) -> Vec<Value> {
         .collect()
 }
 
-fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Option<&str>) {
+fn reconcile(
+    context: &RuntimeContext,
+    clock: &Clock,
+    restored: &mut std::collections::BTreeSet<&'static str>,
+    blocked: Option<&str>,
+) {
     let desired = DesiredStore::new(context.data_dir().join("lifecycle")).read();
     let Ok(cfg) = context.load_config() else {
         return;
@@ -1885,6 +2168,23 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
             return Ok(());
         }
         let _launch_gate = os::launch_gate(context)?;
+        let mut refusals = RelayRefusals::read(context)?;
+        refusals.deliver(context, &cfg);
+        // Replay a contended threshold before another observation or a backoff transition.
+        if refusals.observation.is_some() {
+            let previous = states.clone();
+            if !checkpoint(
+                context,
+                &cfg,
+                &mut states,
+                "relay",
+                None,
+                &desired,
+                &previous,
+            )? {
+                return Ok(());
+            }
+        }
         let mut predecessors_ready = true;
         for name in names(&cfg) {
             if blocked == Some(name) { continue; }
@@ -1899,14 +2199,21 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
                 continue;
             }
             let previous = states.clone();
+            let fresh = !restored.contains(name);
             if fresh {
                 restore_timers(&mut states, name, clock.now(context));
             }
             let ready =
                 prepare(context, &cfg, name, &mut states).and_then(|dependency| match dependency {
-                    Some(dependency) => {
-                        reconcile_one(context, &dependency, &mut states, clock, fresh, &desired)
-                    }
+                    Some(dependency) => reconcile_one(
+                        context,
+                        &cfg,
+                        &dependency,
+                        &mut states,
+                        clock,
+                        fresh,
+                        &desired,
+                    ),
                     None => Ok(false),
                 });
             if ready.is_err()
@@ -1922,7 +2229,7 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
                 failed(&mut states, name, clock.now(context));
             }
             states[name]["timerAt"] = json!(clock.now(context));
-            checkpoint(
+            if !checkpoint(
                 context,
                 &cfg,
                 &mut states,
@@ -1930,12 +2237,19 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
                 ready.as_ref().err().map(String::as_str),
                 &desired,
                 &previous,
-            )?;
+            )? {
+                break;
+            }
+            restored.insert(name);
             predecessors_ready &= matches!(ready, Ok(true));
         }
         Ok::<_, String>(())
     })();
     if let Err(reason) = result {
+        // A failed checkpoint may have changed only the in-memory snapshot.
+        let Ok(mut states) = read_states(context) else {
+            return;
+        };
         let previous = states.clone();
         if let Err(error) = checkpoint(
             context,
@@ -2006,7 +2320,6 @@ fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
 
 #[cfg(windows)]
 mod os {
-    pub(super) use super::relay::windows_private as private;
     use super::*;
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -2172,7 +2485,6 @@ mod os {
 
 #[cfg(unix)]
 mod os {
-    pub(super) use super::relay::unix_private as private;
     use super::*;
     /// npm runs as its own process group so a stop reaches its descendants.
     pub struct NpmTree(std::process::Child);

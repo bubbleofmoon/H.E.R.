@@ -39,6 +39,7 @@ macro_rules! cases {
 }
 
 cases! {
+    rust_world_native_console_transport => "rust-world-native-console-transport",
     a_401_after_a_dsh_restart_heals_once_per_call_and_delivers_the_prompt_once => "reauth-401-rotation-call-counts",
     a_dsh_outage_queues_messages_bounds_the_calls_and_replays_after_recovery => "dsh-outage-queues-then-replays-through-the-access-checks",
     a_revocation_made_during_an_outage_is_honoured_by_the_replay => "dsh-outage-replay-honours-a-revocation-made-while-down",

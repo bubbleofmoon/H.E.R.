@@ -297,6 +297,64 @@ fn closed_agent_maintenance_continues_during_stalled_handshake() {
 }
 
 #[test]
+fn closed_agent_refreshes_settings_while_notification_waits_for_send_chain() {
+    let mut rig = Rig::new(
+        "closed-send-chain",
+        Seed {
+            mode: "closed-agent",
+            config: json!({"ackMessage": "hold send chain"}),
+            ..Seed::default()
+        },
+    );
+    lock(&rig.dsh.inner).settings =
+        json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent"}}]});
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == "hold send chain" {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(13));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            rig.texts_to(OWNER_KEY).iter().any(|text| text == "hold send chain")
+        }),
+        "the acknowledgement did not acquire the send chain"
+    );
+
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+        "eventId":"question-behind-send", "request":{"questions":[{"id":"q1","question":"Queued question"}]}
+    }));
+    assert!(
+        wait_for(Duration::from_secs(4), || {
+            rig.data_json("pending-interactions.json")
+                .as_array()
+                .is_some_and(|items| items.len() == 1)
+        }),
+        "the stream did not register the queued question"
+    );
+    lock(&rig.dsh.inner).settings =
+        json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent","ownerQQ":OWNER}}]});
+    let refreshed = wait_for(Duration::from_secs(7), || {
+        rig.data_json("closed-agent-owner.json")["ownerQQ"] == json!(OWNER)
+    });
+    let before_release = rig.texts_to(OWNER_KEY);
+    drop(release);
+    assert!(refreshed, "owner settings did not refresh while the send chain was held");
+    assert_eq!(before_release, ["hold send chain"]);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("Queued question"))
+        }),
+        "the queued notification was not delivered after the acknowledgement"
+    );
+}
+
+#[test]
 fn closed_agent_reset_cancels_pending_and_old_event_cannot_answer_new_session() {
     let mut rig = Rig::new("closed-reset", Seed { mode: "closed-agent", ..Seed::default() });
     rig.start();
@@ -609,6 +667,196 @@ fn closed_agent_question_arriving_during_interaction_lock_stall_is_delivered() {
     assert!(wait_for(Duration::from_secs(12), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("late question"))), "the question that arrived during the lock stall was dropped");
     assert_eq!(rig.console("GET", "/api/pending", None).1["pending"].as_array().map(Vec::len), Some(1));
     assert!(rig.dsh.calls("$events/result").is_empty(), "a retained question must not be cancelled");
+}
+
+#[test]
+fn closed_agent_cancels_undelivered_question_without_blocking_other_sends() {
+    let mut rig = Rig::new(
+        "closed-lock-delivery",
+        Seed {
+            mode: "closed-agent",
+            config: json!({"ackMessage":"hold delivery chain"}),
+            ..Seed::default()
+        },
+    );
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == "hold delivery chain" {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(15));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 1), ["hold delivery chain"]);
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+        "eventId":"question-blocked-at-delivery", "request":{"questions":[{"id":"q1","question":"Undelivered question"}]}
+    }));
+    assert!(wait_for(Duration::from_secs(4), || {
+        rig.data_json("pending-interactions.json").as_array().map(Vec::len) == Some(1)
+    }), "the stream did not register the question before the mode write");
+
+    let mut stall = StalledModeWrite::begin(&rig);
+    drop(release);
+    assert!(wait_for(Duration::from_secs(2), || {
+        rig.data_lines("send-outbox.jsonl").iter().any(|row| row["k"] == "confirmed")
+    }), "the acknowledgement did not release the send chain");
+    // Give the queued notification a head start before the independent command send.
+    thread::sleep(Duration::from_millis(500));
+    // /persona replies before closed-agent answer handling and requires no release admission.
+    let independent_reply = "closed-agent 模式不使用人设，人设未改变。";
+    says(&rig, OWNER_KEY, OWNER, "owner", "/persona");
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            rig.texts_to(OWNER_KEY) == ["hold delivery chain", independent_reply]
+        }),
+        "the independent send stalled behind the question's gate wait: {:?}",
+        rig.sends()
+    );
+
+    assert!(
+        wait_for(Duration::from_secs(14), || !rig.dsh.calls("$events/result").is_empty()),
+        "the undelivered question was not cancelled to DSH"
+    );
+    stall.release();
+    let receipts = rig.dsh.calls("$events/result");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["eventId"], "question-blocked-at-delivery");
+    assert_eq!(receipts[0]["outcome"], json!({"kind":"result","value":{"answers":[]}}));
+    assert_eq!(
+        rig.data_json("pending-interactions.json"),
+        json!([]),
+        "the undelivered question remained pending after cancellation"
+    );
+    wait_pending(&rig, json!({"pending":[]}));
+    assert_eq!(rig.texts_to(OWNER_KEY), ["hold delivery chain", independent_reply]);
+}
+
+#[test]
+fn refused_approval_is_cancelled_when_outbox_write_fails() {
+    let mut rig = Rig::new("closed-refusal-outbox", Seed { mode: "closed-agent", ..Seed::default() });
+    let outbox = rig.root.join("data/send-outbox.jsonl");
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"].as_str()?.contains("file_write") {
+            // The attempt is durable. Fail the next append before returning the definite refusal.
+            fs::rename(&outbox, outbox.with_extension("saved")).unwrap();
+            fs::create_dir(&outbox).unwrap();
+            return Some(json!({"status":"failed","retcode":1400}));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL#");
+    assert!(wait_for(Duration::from_secs(10), || rig.root.join("data/send-outbox.jsonl").is_dir()));
+    assert!(wait_for(Duration::from_secs(5), || !rig.dsh.calls("$events/result").is_empty()),
+        "the refused approval stayed active after its outbox write failed");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    assert_eq!(rig.data_json("pending-interactions.json"), json!([]));
+}
+
+/// Register an approval while the fake gateway holds the acknowledgement's send chain.
+fn queue_approval_behind_ack(rig: &mut Rig) -> (std::sync::mpsc::Sender<()>, Instant) {
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == ACK {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(15));
+        }
+        None
+    }));
+    rig.start();
+    says(rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 1), [ACK]);
+    let queued = Instant::now();
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"approval/request", "agentId":"fake-session-1",
+        "eventId":"queued-approval", "request":{"toolName":"queued_tool"}
+    }));
+    assert!(wait_for(Duration::from_secs(4), || {
+        rig.data_json("pending-interactions.json")[0]["display"]["toolName"] == "queued_tool"
+    }), "approval did not register while the acknowledgement was held");
+    (release, queued)
+}
+
+#[test]
+fn config_read_failure_clears_undelivered_approval() {
+    let mut rig = Rig::new("closed-config-failure", Seed { mode: "closed-agent", ..Seed::default() });
+    let (release, _) = queue_approval_behind_ack(&mut rig);
+    let config = rig.root.join("config/config.json");
+    let saved = fs::read(&config).unwrap();
+    fs::write(&config, b"{").unwrap();
+    lock(&rig.dsh.inner).hold_result_response = true;
+    drop(release);
+    let cancelled = wait_for(Duration::from_secs(5), || !rig.dsh.calls("$events/result").is_empty());
+    // A later reap sends its receipt before publishing its snapshot. Hold the response
+    // to distinguish that fallback from registration retiring the unseen approval itself.
+    let snapshot = rig.data_json("pending-interactions.json");
+    lock(&rig.dsh.inner).hold_result_response = false;
+    fs::write(&config, saved).unwrap();
+    assert!(cancelled, "no cancellation receipt during the config failure");
+    assert_eq!(snapshot, json!([]), "registration left the undelivered approval pending");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    wait_pending(&rig, json!({"pending":[]}));
+    assert!(!rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("queued_tool")));
+}
+
+#[test]
+fn queued_approval_expires_while_send_chain_is_held() {
+    let mut rig = Rig::new("closed-chain-expiry", Seed {
+        mode: "closed-agent", config: json!({"questionTimeoutMs":2000}), ..Seed::default()
+    });
+    let (release, queued) = queue_approval_behind_ack(&mut rig);
+    assert!(wait_for(Duration::from_secs(4), || !rig.dsh.calls("$events/result").is_empty()),
+        "the expired approval waited for the send chain");
+    assert!(queued.elapsed() >= Duration::from_secs(2), "the queued approval was cancelled before its deadline");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    assert_eq!(rig.data_json("pending-interactions.json"), json!([]));
+    assert_eq!(rig.texts_to(OWNER_KEY), [ACK]);
+    drop(release);
+}
+
+#[test]
+fn cancellation_keeps_pump_running_and_closes_trickling_receipt() {
+    let mut rig = Rig::new("closed-cancel-trickle", Seed {
+        mode: "closed-agent", config: json!({"questionTimeoutMs":3000}), ..Seed::default()
+    });
+    let (closed, disconnected) = std::sync::mpsc::channel();
+    lock(&rig.dsh.inner).trickle_next_result = Some(closed);
+    lock(&rig.gateway).intercept = Some(Arc::new(|action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"].as_str()?.contains("file_write") {
+            Some(json!({"status":"failed","retcode":1400}))
+        } else {
+            None
+        }
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL# #SLOW#");
+    assert!(wait_for(Duration::from_secs(10), || !rig.dsh.calls("$events/result").is_empty()));
+    let receipt_seen = Instant::now();
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    {
+        let mut inner = lock(&rig.dsh.inner);
+        inner.settings = json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent","ownerQQ":OWNER}}]});
+        inner.interactions.push(json!({
+            "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+            "eventId":"during-cancellation", "request":{"questions":[{"id":"q2","question":"Second question"}]}
+        }));
+    }
+    assert!(wait_for(Duration::from_secs(7), || {
+        rig.data_json("closed-agent-owner.json")["ownerQQ"] == json!(OWNER)
+    }), "policy refresh stalled during cancellation");
+    assert!(wait_for(Duration::from_secs(5), || rig.dsh.calls("$events/result").len() == 2),
+        "the second question did not expire during cancellation");
+    assert_eq!(rig.dsh.calls("$events/result")[1]["eventId"], "during-cancellation");
+    assert_eq!(rig.dsh.calls("$events/result")[1]["outcome"]["value"], json!({"answers":[]}));
+    assert!(rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("Second question")));
+    assert!(matches!(disconnected.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "the cancellation response ended before both pump timers ran");
+    let remaining = Duration::from_secs(32).saturating_sub(receipt_seen.elapsed());
+    assert!(disconnected.recv_timeout(remaining).is_ok(),
+        "the bridge did not close the trickling receipt at its total deadline");
 }
 
 #[test]
@@ -2525,6 +2773,41 @@ fn hotfix81_dsh_quota_alert_is_content_free_and_deduped_per_conversation() {
 }
 
 #[test]
+fn dsh_refusal_records_wait_and_unread_refs_for_the_refused_call() {
+    let mut rig = Rig::new("dsh-refused-call", Seed { mode: "reserved2", ..Seed::default() });
+    rig.start();
+    rig.push(group_event(4701, 1001, "tester", "", vec![
+        json!({"type":"at","data":{"qq":SELF_ID.to_string()}}),
+        text_seg("#REFUSE47# CHAT_SECRET_47"),
+    ]));
+    assert!(wait_for(LONG, || !rig.data_lines("logs/model-refusals.jsonl").is_empty()));
+    let rows = rig.data_lines("logs/model-refusals.jsonl");
+    let record = &rows[0];
+    assert_eq!(record["backend"], "dsh");
+    let refs = record["messages"].as_array().unwrap();
+    assert!(refs.iter().any(|r| r["messageId"] == "4701"), "wake reference missing");
+    for (id, seq) in [("wait-fixture-one", 71), ("wait-fixture-two", 72), ("unread-fixture", 73)] {
+        assert!(refs.contains(&json!({"messageId":id,"seq":seq})), "DSH wait or unread reference missing: {id}");
+    }
+    assert_eq!(record["modelCall"], 4, "DSH refused model call index includes retry");
+    assert!(!record.to_string().contains("CHAT_SECRET_47"), "refusal record contains message text");
+    let ledger = rig.ledger();
+    let submission = |kind: &str| ledger.iter().find(|row| row["k"] == kind
+        && row["turn"] == record["turnId"] && row["rpcId"] == record["rpcId"]);
+    let (Some(attempt), Some(binding)) = (submission("attempt"), submission("dsh_turn")) else {
+        panic!("refusal must identify a replayable DSH submission");
+    };
+    let dsh = lock(&rig.dsh.inner);
+    let session = &dsh.sessions[attempt["sessionId"].as_str().unwrap()];
+    let replay: Vec<_> = session.events.iter()
+        .filter(|event| event["data"]["turn"] == binding["dshTurn"])
+        .take_while(|event| event["type"] != "turn/end")
+        .filter(|event| event["type"] == "tool/result")
+        .collect();
+    assert_eq!(replay.len(), 3, "replay must recover the refused DSH call's tool results");
+}
+
+#[test]
 fn hotfix83_dsh_empty_candidates_records_carried_ids_once_per_turn_without_chat() {
     // Live DSH carries recent context in its authenticated packet. Offer the nine
     // older messages this fixture previously carried in the full recent block.
@@ -2869,8 +3152,9 @@ impl DependencyMetadata16 {
         let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));let done=stop.clone();
         let worker=thread::spawn(move||while !done.load(std::sync::atomic::Ordering::SeqCst) {
             if let Ok((mut stream,_))=listener.accept() {
+                let _=stream.set_nonblocking(false);
                 let _=read_request(&mut stream);
-                respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}));
+                respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}));
             } else {thread::sleep(Duration::from_millis(10));}
         });
         Self{url,stop,worker:Some(worker)}
@@ -2886,7 +3170,7 @@ fn update_deps_private_administrator_approves_only_after_a_confirmed_reply() {
         let feed=DependencyMetadata16::new();
         let mut rig=Rig::new(&format!("dependency-approval-{failure}"),Seed{config:json!({"update":{"policy":"notify"},"dependencies":{"dsh":{"version":"0.2.1-rc.2","registry":feed.url}}}),..Seed::default()});
         let (code,check)=rig.console("POST","/api/dependencies/check",Some(&json!({})));
-        assert_eq!(code,200,"{check}");assert_eq!(check["dependencies"]["dsh"]["available"],"0.3.0");
+        assert_eq!(code,200,"{check}");assert_eq!(check["dependencies"]["dsh"]["available"],"0.2.1-rc.5");
         rig.start();
         if failure=="success" {
             says(&rig,GROUP_KEY,OWNER,"owner","/UPDATE DEPS");
@@ -2916,8 +3200,8 @@ fn update_deps_private_administrator_approves_only_after_a_confirmed_reply() {
         says(&rig,OWNER_KEY,OWNER,"owner","/UpDaTe DePs");
         rig.wait_texts(OWNER_KEY,1);
         if failure=="success" {
-            assert!(wait_for(LONG,||rig.console("GET","/api/dependencies",None).1["approval"]["version"]=="0.3.0"));
-            let replies=rig.texts_to(OWNER_KEY).join("\n");assert!(replies.contains("0.2.1-rc.2") && replies.contains("0.3.0"));
+            assert!(wait_for(LONG,||rig.console("GET","/api/dependencies",None).1["approval"]["version"]=="0.2.1-rc.5"));
+            let replies=rig.texts_to(OWNER_KEY).join("\n");assert!(replies.contains("0.2.1-rc.2") && replies.contains("0.2.1-rc.5"));
             confirmed_report=rig.texts_to(OWNER_KEY)[0].clone();
         } else {
             // A second control command is an observable FIFO barrier, without a model turn.

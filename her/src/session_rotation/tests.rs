@@ -1,5 +1,5 @@
 use super::*;
-use crate::digest::{DigestModel, ModelError};
+use crate::harness::one_shot::{install_test_model, Job, ModelError, OneShot};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -23,7 +23,7 @@ struct FixtureModel {
     fault: Fault,
 }
 
-impl DigestModel for FixtureModel {
+impl OneShot for FixtureModel {
     fn complete(&self, _system: &str, _input: &str) -> Result<String, ModelError> {
         use std::fs::OpenOptions;
         let mut calls = OpenOptions::new()
@@ -91,8 +91,9 @@ impl Fixture {
             "sid":"sid","epoch":"epoch","format":1,"lastTurnSeq":5,"rotation":json!({})
         }}}).to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
-        crate::digest::install_test_model(
-            context.runtime_root().unwrap(),
+        install_test_model(
+            &context,
+            Job::Digest,
             Arc::new(FixtureModel { root: root.clone(), fault }),
         );
         let plan = Plan {

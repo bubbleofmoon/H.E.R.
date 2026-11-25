@@ -251,6 +251,21 @@ class ShReceipts(Receipts, unittest.TestCase):
 
 @unittest.skipUnless(POSIX and PWSH, 'needs pwsh on a POSIX host')
 class Ps1Receipts(Receipts, unittest.TestCase):
+    def test_read_only_ignores_cleanup_list(self):
+        out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        prompt, work, env = prepare(out, 'report')
+        victim = out / 'keep.txt'
+        victim.write_text('keep\n', encoding='utf-8')
+        (out / 'case.cleanup.txt').write_text(f'{victim}\n', encoding='utf-8')
+
+        done = self.launch_sandbox(out, prompt, work, env, 'read-only')
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(victim.is_file(), 'read-only run deleted the listed file')
+        # On POSIX the Windows cleanup roots reject the path, but processing it still writes a log.
+        self.assertFalse((out / 'case.cleanup.log').exists(), 'read-only run processed the cleanup list')
+
     def launch(self, mode, out):
         prompt, work, env = prepare(out, mode)
         env.update(install_fake(out, True))
