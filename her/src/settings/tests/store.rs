@@ -898,7 +898,8 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
     let wal = root.0.join("data/settings.db-wal");
     std::fs::write(&wal, vec![0u8; 4096]).unwrap();
 
-    let conn = std::thread::scope(|scope| {
+    let started = std::time::Instant::now();
+    let (conn, waited) = std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(80));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -914,10 +915,19 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
             }
         });
         let conn = crate::settings::backup_source(&context).unwrap().unwrap();
+        let waited = started.elapsed();
         writer.join().unwrap();
-        conn
+        (conn, waited)
     });
-    assert!(!wal.exists(), "backup_source waited for the synthetic WAL transition to clear");
+    assert!(
+        waited >= std::time::Duration::from_millis(60),
+        "backup_source returned before synthetic WAL transition cleared: {waited:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        0,
+        "synthetic non-empty WAL must be cleared before backup_source returns"
+    );
     let backup_timeout: i64 = conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
         .unwrap();
