@@ -1930,7 +1930,7 @@ fn auxiliary_her_tools_are_offered_and_dispatched_in_process() {
         .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
         .collect();
     assert_eq!(results[0]["isError"], true); // sanitized empty search: no external request
-    assert!(results[0].to_string().contains("查询词为空"));
+    assert!(results[0].to_string().contains("未提供有效搜索词，请求已拒绝。"));
     assert_eq!(results[1]["isError"], true); // existing private-IP fetch policy
     assert_ne!(results[2]["isError"], true);
     assert!(results[2].to_string().contains("reachable"));
@@ -2205,7 +2205,7 @@ fn dropped_stream_after_a_dispatched_handler_error_does_not_retry() {
     let response = tool_wire_result(&lock(&model.requests)[1], "error-before-drop");
     assert_eq!(response["isError"], true);
     assert!(
-        response.to_string().contains("查询词为空"),
+        response.to_string().contains("未提供有效搜索词，请求已拒绝。"),
         "handler was not reached: {response}"
     );
     assert!(!rig
