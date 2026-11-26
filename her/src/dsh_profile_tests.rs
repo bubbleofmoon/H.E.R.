@@ -341,27 +341,44 @@ fn guard179_each_guarded_preset_row_is_required() {
 fn guard179_a_preset_missing_a_guarded_row_refuses() {
     let (_root, context) = fixture("missing-rows");
     write_compliant(&context);
-    let rows = [
-        "          - id: agent-instructions\n            name: '@deepseek-ai/dsh-agent-instructions'\n            config:\n              maxBytes: 0\n",
+    let agent_row = "          - id: agent-instructions\n            name: '@deepseek-ai/dsh-agent-instructions'\n            config:\n              maxBytes: 0\n";
+    edit_preset(&context, |text| text.replacen(agent_row, "", 1));
+    assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "missing agent-instructions");
+    write(&context, PRESET_FILE, PRESET);
+    // Omitting the local-tool rows (as `qq-chat` and `qq-chat-v2` do) passes because presets mount only listed
+    // plugins and HER's profile block disables them globally; any local-tool row that is present still must disable.
+    let tool_rows = [
         "          - id: tool-bash\n            name: '@deepseek-ai/dsh-tool-bash'\n            disabled: true\n",
         "          - id: tool-pwsh\n            name: '@deepseek-ai/dsh-tool-pwsh'\n            disabled: true\n",
         "          - id: tool-fs\n            name: '@deepseek-ai/dsh-tool-fs'\n            disabled: true\n",
         "          - id: tool-fs-search\n            name: '@deepseek-ai/dsh-tool-fs-search'\n            disabled: true\n            config:\n              sampleOverCapGlobResults: false\n",
     ];
-    for row in rows {
-        edit_preset(&context, |text| text.replacen(row, "", 1));
-        assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "{row}");
-        write(&context, PRESET_FILE, PRESET);
-    }
+    edit_preset(&context, |text| tool_rows.iter().fold(text.to_string(), |acc, row| acc.replacen(row, "", 1)));
+    assert_eq!(check(&context), Ok(()), "omitted local-tool rows pass when agent-instructions is present");
+    edit_preset(&context, |text| {
+        text.replacen(
+            "          - id: qq-tool-restrict\n",
+            "          - id: tool-pwsh\n            name: '@deepseek-ai/dsh-tool-pwsh'\n          - id: qq-tool-restrict\n",
+            1,
+        )
+    });
+    assert_eq!(problems(&context), vec!["local-tools:preset1".to_string()], "present local-tool row without disabled");
     write(&context, PRESET_FILE, "# a preset file without a preset\n");
     assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "an emptied preset file");
+    let non_preset_with_plugins = "- id: other-plugin\n  name: '@deepseek-ai/other-plugin'\n  config:\n    plugins:\n      - id: agent-instructions\n        disabled: true\n";
+    write(&context, PRESET_FILE, non_preset_with_plugins);
+    assert_eq!(
+        problems(&context),
+        vec!["missing-rows:preset1".to_string()],
+        "a bundle file with config.plugins but no preset row"
+    );
     write(&context, PRESET_FILE, PRESET);
     let good = read(&context, PROFILE_FILE);
-    let without_pwsh = "- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: agent-instructions\n        disabled: true\n      - id: tool-bash\n        disabled: true\n      - id: tool-fs\n        disabled: true\n      - id: tool-fs-search\n        disabled: true\n";
-    write(&context, PROFILE_FILE, &format!("{without_pwsh}{good}"));
+    let without_agent = "- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: tool-web\n        disabled: true\n";
+    write(&context, PROFILE_FILE, &format!("{without_agent}{good}"));
     assert_eq!(problems(&context), vec!["missing-rows:profile".to_string()], "a profile patch replacing a preset's plugins");
-    let full = without_pwsh.replace("      - id: tool-fs\n", "      - id: tool-pwsh\n        disabled: true\n      - id: tool-fs\n");
-    write(&context, PROFILE_FILE, &format!("{full}{good}"));
+    let with_agent = "- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: agent-instructions\n        disabled: true\n";
+    write(&context, PROFILE_FILE, &format!("{with_agent}{good}"));
     assert_eq!(check(&context), Ok(()));
 }
 
@@ -369,25 +386,53 @@ fn guard179_a_preset_missing_a_guarded_row_refuses() {
 fn guard179_only_the_presets_own_plugin_rows_count() {
     let (_root, context) = fixture("plugin-level");
     write_compliant(&context);
-    let pwsh_row = "          - id: tool-pwsh\n            name: '@deepseek-ai/dsh-tool-pwsh'\n            disabled: true\n";
+    let agent_row = "          - id: agent-instructions\n            name: '@deepseek-ai/dsh-agent-instructions'\n            config:\n              maxBytes: 0\n";
     let cases = [
-        // A `tool-pwsh` item nested in another plugin's config list.
+        // An `agent-instructions` item nested in another plugin's config list.
         (
             "              fetch: false\n",
-            "              fetch: false\n              examples:\n                - id: tool-pwsh\n                  disabled: true\n",
+            "              fetch: false\n              examples:\n                - id: agent-instructions\n                  disabled: true\n",
         ),
-        // A `tool-pwsh` item in a list beside `plugins` in the preset's config, at the plugin items' column.
+        // An `agent-instructions` item in a list beside `plugins` in the preset's config, at the plugin items' column.
         (
             "            config: {}\n",
-            "            config: {}\n        examples:\n          - id: tool-pwsh\n            disabled: true\n",
+            "            config: {}\n        examples:\n          - id: agent-instructions\n            disabled: true\n",
         ),
     ];
     for (find, replace) in cases {
-        edit_preset(&context, |text| text.replacen(pwsh_row, "", 1).replacen(find, replace, 1));
+        edit_preset(&context, |text| text.replacen(agent_row, "", 1).replacen(find, replace, 1));
         assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "{replace}");
         write(&context, PRESET_FILE, PRESET);
     }
     assert_eq!(check(&context), Ok(()));
+}
+
+#[test]
+fn guard179_managed_block_tolerates_dsh_blank_lines_and_refuses_non_space_lines() {
+    let (_root, context) = fixture("blank-lines");
+    write_compliant(&context);
+    let block = render_block();
+    // DSH's YAML serializer inserts a blank line right before the trailing `# === her profile guard END ===` comment.
+    let with_trailing_blank = block.replacen(&format!("{END}\n"), &format!("\n{END}\n"), 1);
+    assert_ne!(with_trailing_blank, block);
+    let with_inner_blanks = with_trailing_blank
+        .replacen("- id: harness-dev-context\n", "\n- id: harness-dev-context\n", 1)
+        .replacen("- id: tool-bash\n", "   \n- id: tool-bash\n", 1);
+    for variant in [&with_trailing_blank, &with_inner_blanks] {
+        write(&context, PROFILE_FILE, &format!("{PROFILE_HAND}{variant}"));
+        assert_eq!(check(&context), Ok(()), "{variant}");
+    }
+    // `restore` canonicalizes a profile containing DSH's inserted blank line back to `render_block()`.
+    write(&context, PROFILE_FILE, &format!("{PROFILE_HAND}{with_trailing_blank}"));
+    assert_eq!(restore(&context), Ok(true));
+    assert_eq!(read(&context, PROFILE_FILE), format!("{PROFILE_HAND}{block}"));
+    assert_eq!(check(&context), Ok(()));
+
+    for bad_line in ["\t\n", "\u{a0}\n", "\u{3000}\n", "# extra comment\n"] {
+        let bad_block = block.replacen(&format!("{END}\n"), &format!("{bad_line}{END}\n"), 1);
+        write(&context, PROFILE_FILE, &format!("{PROFILE_HAND}{bad_block}"));
+        assert_eq!(problems(&context), vec!["profile-file".to_string()], "{bad_line:?}");
+    }
 }
 
 #[test]
