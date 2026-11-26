@@ -870,3 +870,47 @@ fn settings_store_refusals_do_not_stall() {
         );
     }
 }
+
+#[test]
+fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
+    let (root, context) = settings_fixture("settings backup source wal retry");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let crate::settings::StoreInspection::Ready(inspected) =
+        crate::settings::inspect_store(&context).unwrap()
+    else {
+        panic!("expected ready settings store");
+    };
+    let timeout: i64 = inspected
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        timeout > 0 && timeout < 1000,
+        "read inspection busy_timeout must stay well below WAL_SWITCH_WAIT: {timeout}"
+    );
+    drop(inspected);
+
+    let wal = root.0.join("data/settings.db-wal");
+    std::fs::write(&wal, vec![0u8; 4096]).unwrap();
+
+    let conn = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let _ = std::fs::remove_file(&wal);
+            crate::settings::apply(&context, QUIET_KEY, &json!(4500), "administrator", "console")
+                .unwrap();
+        });
+        let conn = crate::settings::backup_source(&context).unwrap().unwrap();
+        writer.join().unwrap();
+        conn
+    });
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [QUIET_KEY],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "4500");
+}
