@@ -225,6 +225,7 @@ struct Progress {
     /// The model of the route the turn's last request went to.
     model: String,
     failures: Vec<RouteFailure>,
+    route_chain_exhausted: bool,
     owner_interaction_closed: bool,
 }
 
@@ -268,6 +269,10 @@ impl Turn {
     /// Each route request that failed over or ended the turn, in order.
     pub fn route_failures(&self) -> Vec<RouteFailure> {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
+    }
+
+    pub(crate) fn route_chain_exhausted(&self) -> bool {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).route_chain_exhausted
     }
 
     pub(crate) fn owner_interaction_closed(&self) -> bool {
@@ -642,7 +647,12 @@ async fn tool_loop(
             Ok(success) => (success.value, success.spent_tokens),
             Err(routes::ChainError::Cancelled) => return Err(Failure::Cancelled),
             Err(routes::ChainError::Aborted(reason)) => return Err(Failure::Failed(reason)),
-            Err(routes::ChainError::Missed { summary, .. }) => return Err(Failure::Failed(summary)),
+            Err(routes::ChainError::Missed { summary, .. }) => {
+                if chain.route_chain_exhausted() {
+                    progress.lock().unwrap_or_else(|p| p.into_inner()).route_chain_exhausted = true;
+                }
+                return Err(Failure::Failed(summary));
+            }
         };
         let Event::Assistant { message, .. } = &event else {
             unreachable!()

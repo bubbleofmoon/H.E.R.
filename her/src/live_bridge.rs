@@ -5,6 +5,7 @@
 
 #[path = "reserved2.rs"]
 pub(crate) mod reserved2;
+pub(crate) use reserved2::wake_needs_dsh;
 
 use crate::{
     activity, chat, closed_agent, conversation_state, dependency, dependency_watch, dsh_profile,
@@ -416,19 +417,13 @@ pub(crate) fn sync_wake_configs(
 ) {
     // Finite sleeps must work after restart even before the first inbound event.
     // The live reserved2 hub owns general driver creation and turn lifecycle.
-    let current_cfg = if context.is_isolated() {
-        context.load_config().ok()
-    } else {
-        Some(cfg.clone())
-    };
-    if let Some(cfg) = current_cfg.as_ref().filter(|cfg| {
-        cfg.get("socialV2")
-            .and_then(|s| s.get("enabled"))
-            .and_then(Value::as_bool)
-            != Some(false)
-            && state.get("paused").and_then(Value::as_bool) != Some(true)
-            && social_state::mode(context) == "reserved2"
-    }) {
+    if cfg.get("socialV2")
+        .and_then(|s| s.get("enabled"))
+        .and_then(Value::as_bool)
+        != Some(false)
+        && state.get("paused").and_then(Value::as_bool) != Some(true)
+        && social_state::mode(context) == "reserved2"
+    {
         if let Some(conversations) = state.get("conversations").and_then(Value::as_object) {
             for (key, conversation) in conversations {
                 let finite = conversation.get("wakeConfig").is_some_and(|wc| {
@@ -451,6 +446,9 @@ pub(crate) fn sync_wake_configs(
         }
     }
     for (key, driver) in drivers.iter_mut() {
+        if !social_state::inbound_admitted(cfg, key) {
+            continue;
+        }
         let Some(wc) = state
             .get("conversations")
             .and_then(|c| c.get(key))
@@ -1164,21 +1162,103 @@ impl FallbackWakeDrivers {
         }
     }
 
+    /// Drop scheduler work and settle its saved inputs when current policy refuses it.
+    async fn admitted(
+        &mut self,
+        cfg: &Value,
+        key: &str,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if social_state::inbound_admitted(cfg, key) {
+            return Ok(true);
+        }
+        if let Some(events) = self.awaiting.get(key) {
+            self.journal.mark_handled(events.clone(), now).await?;
+            self.awaiting.remove(key);
+        }
+        self.drivers.remove(key);
+        self.wake_synced.remove(key);
+        Ok(false)
+    }
+
+    async fn pump(
+        &mut self,
+        context: &runtime::RuntimeContext,
+        cfg: &Value,
+        now: i64,
+    ) -> Result<Vec<(String, session::WakeEvent)>, Box<dyn std::error::Error>> {
+        if let Some(state) = conversation_state::read_document_with_bom(context) {
+            sync_wake_configs(
+                context,
+                cfg,
+                &state,
+                &mut self.drivers,
+                &mut self.wake_synced,
+                now,
+            );
+        }
+        let keys: Vec<_> = self.drivers.keys().cloned().collect();
+        for key in keys {
+            self.admitted(cfg, &key, now).await?;
+        }
+        Ok(session::pump_all(&mut self.drivers, now))
+    }
+
+    async fn next_live(
+        &mut self,
+        context: &runtime::RuntimeContext,
+        cfg_raw: &Value,
+        pending: &mut impl Iterator<Item = (String, String)>,
+        now: i64,
+    ) -> Result<Option<(String, String, Value)>, Box<dyn std::error::Error>> {
+        for (key, reason) in pending {
+            let cfg = if context.is_isolated() {
+                let Ok(cfg) = context.load_config() else {
+                    self.pending_live.push((key, reason));
+                    continue;
+                };
+                cfg
+            } else {
+                cfg_raw.clone()
+            };
+            if !self.admitted(&cfg, &key, now).await? {
+                continue;
+            }
+            inbound::start_processing(
+                &self.journal,
+                &mut self.awaiting,
+                &mut self.in_flight,
+                &key,
+                now,
+            )
+            .await?;
+            return Ok(Some((key, reason, cfg)));
+        }
+        Ok(None)
+    }
+
     async fn flush_pending(
         &mut self,
-        mut pipeline: Option<&mut pipeline::Pipeline>,
+        pipeline: Option<&mut pipeline::Pipeline>,
         context: &runtime::RuntimeContext,
         cfg_raw: &Value,
         self_nick: &str,
         self_id: i64,
-    ) {
-        for (key, reason) in std::mem::take(&mut self.pending_live) {
-            if let Some(pipe) = pipeline.as_deref_mut() {
-                println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
-                self.execute_turn(pipe, context, cfg_raw, &key, &reason, self_nick, self_id, false)
-                    .await;
-            }
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(pipe) = pipeline else {
+            self.pending_live.clear();
+            return Ok(());
+        };
+        let tick_now = now_ms() as i64;
+        let mut queued = std::mem::take(&mut self.pending_live).into_iter();
+        while let Some((key, reason, cfg)) =
+            self.next_live(context, cfg_raw, &mut queued, tick_now).await?
+        {
+            println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
+            self.execute_turn(pipe, context, &cfg, &key, &reason, self_nick, self_id, false)
+                .await;
         }
+        Ok(())
     }
 
     async fn finish_in_flight(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1195,25 +1275,26 @@ impl FallbackWakeDrivers {
         cfg_raw: &Value,
         tick_now: i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(state) = conversation_state::read_document_with_bom(context) {
-            sync_wake_configs(
-                context,
-                cfg_raw,
-                &state,
-                &mut self.drivers,
-                &mut self.wake_synced,
-                tick_now,
-            );
-        }
-        for (k, e) in session::pump_all(&mut self.drivers, tick_now) {
-            inbound::start_processing(
-                &self.journal,
-                &mut self.awaiting,
-                &mut self.in_flight,
-                &k,
-                now_ms() as i64,
-            )
-            .await?;
+        let current_cfg = if context.is_isolated() {
+            let Ok(cfg) = context.load_config() else {
+                return Ok(());
+            };
+            cfg
+        } else {
+            cfg_raw.clone()
+        };
+        for (k, e) in self.pump(context, &current_cfg, tick_now).await? {
+            let dispatch = self.live_groups.iter().any(|g| g == &k);
+            if !dispatch {
+                inbound::start_processing(
+                    &self.journal,
+                    &mut self.awaiting,
+                    &mut self.in_flight,
+                    &k,
+                    now_ms() as i64,
+                )
+                .await?;
+            }
             self.wakes += 1;
             println!("[her] 定时唤醒 {k} ({})", e.reason);
             append_runtime_json_line(
@@ -1228,7 +1309,7 @@ impl FallbackWakeDrivers {
                     "shadow": self.shadow_flag
                 }),
             )?;
-            if self.live_groups.iter().any(|g| g == &k) {
+            if dispatch {
                 self.pending_live.push((k, e.reason));
             }
         }
@@ -1274,14 +1355,14 @@ impl FallbackWakeDrivers {
         };
 
         // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
-        let allowed = match context.load_config() {
-            Ok(gate_cfg) => social_state::inbound_admitted(&gate_cfg, &key),
+        let gate_cfg = match context.load_config() {
+            Ok(gate_cfg) => gate_cfg,
             Err(error) => {
                 println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
-                false
+                return Ok(());
             }
         };
-        if !allowed {
+        if !social_state::inbound_admitted(&gate_cfg, &key) {
             return Ok(());
         }
 
@@ -1345,7 +1426,7 @@ impl FallbackWakeDrivers {
             && (self.live_groups.is_empty() || self.live_groups.iter().any(|g| g == &key))
             && (is_message || ev.sub_type == "poke")
         {
-            match social_state::claim_first_wake(context, cfg_raw, &key) {
+            match social_state::claim_first_wake(context, &gate_cfg, &key) {
                 Ok(true) => {
                     println!("[her] {key} 首次唤醒：升级为 bootstrap");
                     wake = true;
@@ -1465,7 +1546,7 @@ impl FallbackWakeDrivers {
         if let Some(state) = conversation_state::read_document_with_bom(context) {
             sync_wake_configs(
                 context,
-                cfg_raw,
+                &gate_cfg,
                 &state,
                 &mut self.drivers,
                 &mut self.wake_synced,
@@ -1598,12 +1679,13 @@ impl SimulationBridge {
         cfg_raw: &Value,
         self_nick: &str,
         self_id: i64,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Self::Fallback(fallback) = self {
             fallback
                 .flush_pending(pipeline, context, cfg_raw, self_nick, self_id)
-                .await;
+                .await?;
         }
+        Ok(())
     }
 
     async fn finish_in_flight(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -2200,7 +2282,7 @@ pub(crate) async fn run(
                     &self_nick,
                     self_id,
                 )
-                .await;
+                .await?;
 
             if lock_touched.elapsed().as_secs() >= 10 {
                 let _ = lock.refresh(tick_now);
@@ -3872,5 +3954,70 @@ mod tests {
         let (wake, why) = decide(&e, "随便说说", true, "Fixture Bot", &HashMap::new(), &tr(), false);
         assert!(wake);
         assert_eq!(why, "atMention");
+    }
+
+    #[tokio::test]
+    async fn t48_compat_queued_timer_work_checks_current_access() {
+        let root = isolated_runtime_fixture("t48-compat-timer");
+        let context = runtime::RuntimeContext::from_root(&root).unwrap();
+        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
+        let key = "group:42";
+        let allowed = json!({"allow":{"groups":[42]}});
+        let timer = json!({"wakeConfig":{"mode":"diving","infinite":false,"confirmedAt":1,
+            "sleepUntil":"2000-01-01T00:00:00.000Z"}});
+        let mut state = json!({"conversations":{(key):timer.clone()}});
+        state["conversations"][key]["wakeConfig"]["confirmedAt"] = json!(2);
+        let now = now_ms() as i64;
+        let due_driver = || {
+            let mut driver = session::Driver::new(session::scheduler_from_state(wake_cfg_of(&allowed), &timer), 1);
+            driver.adopt_wake_config(session::wake_config_from_json(timer.get("wakeConfig")), now);
+            driver
+        };
+        for (id, current) in [
+            (1, json!({"allow":{"groups":[]},"allowAllWhenEmpty":true})),
+            (2, json!({"allow":{"groups":[42]},"deny":{"groups":[42]}})),
+        ] {
+            let mut wakes = FallbackWakeDrivers::new(journal.clone(), vec![]);
+            let event = format!("{key}|message:{id}");
+            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
+            wakes.awaiting.insert(key.into(), vec![event.clone()]);
+            wakes.drivers.insert(key.into(), due_driver());
+            wakes.wake_synced.insert(key.into(), session::WakeSync::of(&timer["wakeConfig"]));
+
+            sync_wake_configs(&context, &current, &state, &mut wakes.drivers, &mut wakes.wake_synced, now);
+            assert!(
+                session::WakeSync::changed(wakes.wake_synced.get(key), &state["conversations"][key]["wakeConfig"]).is_some(),
+                "a denied driver must not adopt a new wake configuration"
+            );
+            assert!(
+                wakes.pump(&context, &current, now).await.unwrap().is_empty(),
+                "a denied timer must not be pumped"
+            );
+            assert!(!wakes.awaiting.contains_key(key) && !wakes.wake_synced.contains_key(key));
+            let check = event.clone();
+            assert_eq!(journal.run(move |j| j.stage_of(&check)).await.unwrap().as_deref(), Some("handled"));
+
+            let event = format!("{key}|message:pending-{id}");
+            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
+            wakes.awaiting.insert(key.into(), vec![event.clone()]);
+            wakes.drivers.insert(key.into(), due_driver());
+            let ready = wakes.pump(&context, &allowed, now).await.unwrap();
+            assert_eq!(ready.len(), 1, "the allowed timer queues a wake");
+            assert_eq!(ready[0].0, key);
+            assert_eq!(ready[0].1.reason, "timeout");
+            wakes.pending_live.extend(ready.into_iter().map(|(key, event)| (key, event.reason)));
+            context.write_atomic(runtime::RuntimeArea::Config, "config.json", current.to_string().as_bytes()).unwrap();
+            let mut pending = std::mem::take(&mut wakes.pending_live).into_iter();
+            assert!(
+                wakes.next_live(&context, &allowed, &mut pending, now).await.unwrap().is_none(),
+                "a queued live wake must be refused if access changes before dispatch"
+            );
+            assert!(wakes.in_flight.is_empty());
+            assert_eq!(journal.run(move |j| j.stage_of(&event)).await.unwrap().as_deref(), Some("handled"));
+        }
+        assert!(crate::turn_ledger::read_records(&context).unwrap().is_empty());
+        assert!(crate::send_outbox::read_records(&context).unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

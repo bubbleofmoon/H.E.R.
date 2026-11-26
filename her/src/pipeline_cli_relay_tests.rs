@@ -434,3 +434,79 @@ async fn hf123_cli_protocol_with_mute(
         assert_eq!(prompts.len(), 1);
     }
 }
+
+#[tokio::test]
+async fn t48_pinned_cli_failure_sends_only_while_the_turn_owns_delivery() {
+    use serde_json::json;
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    for (case, expected) in [
+        ("exhausted", true),
+        ("policy-refused", false),
+        ("revoked", false),
+        ("cancelled", false),
+        ("send-unresolved", false),
+    ] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let root = fake_runtime_root(case);
+        write_selected_secret(&root, [0x48; 32]);
+        let key = "group:42";
+        let line = "A moment, please.";
+        let cfg = json!({"consoleToken": "fixture-token", "allow": {"groups": [42]}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), json!({
+            "onebot": endpoint, "dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2"
+        }).to_string()).unwrap();
+        std::fs::write(root.join("data/personas.json"), json!({
+            "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+            "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+                {"version": 1, "approved": true, "name": "Fixture", "core": "Speak plainly.", "failureLine": line}
+            ]}}
+        }).to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let mut pipeline = Pipeline::new_without_dsh(&context, &cfg, true).unwrap();
+        pipeline.begin_ledger_turn_as(key, "dsh", true).map_err(String::from).unwrap();
+        let turn = pipeline.cur_turn.clone().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, request) = fake_dsh_accept(&listener, Duration::from_secs(2))?;
+            let body = r#"{"status":"ok","retcode":0,"data":{"message_id":123}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            Some(request)
+        });
+        let result = pipeline.run_cli_turn(&Target::Group(42), "fixture", &cfg, "fixture", |_| {
+            match case {
+                "policy-refused" => return Err("model/backend refusal (SAFETY)".into()),
+                "revoked" => std::fs::write(root.join("config/config.json"),
+                    json!({"allow": {"groups": []}}).to_string()).unwrap(),
+                "cancelled" => turn.verified("cancel-requested", "superseded").unwrap(),
+                "send-unresolved" => {
+                    let record = crate::recorded_send::Recorded::begin(
+                        &context, crate::turn_ledger::now_ms, crate::turn_ledger::now_ms(),
+                        json!({"key": key, "purpose": "ack", "epoch": "earlier", "messages": ["ack fixture"]}),
+                    ).unwrap();
+                    record.attempt(0, None).unwrap();
+                }
+                _ => {}
+            }
+            Err("model/backend backend (FIXTURE_EXIT)".into())
+        }).await;
+        pipeline.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
+        let request = worker.join().unwrap();
+        let outbox = crate::send_outbox::read_records(&context).unwrap();
+        drop(pipeline);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err(), "{case}: a failure line cannot turn failure into success");
+        assert_eq!(request.is_some(), expected, "{case}: gateway delivery");
+        assert_eq!(outbox.iter().filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure").count(),
+            usize::from(expected), "{case}: durable failure-line intent");
+        if let Some(request) = request {
+            assert_eq!(request.path, "/send_group_msg");
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(body["message"], json!([{"type":"text", "data":{"text": line}}]));
+        }
+    }
+}

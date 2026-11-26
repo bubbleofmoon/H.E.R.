@@ -46,8 +46,8 @@ mod session;
 mod live_bridge;
 pub(crate) use live_bridge::{
     append_runtime_json_line, decide, event_message_id, feed_slang, names_self, now_ms,
-    parse_target, plain_text, protocol_integer, sync_wake_configs, text_seed, wake_cfg_of, Event,
-    Triggers,
+    parse_target, plain_text, protocol_integer, sync_wake_configs, text_seed, wake_cfg_of,
+    wake_needs_dsh, Event, Triggers,
 };
 #[cfg(test)]
 pub(crate) use live_bridge::reserved2;

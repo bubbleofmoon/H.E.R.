@@ -5,10 +5,33 @@ use crate::{
     session, social_state,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+const MAX_WAKE_RETRIES: u32 = 3;
+
+/// Harness and pinned CLI wakes can run during an outage if admission needs no DSH handover.
+pub(crate) fn wake_needs_dsh(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
+    match crate::turn_engine::Engine::selected(context, cfg, key, "reserved2") {
+        Ok(engine) => (engine.uses_dsh() && pipeline::pinned_cli_backend(cfg, key).is_none())
+            || crate::engine_switch::handover_needs_dsh(context, key, engine).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+struct DispatchResult {
+    result: Result<usize, String>,
+    unsubmitted: bool,
+    failure_parks: Option<bool>,
+}
+
+impl DispatchResult {
+    fn new(result: Result<usize, String>, unsubmitted: bool) -> Self {
+        Self { result, unsubmitted, failure_parks: None }
+    }
+}
 
 struct Active {
-    task: tokio::task::JoinHandle<(Result<usize, String>, bool)>,
+    task: tokio::task::JoinHandle<DispatchResult>,
     inbound: Vec<String>,
     reason: String,
     previous: Value,
@@ -413,7 +436,7 @@ mod tests {
         let event=format!("{key}|message:1");
         assert_eq!(hub.journal.run(move |j|j.stage_of(&event)).await.unwrap().as_deref(),Some("received"));
         assert!(hub.active.is_empty());
-        for m in hub.maintenance.values() {m.cancel.store(true,Ordering::SeqCst);m.task.abort();}
+        for m in hub.maintenance.values() {m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);m.task.abort();}
         let _=stop.send(());let methods=server.join().unwrap();
         assert!(!methods.iter().any(|m|m=="session/prompt" || m=="session/create"));
         drop(hub);std::fs::remove_dir_all(root).unwrap();
@@ -782,7 +805,7 @@ mod tests {
             let state = hub.state().unwrap();
             let (finish_turn, finished) = tokio::sync::oneshot::channel();
             hub.active.insert(key.into(), Active {
-                task:tokio::spawn(async move { let _ = finished.await; (Err("回合已取消".into()),false) }),inbound:vec![],reason:"atMention".into(),
+                task:tokio::spawn(async move { let _ = finished.await; DispatchResult::new(Err("回合已取消".into()), false) }),inbound:vec![],reason:"atMention".into(),
                 previous:state["conversations"][key].clone(),at:now-cap-14,token:"test-token".into(),
                 mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
             });
@@ -886,7 +909,7 @@ mod tests {
         let previous = hub.state().unwrap()["conversations"][key].clone();
         let (stop_server, server) = fake_dsh(&root, &mut hub, key, false);
         hub.active.insert(key.into(), Active {
-            task: tokio::spawn(std::future::pending::<(Result<usize, String>, bool)>()),
+            task: tokio::spawn(std::future::pending::<DispatchResult>()),
             inbound: vec![], reason: "atMention".into(), previous,
             at: now - cap, token: token.clone(), mode_stamp: hub.mode_stamp.clone(),
             session: Default::default(), minted: Default::default(), cap_abort_at: None,
@@ -985,7 +1008,7 @@ mod tests {
         configure(&mut pipe);
         let task = tokio::spawn(async move {
             let result = pipe.run_turn(&crate::onebot::Target::Group(420042), "cap fixture wake", "", &cfg).await;
-            (result, pipe.dispatch_definitely_unsubmitted())
+            DispatchResult::new(result, pipe.dispatch_definitely_unsubmitted())
         });
         let abort = task.abort_handle();
         hub.active.insert(key.into(), Active {
@@ -1595,7 +1618,7 @@ mod tests {
         pipe.expect_dispatch_token(token.clone());
         let previous = hub.state().unwrap()["conversations"][key].clone();
         hub.active.insert(key.into(), Active {
-            task: tokio::spawn(std::future::pending::<(Result<usize, String>, bool)>()),
+            task: tokio::spawn(std::future::pending::<DispatchResult>()),
             inbound: vec![], reason: "atMention".into(), previous,
             at: now - cap, token: token.clone(), mode_stamp: hub.mode_stamp.clone(),
             session: Default::default(), minted, cap_abort_at: None, route, admitted,
@@ -1694,13 +1717,13 @@ mod tests {
         assert!(crate::session_map::lookup(&hub.context, key).unwrap().is_none());
         crate::dsh_health::observe(&hub.context, &cfg, false, "fixture outage", true);
 
-        assert!(hub.wake_needs_dsh(&cfg, key), "the hub must park a wake with a pending DSH archive");
+        assert!(wake_needs_dsh(&hub.context, &cfg, key), "the hub must park a wake with a pending DSH archive");
         let admission = crate::engine_switch::prepare_turn(&hub.context, key, "reserved2", Some(&token), None);
         assert_eq!(admission.err().as_deref(), Some("DSH is unavailable for the handover"));
         assert_eq!(hub.state().unwrap()["conversations"][key]["engineHandover"], state["conversations"][key]["engineHandover"]);
         state["conversations"][key]["engineHandover"] = Value::Null;
         hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
-        assert!(!hub.wake_needs_dsh(&cfg, key), "a wake with neither mapping nor archive can use the harness during the outage");
+        assert!(!wake_needs_dsh(&hub.context, &cfg, key), "a wake with neither mapping nor archive can use the harness during the outage");
     }
 
     /// Engagement window: while she is engaged the hard cap runs from her last successful send in
@@ -1727,7 +1750,7 @@ mod tests {
             driver.sched.turn_started_at = Some(now - started_ago);
             driver.sched.prompt_running = true;
             hub.active.insert(key.into(), Active {
-                task:tokio::spawn(async { std::future::pending::<()>().await; (Err("cancelled".into()),false) }),
+                task:tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Err("cancelled".into()), false) }),
                 inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
                 at:now-started_ago,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
             });
@@ -1809,7 +1832,7 @@ mod tests {
             driver.apply(session::Input::Message {reason:"nameMention".into(),seq:2,at_ms:now-1000});
             let state = hub.state().unwrap();
             hub.active.insert(key.into(), Active {
-                task:tokio::spawn(async { std::future::pending::<()>().await; (Err("cancelled".into()),false) }),
+                task:tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Err("cancelled".into()), false) }),
                 inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
                 at:now-cap-14,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
             });
@@ -1858,7 +1881,7 @@ mod tests {
         driver.sched.turn_started_at = Some(now - 3000);
         driver.sched.prompt_running = true;
         hub.active.insert(key.into(), Active {
-            task: tokio::spawn(async { std::future::pending::<()>().await; (Ok(0), false) }),
+            task: tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Ok(0), false) }),
             inbound: vec![], reason: "atMention".into(), previous: state["conversations"][key].clone(),
             at: now - 3000, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(),
             session: Default::default(), minted: Default::default(), cap_abort_at: None, route: Default::default(), admitted: Default::default(),
@@ -1905,7 +1928,7 @@ mod tests {
         driver.sched.prompt_running = true;
         let state = hub.state().unwrap();
         hub.active.insert(key.into(), Active {
-            task:tokio::spawn(async { std::future::pending::<()>().await; (Err("collector still waiting".into()),false) }),
+            task:tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Err("collector still waiting".into()), false) }),
             inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
             at:now-cap-14,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
         });
@@ -1960,7 +1983,7 @@ mod tests {
         driver.sched.turn_started_at = Some(now - cap - 14);
         driver.sched.prompt_running = true;
         hub.active.insert(key.into(), Active {
-            task:tokio::spawn(async { (Ok(0), false) }),
+            task:tokio::spawn(async { DispatchResult::new(Ok(0), false) }),
             inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
             at:now-cap-14,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
         });
@@ -1990,7 +2013,7 @@ mod tests {
         let now = crate::now_ms() as i64;
         let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         hub.active.insert(key.into(), Active {
-            task: tokio::spawn(async { std::future::pending::<()>().await; (Ok(0), false) }),
+            task: tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Ok(0), false) }),
             inbound: vec![], reason: "atMention".into(), previous: hub.state().unwrap()["conversations"][key].clone(),
             at: now, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(),
             session: Default::default(), minted: minted.clone(), cap_abort_at: None, route: Default::default(), admitted: Default::default(),
@@ -2053,7 +2076,7 @@ mod tests {
             let state = hub.state().unwrap();
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
             hub.active.insert(key.into(), Active {
-                task:tokio::spawn(async { std::future::pending::<()>().await; (Err("cancelled".into()),false) }),
+                task:tokio::spawn(async { std::future::pending::<()>().await; DispatchResult::new(Err("cancelled".into()), false) }),
                 inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
                 at:now,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),
                 minted:minted.clone(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
@@ -2097,7 +2120,7 @@ mod tests {
         let previous = hub.state().unwrap()["conversations"][key].clone();
         let (release, released) = tokio::sync::oneshot::channel();
         hub.active.insert(key.into(), Active {
-            task:tokio::spawn(async move { let _ = released.await; (Ok(1),false) }),
+            task:tokio::spawn(async move { let _ = released.await; DispatchResult::new(Ok(1), false) }),
             inbound:vec![],reason:"atMention".into(),previous:previous.clone(),at:now,
             token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),
             minted:Default::default(),cap_abort_at:None,route: std::sync::Arc::new(std::sync::Mutex::new(pipeline::Reserved2Route::Cli)), admitted: Default::default(),
@@ -2116,7 +2139,7 @@ mod tests {
         // Test the scheduler completion boundary: isolated CLI processes cannot run on Linux.
         followup.task.abort();
         let _ = (&mut followup.task).await;
-        followup.task = tokio::spawn(async { (Ok(1),false) });
+        followup.task = tokio::spawn(async { DispatchResult::new(Ok(1), false) });
         *followup.route.lock().unwrap() = pipeline::Reserved2Route::Cli;
         while !followup.task.is_finished() { tokio::task::yield_now().await; }
         hub.active.insert(key.into(),followup);
@@ -2174,7 +2197,7 @@ mod tests {
                 }
                 if let Some(done) = snapshot_done { done.send(()).unwrap(); }
             }).await.unwrap();
-            (Err("collector failed after the tick snapshot".into()),false)
+            DispatchResult::new(Err("collector failed after the tick snapshot".into()), false)
         });
         // Ensure completion collection sees the finished collector, without timing sleeps.
         let collector = task.abort_handle();
@@ -2214,7 +2237,7 @@ mod tests {
             active.task.abort();
             let _ = (&mut active.task).await;
             // Finish the queued follow-up at the scheduler seam; no external backend is used.
-            active.task = tokio::spawn(async { (Ok(1),false) });
+            active.task = tokio::spawn(async { DispatchResult::new(Ok(1), false) });
             *active.route.lock().unwrap() = pipeline::Reserved2Route::Cli;
             while !active.task.is_finished() { tokio::task::yield_now().await; }
         }
@@ -2275,7 +2298,7 @@ mod tests {
                 "epoch":crate::send_outbox::token_epoch("test-token"),"inbound":[],"reason":"atMention","t":now})).unwrap();
             let (finish, finished) = tokio::sync::oneshot::channel();
             hub.active.insert(key.into(), Active {
-                task:tokio::spawn(async move { let _ = finished.await; (Ok(0),false) }),
+                task:tokio::spawn(async move { let _ = finished.await; DispatchResult::new(Ok(0), false) }),
                 inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),at:now,
                 token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),
                 minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
@@ -2371,7 +2394,7 @@ mod tests {
             "epoch":epoch,"inbound":[],"reason":"atMention","t":now})).unwrap();
         let (finish, finished) = tokio::sync::oneshot::channel();
         hub.active.insert(key.into(), Active {
-            task:tokio::spawn(async move { let _ = finished.await; (Ok(0),false) }),
+            task:tokio::spawn(async move { let _ = finished.await; DispatchResult::new(Ok(0), false) }),
             inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),at:now,
             token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),
             minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
@@ -2564,7 +2587,7 @@ mod tests {
         let state = hub.state().unwrap();
         let (finish, finished) = tokio::sync::oneshot::channel();
         hub.active.insert(key.into(), Active {
-            task:tokio::spawn(async move { let _ = finished.await; (Err("回合已取消".into()),false) }),
+            task:tokio::spawn(async move { let _ = finished.await; DispatchResult::new(Err("回合已取消".into()), false) }),
             inbound:vec![],reason:"atMention".into(),previous:state["conversations"][key].clone(),
             at:now,token:"test-token".into(),mode_stamp:hub.mode_stamp.clone(),session:Default::default(),minted:Default::default(),cap_abort_at:None,route: Default::default(), admitted: Default::default(),
         });
@@ -2615,6 +2638,48 @@ mod tests {
             assert_eq!(record["predicate"],predicate);
             assert!(!log.contains("test-token"));
         }
+    }
+
+    #[tokio::test]
+    async fn t48_pause_during_claim_keeps_queued_ingress() {
+        let fixture = queued_hub("t48-pause-before-claim").await;
+        let _cleanup = CleanupRoot(fixture.0.clone());
+        let (_, mut hub) = fixture;
+        let key = "group:420042";
+        let event = format!("{key}|message:1");
+        hub.ready.truncate(1);
+        let context = hub.context.clone();
+        let (snapshot, reached) = tokio::sync::oneshot::channel();
+        hub.tick_snapshot_hook = Some(snapshot);
+        let pause = async {
+            let resume = reached.await.unwrap();
+            crate::conversation_state::update_raw(&context, |state| {
+                state["paused"] = json!(true);
+                Ok(())
+            }).unwrap();
+            resume.send(()).unwrap();
+        };
+        let (tick, ()) = tokio::join!(hub.tick("bot", 9001), pause);
+        tick.unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(hub.awaiting.get(key).map(Vec::as_slice), Some(std::slice::from_ref(&event)),
+                "pausing during the claim must preserve queued ingress");
+            assert!(hub.active.is_empty());
+            let check = event.clone();
+            assert_eq!(hub.journal.run(move |j| j.stage_of(&check)).await.unwrap().as_deref(), Some("received"));
+            hub.tick("bot", 9001).await.unwrap();
+        }
+        crate::conversation_state::update_raw(&hub.context, |state| {
+            state["paused"] = json!(false);
+            Ok(())
+        }).unwrap();
+        hub.tick("bot", 9001).await.unwrap();
+        let active = hub.active.remove(key).expect("the queued wake must dispatch after unpause");
+        assert_eq!(active.inbound, [event]);
+        active.task.abort();
+        let _ = active.task.await;
+        drop(hub);
     }
 
     #[tokio::test]
@@ -2754,7 +2819,7 @@ mod tests {
         driver.apply(session::Input::ReplySent { at_ms: now - 5000, text: "first send".into() });
         let (release, wait) = tokio::sync::oneshot::channel();
         hub.active.insert(key.into(), Active {
-            task: tokio::spawn(async move { wait.await.unwrap(); (Ok(0), false) }),
+            task: tokio::spawn(async move { wait.await.unwrap(); DispatchResult::new(Ok(0), false) }),
             inbound: vec![], reason: "atMention".into(), previous: state["conversations"][key].clone(),
             at: now - 3000, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted: Default::default(), cap_abort_at: None, route: Default::default(), admitted: Default::default(),
         });
@@ -2832,6 +2897,40 @@ mod tests {
         assert_eq!(hub.drivers[key].sched.pending_wake_reason.as_deref(), Some("anyMessage"), "configuration adoption discarded the first active-mode message");
         drop(hub);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn t48_denied_ingress_leaves_bootstrap_unclaimed() {
+        let (root, hub) = queued_hub("t48-denied-ingress").await;
+        let _cleanup = CleanupRoot(root);
+        let mut hub = hub;
+        hub.ready.clear();
+        let key = "group:420042";
+        let mut state = hub.state().unwrap();
+        state["conversations"][key]["bootstrapSent"] = json!(false);
+        hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+        for (id, allow, deny) in [
+            (48, json!([]), json!([])),
+            (49, json!([420042]), json!([420042])),
+        ] {
+            let mut cfg = hub.context.load_config().unwrap();
+            cfg["allow"]["groups"] = allow;
+            cfg["deny"] = json!({"groups":deny});
+            cfg["allowAllWhenEmpty"] = json!(true);
+            cfg["slang"] = json!({"enabled":false});
+            let frame = json!({"post_type":"message","message_type":"group","group_id":420042,"user_id":1001,
+                "message_id":id,"message":[{"type":"text","data":{"text":"fixture wake"}}]});
+            let raw = frame.to_string();
+            let ev = serde_json::from_value(frame).unwrap();
+            hub.handle_with_config(cfg, &ev, &raw, false, 9001, "bot", &HashMap::new()).await.unwrap();
+            let event_key = inbound::event_key(key, "message", Some(&id.to_string()), &raw);
+            assert_eq!(hub.journal.run(move |j| j.stage_of(&event_key)).await.unwrap(), None,
+                "refused ingress must never enter wake evaluation");
+            assert_eq!(hub.state().unwrap()["conversations"][key]["bootstrapSent"], false);
+            assert!(hub.ready.is_empty() && hub.active.is_empty());
+        }
+        assert!(crate::turn_ledger::read_records(&hub.context).unwrap().is_empty());
+        assert!(crate::send_outbox::read_records(&hub.context).unwrap().is_empty());
     }
 
     /// #186: the reserved2 ingress gate reads the allow and deny lists of each event's configuration.
@@ -2970,7 +3069,7 @@ mod tests {
         let (status, reply) = snapshot();
         assert_eq!(status, 403, "a denied conversation's wake snapshot must be refused: {reply}");
         let refused = social_state::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None);
-        assert_eq!(refused.unwrap_err().message(), "wake invalidated by current settings");
+        assert_eq!(refused.unwrap_err().message(), social_state::WAKE_ACCESS_REFUSED);
         drop(hub);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3050,6 +3149,8 @@ pub struct Hub {
     maintenance: HashMap<String, Maintenance>,
     maintenance_scan_at: i64,
     ready: Vec<(String, String)>,
+    /// Batches whose claim detected suspension after the tick read its settings.
+    suspended_claims: HashSet<String>,
     groups: Vec<String>,
     live_all: bool,
     mode_stamp: String,
@@ -3120,6 +3221,7 @@ impl Hub {
             maintenance: HashMap::new(),
             maintenance_scan_at: 0,
             ready: Vec::new(),
+            suspended_claims: HashSet::new(),
             groups,
             live_all,
             mode_stamp,
@@ -3221,6 +3323,7 @@ impl Hub {
     /// Forget every queued, held, retried and awaited job (their ingress is settled).
     async fn drop_everything(&mut self, now: i64) -> Result<(), String> {
         self.ready.clear();
+        self.suspended_claims.clear();
         self.recovered.clear();
         self.queued_messages.clear();
         self.held.clear();
@@ -3257,19 +3360,11 @@ impl Hub {
         self.rollback_pending.remove(key);
         self.failures.remove(key);
         self.ready.retain(|(k, _)| k != key);
+        self.suspended_claims.remove(key);
         if let Some(keys) = self.awaiting.remove(key) {
             self.journal.mark_handled(keys, now).await?;
         }
         Ok(())
-    }
-
-    /// Harness and pinned CLI wakes can run during an outage if admission needs no DSH handover.
-    fn wake_needs_dsh(&self, cfg: &Value, key: &str) -> bool {
-        match crate::turn_engine::Engine::selected(&self.context, cfg, key, "reserved2") {
-            Ok(engine) => (engine.uses_dsh() && pipeline::pinned_cli_backend(cfg, key).is_none())
-                || crate::engine_switch::handover_needs_dsh(&self.context, key, engine).unwrap_or(true),
-            Err(_) => true,
-        }
     }
 
     /// Driver control events never become prompts. Our cancellation's minted epoch keeps
@@ -3456,7 +3551,7 @@ impl Hub {
                 let key = key.as_str();
                 self.taken(key)
                     && social_state::inbound_admitted(cfg, key)
-                    && (!dsh_down || !self.wake_needs_dsh(cfg, key))
+                    && (!dsh_down || !wake_needs_dsh(&self.context, cfg, key))
                     && !self.active.contains_key(key)
                     && !self.recovered.contains_key(key)
                     && !self.maintenance.contains_key(key)
@@ -4003,6 +4098,7 @@ impl Hub {
             || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
         self.maintain_sessions(&cfg,suspended,now).await?;
         let mut state=self.state()?;
+        let suspended = suspended || state["paused"] == true;
         #[cfg(test)]
         if let Some(hook) = self.tick_snapshot_hook.take() {
             let (done, finished) = tokio::sync::oneshot::channel();
@@ -4017,13 +4113,14 @@ impl Hub {
             (state, _) = self.observe_turn_epoch(&key)?;
             let doc = crate::conversation_state::SocialDocument::from_value(state.clone())
                 .map_err(|(_, e)| e)?;
-            let predicate = if suspended || doc.paused() { "suspended" }
-                else if !self.taken(&key) { "notTaken" }
+            let predicate = if !self.taken(&key) { "notTaken" }
                 else if !social_state::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if !doc.has_conversation(key.as_str()) { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
                     old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
                 }) { "tokenChanged" }
+                // Only a batch already refused by the claim can survive a suspended tick.
+                else if suspended && !self.suspended_claims.contains(&key) { "suspended" }
                 else { continue; };
             invalid.push((key, predicate));
         }
@@ -4134,11 +4231,11 @@ impl Hub {
             let admitted_token = active.admitted_token();
             let route = active.route();
             let uses_cli = route == pipeline::Reserved2Route::Cli;
-            let (result, unsubmitted) = match active.task.await {
+            let DispatchResult { result, unsubmitted, failure_parks } = match active.task.await {
                 Ok(ended) => ended,
                 // Our own abort after a failed cap stop: the cap cancellation already settled the turn.
                 Err(error) if error.is_cancelled() && active.cap_abort_at.is_some() =>
-                    (Err("回合已取消：turnTimeout（DSH 未确认停止，已中止收集）".to_string()), false),
+                    DispatchResult::new(Err("回合已取消：turnTimeout（DSH 未确认停止，已中止收集）".to_string()), false),
                 Err(error) => return Err(error.to_string()),
             };
             println!("[reserved2] {key} turn ended: {result:?}");
@@ -4178,7 +4275,8 @@ impl Hub {
                     .as_ref()
                     .err()
                     .is_some_and(|e| e.starts_with(pipeline::HELD_ERROR_PREFIX));
-            if still_valid && !held {
+            let access_refused = result.as_ref().is_err_and(|error| pipeline::is_dsh_access_refusal(error));
+            if still_valid && !held && !access_refused {
                 if let (Err(message), None) = (&result, &model_error) {
                     let shown = if crate::pipeline::configured_outbound_violation(&cfg, message, &[]).is_some() {
                         "（含敏感信息，已隐藏）".to_string()
@@ -4188,11 +4286,12 @@ impl Hub {
                     crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&shown, 80)));
                 }
             }
-            let retry = still_valid && result.is_err() && unsubmitted && !held
+            let retry = still_valid && result.is_err() && unsubmitted && !held && !access_refused
                 && route != pipeline::Reserved2Route::ExpiredBeforeAdmission;
             // The prompt never reached DSH and DSH is down: wait for it (bounded) instead of burning the retries.
-            let wait_for_dsh = retry && !uses_cli
-                && crate::dsh_health::is_down(&self.context) && self.wake_needs_dsh(&cfg, &key);
+            let wait_for_dsh = retry && !uses_cli && failure_parks.unwrap_or_else(|| {
+                crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key)
+            });
             if held || retry {
                 social_state::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
                 if held && active.inbound.is_empty() {
@@ -4211,7 +4310,7 @@ impl Hub {
             } else if retry {
                 let failures = self.failures.entry(key.clone()).or_default();
                 *failures += 1;
-                if *failures <= 3 {
+                if *failures <= MAX_WAKE_RETRIES {
                     self.retries.insert(
                         key.clone(),
                         (now + 5_000 * (1_i64 << (*failures - 1)), active.reason),
@@ -4283,7 +4382,7 @@ impl Hub {
             // A new explicit CLI choice also releases that conversation while DSH stays down.
             // Every released wake still passes the normal mode, access, pause and epoch checks.
             let runnable: std::collections::HashSet<_> = self.dsh_wait.per_key.keys()
-                .filter(|key| !dsh_down || !self.wake_needs_dsh(&cfg, key)).cloned().collect();
+                .filter(|key| !dsh_down || !wake_needs_dsh(&self.context, &cfg, key)).cloned().collect();
             for (key, reason) in self.dsh_wait.drain_ready(|key| runnable.contains(key)) {
                 println!("[reserved2] {key} 重新投递等待中的唤醒（先核对权限与会话状态）");
                 self.ready.push((key, reason));
@@ -4342,8 +4441,14 @@ impl Hub {
             }
             println!("[reserved2] {key} 手动唤醒（{reason}）");
         }
-        self.pump_timers(&cfg, now);
+        if !suspended {
+            self.pump_timers(&cfg, now);
+        }
         self.sync_schedule(&cfg, suspended, now);
+        if suspended {
+            self.ready.retain(|(key, _)| self.suspended_claims.contains(key));
+            return Ok(());
+        }
         for (key, reason) in std::mem::take(&mut self.ready) {
             if let Some(m)=self.maintenance.get(&key) {
                 m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
@@ -4359,7 +4464,8 @@ impl Hub {
                 }
                 continue;
             }
-            if suspended || !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
+            self.suspended_claims.remove(&key);
+            if !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
                 continue;
             }
             if crate::group_mute::active(&self.context, &key).is_some() {
@@ -4367,7 +4473,7 @@ impl Hub {
                 println!("[reserved2] {key} 禁言中，唤醒跳过（{reason}）");
                 continue;
             }
-            if crate::dsh_health::is_down(&self.context) && self.wake_needs_dsh(&cfg, &key) {
+            if crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key) {
                 // DSH-dependent work waits without a call. A pinned CLI is an independent backend
                 // and must not be prevented from handling its conversation by a DSH outage.
                 println!("[reserved2] {key} DSH 不可用，唤醒排队等待恢复");
@@ -4427,13 +4533,12 @@ impl Hub {
             }.await;
             let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
                 Ok(prepared) => prepared,
-                Err(error) if error == STALE_WAKE => {
-                    // Its epoch ended while it waited: nothing of it runs or is retried, and its
-                    // ingress is settled.
-                    println!("[reserved2] {key} 排队的唤醒令牌代际已变，丢弃");
+                Err(error) if error == STALE_WAKE || error == social_state::WAKE_ACCESS_REFUSED => {
+                    // Authority changed while the wake was queued. Settle its ingress without a retry.
                     self.invalidate_key(&key, now).await?;
                     self.journal.mark_handled(keys, now).await?;
-                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":"token-invalidated"}))?;
+                    let reason = if error == STALE_WAKE { "token-invalidated" } else { "settings-invalidated" };
+                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":reason}))?;
                     continue;
                 }
                 Err(error) => {
@@ -4455,9 +4560,14 @@ impl Hub {
                         d.sched.pending_wake_key_at = None;
                         d.sched.wake_times.retain(|at| *at != now);
                     }
+                    if error == social_state::WAKE_SUSPENDED {
+                        self.suspended_claims.insert(key.clone());
+                        self.ready.push((key, reason));
+                        continue;
+                    }
                     let failures = self.failures.entry(key.clone()).or_default();
                     *failures += 1;
-                    if *failures <= 3 {
+                    if *failures <= MAX_WAKE_RETRIES {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
                     }
                     continue;
@@ -4493,19 +4603,25 @@ impl Hub {
             let route_shared = route.clone();
             let admitted = pipeline::MintedEpoch::default();
             let admitted_shared = admitted.clone();
+            let retries_remaining = self.failures.get(&key).copied().unwrap_or_default() < MAX_WAKE_RETRIES;
             let task = tokio::spawn(async move {
                 match pipeline::Pipeline::new_without_dsh(&context, &cfg2, true) {
-                    Err(error) => (Err(error), true),
+                    Err(error) => DispatchResult::new(Err(error), true),
                     Ok(mut pipe) => {
                         pipe.share_session(shared);
                         pipe.share_minted_epoch(minted_shared);
                         pipe.share_reserved2_route(route_shared, admitted_shared);
+                        pipe.set_reserved2_retry_budget(retries_remaining);
                         pipe.note_turn(&reason2, &keys2);
                         pipe.expect_dispatch_token(dispatch_token);
                         pipe.expect_dispatch_deadline(now.saturating_add(hard_cap_ms));
                         if reason2 != "wakeReminder" { pipe.expect_dispatch_wake(now, wake_claim); }
                         let result = pipe.run_turn(&target, &prompt, &cli_prompt, &cfg2).await;
-                        (result, pipe.dispatch_definitely_unsubmitted())
+                        DispatchResult {
+                            result,
+                            unsubmitted: pipe.dispatch_definitely_unsubmitted(),
+                            failure_parks: pipe.reserved2_failure_parks(),
+                        }
                     }
                 }
             });

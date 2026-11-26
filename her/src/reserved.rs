@@ -429,7 +429,7 @@ fn push_bounded(pending: &mut VecDeque<Job>, job: Job) -> Vec<Job> {
 }
 struct Active {
     job: Job,
-    task: tokio::task::JoinHandle<(Result<(), String>, bool)>,
+    task: tokio::task::JoinHandle<(Result<(), String>, bool, Option<bool>)>,
 }
 pub struct Hub {
     context: RuntimeContext,
@@ -950,9 +950,9 @@ impl Hub {
         for key in done {
             let active = self.active.remove(&key).unwrap();
             let job = active.job;
-            let (result, unsubmitted) = active.task.await.map_err(|e| e.to_string())?;
+            let (result, unsubmitted, failure_parks) = active.task.await.map_err(|e| e.to_string())?;
             if result.is_err() && unsubmitted && job.authority.check(&self.context, &key).is_ok() {
-                if crate::dsh_health::is_down(&self.context) {
+                if failure_parks.unwrap_or_else(|| crate::dsh_health::is_down(&self.context)) {
                     // The prompt never reached DSH and DSH is known down: the message waits for it (JS queues while
                     // dshReady is false and replays on recovery) instead of burning its retries and being lost. No attempt
                     // is used; the dispatch below holds it until DSH is back, then re-checks its authority.
@@ -1211,8 +1211,9 @@ impl Hub {
             let task = tokio::spawn(async move {
                 let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg, true) {
                     Ok(p) => p,
-                    Err(e) => return (Err(e), true),
+                    Err(e) => return (Err(e), true, None),
                 };
+                pipe.set_reserved_retry_budget(work.attempt < 3);
                 let result = pipe
                     .run_reserved_turn(
                         &work.key,
@@ -1224,7 +1225,7 @@ impl Hub {
                         work.authority.clone(),
                     )
                     .await;
-                (result, pipe.dispatch_definitely_unsubmitted())
+                (result, pipe.dispatch_definitely_unsubmitted(), pipe.reserved_failure_parks())
             });
             self.active.insert(job.key.clone(), Active { job, task });
         }

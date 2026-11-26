@@ -17,7 +17,7 @@ import {
 } from '../api/her';
 import { useConsole } from '../stores/consoleStore';
 import { formatDateTimeMs, formatErrorMessage } from '../utils/format';
-import { INPUT_CLASS, utf16Length } from '../utils/herHelpers';
+import { INPUT_CLASS, isSingleLineWithin, utf16Length } from '../utils/herHelpers';
 import { Badge, Button, Card, Switch, Tabs } from './Primitives';
 
 const AUTO_PARTS: { id: PersonaAutoPart; label: string }[] = [
@@ -40,6 +40,7 @@ interface PersonaDraft {
   core: string;
   notes: string;
   compact: string;
+  failureLine: string;
   names: string[];
   neediness: number;
   editMode: 'auto' | 'manual';
@@ -55,6 +56,7 @@ function versionToDraft(v: PersonaVersionDetail): PersonaDraft {
     core: v.core ?? '',
     notes: v.notes ?? '',
     compact: v.compact ?? '',
+    failureLine: typeof v.failureLine === 'string' ? v.failureLine : '',
     names: Array.isArray(v.names) ? [...v.names] : [],
     neediness: typeof v.traits?.neediness === 'number' ? v.traits.neediness : 1,
     editMode: v.editMode === 'manual' ? 'manual' : 'auto',
@@ -71,6 +73,7 @@ function normalizeDraftForCompare(d: PersonaDraft): string {
     core: d.core,
     notes: d.notes,
     compact: d.compact,
+    failureLine: d.failureLine.trim() ? d.failureLine : '',
     names: d.names,
     neediness: d.neediness,
     editMode: d.editMode,
@@ -79,10 +82,6 @@ function normalizeDraftForCompare(d: PersonaDraft): string {
     monthlyDriftPause: d.monthlyDriftPause,
     notify: d.notify,
   });
-}
-
-function isSingleLineWithin(value: string, maxUnits: number): boolean {
-  return !/[\r\n]/.test(value) && utf16Length(value) <= maxUnits;
 }
 
 export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId }) => {
@@ -234,6 +233,10 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
       pushToast('唤醒别名最多 10 个，且每项为单行不超过 40 个 UTF-16 字符', 'warn');
       return;
     }
+    if (draft.failureLine.trim() && !isSingleLineWithin(draft.failureLine, 160)) {
+      pushToast('终端失败提示语需为单行且不超过 160 个 UTF-16 字符', 'warn');
+      return;
+    }
 
     const saveStartDraftGen = draftGenRef.current;
     const submittedDraft = draft;
@@ -245,6 +248,7 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
         core: submittedDraft.core,
         notes: submittedDraft.notes,
         compact: submittedDraft.compact,
+        failureLine: submittedDraft.failureLine.trim() ? submittedDraft.failureLine : null,
         names: submittedDraft.names,
         traits: { neediness: submittedDraft.neediness },
         editMode: submittedDraft.editMode,
@@ -655,6 +659,24 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
                 }}
                 placeholder="关系细节、近期口癖、人设资料（仅改动此项可自动批准激活）…"
                 className={`${INPUT_CLASS} font-mono`}
+              />
+            </label>
+
+            <label className="block space-y-1">
+              <span className="font-medium text-[var(--text-primary)]">
+                终端失败提示语 (failureLine · 可选，单行 {utf16Length(draft.failureLine)}/160)
+              </span>
+              <input
+                type="text"
+                maxLength={160}
+                disabled={busy}
+                value={draft.failureLine}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateDraft((prev) => ({ ...prev, failureLine: val }));
+                }}
+                placeholder="路由与重试均耗尽时按原文本发送的一句话（留空保持静默）…"
+                className={INPUT_CLASS}
               />
             </label>
 

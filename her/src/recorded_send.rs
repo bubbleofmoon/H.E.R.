@@ -74,6 +74,7 @@ pub fn message_id(value: Option<&Value>) -> Option<i64> {
 #[derive(Clone, Copy, Debug)]
 pub enum Proof<'a> {
     Text(&'a str),
+    LiteralText(&'a str),
     Segment(&'static str),
 }
 
@@ -407,6 +408,15 @@ pub fn history_evidence(
 fn proof_matches(message: &Value, proof: Proof<'_>) -> bool {
     match proof {
         Proof::Text(text) => history_text_matches(message, text),
+        Proof::LiteralText(text) => {
+            let expected = crate::onebot::escape_cq(text);
+            match message.get("message").and_then(Value::as_array) {
+                Some(segments) => segments.len() == 1
+                    && segments[0]["type"] == "text"
+                    && segments[0]["data"]["text"].as_str() == Some(expected.as_str()),
+                None => plain_text_of_message(message) == expected,
+            }
+        }
         Proof::Segment(kind) => message
             .get("message")
             .and_then(Value::as_array)

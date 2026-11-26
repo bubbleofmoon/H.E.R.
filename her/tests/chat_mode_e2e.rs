@@ -1305,6 +1305,63 @@ fn model_failure_never_puts_an_internal_error_in_the_group_and_the_fallback_answ
     }
 }
 
+const T48_FAILURE_LINE: &str = "**Give me a moment.** [表情28]";
+
+fn t48_failed_dsh_turn(name: &str, line: Option<&str>) -> Rig {
+    let mut rig = Rig::new(name, Seed::default());
+    if let Some(line) = line {
+        fs::write(rig.root.join("data/personas.json"), json!({
+            "format": 1, "nextId": 3, "default": "p1", "overrides": {(GROUP_KEY): "p2"},
+            "personas": {
+                "p1": {"id": "p1", "activeVersion": 1, "versions": [
+                    {"version": 1, "approved": true, "name": "Default", "core": "Speak plainly.", "failureLine": "Default line."}
+                ]},
+                "p2": {"id": "p2", "activeVersion": 1, "versions": [
+                    {"version": 1, "approved": true, "name": "Override", "core": "Speak plainly.", "failureLine": line},
+                    {"version": 2, "approved": false, "name": "Override", "core": "Draft core.", "failureLine": "Draft line."}
+                ]}
+            }
+        }).to_string()).unwrap();
+    }
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "#FAIL#");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "failed")),
+        "the DSH failure must settle: {:?}", rig.ledger());
+    rig
+}
+
+#[test]
+fn t48_terminal_failure_is_silent_without_a_persona_line() {
+    let rig = t48_failed_dsh_turn("t48-no-failure-line", None);
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK], "a persona without a line owes no conversation reply");
+}
+
+#[test]
+fn t48_terminal_failure_sends_one_literal_persona_line() {
+    let rig = t48_failed_dsh_turn("t48-literal-failure-line", Some(T48_FAILURE_LINE));
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK, T48_FAILURE_LINE], "the exhausted chain sends exactly one literal line");
+    let requests = rig.dsh.prompts();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].text.contains(T48_FAILURE_LINE));
+    assert!(!serde_json::to_string(&rig.ledger()).unwrap().contains(T48_FAILURE_LINE));
+    let outbox = rig.data_lines("send-outbox.jsonl");
+    assert_eq!(outbox.iter().filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure").count(), 1);
+}
+
+#[test]
+fn t48_persona_line_preserves_private_owner_reporting() {
+    let rig = t48_failed_dsh_turn("t48-owner-failure-report", Some(T48_FAILURE_LINE));
+    assert_eq!(rig.texts_to(OWNER_KEY),
+        ["[group:420042] 模型/后端回合失败：backend=dsh provider=ticket12-provider model=ticket12-model class=backend code=boom"],
+        "the owner receives the original metadata-only alert");
+}
+
+#[test]
+fn t48_failure_line_obeys_outbound_policy() {
+    let rig = t48_failed_dsh_turn("t48-failure-line-outbound", Some(r"Try again at C:\fixture\private."));
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK], "outbound policy must block the configured line");
+}
+
 #[test]
 fn an_aborted_turn_says_stopped_and_a_timed_out_turn_says_nothing() {
     let mut rig = Rig::new("abort", Seed { config: json!({"socialV2": {"turnTimeoutSecs": 3}}), ..Seed::default() });
@@ -3874,6 +3931,30 @@ process.stdin.on('end', () => {
     assert_eq!(count(), "2", "the base urgent followup must finish without a replay loop");
     assert_eq!(rig.texts_to(GROUP_KEY), vec!["synthetic cli answer 1", "synthetic cli answer 2"]);
     assert_eq!(rig.data_lines("logs/rbridge-live-wakes.jsonl").len(), 2);
+}
+
+#[test]
+fn t48_reserved2_dsh_failure_line_waits_for_retry_exhaustion() {
+    let mut rig = hf129_rig("t48-unsubmitted-exhaustion");
+    fs::write(rig.root.join("data/personas.json"), json!({
+        "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+            {"version": 1, "approved": true, "name": "Companion", "core": "Speak plainly.",
+             "failureLine": T48_FAILURE_LINE}
+        ]}}
+    }).to_string()).unwrap();
+    lock(&rig.dsh.inner).refuse_prompt = true;
+    rig.start();
+    rig.push(group_event(48, 1001, "tester", "", vec![
+        json!({"type":"at","data":{"qq":SELF_ID.to_string()}}), text_seg("wake with a refused submission"),
+    ]));
+    let failed = || rig.ledger().iter().filter(|r| r["k"] == "ended" && r["outcome"] == "failed").count();
+    assert!(wait_for(LONG, || failed() >= 1), "the first unsubmitted turn must finish");
+    assert!(rig.texts_to(GROUP_KEY).is_empty(), "an unsubmitted failure must stay silent while hub retries remain");
+    assert!(wait_for(Duration::from_secs(65), || failed() >= 4), "all three hub retries must run");
+    assert_eq!(rig.dsh.calls("session/prompt").len(), 4);
+    assert!(rig.dsh.prompts().is_empty(), "DSH must refuse every submission");
+    assert_eq!(rig.texts_to(GROUP_KEY), [T48_FAILURE_LINE], "only the exhausted wake owes a failure line");
 }
 
 #[test]

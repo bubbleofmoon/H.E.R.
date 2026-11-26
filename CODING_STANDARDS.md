@@ -4,8 +4,8 @@ Read by reviewers and merge gates; each rule is a judgement call no automated ch
 
 ## Outbound chat text
 
-- Text reaches a QQ conversation from exactly two sources: the model's own send tools (`qq_send_*`), and a backend answer the code has classified as a successful reply. Raw process output, backend or provider error text, refusals, exception messages and log lines go to the owner's private chat as an administrator alert, or to a log, never to a group or a non-owner private chat. A provider refusal printed with exit 0 is still an error, not a reply.
-- A new or changed backend, provider or CLI route has seam tests for its failure modes as well as its answer: refusal or empty answer, quota/429, 5xx, timeout, and an error printed with exit 0. Each failure sends nothing to the conversation.
+- The bridge sends model text to a QQ conversation through the model's own send tools (`qq_send_*`) or as a backend answer classified as successful. An eligible turn that exhausts its backend routes may also attempt one literal failure line the owner configured on its active persona. The same outbound policy and durable send guards apply. Raw process output, backend or provider error text, refusals, exception messages and log lines go to the owner's private chat as an administrator alert, or to a log, never to a group or a non-owner private chat. A provider refusal printed with exit 0 is still an error, not a reply.
+- A new or changed backend, provider or CLI route has seam tests for its failure modes as well as its answer: refusal or empty answer, quota/429, 5xx, timeout, and an error printed with exit 0. Assert silence for failures by default and cover the owner-authored persona line wherever the turn can exhaust its routes.
 
 ## Model-facing text
 

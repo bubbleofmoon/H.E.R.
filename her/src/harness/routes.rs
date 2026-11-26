@@ -1115,6 +1115,7 @@ pub(crate) struct ChainExecutor {
     stream_retried: bool,
     dispatched: bool,
     sent: bool,
+    route_chain_exhausted: bool,
     spent_tokens: u32,
     usage_turn: i64,
 }
@@ -1141,6 +1142,7 @@ impl ChainExecutor {
             stream_retried,
             dispatched: false,
             sent: false,
+            route_chain_exhausted: false,
             spent_tokens: 0,
             usage_turn: usage::next_number(),
         }
@@ -1148,6 +1150,10 @@ impl ChainExecutor {
 
     pub(crate) fn steps_used(&self) -> usize {
         self.step
+    }
+
+    pub(crate) fn route_chain_exhausted(&self) -> bool {
+        self.route_chain_exhausted
     }
 
     pub(crate) fn mark_dispatched(&mut self) {
@@ -1354,6 +1360,16 @@ impl ChainExecutor {
                         Next::Fail => {
                             if cancel.is_cancelled() {
                                 return Err(ChainError::Cancelled);
+                            }
+                            let unsafe_miss = self.dispatched
+                                && (matches!(miss, Miss::Dropped) || matches!(class, "timeout" | "network"));
+                            if !next_route
+                                && !self.sent
+                                && !unsafe_miss
+                                && class != "refusal"
+                                && tokio::time::Instant::now() < self.cfg.deadline
+                            {
+                                self.route_chain_exhausted = true;
                             }
                             self.record_route_miss(
                                 adapter,

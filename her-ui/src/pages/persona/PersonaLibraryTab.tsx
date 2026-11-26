@@ -32,7 +32,7 @@ import { EmptyState, SearchInput } from '../../components/ConsoleWidgets';
 import { Badge, Button, Card, CardHeader } from '../../components/Primitives';
 import { useConsole } from '../../stores/consoleStore';
 import { formatDateTimeMs, formatErrorMessage } from '../../utils/format';
-import { INPUT_CLASS, utf16Length } from '../../utils/herHelpers';
+import { INPUT_CLASS, isSingleLineWithin, utf16Length } from '../../utils/herHelpers';
 
 export const PersonaLibraryTab: React.FC = () => {
   const { conversations, setInspector, openConfirm, pushToast } = useConsole();
@@ -55,6 +55,7 @@ export const PersonaLibraryTab: React.FC = () => {
   const [newCore, setNewCore] = useState('');
   const [newCompact, setNewCompact] = useState('');
   const [newNotes, setNewNotes] = useState('');
+  const [newFailureLine, setNewFailureLine] = useState('');
   const [newNeediness, setNewNeediness] = useState(1);
 
   // Duplicate inline target
@@ -230,6 +231,10 @@ export const PersonaLibraryTab: React.FC = () => {
       pushToast('唤醒别名最多 10 个', 'warn');
       return;
     }
+    if (newFailureLine.trim() && !isSingleLineWithin(newFailureLine, 160)) {
+      pushToast('终端失败提示语需为单行且不超过 160 个 UTF-16 字符', 'warn');
+      return;
+    }
     setBusy(true);
     try {
       const res = await createPersona({
@@ -237,6 +242,7 @@ export const PersonaLibraryTab: React.FC = () => {
         core: newCore,
         compact: newCompact,
         notes: newNotes,
+        failureLine: newFailureLine.trim() ? newFailureLine : null,
         names: newAliases.length > 0 ? newAliases : [trimmedName],
         traits: { neediness: newNeediness },
       });
@@ -249,6 +255,7 @@ export const PersonaLibraryTab: React.FC = () => {
       setNewCore('');
       setNewCompact('');
       setNewNotes('');
+      setNewFailureLine('');
       emitPersonaUpdated();
       setInspector({ kind: 'persona', id: res.id });
     } catch (err) {
@@ -578,6 +585,16 @@ export const PersonaLibraryTab: React.FC = () => {
                     className={`${INPUT_CLASS} font-mono`}
                   />
                 </div>
+                <input
+                  type="text"
+                  maxLength={160}
+                  disabled={busy}
+                  value={newFailureLine}
+                  onChange={(e) => setNewFailureLine(e.target.value)}
+                  placeholder="终端失败提示语 (failureLine, 单行 ≤ 160 字符，可选)"
+                  aria-label="新建人设终端失败提示语"
+                  className={INPUT_CLASS}
+                />
                 <div className="flex justify-end gap-2">
                   <Button size="sm" variant="primary" type="submit" disabled={busy}>
                     创建人设
