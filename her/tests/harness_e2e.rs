@@ -1255,7 +1255,7 @@ fn reset_harness_history(command: &str) {
         wait_for(Duration::from_secs(8), || rig
             .texts_to(GROUP_KEY)
             .iter()
-            .any(|s| s.contains("已重置会话"))),
+            .any(|s| s.contains("会话已清理"))),
         "{command} did not reset a harness-only conversation"
     );
     assert_ne!(
@@ -1667,7 +1667,7 @@ fn owner_tokenless_image_lookup_keeps_the_closed_agent_permission() {
     assert_eq!(facts["tools"][0]["state"], "completed", "{facts}");
     assert!(facts["tools"][0]["result"]
         .to_string()
-        .contains("没有可返回的图片"));
+        .contains("不含可提取的图片或表情"));
     assert_eq!(rig.wait_texts(OWNER_KEY, 2)[1], "image lookup complete");
 }
 
@@ -1930,7 +1930,7 @@ fn auxiliary_her_tools_are_offered_and_dispatched_in_process() {
         .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
         .collect();
     assert_eq!(results[0]["isError"], true); // sanitized empty search: no external request
-    assert!(results[0].to_string().contains("查询词为空"));
+    assert!(results[0].to_string().contains("未提供有效搜索词，请求已拒绝。"));
     assert_eq!(results[1]["isError"], true); // existing private-IP fetch policy
     assert_ne!(results[2]["isError"], true);
     assert!(results[2].to_string().contains("reachable"));
@@ -2205,7 +2205,7 @@ fn dropped_stream_after_a_dispatched_handler_error_does_not_retry() {
     let response = tool_wire_result(&lock(&model.requests)[1], "error-before-drop");
     assert_eq!(response["isError"], true);
     assert!(
-        response.to_string().contains("查询词为空"),
+        response.to_string().contains("未提供有效搜索词，请求已拒绝。"),
         "handler was not reached: {response}"
     );
     assert!(!rig
@@ -4818,7 +4818,7 @@ fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
             assert_eq!(requests.len(), 4);
             (reserved2_current_prompt(&requests[0]).to_owned(), reserved2_current_prompt(&requests[2]).to_owned())
         };
-        let prefix = format!("{GROUP_KEY} [reserved2] AI 内部输出：");
+        let prefix = format!("{GROUP_KEY} [reserved2] 对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：");
         let read_internal = || {
             let activity = fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default();
             activity.lines().filter_map(|line| line.split_once(&prefix).map(|(_, text)| text.to_owned()))

@@ -758,7 +758,7 @@ fn prompt_key(prompt:&str)->Option<&str> {
         .and_then(|(_, rest)| rest.lines().next())
         .or_else(|| {
             prompt
-                .split_once("【引导唤醒】你已接入 QQ 会话 ")
+                .split_once("【引导唤醒】已接入 QQ 对话：")
                 .and_then(|(_, rest)| rest.lines().next())
                 .map(|line| line.trim_end_matches('。'))
         })
@@ -1655,7 +1655,7 @@ fn scheduling_unclosed_wake_gets_one_reminder_then_resets_its_counter() {
         let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
         state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"] == 0
     }), "scheduler did not reset the completed unclosed wake");
-    assert!(rig.dsh.applied()[1].text.contains("【提醒】你还没有完成回合收尾"));
+    assert!(rig.dsh.applied()[1].text.contains("【提醒】本轮对话还没执行收尾动作"));
     assert!(!rig.dsh.applied()[1].text.contains("【本次消息快照】"), "JS reminders do not offer a wake snapshot");
     let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
     assert_eq!(state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"], 0);
@@ -3633,7 +3633,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     assert!(first.contains("operator-briefing-85"), "a non-bootstrap first hydration lost operator background");
     assert!(first.contains("【简报 revision="));
     assert!(first.contains("【简报节 behaviour】"));
-    assert!(first.contains("【简报节 sending】\n【发送规则】") && first.contains("文本输出不会发送到 QQ"), "first non-bootstrap briefing lost tool-only delivery rules");
+    assert!(first.contains("【简报节 sending】\n【发送规则】") && first.contains("直接输出的文字不会发往 QQ"), "first non-bootstrap briefing lost tool-only delivery rules");
     for i in 1..25 {
         lock(&rig.gateway).frames.push(mention_event(85000+i as i64,"fresh delta message"));
         await_completed_briefing_turn(&mut rig, i);
@@ -3641,7 +3641,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
         assert!(text.contains("【唤醒增量】"), "wake {i}: {text}");
         assert!(!text.contains("【替换简报节 behaviour】"), "wake {i} repeated unchanged rules");
         assert!(!text.contains("operator-briefing-85"));
-        assert!(!text.contains("【首回复节奏】先处理") && !text.contains("【沉睡前强制等待】这是"));
+        assert!(!text.contains("【替换简报节 reply】") && !text.contains("【回复节奏】需要说话时请直接发起发送工具") && !text.contains("【沉睡前强制等待】"));
         assert!(text.contains("【会话令牌】"));
         assert!(text.contains("【本轮发送】") && text.contains("文本输出不会发送到 QQ"), "wake {i} lost current-turn tool-only delivery instruction");
         assert!(text.contains("【本次消息快照】"));
@@ -3713,7 +3713,7 @@ fn hf85_briefing_changes_replace_remove_and_clock_does_not_resend_memory() {
     let removed=rig.dsh.applied()[3].text.clone();
     assert!(removed.contains("【删除简报节 operator】") && removed.contains("【删除简报节 memory】") && removed.contains("【删除简报节 impressions】"),"{removed}");
     assert!(removed.contains("【删除简报节 stickers】"));
-    assert!(removed.contains("【替换简报节 sending】") && removed.contains("文本输出不会发送到 QQ"), "removing the optional hint must retain delivery rules");
+    assert!(removed.contains("【替换简报节 sending】") && removed.contains("直接输出的文字不会发往 QQ"), "removing the optional hint must retain delivery rules");
     assert!(rig.onebot_sends().is_empty(),"final model text was forwarded");
 }
 
@@ -3823,7 +3823,7 @@ fn hf85_idle_rotation_digest_archive_and_next_wake_fresh_briefing() {
     let next=rig.dsh.applied()[1].clone();
     assert_ne!(next.session,"js-origin-session");
     assert!(next.text.contains("【简报 revision=") && next.text.contains("preserve this recent message"));
-    assert!(next.text.contains("【简报节 sending】\n【发送规则】") && next.text.contains("文本输出不会发送到 QQ"), "rotated session lost delivery rules");
+    assert!(next.text.contains("【简报节 sending】\n【发送规则】") && next.text.contains("直接输出的文字不会发往 QQ"), "rotated session lost delivery rules");
 }
 
 

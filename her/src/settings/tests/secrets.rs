@@ -240,7 +240,7 @@ fn ticket219_core_search_sends_the_credential_only_to_its_endpoint() {
     for (i, cfg) in [&selected, &changed].into_iter().enumerate() {
         assert_eq!(
             crate::aux_search::web_search(&format!("fixture query {i}"), cfg, &context, &net).unwrap_err(),
-            "主搜索接口 HTTP 401",
+            "主检索服务状态码 401",
         );
     }
     assert_eq!(seen.into_inner(), [KEY, "fixture-search-literal"], "credential did not follow its endpoint binding");

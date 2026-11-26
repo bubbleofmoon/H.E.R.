@@ -73,10 +73,10 @@ impl GatewayHealth {
         let silent = self.last_packet_at > 0 && ago.is_some_and(|a| a > self.silence_warn_ms);
         let confirmed = self.good == Some(false);
         let hint = if confirmed {
-            Some("SnowLuma 自报接收链路异常（good=false）：它的 [Hook] 收不到 QQ 客户端的数据，消息进不来。这不是桥接的问题。请查看 SnowLuma 的 logs/snowluma-*.log 里的 [Hook] 行（receive path stale / process enumeration timed out），并考虑升级 SnowLuma。".to_string())
+            Some("网关回报收消息链路异常（good=false），其内部挂钩未能收到客户端推送造成消息断流，并非桥接层自身故障。请打开网关运行目录查看报错细节（常见如队列滞留或进程扫描超时），如有必要请更新网关组件版本。".to_string())
         } else if silent {
             Some(format!(
-                "已连接但 {} 分钟没有收到任何事件包（连 30 秒一次的心跳都没有）。这说明 SnowLuma 的 OneBot 服务/进程本身可能已经卡住或不在了，而不只是收不到 QQ 数据；请直接查看 SnowLuma 的 logs/snowluma-*.log。",
+                "连接虽在但已有 {} 分钟未收到任何事件（包括每 30 秒的心跳包），SnowLuma 服务进程可能已卡死或退出，请直接检查 logs/snowluma-*.log。",
                 (ago.unwrap_or(0) as f64 / 60000.0).round() as i64
             ))
         } else {

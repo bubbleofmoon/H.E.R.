@@ -1,7 +1,5 @@
-//! Voice surface of the console (ticket 21): the library list, the AI send route, the operator
-//! send route and the prompt summary, ported from `bridge.js` (`voiceCfg`, `sendVoiceV2`,
-//! `sendVoiceForV2`, `/api/socialV2/send-voice`, `/api/voice/send`, `/api/send/voice`,
-//! `/api/socialV2/voices`, `/api/voice/list`).
+//! Voice surface of the console (ticket 21): library listing, agent/operator playback routes,
+//! and prompt summary.
 //!
 //! This module is a child of `console.rs` (`#[path]`) and uses that file's private helpers.
 //!
@@ -18,7 +16,7 @@ use crate::voice::{self, AudioOptions, Loudness};
 use std::path::{Path, PathBuf};
 
 const OPERATOR_SCOPE: &str = "operator:cli";
-const NOT_FROM_LIBRARY: &str = "语音只接受语音库里的本地文件；不接受 base64://、data: 或 http(s):// 来源";
+const NOT_FROM_LIBRARY: &str = "此处谢绝远端网址或编码串输入，仅受理本地语音曲库里的文件名";
 
 // ----- configuration ---------------------------------------------------------------------------------------
 
@@ -260,7 +258,7 @@ impl Library {
 fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Result<PathBuf, String> {
     let raw = input.trim();
     if raw.is_empty() {
-        return Err("缺少音频：给语音库里的文件名（可用 qq_list_voices 查看）".to_string());
+        return Err("音频文件名不可为空，请填入曲库里存在的条目名称（可先列出曲库查名）".to_string());
     }
     let lower = raw.to_lowercase();
     if lower.starts_with("base64://") || lower.starts_with("data:") || lower.starts_with("http://") || lower.starts_with("https://") {
@@ -276,7 +274,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
             None => {
                 // Only the directory name: this message goes back to a model facing untrusted chat.
                 return Err(format!(
-                    "语音只能从语音库取文件（语音库目录：{}）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽工具通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。",
+                    "该工具通道只放行语音库目录（{}）里的音频；就算传入完整磁盘路径也必须位于此目录内，放开任意路径的全局开关对本工具不生效。库外录音请先挪进库中或改经管理台发。",
                     lib.dir_name()
                 ));
             }
@@ -289,7 +287,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
         if resolved.is_none() {
             let escapes = raw.replace('\\', "/").split('/').any(|part| part == "..") || Path::new(raw).has_root();
             if escapes {
-                return Err("语音只能从语音库取文件：路径里出现了「..」或绝对路径，已拒绝（防止读到库外的本机文件）".to_string());
+                return Err("已拒绝越界路径：此通道不可传入「..」或根目录路径读取库外文件".to_string());
             }
         }
     }
@@ -298,7 +296,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
     }
     let names: Vec<String> = lib.files(context).into_iter().map(|(n, _)| n).collect();
     let hint = if names.is_empty() {
-        format!("语音库（{}）目前是空的，先把音频文件放进去", lib.dir_name())
+        format!("{} 目录目前无音频，请先放入音频文件", lib.dir_name())
     } else {
         let more = if names.len() > 12 { format!(" 等 {} 个", names.len()) } else { String::new() };
         format!("语音库里现有：{}{more}", names.iter().take(12).cloned().collect::<Vec<_>>().join("、"))
@@ -314,7 +312,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
         })
         .collect();
     let fuzzy = if fuzzy.is_empty() { String::new() } else { format!("；近似匹配：{}", fuzzy.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")) };
-    Err(format!("语音库里找不到「{raw}」{fuzzy}。{hint}"))
+    Err(format!("未在语音库找到「{raw}」{fuzzy}。{hint}"))
 }
 
 /// `resolveVoicePathForOperator`: operators may name any local file; library names resolve too.
@@ -325,7 +323,7 @@ fn resolve_for_operator(lib: &Library, input: &str) -> Result<(PathBuf, String),
     }
     let lower = raw.to_lowercase();
     if lower.starts_with("base64://") || lower.starts_with("data:") || lower.starts_with("http://") || lower.starts_with("https://") {
-        return Err("语音只接受本地文件；不接受 base64://、data: 或 http(s):// 来源".to_string());
+        return Err("本接口只接受本机磁盘文件路径，禁止传入网址或内联编码数据".to_string());
     }
     let found = voice::resolve_audio_source(raw, Some(&lib.root), &lib.cwd);
     if let Some(path) = found.path {
@@ -369,7 +367,7 @@ pub(super) fn handle_voice_list(
             return Err((403, "agent token 无效".to_string()));
         }
         if !social_v2_projection_session_allowed(cfg, &key) {
-            return Err((403, "目标不在当前模式允许范围内".to_string()));
+            return Err((403, "目标会话未被当前运行模式放行".to_string()));
         }
         if !send_voice_tool_enabled(cfg) {
             return Err((403, "工具未启用：qq_send_voice".to_string()));
@@ -385,7 +383,7 @@ pub(super) fn handle_voice_list(
         if want_probe {
             let info = match lib.file(context, name) {
                 Some(path) => voice::inspect_audio(&path, vc.max_bytes as u64, vc.max_seconds, &ffprobe),
-                None => voice::Inspect { error: Some("文件不存在或不可读".to_string()), ..voice::Inspect::default() },
+                None => voice::Inspect { error: Some("无法读取该文件（可能不存在或无权限）".to_string()), ..voice::Inspect::default() },
             };
             entry["ok"] = json!(info.ok);
             entry["bytes"] = json!(info.size.unwrap_or(*size));
@@ -398,11 +396,11 @@ pub(super) fn handle_voice_list(
         items.push(entry);
     }
     let hint = if !items.is_empty() {
-        "用 qq_send_voice 传 name 即可把其中一个当语音发出去".to_string()
+        "任选条目名填入发语音工具参数即可播发对应录音".to_string()
     } else if agent_call {
-        "语音库为空：请让管理员先把音频放进语音库".to_string()
+        "语音列表为空：请联系管理端先向语音库放入音频文件".to_string()
     } else {
-        format!("语音库为空：把音频文件放进 {} 后重试", lib.display_dir())
+        format!("语音列表为空：请向 {} 放入音频后再试", lib.display_dir())
     };
     let mut out = json!({
         "ok": true,
@@ -432,7 +430,7 @@ pub(super) fn prompt_summary(context: &RuntimeContext, cfg: &Value) -> Value {
         "total": names.len(),
         "names": names.iter().take(12).collect::<Vec<_>>(),
         "maxSeconds": voice::json_number(vc.max_seconds),
-        "hint": "可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去",
+        "hint": "请先调用曲库列表接口挑选合规文件名，再交给发语音工具传入对应条目名播发",
     })
 }
 
@@ -512,8 +510,8 @@ fn send_voice_core(
     if should_audit_key(context, cfg, args.key) {
         let subject = format!("[语音:{file_name}]");
         if crate::pipeline::configured_outbound_violation(cfg, &subject, &known_tokens(context)).is_some() {
-            crate::safe_println!("[voice] ⚠️ 语音发送被安全策略拦截 ({})：文件名疑似含敏感信息", args.key);
-            return Err(Failure::Plain("音频文件名疑似包含敏感信息（路径/凭据/会话令牌），已阻止发送；请重命名后再发".to_string()));
+            crate::safe_println!("[voice] 拦截语音发送 ({})：文件名触发安全审计", args.key);
+            return Err(Failure::Plain("检测到音频文件名含敏感内容（路径、凭据或会话密钥），已拦截，请更名后再试".to_string()));
         }
     }
     let info = voice::inspect_audio(args.file, vc.max_bytes as u64, vc.max_seconds, &voice::ffprobe_path());
@@ -725,11 +723,11 @@ pub(super) fn operator_send(
     let agent_token = headers.get("x-agent-token").map(|t| t.trim().to_string()).unwrap_or_default();
     // /api/send/voice is the AI tool entrance when a token is present: never a way around "own session only".
     if path == "/api/send/voice" && !agent_token.is_empty() {
-        return err(403, "请改用 /api/socialV2/send-voice（带 key + token）");
+        return err(403, "这个接口口令仅限发起二代仿真语音投递时使用，填报参数请写齐目标对话和口令密码后再递交");
     }
     let key = first_member(&b, &["target", "key"]).trim().to_string();
     let Some((kind, id_s)) = voice::parse_target_key(&key) else {
-        return err(400, "target 格式应为 group:群号 或 private:QQ号");
+        return err(400, "收件对象标识写得不对，须按群号或好友号标准格式给出");
     };
     let mode = match current_mode_for(context) {
         Ok(mode) => mode,
@@ -744,7 +742,7 @@ pub(super) fn operator_send(
                 .unwrap_or_default();
             if joined.is_empty() { "空".to_string() } else { joined }
         };
-        return err(403, format!("目标 {key} 不在白名单内（config.json allow.groups / allow.private：群 {}；私聊 {}）", list("groups"), list("private")));
+        return err(403, format!("所选会话 {key} 不在放行白名单里（请核对配置中的允许群组与好友清单；群：{}；私聊：{}）", list("groups"), list("private")));
     }
     let lib = match open_library(context, &vc) {
         Ok(lib) => lib,
@@ -789,7 +787,7 @@ pub(super) fn operator_send(
         Err(failure) => return failure.reply(),
     };
     crate::safe_println!(
-        "[voice] (操作者) {key} 已发送语音 {} ({}{}, messageId={})",
+        "[voice] (操作者) 会话 {key} 已顺利发出指定音频条目 {} ({}{})，回执消息序号={}",
         file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         sent.detail,
         if sent.audio_mode == "original" { String::new() } else { format!("，{}", sent.audio_processing) },
@@ -821,15 +819,15 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         return err(403, "语音功能已关闭");
     }
     if key.is_empty() {
-        return err(400, "key 不能为空（格式 group:群号 或 private:QQ号）");
+        return err(400, "请求体缺少会话标识（须按群组或私聊规范写明）");
     }
     match current_mode_for(context) {
         Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return err(403, "该接口仅 reserved2 模式可用"),
+        Ok(_) => return err(403, "仅在 reserved2 模式下开放此端点"),
         Err((status, message)) => return err(status, message),
     }
     if token.is_empty() {
-        return err(403, "reserved2 模式发送必须携带 agent token");
+        return err(403, "处于二代仿真态调用该动作时，必须附带对应会话口令");
     }
     match agent_token_ok_for(context, &key, &token) {
         Ok(true) => {}
@@ -840,18 +838,18 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         return err(403, "工具未启用：qq_send_voice");
     }
     if !social_v2_projection_session_allowed(cfg, &key) {
-        return err(403, "目标不在当前模式允许范围内");
+        return err(403, "目标会话未被当前运行模式放行");
     }
     match silent_blocks_send(context, cfg, &key) {
         Ok(false) => {}
-        Ok(true) => return err(403, "静默模式已开启，当前不允许发送"),
+        Ok(true) => return err(403, "当前处于静默状态，暂停对外发送"),
         Err((status, message)) => return err(status, message),
     }
     let Some((kind, id_s, id)) = agent::parse_key(&key) else {
-        return err(400, "key 格式应为 group:群号 或 private:QQ号");
+        return err(400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>");
     };
     if id <= 0 || !agent::mode_allowed(cfg, "reserved2", &key) {
-        return err(403, "目标不在当前模式允许范围内");
+        return err(403, "目标会话未被当前运行模式放行");
     }
     let lib = match open_library(context, &vc) {
         Ok(lib) => lib,
@@ -906,12 +904,12 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
     let label: String = js_member(&b, "label").chars().take(100).collect();
     let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     crate::safe_println!(
-        "[voice] {key} 已发送语音 {file_name} ({}, messageId={})",
+        "[voice] 会话 {key} 已顺利向对方递出语音条 {file_name} ({})，回执消息序号={}",
         sent.detail,
         sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())
     );
     if let Err((_, message)) = record_voice_sent(context, &storage_key, &sent, &label) {
-        return err(500, format!("语音已发送（messageId={}），但会话记录更新失败：{message}", sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())));
+        return err(500, format!("语音已送出（id={}），可本地聊天纪录写回受阻：{message}", sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())));
     }
     let readback = if b.get("readback") == Some(&json!(true)) { fetch_transcription(cfg, context, sent.message_id) } else { None };
     let want_verify = b.get("verify") == Some(&json!(true)) || (b.get("verify") != Some(&json!(false)) && vc.auto_readback);

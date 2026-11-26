@@ -136,7 +136,7 @@ const RESTART_ERR: &str = "restart is restricted to administrators";
 const DEPS_ERR: &str = "dependency upgrades are restricted to administrators";
 const RELEASES_ERR: &str = "release settings are restricted to administrators";
 const BACKUPS_ERR: &str = "backup settings are restricted to administrators";
-const SCOPE_ERR: &str = "该接口仅控制台可用";
+const SCOPE_ERR: &str = "此操作仅开放给控制台访问";
 
 const EXACT_ROUTES: &[(&str, &str, RoutePolicy)] = &[
     // Public probes (unauthenticated health & icons per ADR 0003).
@@ -1221,7 +1221,7 @@ pub(super) fn host_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
     let shown = if host.is_empty() { "缺失" } else { host };
     Some((
         403,
-        json!({"ok": false, "error": format!("Host 头不被允许（{shown}）：控制台只接受本机回环访问")}),
+        json!({"ok": false, "error": format!("拒绝来自非本机 Host 头的请求（{shown}）：管理台接口只受理本机回环地址连接")}),
     ))
 }
 
@@ -1562,9 +1562,9 @@ fn admit_selected_request(
 
 fn parse_auth_json_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, String)> {
     let Value::Object(map) = serde_json::from_str::<Value>(body)
-        .map_err(|_| (400, "请求体必须是合法 JSON 对象".to_string()))?
+        .map_err(|_| (400, "请求正文未能解析为合法 JSON 对象".to_string()))?
     else {
-        return Err((400, "请求体必须是 JSON 对象".to_string()));
+        return Err((400, "请求正文需为 JSON 对象".to_string()));
     };
     Ok(map)
 }
@@ -1935,7 +1935,7 @@ fn auth_sessions_revoke_route(
         }
         (None, true, false) => RevokeTarget::Others,
         (None, false, true) => RevokeTarget::All,
-        _ => return err(400, "请明确指定 id、others: true 或 all: true"),
+        _ => return err(400, "执行清理前请至少选定一个清理范围，必须显式传入 id、others: true 或是 all: true"),
     };
 
     let outcome =
@@ -2151,11 +2151,11 @@ fn v2_agent_global_gates(
         .and_then(Value::as_bool)
         == Some(false)
     {
-        return Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+        return Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()));
     }
     match current_mode_for(context) {
         Ok(mode) if mode == "reserved2" => None,
-        Ok(_) => Some((403, "该接口仅 reserved2 模式可用".to_string())),
+        Ok(_) => Some((403, "当前接口仅限 reserved2 模式调用".to_string())),
         Err((status, message)) => Some((status, message)),
     }
 }
@@ -2174,7 +2174,7 @@ pub(super) fn policy_agent_denial(
             if token.is_empty() {
                 Some((403, "agent token 不能为空".to_string()))
             } else {
-                Some((403, "该接口仅控制台可用".to_string()))
+                Some((403, "此操作仅开放给控制台访问".to_string()))
             }
         }
         AgentPolicy::V2AdminOnly => {
@@ -2182,7 +2182,7 @@ pub(super) fn policy_agent_denial(
                 return None;
             }
             v2_agent_global_gates(req, cfg, context)
-                .or_else(|| Some((403, "该接口仅控制台可用".to_string())))
+                .or_else(|| Some((403, "此操作仅开放给控制台访问".to_string())))
         }
         AgentPolicy::V2AgentAllowed => v2_agent_global_gates(req, cfg, context),
     }
@@ -2458,7 +2458,7 @@ pub(crate) fn handle_http_request(
             {
                 return json_reply(
                     401,
-                    json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}),
+                    json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
                 );
             }
             if let Some(response) = ui_page_response(req, admission_state.renewal.take(), false) {
@@ -2502,7 +2502,7 @@ pub(crate) fn handle_http_request(
         if !(matches!(kind, CallerKind::Administrator) || cookie_ok) {
             return json_reply(
                 401,
-                json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}),
+                json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
             );
         }
         let session_cookie = if matches!(kind, CallerKind::Administrator) {
@@ -2542,7 +2542,7 @@ pub(crate) fn handle_http_request(
         }
         return json_reply(
             401,
-            json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}),
+            json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
         );
     }
     let administrator = admitted_context.console_authority.is_some()

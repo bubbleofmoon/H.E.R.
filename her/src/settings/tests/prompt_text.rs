@@ -386,7 +386,7 @@ fn prompt_text_is_never_writable_from_chat() {
     for pointer in ["prompts.behaviour.notAClerk", "prompts.mode.chat", "prompts.mode.closedAgent", "prompts", "prompts.mode"] {
         let reply = crate::mcp::call_prepared("settings_set",
             &json!({"key": "private:7001", "token": "owner-token-140", "settingKey": pointer, "value": "x"}), &context).to_string();
-        assert!(reply.contains("该项不可通过对话修改"), "{pointer}: {reply}");
+        assert!(reply.contains("禁止在对话中更改此项"), "{pointer}: {reply}");
     }
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "nothing was written");
 }

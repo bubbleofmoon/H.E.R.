@@ -1,20 +1,13 @@
-// 合并转发消息的**纯函数**移植（对应 JS 的 `src/forward.js`）：
+// Pure formatting and sanitization helpers for OneBot merged forward messages:
 //
-// * 从 OneBot 消息段里提取并清洗 forward id
-// * 把 `get_forward_msg` 的返回格式化成适合 AI 阅读的紧凑结构
-// * 暴露每条消息里的图片/表情元数据与嵌套 forward id
+// * Validate and normalize forward IDs before passing them to gateway calls or logs
+// * Render `get_forward_msg` payloads into compact structured records with image/face metadata and nested forward IDs
 //
-// 两条安全原则照抄：
-// 1. forward id 只允许安全字符、长度受限 —— 它会被当作参数传给 OneBot 并写进日志；
-// 2. 只负责格式化，**不访问网络**；"id 必须来自本会话已见消息"由调用方校验。
-//
-// 这里最容易被写错的是**按 UTF-16 码元截断**：JS 的 `slice` 切在代理对中间会留下
-// 孤立高代理，写进提示词就渲染成乱码或替换符。所以下面先用 `encode_utf16()` 展开、
-// 切完再拼回去，并且和 `splitForQQ` 一样处理"切点被逼到 0"的边界。
+// Preview truncation operates on UTF-16 code units so surrogate pairs are never split.
 
 use serde_json::{json, Value};
 
-/// forward id 白名单：常见 QQ 资源 id 字符，拒绝空白与控制字符。
+/// Allowed characters for forward IDs (rejects whitespace and control chars).
 pub fn sanitize_forward_id(value: &str) -> String {
     let s = value.trim();
     if s.is_empty() || s.chars().count() > 256 {
@@ -256,8 +249,7 @@ fn node_content(node: &Value) -> Vec<Value> {
             return a.clone();
         }
     }
-    // 单个消息段也可能承载图片或嵌套转发
-    // 单个消息段也可能承载图片或嵌套转发
+    // A standalone segment may carry an image or nested forward entry.
     for v in [top, inner].into_iter().flatten() {
         if v.is_object() {
             if v.get("type").is_some() {
@@ -421,11 +413,11 @@ fn cut_utf16(text: &str, max: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     let mut cut = max;
-    // 切点前一个码元若是高代理，说明正好劈开了一对，前移一位
+    // Step back before a trailing high surrogate to keep the pair intact.
     if cut > 0 && (0xD800..=0xDBFF).contains(&units[cut - 1]) {
         cut -= 1;
     }
-    // 切点被逼到 0：至少保留一个完整码点，否则预览会变成空串
+    // Never shrink to empty when limit is 1; retain one full Unicode scalar.
     if cut == 0 {
         let first = units.first().copied().unwrap_or(0);
         let second = units.get(1).copied().unwrap_or(0);

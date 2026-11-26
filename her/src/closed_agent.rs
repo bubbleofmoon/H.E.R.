@@ -585,7 +585,7 @@ impl Hub {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("❓ agent 需要你回答：\n{lines}\n（直接回复选项文字或输入你的回答）")
+            format!("❓ 有问题待确认：\n{lines}\n（回复所选选项或直接写出回答）")
         } else {
             let reason = frame
                 .pointer("/request/reason")
@@ -594,7 +594,7 @@ impl Hub {
                 .map(|r| format!("\n理由：{r}"))
                 .unwrap_or_default();
             format!(
-                "🔐 agent 请求审批：{}{reason}\n回复「通过」或「拒绝」",
+                "🔐 当前挂起待批操作：{}{reason}\n请回复「通过」或者「拒绝」",
                 p.tool.as_str().unwrap_or("")
             )
         };
@@ -726,7 +726,7 @@ impl Hub {
             } else {
                 self.say(
                     &p,
-                    &format!("请回复「通过」或「拒绝」来决定这个审批（{key}）"),
+                    &format!("请发送「通过」或「拒绝」以确认本次审批（{key}）"),
                 );
                 return true;
             };
@@ -748,7 +748,7 @@ impl Hub {
                 let message = if p.kind == "question" {
                     format!("⚠️ 回答提交失败（{key}），请再回复一次。")
                 } else {
-                    format!("⚠️ 审批回执提交失败（{key}），请再回复一次「通过」或「拒绝」。")
+                    format!("⚠️ 审批提交未成功（{key}），请重新回复「通过」或「拒绝」。")
                 };
                 self.say(&p, &message);
             } else {
@@ -822,7 +822,7 @@ impl Hub {
                 if Instant::now() >= p.expires {
                     self.say_guarded(
                         &p,
-                        &format!("⏰ 等待回答超时，已取消该请求（{key}）"),
+                        &format!("⏰ 等待超限，该请求已自动取消（{key}）"),
                         true,
                         // Pending requests outlive their turn; JS notifies regardless.
                         true,

@@ -159,7 +159,7 @@ fn expected_block() -> String {
         "- insert:\n    - id: {id}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server}\n        transport: stdio\n        command: {command}\n        args:\n          - '{arg}'\n{extra}"
     );
     format!(
-        "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 维护；这段区块会被整体替换，请勿手工编辑内部条目。\n{}{}{}# === qq-bridge MCP END ===\n",
+        "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n{}{}{}# === qq-bridge MCP END ===\n",
         entry("mcp-snowluma", "snowluma", "--mcp-serve", "        toolCallTimeoutMs: 725000\n"),
         entry("mcp-snowluma-host", "snowluma-host", "--mcp-host-serve", ""),
         entry("mcp-web-search-safe", "web-search-safe", "--mcp-web-search-serve", ""),
@@ -458,7 +458,7 @@ fn status_text(mcp: &mut Mcp, id: u64) -> String {
     answer["result"]["content"][0]["text"].as_str().unwrap().to_string()
 }
 
-const UNREACHABLE_HINT: &str = "SnowLuma 网关不可达。请自行启动 SnowLuma（本程序不代装、不代启，原因见项目文档的合规说明 L6）。 若 config.json 的 snowluma.httpUrl 与实际端口不一致，也请一并检查。";
+const UNREACHABLE_HINT: &str = "目前连不上 SnowLuma 网关，请手动检查网关程序是否已跑起（依使用约定本工具不代为下载或拉起进程）。 并且核实一下配置文件里的网关 HTTP 入口与实际监听端口是不是一致。";
 
 #[test]
 fn status_reports_the_online_account_and_authenticates_with_the_configured_token() {
@@ -523,7 +523,7 @@ fn status_reports_gateway_failures_with_the_operator_hint() {
     let text = status_text(&mut mcp, 2);
     assert_eq!(
         text,
-        "{\n  \"reachable\": false,\n  \"error\": \"fetch failed\",\n  \"hint\": \"SnowLuma 网关不可达。请自行启动 SnowLuma（本程序不代装、不代启，原因见项目文档的合规说明 L6）。\"\n}"
+        "{\n  \"reachable\": false,\n  \"error\": \"fetch failed\",\n  \"hint\": \"目前连不上 SnowLuma 网关，请手动检查网关程序是否已跑起（依使用约定本工具不代为下载或拉起进程）。\"\n}"
     );
     assert_eq!(mcp.finish(), Some(0));
 }

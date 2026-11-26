@@ -62,7 +62,7 @@ pub struct DigestCursor {
     pub failed_at: i64,
 }
 
-/// Why `Reader::forget` failed. Both stages run in one transaction, so a failed delete rolls back.
+/// Error returned by `Reader::forget`; both stages execute inside a single atomic transaction.
 #[derive(Debug)]
 pub enum ForgetError {
     /// The visibility check could not be read; nothing was deleted.

@@ -462,7 +462,7 @@ pub(crate) fn sync_wake_configs(
             synced.insert(key.clone(), next);
             if announce {
                 println!(
-                    "[her] {key} 唤醒配置已更新（confirmedBy {}）",
+                    "[her] {key} 已刷新唤醒设定（操作来源 {}）",
                     wc.get("confirmedBy").and_then(|v| v.as_str()).unwrap_or("?")
                 );
             }
@@ -884,7 +884,7 @@ fn prepare_live_startup(
         println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
         println!("           命令行 --live-groups = {live_groups:?}");
         println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
-        println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
+        println!("           应当把它们补进启动参数里，或者从配置文件的灰度群组列表中移走。");
         std::process::exit(2);
     }
     let live_all = args.iter().any(|a| a == "--live-all");
@@ -1428,7 +1428,7 @@ impl FallbackWakeDrivers {
         {
             match social_state::claim_first_wake(context, &gate_cfg, &key) {
                 Ok(true) => {
-                    println!("[her] {key} 首次唤醒：升级为 bootstrap");
+                    println!("[her] {key} 初次触发唤醒：切为引导开场");
                     wake = true;
                     reason = "bootstrap".to_string();
                 }

@@ -171,7 +171,7 @@ impl Pipeline {
         // it is bound; a revocation, reset or mode change in between archives the new session.
         let epoch = if self.context.is_isolated() { Some(self.access_epoch(key)) } else { None };
         if epoch.as_ref().is_some_and(|e| !matches!(e.allowed, Ok(true))) {
-            return Err(DshTurnError::AccessRefused(format!("当前模式不允许会话 {key}")));
+            return Err(DshTurnError::AccessRefused(format!("当前运行模式未放行会话 {key}")));
         }
         if self.context.is_isolated() {
             // Fresh read: the console may have reset or replaced this mapping since the last turn.
@@ -210,7 +210,7 @@ impl Pipeline {
             self.require_preset(&preset)?;
         }
         let access_changed = |pipe: &Self| epoch.as_ref().is_some_and(|before| !pipe.access_epoch(key).still(before));
-        let refused = || DshTurnError::AccessRefused(format!("会话创建期间 {key} 已重置或权限已变化"));
+        let refused = || DshTurnError::AccessRefused(format!("创建对话过程中 {key} 发生重置或权限变动"));
         if access_changed(self) {
             return Err(refused());
         }
@@ -228,7 +228,7 @@ impl Pipeline {
             Ok(v) => v,
             Err(_) if access_changed(self) => return Err(refused()),
             Err(e) if e.contains("401") => {
-                println!("[dsh] session/create 401，重读密钥后重试");
+                println!("[dsh] 建联接口遇 401，重载本地凭证后再重投一次");
                 self.rpc.relogin().map_err(|re| format!("{e}；重新登录也失败：{re}"))?;
                 if access_changed(self) {
                     return Err(refused());
@@ -328,12 +328,12 @@ impl Pipeline {
         if let Err(error) = crate::dsh::archive_session(&self.rpc, sid) {
             failures.push(format!("归档新会话 {sid} 失败：{error}"));
         }
-        println!("[session] 会话创建期间 {key} 已重置或权限已变化，丢弃新会话 {sid}");
+        println!("[session] 创建对话过程中 {key} 发生重置或权限变动，放弃新建会话 {sid}");
         if failures.is_empty() {
-            "会话创建期间已重置或权限已变化，丢弃新会话".to_string()
+            "创建对话过程中发生重置或权限变动，放弃新建会话".to_string()
         } else {
             println!("[session] ⚠️ 丢弃新会话 {sid} 未完成：{}", failures.join("；"));
-            format!("会话创建期间已重置或权限已变化，丢弃新会话；{}", failures.join("；"))
+            format!("创建对话过程中发生重置或权限变动，放弃新建会话；{}", failures.join("；"))
         }
     }
 
@@ -349,7 +349,7 @@ impl Pipeline {
             return Ok(());
         }
         Err(format!(
-            "拒绝创建会话：模式 chat 需要 preset \"{preset}\"，但它不在 DSH 可用清单中（{}）；回退到 DSH 默认 preset 会把本地工具暴露给 QQ 群",
+            "拒建会话：chat 模式要求预设 \"{preset}\"，未在 DSH 列表（{}）中查到；若退回默认预设会将本机工具暴露到 QQ 群",
             ids.join(", ")
         ))
     }
@@ -760,7 +760,7 @@ impl Pipeline {
                     }
                 }
             }
-            println!("[failover] {} 不可用，降级到下一个候选", cand.label());
+            println!("[failover] {} 暂不可达，切换下一备选路由", cand.label());
         }
         recovery_log::record(
             &self.context,
@@ -844,11 +844,11 @@ impl Pipeline {
             && crate::chat::is_owner_key(cfg, key))
     }
 
-    /// JS `shouldAuditKey(key) && SENSITIVE_RE.test(text) ? '（含敏感信息，已隐藏）' : text`.
+    /// Redact outbound sensitive text when the conversation requires audit masking.
     fn hide_if_sensitive(&self, cfg: &serde_json::Value, key: &str, text: &str) -> String {
         let guard_cfg = self.context.load_config().unwrap_or_else(|_| cfg.clone());
         if self.should_audit_key(cfg, key) && configured_outbound_violation(&guard_cfg, text, &[]).is_some() {
-            "（含敏感信息，已隐藏）".to_string()
+            "（涉及敏感内容，已遮蔽）".to_string()
         } else {
             text.to_string()
         }
@@ -857,7 +857,7 @@ impl Pipeline {
     /// Retain the local activity/recovery diagnostics; the shared failure reporter owns the private alert.
     fn report_turn_error(&mut self, cfg: &serde_json::Value, key: &str, message: &str) {
         let safe = self.hide_if_sensitive(cfg, key, &crate::activity::slice(message, 500));
-        println!("[turn] ⚠️ agent 处理出错 ({key})：{}", crate::activity::redact(&self.context, &safe));
+        println!("[turn] ⚠️ 处理回合发生故障 ({key})：{}", crate::activity::redact(&self.context, &safe));
         crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&safe, 80)));
         recovery_log::record(
             &self.context,
@@ -1444,7 +1444,7 @@ impl Pipeline {
             let outcome = match action {
                 failover::FailoverAction::Retry { idx: next } => {
                     println!(
-                        "[failover] {key} 失败（{} {}），换 {} 重投",
+                        "[failover] {key} 线路遇挫（{} {}），换接 {} 重试",
                         kind.as_str(),
                         crate::activity::redacted_preview(&self.context, &why, 80),
                         chain[next].label()

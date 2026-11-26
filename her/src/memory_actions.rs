@@ -201,7 +201,7 @@ fn handle_inner(
         let owner_ok = authority::owner_holds_token(context, cfg, key0, &agent_token)
             .map_err(|e| unavailable(e.to_string()))?;
         if !console_ok && !owner_ok {
-            return Err((403, "ACL 操作只允许管理员私聊或控制台".to_string()));
+            return Err((403, "权限调整仅限管理端私聊或控制台操作".to_string()));
         }
         let sub = match b.get("action").and_then(Value::as_str) {
             Some("grant") => Some(AclAction::Grant),
@@ -210,14 +210,13 @@ fn handle_inner(
         };
         return acl_action(context, cfg, sub, &b);
     }
-    // `settings-*` 只允许管理员私聊（自己的 agent token）；控制台令牌不行 ——
-    // 它等于管理端全权，而"对话式配置"的整个设计前提是**只有管理员能改**。
+    // `settings-*` 允许管理员私聊调用；控制台令牌拥有管理全权，不能从聊天上下文借用。
     if action == "settings-get" || action == "settings-set" {
         let key0 = b.get("key").and_then(Value::as_str).unwrap_or("").trim();
         if !authority::owner_holds_token(context, cfg, key0, &agent_token)
             .map_err(|e| unavailable(e.to_string()))?
         {
-            return Err((403, "配置读写只允许管理员私聊".to_string()));
+            return Err((403, "配置调整仅限管理员私聊".to_string()));
         }
         match crate::config_tx::commit_chat_settings(
             action,
@@ -241,7 +240,7 @@ fn handle_inner(
         let owner_ok = authority::owner_holds_token(context, cfg, key, &agent_token)
             .map_err(|e| unavailable(e.to_string()))?;
         if !console_ok && !owner_ok {
-            return Err((403, "归档操作只允许管理员私聊或控制台".to_string()));
+            return Err((403, "条目归档仅限管理端私聊或控制台执行".to_string()));
         }
         let id = b.get("id").and_then(Value::as_i64).filter(|id| *id > 0).ok_or((400, "id 无效".to_string()))?;
         let archived = b.get("archived").and_then(Value::as_bool).unwrap_or(true);
@@ -253,12 +252,11 @@ fn handle_inner(
     if key.is_empty() {
         return Err((400, "key 不能为空".to_string()));
     }
-    // 其余动作必须带该会话自己的 agent token；控制台令牌在 MCP 进程里也有，
-    // 若 search/write 也认它，任何会话都能借 MCP 读到别的会话语料。
+    // 必须校验目标会话自己的 agent token，避免借控制台令牌跨会话读取语料。
     if !authority::holds_token(context, &key, &agent_token)
         .map_err(|e| unavailable(e.to_string()))?
     {
-        return Err((403, "agent token 无效（必须是该会话自己的令牌）".to_string()));
+        return Err((403, "会话令牌校验失败（须附上该对话的专属 token）".to_string()));
     }
     let store = open_store(context, cfg)?;
     let reader = store.for_reader(&key);
@@ -347,18 +345,18 @@ fn handle_inner(
             let Some(number) = b.get("id").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))).filter(|n| n.is_finite()) else {
                 return Err((400, "id 无效".to_string()));
             };
-            if number.fract() != 0.0 { return Err((403, "无权删除该条（不在可见范围）".to_string())); }
+            if number.fract() != 0.0 { return Err((403, "无权操作该条目（不在当前授权范围）".to_string())); }
             let id = number as i64;
             // 先按可见范围确认这条确实看得见，看不见就当无权删（不是"不存在"）
             match reader.forget(id) {
                 Ok(Some(ok)) => Ok(json!({ "ok": ok })),
-                Ok(None) => Err((403, "无权删除该条（不在可见范围）".to_string())),
+                Ok(None) => Err((403, "无权操作该条目（不在当前授权范围）".to_string())),
                 Err(ForgetError::Check(e)) => Err((500, format!("检索失败：{e}"))),
                 Err(ForgetError::Delete(e)) => Err((500, format!("删除失败：{e}"))),
             }
         }
         "preview" => {
-            // 原样返回「若现在唤醒会注入的记忆段」，并可能回填派生的向量缓存。
+            // 原样返回唤醒时会注入的记忆段落，并视情况补算缺失向量缓存。
             // 用的是唤醒提示词里同一个 recall_block（不是另写一份），
             // 否则"预览"和"实际注入"会慢慢走偏，而这个接口的全部意义就是验证后者。
             // 传的是**该会话的** state（同提示词那条链），不是根 state ——

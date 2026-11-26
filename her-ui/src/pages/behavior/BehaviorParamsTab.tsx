@@ -301,7 +301,7 @@ export const BehaviorParamsTab: React.FC = () => {
     openConfirm({
       title: '确认重置社交状态（socialV2）？',
       description:
-        '此操作将调用 POST /api/socialV2/reset：\n• 清空社交运行时状态与唤醒计时缓存\n• 丢弃已入队的待处理提示词\n• 结束并注销全部活动会话及会话令牌\n• 解除当前社交暂停状态（仅选定运行时可用）\n\n确定要继续执行重置吗？',
+        '此操作将调用 POST /api/socialV2/reset：\n• 清空社交状态记录与唤醒排程缓存\n• 丢弃已入队的待处理提示词\n• 结束并注销全部活动会话及会话令牌\n• 解除当前社交暂停状态（仅选定运行时可用）\n\n确定要继续执行重置吗？',
       confirmLabel: '确认重置',
       danger: true,
       onConfirm: async () => {

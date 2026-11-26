@@ -625,7 +625,7 @@ export const SecurityPage: React.FC = () => {
         }
         if (mirrorWarnings.length > 0) {
           pushToast(
-            `白名单与主人配置已写入设置库，但写回 config.json 失败：${mirrorWarnings.join('；')}`,
+            `黑白名单及主人设置已存入本地配置库，但同步到主配置文件未成：${mirrorWarnings.join('；')}`,
             'warn',
           );
         }

@@ -61,7 +61,7 @@ fn unanswered_question_expires_without_a_model_continuation() {
     fs::write(path, cfg.to_string()).unwrap();
     rig.start();
     says(&rig, OWNER_KEY, OWNER, "owner", "ask and wait");
-    assert!(wait_for(Duration::from_secs(7), || rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("等待回答超时"))), "question did not use its configured expiry");
+    assert!(wait_for(Duration::from_secs(7), || rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("⏰ 等待超限，该请求已自动取消。"))), "question did not use its configured expiry");
     assert!(wait_for(LONG, || conversation_facts(&rig)["turns"][0]["state"] == "failed"));
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "refused");
     assert_eq!(rig.console("GET", "/api/pending", None), (200, json!({"pending":[]})));
@@ -75,7 +75,7 @@ fn the_turn_deadline_tells_the_owner_the_question_is_closed() {
     let mut rig = owner_harness_rig("owner-question-turn-deadline", &model);
     set_harness_config(&rig, json!({}), 5);
     request_question(&mut rig);
-    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| text == "⏰ 等待回答超时，已取消该请求。")), "the turn deadline did not send the question closure notice");
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| text == "⏰ 等待超限，该请求已自动取消。")), "the turn deadline did not send the question closure notice");
     assert!(wait_for(LONG, || conversation_facts(&rig)["turns"][0]["state"] == "failed"));
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "refused");
     assert_eq!(rig.console("GET", "/api/pending", None), (200, json!({"pending":[]})));
@@ -139,7 +139,7 @@ fn assert_one_closure_notice(rig: &Rig) {
         .filter(|text| text.as_str() != ACK && !text.contains("Which colour?"))
         .map(String::as_str)
         .collect();
-    assert_eq!(notices, ["⏰ 等待回答超时，已取消该请求。"], "the owner received an extra failure notice");
+    assert_eq!(notices, ["⏰ 等待超限，该请求已自动取消。"], "the owner received an extra failure notice");
 }
 
 #[test]

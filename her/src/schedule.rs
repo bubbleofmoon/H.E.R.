@@ -898,7 +898,7 @@ impl ScheduleStore {
         for timer in timers {
             let (action, mut actions): (&str, Vec<&'static str>) = match timer.kind {
                 TimerKind::Sleep => ("潜水结束后唤醒", vec!["edit", "cancel", "run"]),
-                TimerKind::ReplyCheck => ("检查是否有人回复", vec!["cancel", "run"]),
+                TimerKind::ReplyCheck => ("确认对方是否已接话", vec!["cancel", "run"]),
                 TimerKind::ReachOut => ("主动冒泡机会", vec!["cancel", "run"]),
             };
             if stale {

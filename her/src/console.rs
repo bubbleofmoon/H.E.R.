@@ -1256,7 +1256,7 @@ fn parse_role_management_body(
 ) -> Result<Value, (u16, String)> {
     match serde_json::from_str::<Value>(body) {
         Ok(value) if context.is_isolated() && !value.is_object() => {
-            Err((400, "请求体必须是 JSON 对象".to_string()))
+            Err((400, "请求正文需为 JSON 对象".to_string()))
         }
         Ok(value) => Ok(value),
         Err(_) if context.is_isolated() => Err((400, "请求体不是合法 JSON".to_string())),
@@ -1271,9 +1271,9 @@ pub(crate) fn parse_object_body(body: &str) -> Result<Value, (u16, String)> {
         return Ok(json!({}));
     }
     let value = serde_json::from_str::<Value>(body)
-        .map_err(|_| (400, "请求体必须是合法 JSON".to_string()))?;
+        .map_err(|_| (400, "请求正文未能解析为合法 JSON".to_string()))?;
     if !value.is_object() {
-        return Err((400, "请求体必须是 JSON 对象".to_string()));
+        return Err((400, "请求正文需为 JSON 对象".to_string()));
     }
     Ok(value)
 }
@@ -1324,7 +1324,7 @@ fn role_inject_max(context: &RuntimeContext) -> usize {
     crate::role::apply_inject_limit(cfg.get("role").and_then(|r| r.get("maxInjectChars")))
 }
 
-/// `/api/socialV2/prompt?key=`：管理台「会话详情」要的结构化信息。
+/// `/api/socialV2/prompt?key=`: structured prompt preview payload for the console.
 ///
 /// 这是最大的一个读端点（17 个顶层字段）。能复用的都复用
 /// （身份行 / 表情上下文 / 短期记忆 / 参与度），不重写一遍文案 ——
@@ -1619,7 +1619,7 @@ fn handle_presets(context: &RuntimeContext, cfg: &Value) -> Result<Value, String
     let v = match rpc.call("agentPresets/list", json!({})) {
         Ok(v) => v,
         Err(e) if e.contains("401") => {
-            crate::safe_println!("[console] agentPresets/list 401，重试一次（频繁出现说明 DSH 鉴权在抖）");
+            crate::safe_println!("[console] 拉取预设列表遇到 401，自动重试一次（若频繁出现多半是 DSH 凭证抖动）");
             std::thread::sleep(std::time::Duration::from_millis(120));
             rpc.call("agentPresets/list", json!({}))?
         }
@@ -1795,7 +1795,7 @@ fn parse_after_seq(raw: Option<&str>) -> Result<Option<i64>, (u16, String)> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    const ERROR: &str = "afterSeq 必须是非负安全整数；从最早未读开始请传 0";
+    const ERROR: &str = "afterSeq 须为非负整数；从首条未读起请传 0";
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err((400, ERROR.to_string()));
     }
@@ -2078,8 +2078,7 @@ fn handle_my_recent_from_doc(
 
 /// `/api/socialV2/active-members?key=&limit=`：最近参与过的人。
 ///
-/// 排序是 `count` 降序、再按 `lastTime` 降序（JS 用的是 `b.count - a.count ||
-/// b.lastTime - a.lastTime`）。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
+/// 排序是 `count` 降序、再按 `lastTime` 降序。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
 fn handle_active_members_from_doc(doc: &SocialDocument, key: &str, limit: i64) -> Value {
     let conv = doc.conversation(key).unwrap_or_default();
     let msgs = conv
@@ -2540,7 +2539,7 @@ fn dsh_usage_total(context: &RuntimeContext, start_day: &str) -> Result<(i64, f6
     Ok((turns, tokens, cost))
 }
 
-/// `/api/usage/attribution?days=`：用量归属（DSH 总账 vs 桥接账本）。
+/// `/api/usage/attribution?days=` compares host ledger usage against local bridge records.
 ///
 /// 为什么必须有这条：`.dshw-usage.json` 是**所有入口**的总账（Web GUI、CLI 探针、
 /// QQ 桥接都算），而 `token-usage.jsonl` 只记带 `key` 的 QQ 会话。差额必须显式
@@ -2606,7 +2605,7 @@ fn handle_initial_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Re
         return Ok(json!({ "ok": true, "entries": list, "maxChars": max_chars, "writable": store.writable }));
     }
     let Some(canonical) = crate::initial_prompts::canonical_key(raw) else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     let entry = store.get(&canonical);
     Ok(json!({
@@ -2629,7 +2628,7 @@ fn handle_pending(_context: &RuntimeContext) -> Value {
     json!({ "pending": [] })
 }
 
-/// 归一化操作者输入：去 BOM、统一行尾、删控制字符、只裁首尾空白（保留段落换行）。
+/// Normalize role content: strip BOM and control chars, normalize line endings, and trim outer whitespace while preserving inner newlines.
 fn normalize_initial_prompt_text(raw: &str) -> String {
     let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     let mut out = String::with_capacity(stripped.len());
@@ -2675,7 +2674,7 @@ fn handle_initial_prompt_post(context: &RuntimeContext, cfg: &Value, body: &str)
     let text = match req.get("text") {
         Some(Value::String(s)) if !explicit_delete => s.clone(),
         _ if explicit_delete => String::new(),
-        _ => return Err((400, "text 必须是字符串（留空表示删除），或用 delete:true 显式删除".to_string())),
+        _ => return Err((400, "text 须为字符串（空串代表删除），亦可传入 delete:true 移除".to_string())),
     };
     let saved = crate::initial_prompts::set(context, cfg, key_raw.trim_matches(crate::role::js_is_space), &text, now_ms_i64())?;
     Ok(json!({
@@ -2698,7 +2697,7 @@ const ROLE_CONTENT_MAX_BYTES: usize = 64 * 1024;
 fn validate_role_name(raw: &str) -> Result<String, String> {
     let name = sanitize_role_name(raw);
     if name.is_empty() {
-        return Err("人格名不能为空（仅限中文 / 字母 / 数字 / 横线）".to_string());
+        return Err("角色名称不可为空（只允许中文、字母、数字或短横线）".to_string());
     }
     if name.chars().count() > ROLE_NAME_MAX {
         return Err(format!("人格名过长（最多 {ROLE_NAME_MAX} 字）"));
@@ -2706,13 +2705,13 @@ fn validate_role_name(raw: &str) -> Result<String, String> {
     if name == "README" {
         return Err("「README」是保留名称".to_string());
     }
-    // Windows 设备名：roles/CON.md 这类路径会被当成设备，写入会失败甚至挂起
+    // Reject Windows reserved device stems such as CON so file writes never target a device handle.
     const RESERVED: [&str; 22] = [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
         "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if RESERVED.contains(&name.to_uppercase().as_str()) {
-        return Err(format!("「{name}」是系统保留名称（Windows 设备名），请换一个"));
+        return Err(format!("「{name}」命中系统保留设备名，请改用其他名称"));
     }
     Ok(name)
 }
@@ -2724,7 +2723,7 @@ fn role_file_path(name: &str) -> String {
 /// `POST /api/roles/rename`：重命名人格卡。
 ///
 /// 关键语义：如果被改名的那张卡**正在启用**，要跟着改 `current-role.json`，
-/// 否则机器人会指向一个不存在的文件（表现为「人格突然没了」）。
+/// Missing target files would break active persona resolution on the next load.
 fn handle_roles_rename(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let Ok(req) = serde_json::from_str::<Value>(body) else {
         return Err((400, "请求体不是合法 JSON".to_string()));
@@ -2790,7 +2789,7 @@ fn validate_role_content(raw: &str) -> Result<String, String> {
     let content = raw.replace("\r\n", "\n");
     let content = crate::role::js_trim(&content).to_string();
     if content.is_empty() {
-        return Err("人格内容不能为空".to_string());
+        return Err("角色设定正文不可为空".to_string());
     }
     let bytes = content.len();
     if bytes > ROLE_CONTENT_MAX_BYTES {
@@ -2940,7 +2939,7 @@ fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
 /// 三条与 JS 一致的语义：
 ///   · `allow`/`deny` 里的值统一转数字去重（配置里存的就是数字）
 ///   · 字段缺省 = 保持原值（**不是**清空）
-///   · 配置文件损坏时直接失败，绝不回写 —— 否则会把整份配置压成只剩
+///   Fail closed on corrupt config files instead of overwriting partial state:
 ///     allow/deny/ownerQQ 三个键，等于把机器人配置清空
 fn handle_whitelist_post(context: &RuntimeContext, cfg_path: &str, body: &str) -> Result<Value, (u16, String)> {
     let to_num = |v: Option<&Value>| -> Option<Vec<i64>> {
@@ -3164,12 +3163,12 @@ fn social_projection_write_denial_doc(
     {
         return Err((
             403,
-            "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
+            "二代社交功能已停用，禁止调用 v2 工具".to_string(),
         ));
     }
     match current_mode_for(context) {
         Ok(mode) if mode == "reserved2" => {}
-        Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
+        Ok(_) => return Err((403, "当前接口仅限 reserved2 模式调用".to_string())),
         Err(error) => return Err(error),
     }
     if let Some(denial) = social_projection_agent_denial_doc(
@@ -3222,11 +3221,11 @@ where
                     .and_then(Value::as_bool)
                     == Some(false)
                 {
-                    return Err((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+                    return Err((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()));
                 }
                 match current_mode_for(context) {
                     Ok(mode) if mode == "reserved2" => {}
-                    Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
+                    Ok(_) => return Err((403, "当前接口仅限 reserved2 模式调用".to_string())),
                     Err(error) => return Err(error),
                 }
                 if let Some(denial) = agent_memory_denial_doc(doc, &fresh_cfg, &key, token, tool_name) {
@@ -3271,11 +3270,11 @@ fn handle_memory_append(
             return Err((400, "key/category/content 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         let parsed = crate::social_mem::append_extra_from(&extra);
         if category == "memberImpression" && parsed.target.is_empty() {
-            return Err((400, "memberImpression 需要 extra.target 指定群友名字".to_string()));
+            return Err((400, "新增人物观感条目时，须在附加字段中写明目标成员称呼".to_string()));
         }
         crate::social_mem::append_memory(conv, &category, &content, &parsed, tokens, now_ms(), &crate::social_mem::ImpressionPolicy::from_cfg(cfg));
         Ok(json!({
@@ -3311,13 +3310,13 @@ fn handle_memory_update(
             return Err((400, "key/category 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         if category == "memberImpression" && target.is_empty() {
-            return Err((400, "memberImpression 需要 target 指定原群友名字".to_string()));
+            return Err((400, "更新人物观感条目时，须给出要改写的原成员称呼".to_string()));
         }
         if category != "memberImpression" && old_content.is_empty() {
-            return Err((400, "该类别需要 oldContent 指定要编辑的记忆内容".to_string()));
+            return Err((400, "此记忆类别需要提供 oldContent 定位待改条目".to_string()));
         }
         crate::social_mem::update_memory(
             conv,
@@ -3350,13 +3349,13 @@ fn handle_memory_remove(
             return Err((400, "key/category 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         if category == "memberImpression" && target.is_empty() {
-            return Err((400, "memberImpression 需要 target 指定群友名字".to_string()));
+            return Err((400, "移除人物观感条目时，须指明待清理的成员称呼".to_string()));
         }
         if category != "memberImpression" && content.is_empty() {
-            return Err((400, "该类别需要 content 指定要删除的记忆内容".to_string()));
+            return Err((400, "此记忆类别需要提供 content 定位待删条目".to_string()));
         }
         crate::social_mem::remove_memory(conv, &category, &content, &target);
         Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted_conversation(conv, cfg) }))
@@ -3375,7 +3374,7 @@ fn handle_memory_clear(
             .unwrap_or_default();
         let category = req.get("category").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if !category.is_empty() && !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         crate::social_mem::clear_memory(conv, &category);
         Ok(json!({
@@ -3492,7 +3491,7 @@ fn handle_slang_clear(context: &RuntimeContext, body: &str) -> Result<Value, (u1
     if !status.is_empty() && !SLANG_STATUSES.contains(&status.as_str()) {
         return Err((
             400,
-            format!("无效的 status：{status}，仅支持 candidate/confirmed/rejected 或留空全部删除"),
+            format!("非法 status：{status}，允许值仅为 candidate、confirmed、rejected，或置空以全清"),
         ));
     }
     let removed = crate::slang::mutate_entries(context, |entries| {
@@ -3652,7 +3651,7 @@ fn handle_slang_batch_delete(context: &RuntimeContext, body: &str) -> Result<Val
             });
             let removed = before - entries.len();
             if removed == 0 {
-                return Err((404, "没有匹配到要删除的黑话".to_string()));
+                return Err((404, "未找到符合条件的黑话词条可供删除".to_string()));
             }
             Ok((true, removed))
         })
@@ -3698,7 +3697,7 @@ fn handle_slang_batch_confirm(context: &RuntimeContext, body: &str) -> Result<Va
         .map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     if ids.is_empty() {
-        return Err((400, "请选择要确认的黑话".to_string()));
+        return Err((400, "请先勾选待确认的黑话词条".to_string()));
     }
     let (confirmed, skipped_count, skipped) = crate::slang::mutate_entries(context, |entries| {
         let now = crate::sticker::now_iso();
@@ -3749,7 +3748,7 @@ fn handle_slang_batch_reject(context: &RuntimeContext, body: &str) -> Result<Val
         .map(|a| a.iter().map(js_string).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     if ids.is_empty() {
-        return Err((400, "请选择要拒绝的黑话".to_string()));
+        return Err((400, "请先勾选待拒绝的黑话词条".to_string()));
     }
     let rejected = crate::slang::mutate_entries(context, |entries| {
         let now = crate::sticker::now_iso();
@@ -3788,7 +3787,7 @@ fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
     social_state::mode_checked(context).map_err(SocialError::into_http)
 }
 
-/// 会话是否在当前模式的白名单里（JS 的 isSessionAllowedInCurrentMode）。
+/// Whether the conversation is admitted under the active mode policy.
 fn session_allowed(cfg: &Value, key: &str) -> bool {
     let Some((kind, id)) = key.split_once(':') else {
         return false;
@@ -3859,7 +3858,7 @@ fn agent_memory_denial_doc(
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_session_allowed(cfg, key) {
-        return Some((403, "目标不在当前模式允许范围内".to_string()));
+        return Some((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !tool_enabled(cfg, "memory") {
         return Some((403, format!("工具未启用：{tool_name}")));
@@ -3871,7 +3870,7 @@ fn agent_memory_denial_doc(
 ///
 /// 这个端点的一次线上事故留下了两条硬约束，移植时**不能简化掉**：
 /// 1. 基线取「已展示水位」(readThroughSeq) 而不是「请求时水位」，否则回合同两次
-///    工具调用之间到达的消息会永远没人看见（表现为「@ 了好几分钟没动静」）。
+///    Concurrent messages arriving between tool calls could otherwise stall without waking.
 /// 2. 返回的 newMessages 必须带 `seq > baseline` 的全部消息，而不是只返回本次新增。
 ///
 /// 租约：新等待接管同一会话的旧等待；旧等待在下一次轮询返回且不记录观察。
@@ -3889,7 +3888,7 @@ pub(super) fn handle_wait_post(
     }
     if let Some(purpose) = req.get("purpose") {
         if purpose.as_str() != Some("messages") && purpose.as_str() != Some("reply") {
-            return Err((400, "purpose 必须是 messages（等后续消息）或 reply（回复前短静默）".to_string()));
+            return Err((400, "等待用途字段仅受理 messages（等候新来发言）或 reply（发出前确认静默）".to_string()));
         }
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
@@ -4069,7 +4068,7 @@ pub(super) fn handle_wait_post(
 
     // A console wait never supersedes an agent's wait; it is refused while one runs.
     let Some(mut lease) = WaitLease::try_acquire(&key, is_agent) else {
-        return Err((429, "该会话已有一个等待中的 qq_wait_for_messages，请等待它结束".to_string()));
+        return Err((429, "该会话已有另一笔挂起的等待请求尚未返回，请稍后再试".to_string()));
     };
     if let Some((turn, _)) = &turn_budget {
         lease.publish(context, agent_token.unwrap_or(""), turn, if reply_wait {"reply"} else {"messages"})?;
@@ -4081,7 +4080,7 @@ pub(super) fn handle_wait_post(
     }
     // A wait that runs to the window's end is a complete observation of the window.
     let window_observation = engaged_end.is_some_and(|end| start.saturating_add(timeout_ms) >= end);
-    const CHANGED: &str = "等待期间会话已重置或权限已变化，请重新读取会话";
+    const CHANGED: &str = "候场期间对话已重置或访问权限已变动，请重新拉取会话";
     // A cancelled turn may have no successor wait. Observe its epoch on every poll,
     // before recording any observation; the generation guard still handles takeover.
     // A failed read (replace window, parse error) proves nothing: that poll is skipped (`None`).
@@ -4289,7 +4288,7 @@ pub(super) fn handle_wait_post(
         entry["preSleepWaitAccumMs"] = json!(0);
     } else if !budget_ended && !reply_wait {
         if !arrived {
-            // 短等待不累计：必须单次等满观察窗口
+            // Quiet-window progress is tracked per wait call rather than accumulated across retries.
             entry["preSleepWaitAccumMs"] = json!(0);
         } else {
             if pre_sleep_attempt {
@@ -4728,7 +4727,7 @@ fn handle_dsh_effort(context: &RuntimeContext, body: &str) -> Result<Value, (u16
         .map(|o| o.value)
         .map_err(crate::config_tx::CommitError::into_http)
 }
-/// `GET /api/socialV2/sticker-list`：表情列表（控制台与 qq_list_stickers 共用）。
+/// `GET /api/socialV2/sticker-list`: sticker catalog endpoint shared by console and `qq_list_stickers`.
 ///
 /// `syncedAt` / `fromCache` 在 JS 里是**进程内存变量**，不落盘，
 /// 所以两边刚启动时都是 0/false —— 这两个字段天生不可对拍，测试里当易变字段。
@@ -4744,7 +4743,7 @@ fn handle_sticker_list(
         read_json(CONFIG_PATH).unwrap_or_default()
     };
     if !crate::sticker::enabled(&cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let key = params.get("key").map(|s| s.trim().to_string()).unwrap_or_default();
     if key.is_empty() {
@@ -4871,7 +4870,7 @@ fn normalize_social_v1_config(body_v: &Value, prior_social: Option<&Value>) -> V
     for (key, value) in social_v1_spread(Some(body_v)) {
         merged.insert(key, value);
     }
-    // 旧分句逻辑的字段：保存时统一清理，避免旧配置残留
+    // Strip deprecated sentence-splitting config keys on save.
     for k in ["burstProbability", "burstMaxMessages", "followUpEnabled", "followUpProbability", "followUpDelayMinMs", "followUpDelayMaxMs", "followUpCooldownMs"] {
         merged.remove(k);
     }
@@ -5010,7 +5009,7 @@ fn handle_social_v1_config(context: &RuntimeContext, body: &str) -> Result<Value
 // 正斜杠在 Windows 上看着就别扭，而且和 JS 的 path.resolve 输出不一致。
 const STATE_DIR: &str = crate::legacy_path!(windows "qq-bridge\\state");
 
-/// 目标路径的权限是否已收紧。
+/// Check whether file permissions on the token path are restricted to the owner.
 fn is_hardened(target: &str) -> bool {
     crate::guarded_fs::is_directory_hardened(
         std::path::Path::new(target),
@@ -5036,7 +5035,7 @@ fn harden_dir(dir: &str) -> (bool, String) {
 
 /// `GET /api/security`：安全拦截配置 + state/ 的 ACL 收紧状态。
 ///
-/// 控制台据此显示警告和**可复制的手工命令** —— 而不是让用户以为已经安全了。
+/// Surface a remediation command in the console when permissions cannot be tightened automatically.
 fn handle_security_get(cfg: &Value) -> Value {
     let security = cfg
         .get("security")
@@ -5058,7 +5057,7 @@ fn handle_security_post(body: &str) -> Result<Value, (u16, String)> {
     if b.get("rehardenStateDir").and_then(|v| v.as_bool()) == Some(true) {
         let (ok, detail) = harden_dir(STATE_DIR);
         if !ok {
-            crate::safe_println!("[console] 收紧 state/ 权限失败：{detail}");
+            crate::safe_println!("[console] 收紧目录访问控制列表失败：{detail}");
         }
         return Ok(json!({
             "ok": ok,
@@ -5095,7 +5094,7 @@ fn handle_security_post(body: &str) -> Result<Value, (u16, String)> {
     crate::config_tx::write_config_json(&RuntimeContext::legacy(), &file).map_err(|e| (500, e))?;
     let intercept = security.get("interceptNotify").and_then(|v| v.as_bool());
     crate::safe_println!(
-        "[console] 安全拦截通知已更新（interceptNotify={}）",
+        "[console] 已将本次调整的安全拦截提示通知策略写入硬盘并生效，当前配置开关取值（interceptNotify={}）",
         intercept.map(|b| b.to_string()).unwrap_or_else(|| "未设置".into())
     );
     Ok(json!({ "ok": true, "security": security }))
@@ -5215,17 +5214,17 @@ fn known_preset(params_name: Option<&String>) -> Option<&'static str> {
 }
 /// `POST /api/preset/sim-prompt`：写入新的仿真提示词。
 ///
-/// 三步都是必需的：**先备份**（可回滚）、写源文件、再同步到 DSH 实际读取的安装副本。
-/// 内容没变就直接返回 `unchanged` —— 写回会把折叠块规整成字面量块，
-/// 值不变但排版变了，让一次"打开又保存"变成全删全加的 diff，失去可复审性。
+/// Backup first, update the source preset, then mirror to the active preset copy.
+/// Return `unchanged` on identical text to avoid reformatting block scalar indentation
+/// into noisy diffs.
 fn handle_preset_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let b: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let name = known_preset(b.get("preset").and_then(|v| v.as_str()).map(|s| s.to_string()).as_ref())
-        .ok_or((400, "未知预设（只支持 qq-chat / qq-chat-v2）".to_string()))?;
+        .ok_or((400, "请求指定的仿真预设名称无法识别，目前仅开放两种内置预设（第一代 qq-chat 以及第二代 qq-chat-v2）".to_string()))?;
     let src = preset_source_yaml(name);
     let text = read_text_for(context, &src).map_err(|e| (400, format!("读取预设失败：{e}")))?;
     let prefix = crate::preset_prompt::extract_prefix(&text)
-        .ok_or((400, "无法定位预设里的 prefix 块（文件结构可能已变化）".to_string()))?;
+        .ok_or((400, "未能在预设文件内识别 prefix 字段块（格式可能已调整）".to_string()))?;
     let raw_content = b.get("content").map(|v| js_scalar(Some(v))).unwrap_or_default();
     let normalized = raw_content.replace("\r\n", "\n").trim_end_matches('\n').to_string();
     let is_v1 = name == "qq-chat";
@@ -5252,14 +5251,14 @@ fn handle_preset_post(context: &RuntimeContext, body: &str) -> Result<Value, (u1
         return Err((500, format!("写入失败：{e}")));
     }
     // 同步到安装副本：它和源文件内容一致，**不做仓库内备份** ——
-    // 备份它等于把含本机绝对路径的快照塞进工作区，没有额外价值。
+    // Skip backing up config snapshots outside the editable prompt workspace.
     if let Some(installed) = preset_installed_path_for(context, name) {
         if file_exists_for(context, &installed) {
             let _ = copy_file_for(context, &src, &installed);
         }
     }
     crate::safe_println!(
-        "[console] {name} 仿真提示词已更新（{} 字符）{}；需重启 DSH 生效",
+        "[console] {name} 预设提示词已保存（{} 字符）{}；重启 DSH 后起效",
         raw_content.encode_utf16().count(),
         if warnings.is_empty() { String::new() } else { format!("，{} 条警告", warnings.len()) }
     );
@@ -5273,15 +5272,14 @@ fn handle_preset_post(context: &RuntimeContext, body: &str) -> Result<Value, (u1
     }))
 }
 
-/// `POST /api/preset/sim-prompt/restore`：从备份还原。
+/// 仿真提示词备份恢复端点。
 ///
-/// **还原路径必须与保存路径同样严格**：旧备份可能来自安全基线加入之前，
-/// 直接还原会把弱化版提示词（缺「你没有本地工具」等不变量）写回去。
-/// 只接受本预设目录下的备份文件名，拒绝路径穿越。
+/// Restore checks the same required prompt rules as save. Only filenames from the backup
+/// list for this preset can be restored.
 fn handle_preset_restore(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let b: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let name = known_preset(b.get("preset").and_then(|v| v.as_str()).map(|s| s.to_string()).as_ref())
-        .ok_or((400, "未知预设（只支持 qq-chat / qq-chat-v2）".to_string()))?;
+        .ok_or((400, "请求指定的仿真预设名称无法识别，目前仅开放两种内置预设（第一代 qq-chat 以及第二代 qq-chat-v2）".to_string()))?;
     let requested = b.get("file").map(|v| js_scalar(Some(v))).unwrap_or_default().trim().to_string();
     let candidates: Vec<String> = list_preset_backups(context, name)
         .iter()
@@ -5298,13 +5296,13 @@ fn handle_preset_restore(context: &RuntimeContext, body: &str) -> Result<Value, 
     let path = format!("{PRESET_BACKUP_DIR}/{target}");
     let restored = read_text_for(context, &path).map_err(|e| (500, e))?;
     let restored_prefix = crate::preset_prompt::extract_prefix(&restored)
-        .ok_or((400, "备份内容不是有效的预设文件".to_string()))?;
+        .ok_or((400, "所选备份不包含合法的预设结构".to_string()))?;
     let blockers = crate::preset_prompt::preset_blockers(&restored_prefix, name == "qq-chat");
     if !blockers.is_empty() {
         return Err((
             400,
             format!(
-                "该备份不满足当前的安全不变量，拒绝还原：{}",
+                "无法还原此备份。请先补齐预设约束：{}",
                 blockers.join("；")
             ),
         ));
@@ -5317,7 +5315,7 @@ fn handle_preset_restore(context: &RuntimeContext, body: &str) -> Result<Value, 
             let _ = copy_file_for(context, &src, &installed);
         }
     }
-    crate::safe_println!("[console] {name} 仿真提示词已还原自备份 {target}；需重启 DSH 生效");
+    crate::safe_println!("[console] {name} 预设提示词已从备份 {target} 恢复；重启 DSH 后起效");
     Ok(json!({ "ok": true, "restoredFrom": target, "requiresRestart": true }))
 }
 
@@ -5333,7 +5331,7 @@ fn handle_preset_get(context: &RuntimeContext, params: &HashMap<String, String>)
         _ => {
             return Err((
                 400,
-                "未知预设（只支持 qq-chat / qq-chat-v2）".to_string(),
+                "请求指定的仿真预设名称无法识别，目前仅开放两种内置预设（第一代 qq-chat 以及第二代 qq-chat-v2）".to_string(),
             ))
         }
     };
@@ -5800,9 +5798,9 @@ fn handle_social_config_post_tx(
             prior_wake,
             keep_error_fmt,
             isolated_write_error_503: false,
-            wake_error_prefix: "配置已保存，但沿用默认唤醒配置的会话未能同步：",
+            wake_error_prefix: "设置已保存，但继承默认唤醒策略的会话未能完成同步：",
             finish: Box::new(move |finish_ctx, written| {
-                crate::safe_println!("[console] 二代仿真配置已更新");
+                crate::safe_println!("[console] 二代社交参数已更新");
                 let mut effective = finish_ctx.overlay_config(written.clone());
                 if finish_ctx.is_isolated() {
                     crate::settings::resolve_live_batch(&mut effective);
@@ -5883,7 +5881,7 @@ fn forward_id_known(key: &str, id: &str, conv: Option<&Conversation>) -> bool {
 
 /// `GET /api/socialV2/forward-message`：读取一条合并转发（含嵌套预览）。
 ///
-/// **安全边界**：只允许读本会话确实收到过的 forward id —— 否则这个端点就是
+/// Restrict forward lookups to forward IDs already observed inside the caller's conversation.
 /// "任意 id 探测工具"，AI 可以拿它跨会话读别人的聊天记录。
 ///
 /// 嵌套转发最多预读 5 条、每条只取前 3 句（120 字），避免一次调用把整棵转发树拉下来。
@@ -5897,25 +5895,25 @@ fn handle_forward_message(
     let id = params.get("id").map(|s| s.trim().to_string()).unwrap_or_default();
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     let Some((kind, conv_id)) = key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     if (kind != "group" && kind != "private") || conv_id.is_empty() || !conv_id.chars().all(|c| c.is_ascii_digit()) {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if id.is_empty() {
         return Err((400, "id 不能为空".to_string()));
     }
     if current_mode_for(context)? != "reserved2" {
-        return Err((403, "合并转发查看仅 reserved2 模式可用".to_string()));
+        return Err((403, "查看合并转发仅对 reserved2 模式开放".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "reserved2 模式读取合并转发必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
     }
     if !(if context.is_isolated() { social_v2_projection_session_allowed(cfg, &key) } else { session_allowed(cfg, &key) }) {
-        return Err((403, "当前模式不允许读取该会话".to_string()));
+        return Err((403, "当前运行模式下无权查看此会话".to_string()));
     }
     let enabled = cfg
         .get("socialV2")
@@ -5932,15 +5930,15 @@ fn handle_forward_message(
     if !forward_id_known(&scope_key, &id, conv.as_ref()) {
         return Err((
             404,
-            "该转发消息 id 不在当前会话可见范围内，拒绝读取".to_string(),
+            "目标转发编号不属于当前对话可见范畴，拒绝访问".to_string(),
         ));
     }
-    let ob = onebot_for_runtime(context, cfg).map_err(|_| (503, "合并转发查询失败：网关不可用".to_string()))?;
+    let ob = onebot_for_runtime(context, cfg).map_err(|_| (503, "读取合并转发失败：网关未就绪".to_string()))?;
     let data = ob
         .request("get_forward_msg", json!({ "id": id }))
-        .ok_or((500, "合并转发查询失败：网关无响应".to_string()))?;
+        .ok_or((500, "读取合并转发失败：网关超时未应答".to_string()))?;
     if data.get("status").and_then(|s| s.as_str()) == Some("failed") {
-        return Err((500, "合并转发查询失败：网关读取失败".to_string()));
+        return Err((500, "读取合并转发失败：网关返回错误".to_string()));
     }
     let payload = data.get("data").cloned().unwrap_or(data.clone());
     let formatted = crate::forward_fmt::format_forward_response(&payload, None, None);
@@ -5985,7 +5983,7 @@ fn handle_forward_message(
                 previews.push(Value::Object(o));
             }
             _ => {
-                previews.push(json!({ "id": fid, "error": "嵌套转发读取失败" }));
+                previews.push(json!({ "id": fid, "error": "内层转发加载出错" }));
             }
         }
     }
@@ -6019,7 +6017,7 @@ fn handle_forward_media(
         return Err((403, "agent token 无效".to_string()));
     }
     if !token.is_empty() && !(if context.is_isolated() { social_v2_projection_session_allowed(cfg, &key) } else { session_allowed(cfg, &key) }) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !token.is_empty() {
         let enabled = cfg
@@ -6033,7 +6031,7 @@ fn handle_forward_media(
         }
     }
     if current_mode_for(context)? != "reserved2" {
-        return Err((403, "转发媒体读取仅 reserved2 模式可用".to_string()));
+        return Err((403, "按需读取媒体仅对 reserved2 模式开放".to_string()));
     }
     if media.is_empty() {
         return Ok(json!({ "ok": true, "key": key, "media": [], "images": [] }));
@@ -6051,7 +6049,7 @@ fn handle_images_message(
     let key = params.get("key").map(|s| s.trim().to_string()).unwrap_or_default();
     let message_id = params.get("messageId").map(|s| s.trim().to_string()).unwrap_or_default();
     if projection_storage_key(&key).is_err() {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if message_id.is_empty() {
         return Err((400, "messageId 不能为空".to_string()));
@@ -6059,19 +6057,19 @@ fn handle_images_message(
     let mode = current_mode_for(context)?;
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if mode == "reserved2" && token.is_empty() {
-        return Err((403, "reserved2 模式读取图片必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if mode == "chat" || mode == "reserved" {
         return Err((
             403,
-            "一代 chat/reserved 模式图片已自动内联，按需图片工具仅 reserved2 模式可用".to_string(),
+            "一代模式消息已默认内联图片，按需取图接口仅对 reserved2 模式开放".to_string(),
         ));
     }
     if !token.is_empty() && !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
     }
     if !(if context.is_isolated() { social_v2_projection_session_allowed(cfg, &key) } else { session_allowed(cfg, &key) }) {
-        return Err((403, "当前模式不允许读取该会话".to_string()));
+        return Err((403, "当前运行模式下无权查看此会话".to_string()));
     }
     if !token.is_empty() || mode == "closed-agent" {
         let enabled = cfg
@@ -6120,7 +6118,7 @@ fn handle_images_message(
             "messageId": message_id,
             "media": [],
             "images": [],
-            "note": "该消息没有可读取的图片/表情元数据",
+            "note": "该条记录未携带可用的图片或表情元信息",
         }));
     }
     // JS configured source-count and original-byte budgets precede normalization.
@@ -6132,13 +6130,10 @@ fn handle_images_message(
         "images": images,
     }))
 }
-/// `POST /api/socialV2/collect-sticker`：AI 从群友的消息里"偷"一张表情进 QQ 收藏。
+/// `POST /api/socialV2/collect-sticker`: save an incoming chat image or sticker into QQ favorites.
 ///
-/// 顺序与 JS 一致：找消息 → 不能收藏自己发的 → 取第一个媒体 → **在桥接内下载**
-/// （safe_fetch，带 SSRF 防线）→ 体积/像素护栏 → add_custom_face → 可选改备注 → 强刷本地库。
-///
-/// 表情 CDN 候选：网关给的 media.url 有时不可用（带签名/防盗链），
-/// 所以再按 emojiId 拼一个 `gxh.vip.qq.com` 的 raw300.gif 地址兜底（JS 同款）。
+/// Looks up the conversation message, rejects self-sent items, downloads media via `safe_fetch`,
+/// validates size and dimensions, uploads via `add_custom_face`, applies optional remarks, and refreshes cache.
 fn handle_collect_sticker(
     context: &RuntimeContext,
     headers: &std::collections::HashMap<String, String>,
@@ -6171,7 +6166,7 @@ where
     F: FnMut(&str, usize) -> Result<Vec<u8>, String>,
 {
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let b: Value = if context.is_isolated() {
         parse_object_body(body)?
@@ -6209,13 +6204,13 @@ where
         key.clone()
     };
     let Some((kind, conv_id)) = key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     if (kind != "group" && kind != "private") || conv_id.is_empty() {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if !crate::settings::COLLECT_ENABLED.switch(cfg) {
-        return Err((403, "收藏表情功能已关闭".to_string()));
+        return Err((403, "表情收藏开关未启用".to_string()));
     }
     // 频率限制（state 里的 stickerCollectTimes）
     if context.is_isolated() {
@@ -6235,7 +6230,7 @@ where
     let max_hour = crate::settings::COLLECT_HOUR.integer(cfg);
     let reservation = crate::turn_ledger::mint_id("sticker-collect-");
     if context.is_isolated() {
-        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::conversation_state::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
+        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::conversation_state::token_epoch).as_deref(), "加收藏节奏太快了，隔一会儿再试")?;
     } else {
     let times: Vec<i64> = conv_opt
         .as_ref()
@@ -6246,7 +6241,7 @@ where
     let in_min = times.iter().filter(|t| now - **t < 60_000).count() as i64;
     let in_hour = times.iter().filter(|t| now - **t < 3_600_000).count() as i64;
     if (max_min > 0 && in_min + 1 > max_min) || (max_hour > 0 && in_hour + 1 > max_hour) {
-        return Err((429, "收藏表情太频繁了，请过一会儿再偷图".to_string()));
+        return Err((429, "加收藏节奏太快了，隔一会儿再试".to_string()));
     }
     }
     let mut retain_reservation = false;
@@ -6264,16 +6259,16 @@ where
                 })
                 .cloned()
         })
-        .ok_or((500, "收藏表情失败：找不到这条消息，请确认 messageId/seq 有效且属于当前会话".to_string()))?;
+        .ok_or((500, "收藏操作失败：找不到这条消息；核对 messageId 或 seq 后重试（需归属本对话）".to_string()))?;
     if found.get("isSelf").and_then(|v| v.as_bool()) == Some(true) {
-        return Err((500, "收藏表情失败：不能收藏自己发的表情，只能收藏群友发的".to_string()));
+        return Err((500, "收藏操作失败：自己的表情无法收藏，请另选他人发出的图片".to_string()));
     }
     let media = found
         .get("media")
         .and_then(|m| m.as_array())
         .and_then(|a| a.first())
         .cloned()
-        .ok_or((500, "收藏表情失败：这条消息没有可收藏的图片/表情".to_string()))?;
+        .ok_or((500, "收藏操作失败：目标消息中未含可收藏的图像或表情".to_string()))?;
     let media_kind = media.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if media_kind != "image" && media_kind != "face" && media_kind != "sticker" {
         return Err((500, "收藏表情失败：这条消息里的媒体类型不支持收藏（只收图片/表情）".to_string()));
@@ -6324,7 +6319,7 @@ where
     let Some(bytes) = bytes else {
         return Err((
             500,
-            format!("收藏表情失败：无法安全获取该图片字节，已拒绝收藏（{}）", failures.join("；")),
+            format!("收藏操作失败：无法通过安全校验获取图源内容（{}）", failures.join("；")),
         ));
     };
     if bytes.len() > max_bytes {
@@ -6333,7 +6328,7 @@ where
         let limit_mb = crate::voice::js_to_fixed(max_bytes as f64 / 1024.0 / 1024.0, 0);
         return Err((
             500,
-            format!("收藏表情失败：这张表情太大（{mb} MB），收藏上限是 {limit_mb} MB，收不了。别重试，跟对方说一声或者换个小的。"),
+            format!("收藏操作失败：该图片体积 {mb} MB 超出 {limit_mb} MB 限额，请换小图或告知对方，切勿重复尝试。"),
         ));
     }
     let b64 = {
@@ -6362,7 +6357,7 @@ where
     };
     let emoji_id_new = add.get("emoji_id").map(|v| js_scalar(Some(v))).unwrap_or_default();
     if emoji_id_new.is_empty() {
-        return Err((500, "收藏表情失败：add_custom_face 未返回 emoji_id".to_string()));
+        return Err((500, "向平台提交收图入库请求遭到拒绝：网关返回体里缺少新图库条目编号字段（emoji_id 为空）".to_string()));
     }
     #[cfg(test)]
     COLLECT_AFTER_ADD_TEST_HOOK.with(|hook| {
@@ -6384,10 +6379,10 @@ where
             }) == Some(true)
         };
         if !success {
-            crate::safe_println!("[console] 收藏成功但备注失败 {emoji_id_new}");
+            crate::safe_println!("[console] 已加入收藏，但写入备注失败 {emoji_id_new}");
         }
     }
-    // 强制刷新本地库，让刚收藏的表情立即可用
+    // Force an immediate cache refresh so newly added stickers are selectable right away.
     if context.is_isolated() {
         if let Err(error) = sync_sticker_forced_with_counts(context, cfg) {
             crate::safe_println!("[console] selected sticker refresh after collection failed: {error}");
@@ -6448,7 +6443,7 @@ fn handle_slang_add(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if content.is_empty() {
-        return Err((400, "黑话内容不能为空".to_string()));
+        return Err((400, "词条内容不可为空".to_string()));
     }
     let entry = crate::slang::mutate_entries(context, |entries| {
         if entries
@@ -6495,7 +6490,7 @@ fn handle_slang_add(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
 /// `POST /api/socialV2/sticker-list`：带会话校验的表情列表（GET 的 POST 版）。
 ///
 /// 与 GET 的差别：`refresh:true` 会**强制同步**（拉网关并落盘）。
-/// 同步是有副作用的写操作，所以 JS 把它从 GET 上摘掉了（否则绕开 CSRF 防护）；
+/// State-mutating sticker sync must run on POST rather than GET.
 /// POST 这里还加了 10 秒最小间隔，避免 AI 反复拉网关。
 fn handle_sticker_list_post(
     context: &RuntimeContext,
@@ -6504,7 +6499,7 @@ fn handle_sticker_list_post(
     cfg: &Value,
 ) -> Result<Value, (u16, String)> {
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let b: Value = if context.is_isolated() {
         parse_object_body(body)?
@@ -6525,7 +6520,7 @@ fn handle_sticker_list_post(
     let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let mut force = b.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut sync_outcome = StickerSyncOutcome::Skipped;
-    // AI 强制刷新加最小间隔：反复拉网关的表情接口会被限频
+    // Throttle forced refreshes from model calls to avoid gateway rate limits.
     if context.is_isolated() {
         if force {
             match sync_sticker_if_stale(context, cfg, true, is_agent) {
@@ -6563,7 +6558,7 @@ fn handle_sticker_list_post(
             .unwrap_or("")
             .to_string();
         let ob = crate::onebot::OneBot::new(http_url, ob_token);
-        crate::sticker::sync(&ob, cfg).map_err(|e| (500, format!("获取表情列表失败：{e}")))?;
+        crate::sticker::sync(&ob, cfg).map_err(|e| (500, format!("同步表情清单失败：{e}")))?;
         sync_outcome = StickerSyncOutcome::Refreshed;
     }
     let entries = load_sticker_entries_for(context).map_err(|error| {
@@ -6659,9 +6654,9 @@ fn handle_activity_post(context: &RuntimeContext, body: &str) -> Result<Value, (
     })?;
     Ok(json!({ "ok": true, "paused": paused }))
 }
-/// `GET /api/preset/sim-prompt/backups`：列出某个预设的备份文件。
+/// 列出仿真提示词历史备份快照。
 ///
-/// 只管「列出」，不做还原。名字必须在拼路径**之前**校验 ——
+/// List backup entries only; validate filenames strictly before joining paths.
 /// `preset=..\..\x` 这类路径穿越会让读/写跑出仓库（JS 注释里写明过这个风险）。
 fn handle_preset_backups(
     context: &RuntimeContext,
@@ -6671,7 +6666,7 @@ fn handle_preset_backups(
     let raw = params.get("preset").map(|s| s.trim()).unwrap_or("");
     let preset = if raw.is_empty() { "qq-chat-v2" } else { raw };
     if !NAMES.contains(&preset) {
-        return Err((400, "未知预设（只支持 qq-chat / qq-chat-v2）".to_string()));
+        return Err((400, "请求指定的仿真预设名称无法识别，目前仅开放两种内置预设（第一代 qq-chat 以及第二代 qq-chat-v2）".to_string()));
     }
     let backups = list_preset_backups(context, preset);
     Ok(json!({ "ok": true, "backups": backups }))
@@ -6688,7 +6683,7 @@ fn handle_sticker_alias(
     cfg: &Value,
 ) -> Result<Value, (u16, String)> {
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let req: Value = if context.is_isolated() {
         parse_object_body(body)?
@@ -6811,13 +6806,13 @@ fn handle_console_token_post_tx(
     if new_token.len() < 16 {
         return Err(crate::config_tx::CommitError::plain(
             400,
-            "控制台访问令牌至少需要 16 位；留空可生成随机令牌",
+            "访问令牌长度不得短于 16 个字符；留空可由系统随机生成",
         ));
     }
     if new_token.len() > 128 {
         return Err(crate::config_tx::CommitError::plain(
             400,
-            "控制台访问令牌不能超过 128 位",
+            "访问令牌长度不得超过 128 个字符",
         ));
     }
     if !new_token
@@ -6826,7 +6821,7 @@ fn handle_console_token_post_tx(
     {
         return Err(crate::config_tx::CommitError::plain(
             400,
-            "控制台访问令牌只能包含字母、数字、下划线或短横线",
+            "访问令牌字符集只限英文字母、阿拉伯数字、_ 与 -",
         ));
     }
     let config_diff = if context.is_isolated() {
@@ -6884,7 +6879,7 @@ fn handle_sticker_image(
     cfg: &Value,
 ) -> Result<Value, (u16, String)> {
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let key = params.get("key").map(|s| s.trim()).unwrap_or("").to_string();
     let sticker_id = params
@@ -6935,26 +6930,26 @@ fn handle_sticker_image(
     let Some(idx) = idx else {
         return Err((
             500,
-            format!("获取表情图片失败：找不到表情 {sticker_id}，请先用 qq_list_stickers 获取有效 id"),
+            format!("读取表情图片出错：找不到表情 {sticker_id}，须先调用图库清单工具取有效编号"),
         ));
     };
     let entry = entries[idx].clone();
     let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if url.is_empty() {
-        return Err((500, format!("获取表情图片失败：表情 {sticker_id} 没有图片地址")));
+        return Err((500, format!("读取表情图片出错：表情 {sticker_id} 没有图片地址")));
     }
     let limits = crate::media::Limits::from_config(cfg);
     let _source = crate::media::admit_source()
-        .ok_or_else(|| (500, "获取表情图片失败：（表情获取失败）".to_string()))?;
+        .ok_or_else(|| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
     let fetched = crate::safe_fetch::fetch_bytes(&url, limits.bytes)
-        .map_err(|_| (500, "获取表情图片失败：（表情获取失败）".to_string()))?;
+        .map_err(|_| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
     if let Some((w, h)) = crate::media_normalize::image_dimensions(&fetched.bytes) {
         if w * h > limits.pixels {
-            return Err((400, format!("表情图片像素超限（{w}x{h}），已拒绝")));
+            return Err((400, format!("图片分辨率（{w}x{h}）超出上限，已拦截")));
         }
     }
     let normalized = crate::media_normalize::normalize(&fetched.bytes, limits.pixels)
-        .map_err(|_| (500, "获取表情图片失败：（表情获取失败）".to_string()))?;
+        .map_err(|_| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
     let images = crate::media::image_values(&normalized);
     Ok(json!({
         "ok": true,
@@ -7003,7 +6998,7 @@ fn handle_self_image(
         session_allowed(cfg, &key)
     };
     if !token.is_empty() && !session_is_allowed {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !token.is_empty() {
         let enabled = cfg
@@ -7064,7 +7059,7 @@ fn js_scalar(v: Option<&Value>) -> String {
         _ => String::new(),
     }
 }
-/// `POST /api/socialV2/send-sticker`：发一张收藏表情。
+/// `POST /api/socialV2/send-sticker`: send a saved sticker bubble.
 ///
 /// 三步：查本地表情库拿 url → **在桥接内**下载图片（`safe_fetch`，带 SSRF 防线）
 /// → 以 base64 图片段发给网关。
@@ -7081,7 +7076,7 @@ fn handle_send_sticker(
         return handle_send_sticker_selected(context, headers, body, cfg);
     }
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let b: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -7101,11 +7096,11 @@ fn handle_send_sticker(
     if key.is_empty() || sticker_id.is_empty() {
         return Err((400, "key 和 stickerId 不能为空".to_string()));
     }
-    // 表情消息只能是一张表情，不能在同一气泡里附带文字（仿真常识）
+    // Sticker replies must be sent as standalone image bubbles without inline text.
     if !caption.is_empty() {
         return Err((
             400,
-            "表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情"
+            "表情图须独立成条发往会话，不能与文字混在一起；需要先说话请分两条先后发出"
                 .to_string(),
         ));
     }
@@ -7114,7 +7109,7 @@ fn handle_send_sticker(
         return Err((403, "agent token 无效".to_string()));
     }
     if !token.is_empty() && !session_allowed(cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !token.is_empty() {
         let enabled = cfg
@@ -7128,19 +7123,19 @@ fn handle_send_sticker(
         }
     }
     if social_state::mode(&RuntimeContext::legacy()) != "reserved2" {
-        return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+        return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     let Some((kind, id_s)) = key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     if (kind != "group" && kind != "private") || id_s.is_empty() || !id_s.chars().all(|c| c.is_ascii_digit()) {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if !session_allowed(cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     let entries = crate::sticker::load()
         .map_err(|e| (500, e))?
@@ -7215,17 +7210,17 @@ where
     F: FnMut(&str, usize) -> Result<Vec<u8>, String>,
 {
     let Some(idx) = crate::sticker::find(entries, sticker_id) else {
-        return Err((500, format!("发送表情失败：找不到表情 {sticker_id}，请先用 qq_list_stickers 获取有效 id")));
+        return Err((500, format!("发送表情失败：找不到表情 {sticker_id}，须先调用图库清单工具取有效编号")));
     };
     let entry = &entries[idx];
     let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let entry_id = entry.get("id").and_then(Value::as_str).unwrap_or(sticker_id);
     if url.is_empty() {
-        return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
+        return Err((500, format!("发送表情失败：表情 {entry_id} 缺少可用图源地址")));
     }
     let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     fetch(url, max_bytes)
-        .map_err(|e| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{e}")))
+        .map_err(|e| (500, format!("发送表情失败：表情 {entry_id} 拉取图片数据失败（网络异常或链接已过期）：{e}")))
 }
 
 /// The selected-runtime path uses only the chosen social state, sticker store, and OneBot
@@ -7253,7 +7248,7 @@ where
     F: FnMut(&str, usize) -> Result<Vec<u8>, String>,
 {
     if !crate::sticker::enabled(cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let b = parse_object_body(body)?;
     let key = b.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -7276,7 +7271,7 @@ where
     if !caption.is_empty() {
         return Err((
             400,
-            "表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情"
+            "表情图须独立成条发往会话，不能与文字混在一起；需要先说话请分两条先后发出"
                 .to_string(),
         ));
     }
@@ -7284,19 +7279,19 @@ where
     let _is_agent = sticker_agent_allowed(context, cfg, &key, headers, "sendSticker", "qq_send_sticker")?;
     let mode = current_mode_for(context)?;
     if mode != "reserved2" {
-        return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+        return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     let storage_key = projection_storage_key(&key)?;
     mute_send_denial(context, cfg, &storage_key, token)?;
     let Some((kind, id_s)) = storage_key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     let numeric_id = id_s
         .parse::<i64>()
-        .map_err(|_| (400, "key 格式应为 group:群号 或 private:QQ号".to_string()))?;
+        .map_err(|_| (400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()))?;
 
     let at_user = match b.get("atUserId") {
         None | Some(Value::Null) => None,
@@ -7306,7 +7301,7 @@ where
             if raw.is_empty() {
                 None
             } else if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err((400, "atUserId 必须是正整数 QQ 号，且不能为 all".to_string()));
+                return Err((400, "atUserId 须为正整数账号，不支持填写 all".to_string()));
             } else if kind == "private" {
                 return Err((400, "私聊不需要 @".to_string()));
             } else {
@@ -7330,7 +7325,7 @@ where
             || raw_id.starts_with('0')
             || reply_ref == "-0"
         {
-            return Err((400, "replyToMessageId 必须是非零整数（消息 id 可能为负数）".to_string()));
+            return Err((400, "用于引用的消息编号须设为非零整数（平台部分编号允许为负）".to_string()));
         }
     }
 
@@ -7352,7 +7347,7 @@ where
     let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
     let epoch = crate::conversation_state::token_epoch(token);
     let reservation = crate::turn_ledger::mint_id("sticker-send-");
-    reserve_sticker_quota(context, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, max_minute, max_hour, Some(&epoch), "发送频率超限，请稍后再试")?;
+    reserve_sticker_quota(context, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, max_minute, max_hour, Some(&epoch), "触发发送频控限制，请稍等片刻")?;
     let mut retain_reservation = false;
     // Set once the social-update transaction (which also settles the reservation) has run.
     let mut quota_settled = false;
@@ -7383,7 +7378,7 @@ where
         let Some(info) = resolved else {
             return Err((
                 400,
-                "无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）"
+                "查不到待引用的原消息，请核对编号是否正确且归属当前对话（可先查详情确认）"
                     .to_string(),
             ));
         };
@@ -7402,7 +7397,7 @@ where
     let entries = load_sticker_entries_for(context)
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
     let Some(index) = crate::sticker::find(&entries, &sticker_id) else {
-        return Err((500, format!("发送表情失败：找不到表情 {sticker_id}，请先用 qq_list_stickers 获取有效 id")));
+        return Err((500, format!("发送表情失败：找不到表情 {sticker_id}，须先调用图库清单工具取有效编号")));
     };
     let entry = entries[index].clone();
     let entry_identity = ["id", "resId", "md5", "url"]
@@ -7418,11 +7413,11 @@ where
     let url = entry.get("url").and_then(Value::as_str).unwrap_or("");
     let entry_id = entry.get("id").and_then(Value::as_str).unwrap_or(sticker_id.as_str()).to_string();
     if url.is_empty() {
-        return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
+        return Err((500, format!("发送表情失败：表情 {entry_id} 缺少可用图源地址")));
     }
     let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     let fetched = fetch_image(url, max_bytes)
-        .map_err(|error| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{error}")))?;
+        .map_err(|error| (500, format!("发送表情失败：表情 {entry_id} 拉取图片数据失败（网络异常或链接已过期）：{error}")))?;
     let encoded = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&fetched)
@@ -7498,7 +7493,7 @@ where
         // (unknown delivery). A failed record write is reported beside it, not instead of it.
         if let Some(error) = &settled.record_error {
             crate::safe_eprintln!("[sticker] {storage_key} 禁言拒绝的发送记录未能写入：{error}");
-            crate::activity::append(context, &format!("{storage_key} [sticker] 禁言拒绝的发送记录未能写入"));
+            crate::activity::append(context, &format!("{storage_key} [sticker] 本会话当前正处禁言状态，拒绝发图记录写入磁盘出错"));
         }
         mute_send_denial(context, cfg, &storage_key, token)?;
         return Err((403, format!("发送表情失败：{}", settled.error.unwrap_or_default())));
@@ -7777,7 +7772,7 @@ fn handle_stickers_remark(
         )
     })?;
     let Some(idx) = crate::sticker::find(&entries, &sticker_id) else {
-        return Err((500, format!("修改备注失败：找不到表情 {sticker_id}，请先用 qq_list_stickers 获取有效 id")));
+        return Err((500, format!("修改备注失败：找不到表情 {sticker_id}，须先调用图库清单工具取有效编号")));
     };
     let entry_id = entries[idx]
         .get("id")
@@ -7810,7 +7805,7 @@ fn handle_stickers_remark(
         return Err((
             500,
             format!(
-                "修改备注失败：modify_custom_face 失败: {}",
+                "更改账号图库内的官方备注未能成行，网关执行接口返回异常状态与详情：{}",
                 resp.get("wording").and_then(|w| w.as_str()).unwrap_or("unknown")
             ),
         ));
@@ -7832,7 +7827,7 @@ fn handle_stickers_remark(
         })
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
         let sticker = updated.ok_or_else(|| {
-            (500, format!("修改备注失败：找不到表情 {sticker_id}，请先用 qq_list_stickers 获取有效 id"))
+            (500, format!("修改备注失败：找不到表情 {sticker_id}，须先调用图库清单工具取有效编号"))
         })?;
         return Ok(json!({ "ok": true, "sticker": sticker }));
     }
@@ -7853,14 +7848,14 @@ fn handle_stickers_remark(
     })?;
     Ok(json!({ "ok": true, "sticker": updated[idx].clone() }))
 }
-/// `POST /api/socialV2/send-message`：二代统一发送工具（`qq_send_message`）。
+/// `POST /api/socialV2/send-message`: reserved2 message send handler (`qq_send_message`).
 ///
 /// 和 `send-burst` 的区别：支持引用/@、支持三种条间隔模式、并在响应里回 `delays`
 /// 和两类"话术建议"（中文空格、断点不自然）。
 ///
 /// `gapMode=auto` 用随机间隔 —— 那条路径的 `delays` 两边**天生不同**，
 /// 对拍只比固定/按字数两种模式。
-const SEND_CANCELLED_MESSAGE: &str = "发送已取消：会话、模式或白名单已变化";
+const SEND_CANCELLED_MESSAGE: &str = "发送中止：会话状态、运行模式或访问名单已变动";
 
 // ── ticket 10：会话令牌（回合代际）与回合账本的管理端视图 ───────────────────────────
 
@@ -8235,7 +8230,7 @@ fn reserve_send_quota(
         let in_min = in_min + pending.0;
         let in_hour = in_hour + pending.1;
         if (max_min > 0 && in_min + n > max_min) || (max_hour > 0 && in_hour + n > max_hour) {
-            return Err((429, "发送频率超限，请稍后再试".to_string()));
+            return Err((429, "触发发送频控限制，请稍等片刻".to_string()));
         }
         for _ in 0..n {
             times.push(json!(now));
@@ -8732,7 +8727,7 @@ fn resume_send_batch(
     for message in &candidates {
         if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, message, &[]) {
             crate::safe_println!("[console] send-resume 被哨兵拦下：{why}");
-            return Err((403, "消息含敏感信息，已阻止发送".into()));
+            return Err((403, "内容触及敏感词限制，已拦截该次发送".into()));
         }
     }
     let turn_scope = repeat_guard::admit(context, key, &candidates)?;
@@ -8850,7 +8845,7 @@ fn send_message_inner(
         return Err((403, "agent token 无效".to_string()));
     }
     if !token.is_empty() && !session_allowed(cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !token.is_empty() {
         let enabled = cfg
@@ -8864,19 +8859,19 @@ fn send_message_inner(
         }
     }
     if current_mode_for(context)? != "reserved2" {
-        return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+        return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     let Some((kind, id_s)) = key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     if (kind != "group" && kind != "private") || id_s.is_empty() || !id_s.chars().all(|c| c.is_ascii_digit()) {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if !session_allowed(cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if let Some(storage) = canonical_v2_key(&key) {
         mute_send_denial(context, cfg, &storage, &token)?;
@@ -8889,7 +8884,7 @@ fn send_message_inner(
         return Err((400, "私聊不需要 @".to_string()));
     }
     if silent_blocks_send(context, cfg, &key)? {
-        return Err((403, "静默模式已开启，当前不允许发送".to_string()));
+        return Err((403, "当前处于静默状态，暂停对外发送".to_string()));
     }
     if let Some(blocked) = agent::dup_send_block(context, cfg, &key) {
         return Err((429, blocked));
@@ -8899,7 +8894,7 @@ fn send_message_inner(
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) || digits == "0" {
             return Err((
                 400,
-                "replyToMessageId 必须是非零整数（消息 id 可能为负数）".to_string(),
+                "用于引用的消息编号须设为非零整数（平台部分编号允许为负）".to_string(),
             ));
         }
     }
@@ -8968,7 +8963,7 @@ fn find_cjk_space_warning(messages: &[String]) -> Option<String> {
         )
     };
     Some(format!(
-        "{label}消息内部有中文空格；可以用标点分隔短句。"
+        "{label}正文中包含全角空格；短句停顿请改用常见标点。"
     ))
 }
 
@@ -9006,7 +9001,7 @@ fn find_split_boundary_warning(messages: &[String]) -> Option<String> {
         return None;
     }
     Some(format!(
-        "第 {} 条之间像是把同一句话拆开了；如果两条拼起来才完整，请合并成一条，或把断点移到完整句子的边界。",
+        "第 {} 条似将一整句话强行拆段；若语义相连请拼作一条，或挪至完整句尾再断。",
         bad.join("，")
     ))
 }
@@ -9194,7 +9189,7 @@ pub(crate) fn reply_text_of(ob: crate::onebot::OneBot, kind: &str, conv_id: &str
 /// `POST /api/tokens/reset`：把用量账本清空。
 ///
 /// JS 的 `reset()` 做两件事：清内存里的采样，并把 journal 文件**截断成空**。
-/// Rust 这边每次请求都重新读文件，所以只要截断文件即可 —— 但要注意一个陷阱
+/// Each request reloads from disk, so truncating the log file clears history immediately.
 /// （JS 注释里写过、踩过）：只清内存不清"被淘汰采样"的汇总，下次压缩会把删掉的量写回磁盘，
 /// 表现为"点了重置还是老数字"。Rust 没有内存态，反而不存在这个问题。
 ///
@@ -9235,13 +9230,13 @@ fn handle_test_send(body: &str, cfg: &Value) -> Result<Value, (u16, String)> {
         // 对外文案与 JS 逐字一致（控制台会原样显示）；具体原因只进日志，
         // 不回给调用方 —— 免得把"哪条规则命中"变成探测哨兵的侧信道。
         crate::safe_println!("[console] 测试发送被哨兵拦下：{why}");
-        return Err((403, "消息含敏感信息，已阻止发送".to_string()));
+        return Err((403, "内容触及敏感词限制，已拦截该次发送".to_string()));
     }
     let key = format!("{kind}:{id}");
     if !session_allowed(cfg, &key) {
         return Err((
             403,
-            format!("目标不在白名单内（{kind} {id}），请先加入白名单"),
+            format!("对象 {kind} {id} 尚未列入访问名单，请先添入"),
         ));
     }
     // CQ 码转义：消息正文里的 `[CQ:` 必须失效，否则控制台能借此注入图片/@全体
@@ -9279,22 +9274,22 @@ fn handle_test_send(body: &str, cfg: &Value) -> Result<Value, (u16, String)> {
 /// `POST /api/authorize/read`：给 agent 的读权限探针（旧只读工具用）。
 ///
 /// 空 token 一律拒绝 —— 这个端点对 agent 流量开放，若「不传 token 就跳过校验」
-/// 等于把它变成免鉴权端点。
+/// Treating token-less callers identically would bypass session authentication.
 fn handle_authorize_read(body: &str) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let token = req.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let Some((kind, id)) = key.split_once(':') else {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     };
     if (kind != "group" && kind != "private") || id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-        return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
+        return Err((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()));
     }
     if token.is_empty() || !agent_token_ok(&key, &token) {
         return Err((
             403,
             if token.is_empty() {
-                "缺少会话令牌；旧只读工具在需要令牌的模式下不可用，请改用带会话令牌的 v2 读工具".to_string()
+                "缺少对话令牌；当前模式已关闭无令牌旧读接口，请改调携带令牌的 v2 只读工具".to_string()
             } else {
                 "agent token 无效".to_string()
             },
@@ -9302,7 +9297,7 @@ fn handle_authorize_read(body: &str) -> Result<Value, (u16, String)> {
     }
     let cfg = read_json(CONFIG_PATH).unwrap_or_default();
     if !session_allowed(&cfg, &key) {
-        return Err((403, "当前模式不允许读取该会话".to_string()));
+        return Err((403, "当前运行模式下无权查看此会话".to_string()));
     }
     Ok(json!({ "ok": true, "key": key }))
 }
@@ -9320,7 +9315,7 @@ fn handle_check_send(body: &str) -> Result<Value, (u16, String)> {
     }
     let cfg = read_json(CONFIG_PATH).unwrap_or_default();
     if !session_allowed(&cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     let flag = match tool.as_str() {
         "sendGroup" => "sendGroup",
@@ -9344,7 +9339,7 @@ fn handle_check_send(body: &str) -> Result<Value, (u16, String)> {
 /// 注意这不是"没实现"，是 JS 有意的防线：持会话令牌的调用方不能伪造
 /// 「我说过……」的历史记录（那会影响回复检查与上下文）。
 fn handle_record_sent() -> Result<Value, (u16, String)> {
-    Err((403, "该接口仅桥接内部使用，不接受外部调用".to_string()))
+    Err((403, "该接口为桥接内部保留，不对外开放".to_string()))
 }
 
 
@@ -9379,7 +9374,7 @@ fn handle_role_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
         Some(raw) => {
             let name = sanitize_role_name(raw);
             if !file_exists_for(context, &role_file_path(&name)) {
-                return Err((400, format!("角色「{name}」不存在（roles/{name}.md）")));
+                return Err((400, format!("找不到名为「{name}」的人格卡（roles 目录下查无对应文稿）")));
             }
             social_state::write_role_state(context, Some(&name), &mode)
                 .map_err(|e| (500, e.to_string()))?;
@@ -9407,7 +9402,7 @@ fn handle_role_mode_post(context: &RuntimeContext, body: &str) -> Result<Value, 
     Ok(json!({ "ok": true, "roleMode": mode }))
 }
 
-/// `POST /api/socialV2/sticker-note`：改 AI 自己对某张表情的认知（localNote/tags/usage）。
+/// `POST /api/socialV2/sticker-note`: update local sticker notes, tags, and usage hints.
 ///
 /// 只动本地认知，**不碰 QQ 账号上的备注**（那个是 `sticker-remark`，要走 OneBot）。
 #[allow(dead_code)]
@@ -9415,7 +9410,7 @@ fn handle_sticker_note(body: &str) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let cfg = read_json(CONFIG_PATH).unwrap_or_default();
     if !crate::sticker::enabled(&cfg) {
-        return Err((403, "表情包体系已关闭".to_string()));
+        return Err((403, "表情包功能未开启".to_string()));
     }
     let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let sticker_id = req.get("stickerId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -9568,7 +9563,7 @@ fn slang_submit_times() -> &'static std::sync::Mutex<HashMap<(String, String), V
 
 fn slang_research(context: &RuntimeContext, cfg: &Value, body: &str) -> Result<Value, (u16, String)> {
     if !crate::slang_learn::enabled(cfg) {
-        return Err((400, "黑话学习已关闭（slang.enabled=false）".to_string()));
+        return Err((400, "群聊黑话搜集功能现处于关闭态（配置开关为 false）".to_string()));
     }
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let requested: Vec<String> = req.get("ids").and_then(Value::as_array)
@@ -9581,7 +9576,7 @@ fn slang_research(context: &RuntimeContext, cfg: &Value, body: &str) -> Result<V
         .filter(|id| requested.is_empty() || requested.iter().any(|want| want == id))
         .map(str::to_string)
         .collect();
-    if ids.is_empty() { return Err((400, "没有可研究的候选黑话".to_string())); }
+    if ids.is_empty() { return Err((400, "暂无待处理的候选词条".to_string())); }
     let count = ids.len();
     crate::slang_learn::queue_research(context, cfg, ids).map_err(slang_store_error)?;
     Ok(json!({"ok": true, "count": count}))
@@ -9598,13 +9593,13 @@ fn slang_submit(
     if key.is_empty() { return Err((400, "key 不能为空".to_string())); }
     sticker_agent_allowed(context, cfg, &key, headers, "slangSubmit", "qq_slang_submit")?;
     if !crate::slang_learn::enabled(cfg) {
-        return Err((403, "黑话学习已关闭（slang.enabled=false）".to_string()));
+        return Err((403, "群聊黑话搜集功能现处于关闭态（配置开关为 false）".to_string()));
     }
     let tokens = crate::conversation_state::read_active_tokens(context)?;
     let content = crate::social_mem::redact_tokens(&agent::body_text(&req, "content"), &tokens).trim().to_string();
     let evidence_text = crate::social_mem::redact_tokens(&agent::body_text(&req, "context"), &tokens).trim().to_string();
     if content.is_empty() { return Err((400, "content 不能为空".to_string())); }
-    if content.encode_utf16().count() > 50 { return Err((400, "黑话词条过长（最多 50 字）".to_string())); }
+    if content.encode_utf16().count() > 50 { return Err((400, "词条长度超出 50 字上限".to_string())); }
 
     let mut table = slang_submit_times().lock()
         .map_err(|_| (503, "黑话限频状态不可用".to_string()))?;
@@ -9613,7 +9608,7 @@ fn slang_submit(
     let now = now_ms();
     times.retain(|t| now.saturating_sub(*t) < 3_600_000);
     if times.len() >= 10 || times.iter().filter(|t| now.saturating_sub(**t) < 60_000).count() >= 2 {
-        return Err((429, "黑话提交过于频繁，请稍后再试".to_string()));
+        return Err((429, "词条提交触发频控，请隔片刻再试".to_string()));
     }
     times.push(now);
     drop(table);
@@ -9634,7 +9629,7 @@ fn slang_submit(
                 Some("rejected") => {
                     return Err((
                         403,
-                        "该词已被管理员拒绝，如需重新收录请联系管理员".to_string(),
+                        "该词条已被设定为拒收状态，若需重审请与管理员联系".to_string(),
                     ));
                 }
                 _ => {}
@@ -9678,7 +9673,7 @@ fn slang_submit(
         let suffix = if evidence_text.is_empty() { "" } else { "（附语境）" };
         crate::activity::append(
             context,
-            &format!("{key} [reserved2] AI 提交黑话候选：{content}{suffix}"),
+            &format!("{key} [reserved2] 对话过程新提交一条群聊候选黑话词条，现已记录在案以待管理员查核确认：{content}{suffix}"),
         );
         Ok(json!({"ok": true, "entry": crate::slang::public_entry(&entry)}))
     } else {
@@ -9752,13 +9747,13 @@ fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &
                     entry["status"] = json!(status);
                 }
                 if entry.get("content").and_then(Value::as_str).unwrap_or("").is_empty() {
-                    return Err((400, "黑话内容不能为空".to_string()));
+                    return Err((400, "词条内容不可为空".to_string()));
                 }
             } else if action == "confirm" {
                 if entry.get("meaning").and_then(Value::as_str).unwrap_or("").is_empty() {
                     return Err((
                         400,
-                        "请先填写含义再确认，否则不会注入 AI 上下文".to_string(),
+                        "确认前请先补全词条释义，未填含义不会带入参考背景".to_string(),
                     ));
                 }
                 entry["status"] = json!("confirmed");
@@ -10030,7 +10025,7 @@ fn social_projection_agent_denial_doc(
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_projection_session_allowed(cfg, key) {
-        return Some((403, "目标不在当前模式允许范围内".to_string()));
+        return Some((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !tool_enabled(cfg, tool_flag) {
         return Some((403, format!("工具未启用：{tool_name}")));
@@ -10125,7 +10120,7 @@ fn sticker_agent_allowed(
         return Err((403, "agent token 无效".to_string()));
     }
     if !session_allowed(cfg, key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     let enabled = cfg
         .get("socialV2")
@@ -10238,7 +10233,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
         return (
             401,
             "application/json; charset=utf-8".to_string(),
-            json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
+            json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}).to_string(),
         );
     }
     if let Some(reply) = front::enforce_key_preflight(req, cfg, context, caller) {
@@ -10262,7 +10257,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
         return (
             401,
             "application/json; charset=utf-8".to_string(),
-            json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
+            json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}).to_string(),
         );
     }
     if let Some(reply) = front::enforce_agent_denials(req, cfg, context, caller) {
@@ -10739,13 +10734,13 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
         // S1：手工触发一次抽取。同步返回摘要；dryRun 只数窗口不调模型。
         ("POST", "/api/slang/extract") if context.is_isolated() => {
             if !crate::slang_learn::enabled(cfg) {
-                return (400, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": "黑话学习已关闭（slang.enabled=false）"}).to_string());
+                return (400, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": "群聊黑话搜集功能现处于关闭态（配置开关为 false）"}).to_string());
             }
             let body: Value = serde_json::from_str(&req.body).unwrap_or_else(|_| json!({}));
             let requested = agent::body_text(&body, "key");
             match crate::slang_learn::queue_manual_extraction(context, cfg, &requested) {
                 Ok(key) => (200, "application/json; charset=utf-8".to_string(), json!({"ok": true, "key": key}).to_string()),
-                Err(error) if error == "当前没有可学习消息窗口" => (400, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
+                Err(error) if error == "尚无待提取的消息窗口" => (400, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
                 Err(error) => (503, "application/json; charset=utf-8".to_string(), json!({"ok": false, "error": error}).to_string()),
             }
         }
@@ -11222,7 +11217,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
                     None => (
                         404,
                         "application/json; charset=utf-8".to_string(),
-                        json!({"ok": false, "error": "未找到该会话的用量记录"}).to_string(),
+                        json!({"ok": false, "error": "尚无该会话对应的用量条目"}).to_string(),
                     ),
                 },
                 Err(message) => json_read_error(&message),
@@ -11860,7 +11855,7 @@ fn handle_session_models_post_tx(
             // 这里不做跨 provider 校验（那需要模型目录），只拒绝明显非法的值。
             const EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
             if !effort.is_empty() && !EFFORTS.contains(&effort.as_str()) {
-                return Err((400, "reasoningEffort 只能是 low/medium/high/max".to_string()));
+                return Err((400, "思考深度档位仅可填写 low、medium、high 或 max 之一".to_string()));
             }
 
             let mut entry = json!({ "model": model });
@@ -12452,13 +12447,13 @@ fn initialize_console(context: &RuntimeContext, cfg: &Value) {
         }
         Err(error) => crate::safe_println!("[console] ⚠️ pending access revocations were not checked (the next access change retries them first): {error}"),
     }
-    // JS 启动时同步一次 QQ 收藏表情（强制，失败不阻塞，也不重试；AI 首次调用时按 TTL 再试）。
+    // Warm the local sticker cache once at startup without blocking on transient errors.
     if context.is_isolated() && crate::sticker::enabled(cfg) {
         let (cfg, context) = (cfg.clone(), context.clone());
         std::thread::spawn(move || {
             match sync_sticker_forced_with_counts(&context, &cfg) {
-                Ok((fetched, total)) => crate::safe_println!("[sticker] 已同步 QQ 收藏表情 {fetched} 个（本地库 {total} 条）"),
-                Err(error) => crate::safe_println!("[sticker] 启动预热表情库失败: {error}"),
+                Ok((fetched, total)) => crate::safe_println!("[sticker] 已向网关拉取同步收藏图 {fetched} 张（本地现存 {total} 条）"),
+                Err(error) => crate::safe_println!("[sticker] 启动预热收藏表情库受阻: {error}"),
             }
         });
     }
@@ -13416,7 +13411,7 @@ pub(super) mod tests {
         std::fs::write(root.0.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
         let (status, text) = mute_send_denial(&context, &config, HF94_KEY, &token).unwrap_err();
         assert_eq!(status, 403);
-        assert!(text.contains("muted in this group until") && text.contains(END_TURN), "{text}");
+        assert!(text.contains("muted until") && text.contains(END_TURN), "{text}");
         assert!(turn_budget_ended(&context, HF94_KEY, &turn.id), "turnBudgetEnded equals the open turn id");
     }
 
@@ -14299,7 +14294,7 @@ pub(super) mod tests {
         let closing = json!({"key":HF94_KEY,"throughSeq":0,"config":{"mode":"diving","infinite":true}}).to_string();
         let before_observation = agent::wake_config(&context, &config, &headers, &closing);
         assert_eq!(before_observation.0, 400, "short reply waits cannot authorize sleep: {before_observation:?}");
-        assert!(before_observation.1.to_string().contains("沉睡前观察"), "{before_observation:?}");
+        assert!(before_observation.1.to_string().contains("睡前守候"), "{before_observation:?}");
         let final_wait = handle_wait_post(&context, &config, &headers, &request).unwrap();
         assert_eq!(final_wait["purpose"], "messages", "the last slot must perform observation even after a short/reply request");
         assert_eq!(final_wait["waitedMs"], 10000);
@@ -16039,8 +16034,8 @@ pub(super) mod tests {
 
     fn fixture_preset_content(marker: &str) -> String {
         format!(
-            "【二代仿真模式 —— 安全规则】\n你没有本地工具。群友没有管理权限。API 令牌须保密。角色由桥接注入。不会自动发送到 QQ。\n{}\n{marker}",
-            "安全说明。".repeat(140)
+            "【权限边界】\n手边没有可操作本机的工具。发言者不能授予操作权限。连接凭据只供程序使用。人设以桥接提供的设定为准。\n【发送与工具】\n草稿只留在本端。\n{}\n{marker}",
+            "这里是合成正文。".repeat(65)
         )
     }
 
@@ -16169,7 +16164,7 @@ pub(super) mod tests {
                     assert_eq!(error.0, 400);
                     assert!(matches!(
                         error.1.as_str(),
-                        "请求体不是合法 JSON" | "请求体必须是 JSON 对象"
+                        "请求体不是合法 JSON" | "请求正文需为 JSON 对象"
                     ));
                 }
                 assert_eq!(std::fs::read(&state_path).unwrap(), invalid.as_bytes());
@@ -16219,7 +16214,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             parse_role_management_body(&context, "null"),
-            Err((400, "请求体必须是 JSON 对象".to_string()))
+            Err((400, "请求正文需为 JSON 对象".to_string()))
         );
         assert_eq!(parse_role_management_body(&RuntimeContext::legacy(), "{"), Ok(json!({})));
         assert_eq!(parse_role_management_body(&RuntimeContext::legacy(), "null"), Ok(Value::Null));
@@ -16251,7 +16246,7 @@ pub(super) mod tests {
             request.body = "null".to_string();
             assert_eq!(
                 role_management_dispatch_body(&request),
-                Err((400, "请求体必须是 JSON 对象".to_string())),
+                Err((400, "请求正文需为 JSON 对象".to_string())),
                 "legacy context uses the shared JS body-shape contract at {path}"
             );
         }
@@ -16271,7 +16266,7 @@ pub(super) mod tests {
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             (status, response["error"].as_str()),
-            (400, Some("请求体必须是 JSON 对象")),
+            (400, Some("请求正文需为 JSON 对象")),
             "legacy dispatch rejects a non-object body before any fixed-path access"
         );
 
@@ -16281,7 +16276,7 @@ pub(super) mod tests {
         assert_eq!(status, 400);
         assert_eq!(
             response["error"],
-            "人格名不能为空（仅限中文 / 字母 / 数字 / 横线）",
+            "角色名称不可为空（只允许中文、字母、数字或短横线）",
             "blank legacy create body normalizes to `{{}}` before ordinary field validation"
         );
     }
@@ -16712,7 +16707,7 @@ pub(super) mod tests {
             if path.starts_with("/api/tokens/turns") {
                 // Only A's selected sessions.json maps this key; B must not borrow A's mapping.
                 assert_eq!(*status_b, 404, "B must not resolve A's session mapping: {body_b}");
-                assert_eq!(body_b["error"], "未找到该会话的用量记录");
+                assert_eq!(body_b["error"], "尚无该会话对应的用量条目");
             } else {
                 assert_eq!(*status_b, 200, "B selected usage endpoint {path} failed: {body_b}");
             }
@@ -19888,7 +19883,7 @@ pub(super) mod tests {
         let config_b_after_setup = std::fs::read(root_b.0.join("config/config.json")).unwrap();
         assert_eq!(
             handle_self_image(&context_b, &params, &headers_b, &denied_cfg_b).unwrap_err(),
-            (403, "目标不在当前模式允许范围内".to_string()),
+            (403, "目标会话未被当前运行模式放行".to_string()),
             "a selected deny-list match must take precedence over allow"
         );
 
@@ -19904,12 +19899,12 @@ pub(super) mod tests {
         disabled_cfg["socialV2"]["enabled"] = json!(false);
         assert_eq!(
             social_agent_policy_denial(&request, &disabled_cfg, &context_a),
-            Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()))
+            Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()))
         );
         std::fs::write(root_a.0.join("data/mode.json"), br#"{"mode":"chat"}"#).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg_a, &context_a),
-            Some((403, "该接口仅 reserved2 模式可用".to_string()))
+            Some((403, "当前接口仅限 reserved2 模式调用".to_string()))
         );
         std::fs::remove_file(root_a.0.join("data/mode.json")).unwrap();
 
@@ -20156,7 +20151,7 @@ pub(super) mod tests {
             .unwrap_err(),
             (
                 403,
-                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）"
+                "禁止在对话中更改此项（仅允许调整 settings_get 列出的配置；白名单、访问令牌及路径类须本地修改）"
                     .to_string()
             )
         );
@@ -20507,10 +20502,10 @@ pub(super) mod tests {
         let config_before = std::fs::read(&config_path).unwrap();
 
         for (body, expected_error) in [
-            ("{", "请求体必须是合法 JSON"),
-            ("null", "请求体必须是 JSON 对象"),
-            ("[]", "请求体必须是 JSON 对象"),
-            ("7", "请求体必须是 JSON 对象"),
+            ("{", "请求正文未能解析为合法 JSON"),
+            ("null", "请求正文需为 JSON 对象"),
+            ("[]", "请求正文需为 JSON 对象"),
+            ("7", "请求正文需为 JSON 对象"),
         ] {
             let error = handle_memory_action(
                 "acl",
@@ -20568,7 +20563,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
-            "未授权：请提供控制台访问令牌"
+            "未通过鉴权：缺少有效控制台访问令牌"
         );
         assert!(!database.exists(), "denied memory request must not open or create the DB");
         assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
@@ -20611,7 +20606,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
-            "未授权：请提供控制台访问令牌"
+            "未通过鉴权：缺少有效控制台访问令牌"
         );
         assert!(!database.exists(), "unauthenticated memory request must not open or create the DB");
         assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
@@ -20650,7 +20645,7 @@ pub(super) mod tests {
         assert_eq!(status, 403, "the nonempty agent header reaches the memory handler");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
-            "agent token 无效（必须是该会话自己的令牌）"
+            "会话令牌校验失败（须附上该对话的专属 token）"
         );
         assert!(!database.exists(), "invalid agent credential must fail before DB access");
         assert_eq!(std::fs::read(&state_path).unwrap(), selected_state);
@@ -20687,7 +20682,7 @@ pub(super) mod tests {
             assert_eq!(status, 403, "memory agent denial for {key}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
-                "agent token 无效（必须是该会话自己的令牌）",
+                "会话令牌校验失败（须附上该对话的专属 token）",
                 "memory handler should decide the denial for {key}"
             );
             bodies.push(body);
@@ -20751,7 +20746,7 @@ pub(super) mod tests {
         assert_eq!(status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
-            "agent token 无效（必须是该会话自己的令牌）"
+            "会话令牌校验失败（须附上该对话的专属 token）"
         );
         assert!(!database.exists(), "console auth must not bypass search's agent ACL");
         drop(root);
@@ -21620,12 +21615,12 @@ pub(super) mod tests {
         // rejected request must leave both selected roots byte-identical.
         std::fs::write(&config_a, malformed_config).unwrap();
         for (body, expected_message) in [
-            ("{", "请求体必须是合法 JSON"),
-            ("\u{0085}", "请求体必须是合法 JSON"),
-            ("null", "请求体必须是 JSON 对象"),
-            ("[]", "请求体必须是 JSON 对象"),
-            ("7", "请求体必须是 JSON 对象"),
-            ("\"scalar\"", "请求体必须是 JSON 对象"),
+            ("{", "请求正文未能解析为合法 JSON"),
+            ("\u{0085}", "请求正文未能解析为合法 JSON"),
+            ("null", "请求正文需为 JSON 对象"),
+            ("[]", "请求正文需为 JSON 对象"),
+            ("7", "请求正文需为 JSON 对象"),
+            ("\"scalar\"", "请求正文需为 JSON 对象"),
         ] {
             let social_error = handle_social_v1_config(&context_a, body).unwrap_err();
             let effort_error = handle_dsh_effort(&context_a, body).unwrap_err();
@@ -22048,13 +22043,13 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(
             send_message_global_agent_denial(&request, &cfg, &context),
-            Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()))
+            Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()))
         );
 
         cfg["socialV2"]["enabled"] = json!(true);
         assert_eq!(
             send_message_global_agent_denial(&request, &cfg, &context),
-            Some((403, "该接口仅 reserved2 模式可用".to_string()))
+            Some((403, "当前接口仅限 reserved2 模式调用".to_string()))
         );
         std::fs::write(&mode_path, br#"{"mode":"reserved2"}"#).unwrap();
         assert_eq!(send_message_global_agent_denial(&request, &cfg, &context), None);
@@ -22144,7 +22139,7 @@ pub(super) mod tests {
             let (status, _, body) =
                 route_test(&request, &c, &RuntimeContext::legacy());
             assert_eq!(status, 401, "console auth must precede agent gates and allowlist checks");
-            assert!(body.contains("未授权"));
+            assert!(body.contains("未通过鉴权"));
         }
     }
 
@@ -23108,7 +23103,7 @@ pub(super) mod tests {
             ),
             (
                 "disabled",
-                (403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()),
+                (403, "二代社交功能已停用，禁止调用 v2 工具".to_string()),
             ),
             (
                 "tool",
@@ -23116,7 +23111,7 @@ pub(super) mod tests {
             ),
             (
                 "mode",
-                (403, "该接口仅 reserved2 模式可用".to_string()),
+                (403, "当前接口仅限 reserved2 模式调用".to_string()),
             ),
         ];
 
@@ -23417,8 +23412,8 @@ pub(super) mod tests {
         let cases = [
             ("token", "agent token 无效"),
             ("paused", "当前已暂停，不允许执行 v2 工具"),
-            ("enabled", "二代模式已关闭，当前不允许执行 v2 工具"),
-            ("mode", "该接口仅 reserved2 模式可用"),
+            ("enabled", "二代社交功能已停用，禁止调用 v2 工具"),
+            ("mode", "当前接口仅限 reserved2 模式调用"),
             ("tool", "工具未启用：qq_memory_append"),
         ];
         for (case, expected_error) in cases {
@@ -23899,7 +23894,7 @@ pub(super) mod tests {
                 "getUnread",
                 "qq_get_unread_messages",
             ),
-            Some((403, "目标不在当前模式允许范围内".to_string()))
+            Some((403, "目标会话未被当前运行模式放行".to_string()))
         );
     }
 
@@ -23970,7 +23965,7 @@ pub(super) mod tests {
                 "socialState",
                 "qq_social_state"
             ),
-            Some((403, "目标不在当前模式允许范围内".to_string())),
+            Some((403, "目标会话未被当前运行模式放行".to_string())),
             "allowed IDs compare as String(Number(id)); leading-zero config strings stay distinct"
         );
         let zero_padded_session = "private:07001";
@@ -24008,7 +24003,7 @@ pub(super) mod tests {
                 "socialState",
                 "qq_social_state"
             ),
-            Some((403, "目标不在当前模式允许范围内".to_string())),
+            Some((403, "目标会话未被当前运行模式放行".to_string())),
             "configured IDs are compared as strings; leading zeros are not numerically normalized"
         );
         let denied = json!({
@@ -24025,7 +24020,7 @@ pub(super) mod tests {
                 "socialState",
                 "qq_social_state"
             ),
-            Some((403, "目标不在当前模式允许范围内".to_string())),
+            Some((403, "目标会话未被当前运行模式放行".to_string())),
             "deny-list wins even when allow-all is enabled"
         );
         assert_eq!(
@@ -24164,7 +24159,7 @@ pub(super) mod tests {
                 parse_after_seq(Some(raw)),
                 Err((
                     400,
-                    "afterSeq 必须是非负安全整数；从最早未读开始请传 0".to_string()
+                    "afterSeq 须为非负整数；从首条未读起请传 0".to_string()
                 )),
                 "unexpected afterSeq acceptance for {raw:?}"
             );
@@ -24435,7 +24430,7 @@ pub(super) mod tests {
         assert_eq!(agent_status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&agent_body).unwrap()["error"],
-            "该接口仅控制台可用"
+            "此操作仅开放给控制台访问"
         );
 
         request.headers.insert(
@@ -24451,7 +24446,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&wrong_console_body).unwrap()["error"],
-            "未授权：请提供控制台访问令牌"
+            "未通过鉴权：缺少有效控制台访问令牌"
         );
 
         request.headers.remove("x-console-token");
@@ -24464,7 +24459,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&unauthorized_body).unwrap()["error"],
-            "未授权：请提供控制台访问令牌"
+            "未通过鉴权：缺少有效控制台访问令牌"
         );
 
         for (method, path) in [
@@ -24514,7 +24509,7 @@ pub(super) mod tests {
         std::fs::write(&mode_path, br#"{"mode":"reserved2"}"#).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "该接口仅控制台可用".to_string()))
+            Some((403, "此操作仅开放给控制台访问".to_string()))
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), unpaused);
 
@@ -24541,7 +24536,7 @@ pub(super) mod tests {
         cfg["socialV2"]["enabled"] = json!(false);
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()))
+            Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()))
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), unpaused);
 
@@ -24549,7 +24544,7 @@ pub(super) mod tests {
         std::fs::write(&mode_path, br#"{"mode":"chat"}"#).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "该接口仅 reserved2 模式可用".to_string()))
+            Some((403, "当前接口仅限 reserved2 模式调用".to_string()))
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), unpaused);
 
@@ -24559,7 +24554,7 @@ pub(super) mod tests {
             assert!(social_agent_policy_route(&request));
             assert_eq!(
                 social_agent_policy_denial(&request, &cfg, &context),
-                Some((403, "该接口仅控制台可用".to_string())),
+                Some((403, "此操作仅开放给控制台访问".to_string())),
                 "agent activity request must remain admin-only for {method}"
             );
             assert_eq!(std::fs::read(&state_path).unwrap(), unpaused);
@@ -24626,7 +24621,7 @@ pub(super) mod tests {
                     );
                     assert_eq!(
                         social_agent_policy_denial(&request, cfg, context),
-                        Some((403, "该接口仅控制台可用".to_string())),
+                        Some((403, "此操作仅开放给控制台访问".to_string())),
                         "V1 sticker denial must precede V2 state/config/mode gates: {label} {method} {path}"
                     );
                     request.headers.insert("x-agent-token".to_string(), String::new());
@@ -24709,7 +24704,7 @@ pub(super) mod tests {
             assert_eq!(status, 401, "console auth must precede query allowlist and sticker policy");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
-                "未授权：请提供控制台访问令牌"
+                "未通过鉴权：缺少有效控制台访问令牌"
             );
         }
     }
@@ -24796,14 +24791,14 @@ pub(super) mod tests {
         cfg["socialV2"]["enabled"] = json!(false);
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()))
+            Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()))
         );
         let unpaused_state = std::fs::read(&path).unwrap();
         cfg["socialV2"]["enabled"] = json!(true);
         std::fs::write(&mode_path, br#"{"mode":"chat"}"#).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "该接口仅 reserved2 模式可用".to_string()))
+            Some((403, "当前接口仅限 reserved2 模式调用".to_string()))
         );
         assert_eq!(std::fs::read(&path).unwrap(), unpaused_state);
         std::fs::write(&mode_path, br#"{"mode":"reserved2"}"#).unwrap();
@@ -24935,9 +24930,9 @@ pub(super) mod tests {
         cfg["socialV2"]["send"]["maxSendPerMinute"] = json!(1);
         cfg["socialV2"]["sticker"]["collect"]["maxPerMinute"] = json!(1);
         let send = t20_send(&context, &cfg, "fixture-sticker", |_, _| panic!("quota must refuse before any fetch"));
-        assert_eq!(send.unwrap_err(), (429, "发送频率超限，请稍后再试".to_string()));
+        assert_eq!(send.unwrap_err(), (429, "触发发送频控限制，请稍等片刻".to_string()));
         let collect = t20_collect(&context, &cfg, |_, _| panic!("quota must refuse before any fetch"));
-        assert_eq!(collect.unwrap_err(), (429, "收藏表情太频繁了，请过一会儿再偷图".to_string()));
+        assert_eq!(collect.unwrap_err(), (429, "加收藏节奏太快了，隔一会儿再试".to_string()));
         server.join().unwrap();
         assert_no_pending_tcp_connection(&decoy);
     }
@@ -25035,7 +25030,7 @@ pub(super) mod tests {
         })));
         let first = t20_collect(&context, &cfg, |_, _| Err("cdn down".to_string())).unwrap_err();
         assert_eq!(first.0, 500, "the real cause is reported, not the failed release: {first:?}");
-        assert!(first.1.starts_with("收藏表情失败：无法安全获取该图片字节"), "{first:?}");
+        assert!(first.1.starts_with("收藏操作失败：无法通过安全校验获取图源内容"), "{first:?}");
         assert_eq!(t20_conversation(&root)["stickerCollectPending"].as_array().unwrap().len(), 1, "release failed");
         let second = t20_collect(&context, &cfg, |_, _| Err("cdn down".to_string())).unwrap_err();
         STICKER_SETTLE_FAULT_HOOK.with(|hook| *hook.borrow_mut() = None);
@@ -25068,13 +25063,13 @@ pub(super) mod tests {
         let (_root, context, decoy) = t20_selected("t20 send texts", &url, json!({"recentMessages": [], "sendTimes": []}));
         let cfg = context.load_config().unwrap();
         let missing = t20_send(&context, &cfg, "nope", |_, _| panic!("no fetch for an unknown sticker")).unwrap_err();
-        assert_eq!(missing, (500, "发送表情失败：找不到表情 nope，请先用 qq_list_stickers 获取有效 id".to_string()));
+        assert_eq!(missing, (500, "发送表情失败：找不到表情 nope，须先调用图库清单工具取有效编号".to_string()));
         let download = t20_send(&context, &cfg, "fixture-sticker", |_, _| Err("cdn down".to_string())).unwrap_err();
-        assert_eq!(download, (500, "发送表情失败：表情 fixture-sticker 的图片下载失败（QQ CDN 网络异常或地址已失效）：cdn down".to_string()));
+        assert_eq!(download, (500, "发送表情失败：表情 fixture-sticker 拉取图片数据失败（网络异常或链接已过期）：cdn down".to_string()));
         let (url, onebot) = start_fake_onebot_with_sticker_rows(2, true, vec![t20_sticker_row()]);
         let (_root2, context2, decoy2) = t20_selected("t20 send refused", &url, json!({"recentMessages": [], "sendTimes": []}));
         let refused = t20_send(&context2, &context2.load_config().unwrap(), "fixture-sticker", |_, _| Ok(b"image".to_vec())).unwrap_err();
-        assert_eq!(refused, (500, "发送表情失败：OneBot 发送失败：retcode=100 fixture denied".to_string()));
+        assert_eq!(refused, (500, "发送表情失败：OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=100 fixture denied".to_string()));
         server.join().unwrap();
         onebot.join().unwrap();
         assert_no_pending_tcp_connection(&decoy);
@@ -25088,7 +25083,7 @@ pub(super) mod tests {
             "recentMessages": [t20_source_message()], "stickerCollectTimes": []
         }));
         let refused = t20_collect(&context, &context.load_config().unwrap(), |_, _| Ok(b"image".to_vec())).unwrap_err();
-        assert_eq!(refused, (500, "收藏表情失败：OneBot 发送失败：retcode=100 fixture denied".to_string()));
+        assert_eq!(refused, (500, "收藏表情失败：OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=100 fixture denied".to_string()));
         server.join().unwrap();
 
         // A gateway that accepts the add but returns no emoji_id.
@@ -25105,7 +25100,7 @@ pub(super) mod tests {
             "recentMessages": [t20_source_message()], "stickerCollectTimes": []
         }));
         let no_id = t20_collect(&context2, &context2.load_config().unwrap(), |_, _| Ok(b"image".to_vec())).unwrap_err();
-        assert_eq!(no_id, (500, "收藏表情失败：add_custom_face 未返回 emoji_id".to_string()));
+        assert_eq!(no_id, (500, "向平台提交收图入库请求遭到拒绝：网关返回体里缺少新图库条目编号字段（emoji_id 为空）".to_string()));
         worker.join().unwrap();
         assert_no_pending_tcp_connection(&decoy);
         assert_no_pending_tcp_connection(&decoy2);
@@ -25180,11 +25175,11 @@ pub(super) mod tests {
         ];
         let cfg = json!({});
         let missing = legacy_sticker_image(&entries, "nope", &cfg, |_, _| panic!("no fetch for an unknown sticker")).unwrap_err();
-        assert_eq!(missing, (500, "发送表情失败：找不到表情 nope，请先用 qq_list_stickers 获取有效 id".to_string()));
+        assert_eq!(missing, (500, "发送表情失败：找不到表情 nope，须先调用图库清单工具取有效编号".to_string()));
         let no_url = legacy_sticker_image(&entries, "s-nourl", &cfg, |_, _| panic!("no fetch without an address")).unwrap_err();
-        assert_eq!(no_url, (500, "发送表情失败：表情 s-nourl 没有可发送的图片地址".to_string()));
+        assert_eq!(no_url, (500, "发送表情失败：表情 s-nourl 缺少可用图源地址".to_string()));
         let download = legacy_sticker_image(&entries, "s-ok", &cfg, |_, _| Err("cdn down".to_string())).unwrap_err();
-        assert_eq!(download, (500, "发送表情失败：表情 s-ok 的图片下载失败（QQ CDN 网络异常或地址已失效）：cdn down".to_string()));
+        assert_eq!(download, (500, "发送表情失败：表情 s-ok 拉取图片数据失败（网络异常或链接已过期）：cdn down".to_string()));
         let bytes = legacy_sticker_image(&entries, "s-ok", &json!({"socialV2": {"media": {"maxBytes": 123}}}), |url, max| {
             assert_eq!((url, max), ("https://cdn.invalid/a.png", 262_144));
             Ok(b"img".to_vec())
@@ -25201,7 +25196,7 @@ pub(super) mod tests {
         let mut cfg = context.load_config().unwrap();
         cfg["socialV2"]["sticker"]["collect"]["maxBytes"] = json!(1024 * 1024);
         let refused = t20_collect(&context, &cfg, |_, _| Ok(vec![0u8; 2 * 1024 * 1024])).unwrap_err();
-        assert_eq!(refused, (500, "收藏表情失败：这张表情太大（2.0 MB），收藏上限是 1 MB，收不了。别重试，跟对方说一声或者换个小的。".to_string()));
+        assert_eq!(refused, (500, "收藏操作失败：该图片体积 2.0 MB 超出 1 MB 限额，请换小图或告知对方，切勿重复尝试。".to_string()));
         server.join().unwrap();
         assert_no_pending_tcp_connection(&decoy);
     }
@@ -25217,7 +25212,7 @@ pub(super) mod tests {
         // 2.25 MB is an exact tie at one decimal ("2.3" in JS, "2.2" for {:.1}); 1.5 MB prints as "2".
         cfg["socialV2"]["sticker"]["collect"]["maxBytes"] = json!(1_572_864);
         let refused = t20_collect(&context, &cfg, |_, _| Ok(vec![0u8; 2_359_296])).unwrap_err();
-        assert_eq!(refused, (500, "收藏表情失败：这张表情太大（2.3 MB），收藏上限是 2 MB，收不了。别重试，跟对方说一声或者换个小的。".to_string()));
+        assert_eq!(refused, (500, "收藏操作失败：该图片体积 2.3 MB 超出 2 MB 限额，请换小图或告知对方，切勿重复尝试。".to_string()));
         server.join().unwrap();
         assert_no_pending_tcp_connection(&decoy);
     }
@@ -25313,7 +25308,7 @@ pub(super) mod tests {
         let (root, context) = fixture_runtime("gap social config bad json", "fixture-gap-social-badjson-abcdefghij");
         let path = root.0.join("config/config.json");
         let before = std::fs::read(&path).unwrap();
-        for (body, message) in [("[", "请求体必须是合法 JSON"), ("[1]", "请求体必须是 JSON 对象")] {
+        for (body, message) in [("[", "请求正文未能解析为合法 JSON"), ("[1]", "请求正文需为 JSON 对象")] {
             assert_eq!(handle_social_config_post(&context, body).unwrap_err(), (400, message.to_string()));
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);

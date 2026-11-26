@@ -67,7 +67,7 @@ export const DiagnosticsTab: React.FC = () => {
         setToolLog(Array.isArray(res.entries) ? res.entries : []);
       } catch (err) {
         if (mountedRef.current && seq === toolSeqRef.current) {
-          pushToast(formatErrorMessage(err, '加载工具调用日志失败'), 'danger');
+          pushToast(formatErrorMessage(err, '读取工具执行记录失败'), 'danger');
         }
       } finally {
         if (mountedRef.current && seq === toolSeqRef.current) {
@@ -425,7 +425,7 @@ export const DiagnosticsTab: React.FC = () => {
                 setOutboxBatches([]);
                 setOutboxError(null);
               }}
-              placeholder="输入会话键（如 group:... 或 private:...）"
+              placeholder="填入打算查询的对话标识，例如以 group: 开头的群聊或 private: 开头的单聊"
               className={INPUT_CLASS}
             />
           )}

@@ -1,24 +1,15 @@
-//! 价目表与峰谷分时计费（对应 JS 的 `model-prices.js`）。
+//! Model tariff table and peak/off-peak cost calculation (CNY per 1M tokens).
 //!
-//! 为什么桥接要自己算钱：DSH 只回 token 数，provider 也不报花费
-//! （`dsh-llm-pi-ai` 明写 "no consumer reports spend"）。所以「花了多少钱」
-//! 只能由消费方拿价目表换算。
-//!
-//! 口径（元 / 百万 token）：
-//!   · 扣减 = Σ(各桶 token × 对应单价)
-//!   · 三个互不重叠的输入桶：缓存命中 / 缓存未命中 / 缓存写，再加输出桶
-//!   · 空闲单价 = 高峰单价 ÷ peakMultiplier（默认 2）
-//!   · 高峰 = 北京时间周一至周五 9:00-12:00、14:00-18:00，且不是法定节假日
-//!
-//! 注意一个容易算错钱的地方：DSH 的 `inputTokens` 是**未命中**部分，不是总输入。
-//! 把 cacheRead 当成 inputTokens 的一部分会导致重复计价。
+//! Computes cost across four non-overlapping token buckets (cache hit, uncached cache miss,
+//! cache write, and output), applying `peakMultiplier` during Beijing-time weekday peak hours
+//! excluding configured public holidays. Note that `inputTokens` represents uncached input only.
 
 use serde_json::Value;
 
 /// 价目表版本，改了价目就改这里（控制台用它提示「你看到的是哪版价格」）。
 pub const PRICE_TABLE_VERSION: &str = "2026-11-04";
 
-/// 2026 年法定节假日（放假日，含调休连休段）。
+/// 2026 China statutory holidays (including adjusted consecutive break days).
 pub const CN_HOLIDAYS_2026: &[&str] = &[
     "2026-01-01", "2026-01-02", "2026-01-03", "2026-02-15", "2026-02-16", "2026-02-17",
     "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
@@ -28,11 +19,7 @@ pub const CN_HOLIDAYS_2026: &[&str] = &[
     "2026-10-05", "2026-10-06", "2026-10-07",
 ];
 
-/// 2027 年法定节假日。
-///
-/// 为什么要预置到 2027：缺日期时的表现是**静默高估** —— 节假日里的调用会被
-/// 按高峰计价（2 倍），金额偏高但不报错。春节/国庆横跨多天，很容易把整年账单
-/// 抬高几个百分点，而且没人会发现。
+/// 2027 China statutory holidays; pre-populated to avoid misclassifying holidays as peak hours.
 pub const CN_HOLIDAYS_2027: &[&str] = &[
     "2027-01-01", "2027-01-02", "2027-01-03", "2027-02-05", "2027-02-06", "2027-02-07",
     "2027-02-08", "2027-02-09", "2027-02-10", "2027-02-11", "2027-02-12", "2027-02-13",
@@ -43,7 +30,7 @@ pub const CN_HOLIDAYS_2027: &[&str] = &[
 ];
 
 
-/// 四个互不重叠的计费桶（外加 reasoning，仅展示用）。
+/// Four non-overlapping billing buckets (plus reasoning tokens for display).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Buckets {
     pub cache_miss: f64,
@@ -70,7 +57,7 @@ impl Buckets {
             reasoning: self.reasoning + other.reasoning,
         }
     }
-    /// 逐桶下限为 0（用于「基线之后」的增量）。
+    /// Per-bucket difference floored at zero for incremental usage after a baseline.
     pub fn sub(&self, other: &Buckets) -> Buckets {
         let s = |a: f64, b: f64| (a - b).max(0.0);
         Buckets {
@@ -198,7 +185,7 @@ impl PriceTable {
     }
 }
 
-/// 合并用户配置的价目覆盖项（`config.json` 的 `pricing`），失败回落到默认表。
+/// Merge user tariff overrides from `config.json` `pricing` over the built-in defaults.
 pub fn resolve(override_cfg: Option<&Value>) -> PriceTable {
     let mut table = PriceTable::default();
     let Some(ov) = override_cfg.and_then(|v| v.as_object()) else {
@@ -268,8 +255,7 @@ pub fn resolve(override_cfg: Option<&Value>) -> PriceTable {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(d)
             };
-            // 只有条目**自己**没写 cacheWrite 时才跟随 cacheMiss；
-            // 否则会从兜底模型继承一个不相干的 cacheWrite 价（静默算错钱）。
+            // Default cacheWrite to cacheMiss only when omitted by the entry itself, never inheriting another model's rate.
             let cache_miss = num("cacheMiss", start.cache_miss);
             let cache_write = if given
                 .and_then(|g| g.get("cacheWrite"))
@@ -321,9 +307,7 @@ fn default_model() -> ModelPrice {
     }
 }
 
-/// 把时间戳换成北京时间的日历分量（不依赖运行机器的本地时区）。
-///
-/// 返回 `(weekday 1=周一..7=周日, hour, "YYYY-MM-DD", "HH:MM")`。
+/// Convert epoch milliseconds to Beijing calendar parts `(weekday 1=Mon..7=Sun, hour, "YYYY-MM-DD", "HH:MM")`.
 pub fn beijing_parts(at_ms: i64) -> (i64, i64, String, String) {
     let local = crate::local_time::at(at_ms, &crate::local_time::beijing_tariff_zone());
     (
@@ -334,7 +318,7 @@ pub fn beijing_parts(at_ms: i64) -> (i64, i64, String, String) {
     )
 }
 
-/// 某一时刻是否落在高峰时段。
+/// Return true if `at_ms` falls within a configured peak window on a non-holiday weekday.
 pub fn is_peak_at(at_ms: i64, table: &PriceTable) -> bool {
     let (weekday, hour, date, _) = beijing_parts(at_ms);
     if !table.peak_weekdays.contains(&weekday) {
@@ -349,7 +333,7 @@ pub fn is_peak_at(at_ms: i64, table: &PriceTable) -> bool {
         .any(|(start, end)| hour >= *start && hour < *end)
 }
 
-/// 某模型在某一时刻生效的单价。
+/// Resolve effective rates for `model` at timestamp `at_ms`.
 pub fn rates_at(model: &str, at_ms: i64, table: &PriceTable) -> Rates {
     let key = model.trim().to_string();
     let entry = table.model(&key);
@@ -375,12 +359,7 @@ pub fn rates_at(model: &str, at_ms: i64, table: &PriceTable) -> Rates {
     }
 }
 
-/// 把 usage 归一化成四个互不重叠的计费桶。
-///
-/// 同时接受两种键名，这一点是**必须**的：
-///   · DSH 原始口径 `inputTokens` / `cacheReadTokens` / `cacheWriteTokens` / `outputTokens`
-///   · 账本落盘口径 `cacheMiss` / `cacheHit` / `cacheWrite` / `output`
-/// 只认一种会在「写盘 → 重新载入」时把桶读成 0，花费凭空少一截。
+/// Normalize either DSH raw token keys or persisted ledger bucket keys into four non-overlapping buckets.
 #[allow(dead_code)]
 pub fn normalize_usage(usage: Option<&Value>) -> Buckets {
     let pick = |v: Option<&Value>, keys: &[&str]| -> f64 {
@@ -397,7 +376,7 @@ pub fn normalize_usage(usage: Option<&Value>) -> Buckets {
         0.0
     };
     Buckets {
-        // DSH 的 inputTokens 是「未命中」部分，不是总输入
+        // `inputTokens` holds the uncached portion only.
         cache_miss: pick(usage, &["cacheMiss", "uncachedInputTokens", "inputTokens"]),
         cache_hit: pick(usage, &["cacheHit", "cacheReadTokens"]),
         cache_write: pick(usage, &["cacheWrite", "cacheWriteTokens"]),
@@ -406,7 +385,7 @@ pub fn normalize_usage(usage: Option<&Value>) -> Buckets {
     }
 }
 
-/// 按单价把 token 桶折算成金额。
+/// Convert token buckets into monetary cost using the resolved `rates`.
 pub fn cost_of(buckets: &Buckets, rates: &Rates) -> Cost {
     let cache_hit = buckets.cache_hit / rates.unit * rates.cache_hit;
     let cache_miss = buckets.cache_miss / rates.unit * rates.cache_miss;

@@ -2,7 +2,7 @@
 //!
 //! 与 JS 版对齐：
 //!   端点   POST {httpUrl}/{send_group_msg|send_private_msg}
-//!   参数   { group_id | user_id, message: [{type:"text", data:{text}}] }
+//!   载荷   群号或好友 QQ 号 + 纯文本消息段数组
 //!   鉴权   Authorization: Bearer <accessToken>
 //!   成功   { status:"ok", retcode:0 }
 //!   转义   只把 "[CQ:" 换成 "[CQ："（与 escapeCqText 一致）
@@ -73,15 +73,10 @@ pub fn escape_cq(text: &str) -> String {
     out
 }
 
-/// 按字符数分条（不切断 UTF-8，不切断已有的换行边界优先）。
-/// 按 QQ 单条消息长度上限切分。**与 JS `md-to-plain.js` 的 `splitForQQ` 等价。**
+/// Split outbound QQ text under the per-message UTF-16 limit, preferring newline boundaries.
 ///
-/// 原来的实现是硬切（每 max 个字符切一刀），和 JS 差三件事：
-///   1. JS **优先在换行处切**（`lastIndexOf('\n', max-1)`），不会把一句话从中间劈开；
-///   2. JS 把换行符**留给前一段**，拼接后不丢换行；
-///   3. JS 按 **UTF-16 码元**计数（QQ 的上限就是这个口径），
-///      而 Rust 按标量值数 —— 一个 emoji 在 JS 里算 2 个，在 Rust 里只算 1 个，
-///      于是 emoji 多的消息会被切得比预期长，可能撞 QQ 的上限。
+/// Keeping trailing newlines attached to the preceding chunk avoids broken sentences or lost breaks,
+/// and counting UTF-16 code units aligns with QQ's message length cap on multi-byte emoji.
 ///
 /// Count UTF-16 units while keeping Unicode scalars and supported QQ face tokens atomic.
 /// An atom larger than the configured limit occupies its own part to ensure forward progress.
@@ -181,7 +176,7 @@ const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 fn send_failure_text(v: &serde_json::Value, retcode: i64) -> String {
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
     let marker = if is_mute_reply(v) { MUTE_REFUSAL } else { "" };
-    format!("OneBot 发送失败：retcode={retcode} {wording}{marker}")
+    format!("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode={retcode} {wording}{marker}")
 }
 
 /// Marker in a not-committed error for a group-mute refusal (#46).
@@ -234,7 +229,7 @@ pub(crate) fn classify_send_reply(http_status: u16, raw: &str) -> Result<serde_j
         return Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null));
     }
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
-    let message = format!("OneBot 发送失败：retcode={} {wording}", retcode.unwrap_or(-1));
+    let message = format!("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode={} {wording}", retcode.unwrap_or(-1));
     if is_mute_reply(&v) {
         return Err(SendError::NotCommitted(format!("{message}{MUTE_REFUSAL}")));
     }

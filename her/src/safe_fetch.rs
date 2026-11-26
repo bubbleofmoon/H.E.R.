@@ -83,7 +83,7 @@ pub fn fetch_bytes(raw_url: &str, max_bytes: usize) -> Result<Fetched, String> {
             attempt_cap: Some(Duration::from_secs(8)),
         },
         crate::media_normalize::looks_like_image,
-        "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+        "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
         #[cfg(test)]
         false,
     );
@@ -106,7 +106,7 @@ pub fn fetch_exact(raw_url: &str, max_bytes: usize, budget: Duration) -> Result<
             attempt_cap: Some(Duration::from_secs(8)),
         },
         crate::media_normalize::looks_like_image,
-        "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+        "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
         #[cfg(test)]
         false,
     );
@@ -224,7 +224,7 @@ mod tests {
             },
             (
                 crate::media_normalize::looks_like_image,
-                "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+                "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
             ),
             resolve,
             transfer,
@@ -253,7 +253,7 @@ mod tests {
             },
             (
                 crate::media_normalize::looks_like_image,
-                "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+                "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
             ),
             resolve,
             transfer,
@@ -620,7 +620,7 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
-            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+            "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
             true,
         );
         let direct = crate::guarded_fetch::fetch_bytes_with(
@@ -648,7 +648,7 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
-            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+            "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
             true,
         );
         assert!(
@@ -800,7 +800,7 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
-            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
+            "远端响应并非合法图档（仅接受 PNG、JPEG、GIF 或 WebP）",
             true,
         );
         let direct = crate::guarded_fetch::fetch_bytes_with(

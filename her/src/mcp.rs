@@ -54,15 +54,15 @@ fn memory_tools() -> Value {
         "tools": [
             {
                 "name": "memory_write",
-                "description": "记一条长期记忆。适合：群友的偏好/要求、重要决定、踩过的坑、群里的长期话题。不要记流水账。",
+                "description": "保存一条长期记忆，适用于成员喜好、约定规则、踩坑经验或群内持续话题；流水碎语不要写入。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "key": {"type": "string", "description": "会话 key，格式 group:群号 或 private:QQ号"},
+                        "key": {"type": "string", "description": "对话标识（group:群号 或 private:QQ号）"},
                         "token": {"type": "string", "description": "会话令牌"},
-                        "content": {"type": "string", "minLength": 1, "description": "记忆正文，一句话说清，别超过 200 字"},
+                        "content": {"type": "string", "minLength": 1, "description": "要记录的要点，单句概括且不超过 200 字"},
                         "kind": {"type": "string", "enum": ["fact","topic","thought","impression","event","preference"], "description": "类型，默认 fact"},
-                        "subject": {"type": "string", "description": "话题名或人名（模糊指代时靠它命中，建议填）"},
+                        "subject": {"type": "string", "description": "关联对象或主题名，填写后更易在指代模糊时检索命中"},
                         "tags": {"type": "string", "description": "逗号分隔的标签"},
                         "importance": {"type": "number", "minimum": 0, "maximum": 1, "description": "重要度 0~1，默认 0.5"}
                     },
@@ -71,22 +71,22 @@ fn memory_tools() -> Value {
             },
             {
                 "name": "memory_search",
-                "description": "检索长期记忆。遇到「那个 / 上次 / 之前说的」这类指代不明时，先用话题名试探，不要直接说不记得。",
+                "description": "按关键词检索长期记忆；若出现指代含糊（如之前聊过的某个事），先尝试用主题词搜索，再决定是否回想不起。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "key": {"type": "string"},
                         "token": {"type": "string"},
-                        "query": {"type": "string", "description": "检索词（话题名/关键词，别用整句话）"},
-                        "limit": {"type": "number", "minimum": 1, "maximum": 50, "description": "最多返回几条，默认 8"},
-                        "kinds": {"type": "string", "description": "按类型过滤，逗号分隔"}
+                        "query": {"type": "string", "description": "关键词或主题词，避免填入长整句"},
+                        "limit": {"type": "number", "minimum": 1, "maximum": 50, "description": "返回条数上限，默认 8"},
+                        "kinds": {"type": "string", "description": "逗号分隔的类型过滤列表"}
                     },
                     "required": ["key", "token", "query"]
                 }
             },
             {
                 "name": "memory_index",
-                "description": "看本会话（及已授权范围）里有哪些记忆话题，不返回正文。",
+                "description": "列举当前会话及已授权范围内已记录的记忆主题清单（不含具体正文）。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"key": {"type": "string"}, "token": {"type": "string"}},
@@ -263,7 +263,7 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
             let hits: Vec<memory::Hit> =
                 serde_json::from_value(result["memories"].clone()).map_err(|e| e.to_string())?;
             if hits.is_empty() {
-                "没有找到相关记忆。".to_string()
+                "未查到匹配的长期记忆。".to_string()
             } else {
                 hits.iter()
                     .enumerate()
@@ -298,7 +298,7 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                     .collect::<Vec<_>>()
                     .join("、");
                 format!(
-                    "共 {} 条，话题：{terms}（要细节用 memory_search）",
+                    "共 {} 条，覆盖主题：{terms}（查阅正文请调用检索工具）",
                     result["total"]
                 )
             }
@@ -344,7 +344,7 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                     .collect::<Vec<_>>()
                     .join("\n");
                 lines.push_str(&format!(
-                    "\n\n不可通过对话修改：{}",
+                    "\n\n禁止在聊天中更改：{}",
                     result["readonly"].as_str().unwrap_or("")
                 ));
                 lines

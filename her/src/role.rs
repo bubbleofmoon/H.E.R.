@@ -1,14 +1,7 @@
-//! 人格卡（`roles/<名称>.md`）的解析与「按仿真模式取用」。
+//! Role card parser (`roles/<name>.md`) and per-mode section selector.
 //!
-//! 逐字移植自 `qq-bridge/src/role-card.js`，外加 `bridge.js` 里的
-//! `roleWarnings` / `roleSummaries` / `firstMeaningfulLine`。
-//!
-//! 三条容易踩的判等细节：
-//!   1. JS 的 `String.length` 是 **UTF-16 码元数**，Rust 的 `chars().count()` 是码点数。
-//!      卡片里有 emoji 时两者会差，所以这里统一走 `utf16_len`。
-//!   2. JS 的 `\s` 含 `\u{FEFF}` 不含 `\u{0085}`，与 `char::is_whitespace` 不同。
-//!   3. 模式标记用正则写会踩两个坑（`reserved` 会吃掉 `reserved2` 的前缀、
-//!      `2\s*代` 里的可选空格），所以这几个小模式手写匹配，语义对着 JS 逐条核。
+//! UTF-16 length parity and ECMAScript whitespace rules keep character-limit and heading
+//! behavior aligned across modes without relying on regex prefix traps (`reserved` vs `reserved2`).
 
 use serde_json::{json, Value};
 
@@ -51,7 +44,7 @@ pub fn utf16_take(s: &str, max: usize) -> String {
     out
 }
 
-/// 人格名清洗：与 JS 的 `/[^\w\u4e00-\u9fff-]/g` **同义**。
+/// Strip characters other than ASCII word chars, hyphens, and Han characters.
 pub(crate) fn sanitize_name(raw: &str) -> String {
     raw.chars()
         .filter(|c| {
@@ -64,7 +57,7 @@ pub(crate) fn sanitize_name(raw: &str) -> String {
 }
 
 // ── 模式标记 ────────────────────────────────────────────────────────────────
-// JS: /[\[〔（(]\s*(?:二代|2\s*代|v2|reserved2)\s*[\]〕）)]/gi
+// Mode tag matcher (v2 / reserved2 / Chinese equivalents).
 
 fn is_open_bracket(c: char) -> bool {
     matches!(c, '[' | '〔' | '（' | '(')
@@ -288,7 +281,7 @@ fn collapse_newlines(s: &str) -> String {
     out
 }
 
-/// 取某次仿真真正要注入的人格文本（已去掉模式标记）。
+/// Return the role text selected for a simulation mode, stripped of mode markers.
 pub fn select_role_text(text: &str, mode: &str) -> String {
     let want = if mode == MODE_V1 { MODE_V1 } else { MODE_V2 };
     let joined = parse_role_sections(text)
@@ -420,8 +413,7 @@ pub fn first_meaningful_line(content: &str) -> String {
     String::new()
 }
 
-/// JS 的 `GEN1_ROLE_LINE_RE`（`/\[SILENT\]|空格分隔|按空格|用空格|空格分句|空格代表|自动转发|回复会自动|输出\s*\[SILENT\]/i`）。
-/// 注意最后那个 `输出\s*\[SILENT\]` 被前面的 `\[SILENT\]` 完全覆盖，是冗余分支。
+/// Matches legacy first-generation role-card instructions (silent markers, space-splitting, auto-forwarding) to strip them.
 pub fn gen1_role_line(text: &str) -> bool {
     let lower = text.to_lowercase();
     const NEEDLES: [&str; 7] = [
@@ -434,7 +426,7 @@ fn is_cjk(c: char) -> bool {
     (0x4e00..=0x9fff).contains(&(c as u32))
 }
 
-/// `/[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/`：中文之间夹空白。
+/// Match whitespace placed between adjacent Han characters.
 fn has_cjk_space_cjk(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     for i in 0..chars.len() {
@@ -469,7 +461,7 @@ pub fn role_warnings(content: &str, mode: &str, inject_max: usize) -> Vec<String
     let injected = if mode == MODE_V1 { stats.v1 } else { stats.v2 };
     if injected > inject_max {
         warnings.push(format!(
-            "超出注入上限：当前模式实际注入 {injected} 字符，只有前 {inject_max} 字符会进入提示词（可在配置里调 role.maxInjectChars）"
+            "内容超出最大注入字数：当前正文计 {injected} 字，排在 {inject_max} 字之后的部分将截断不注入（可在角色上限配置里调大）"
         ));
     }
     let untagged = parse_role_sections(content)
@@ -480,13 +472,13 @@ pub fn role_warnings(content: &str, mode: &str, inject_max: usize) -> Vec<String
         .join("\n");
     if gen1_role_line(&untagged) {
         warnings.push(
-            "未标记的小节里含一代仿真专用指令（[SILENT] / 空格分句 / 自动转发…），二代下这些行会被兜底过滤——建议把它们移到带 〔一代〕 标记的小节里"
+            "发现未标明适用范围的小节含有初代规则词句（[SILENT]、空格分句、自动转发等），当前模式下这些行会被过滤；建议为其加上 〔一代〕 标记"
                 .to_string(),
         );
     }
     if untagged.contains("回复示例") && has_cjk_space_cjk(&untagged) {
         warnings.push(
-            "“回复示例”节里的中文空格会被自动改写成逗号（二代不用空格分条），建议直接写逗号，或把该节标记为 〔一代〕"
+            "「回复示例」小节含中文分隔空格，当前模式会自动转为逗号；建议直接改用逗号或标注 〔一代〕"
                 .to_string(),
         );
     }
@@ -787,7 +779,7 @@ mod tests {
         let text = "## 通用\n输出 [SILENT]\n";
         let w = role_warnings(text, MODE_V2, 6000);
         assert_eq!(w.len(), 1);
-        assert!(w[0].contains("一代仿真专用指令"));
+        assert!(w[0].contains("初代规则词句"));
         // 标记过的一代小节不该报警
         let tagged = "## 通用\n\n## 分条 〔一代〕\n输出 [SILENT]\n";
         assert!(role_warnings(tagged, MODE_V2, 6000).is_empty());

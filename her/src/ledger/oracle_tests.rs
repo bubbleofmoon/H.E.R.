@@ -1,4 +1,4 @@
-//! 与 JS 账本（`qq-bridge/src/token-ledger.js`）逐字段对拍。
+//! Oracle parity tests verifying token-usage ledger fields against recorded fixture outputs.
 //!
 //! 合成 DSH 事件流生成：`token-usage.jsonl` 是 JS 写出的账本文件，`expected.json` 是 JS 的
 //! summary / series / conversation / recent / stats 输出。这里让 Rust 读同一份文件，逐值比较。

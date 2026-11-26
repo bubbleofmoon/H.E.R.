@@ -1,12 +1,7 @@
-//! 黑话（slang）的展示层：公开条目、已确认列表、注入块。
+//! Slang display helpers: public entries, confirmed list, and prompt section.
 //!
-//! 逐字移植自 `qq-bridge/src/bridge.js` 的 `publicSlangEntry` /
-//! `confirmedSlangListV2` / `buildSlangContext` 与 `slang-learner.js` 的
-//! `escapeLearnerText`。
-//!
-//! 这一层是**共享给 AI 的**，所以有两条硬规矩（注释在 JS 里写得很清楚，照抄）：
-//!   1. 公开条目**不含 evidence** —— 证据里有别的群的会话名和原话。
-//!   2. 送进提示词前要转义 HTML 并去掉控制字符，防止群友用黑话注入格式。
+//! Public entries omit `evidence` (which carries group names and raw chat lines).
+//! Prompt entries escape HTML and strip control characters to prevent formatting injection.
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
@@ -563,7 +558,7 @@ pub fn build_context(entries: &[Value], max: Option<&Value>) -> String {
         })
         .collect();
     format!(
-        "【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）：\n{}",
+        "【群聊黑话表】以下为群里核准并常用的网络用语与梗（按频次排列，仅作背景参考，勿生硬堆词）：\n{}",
         lines.join("\n")
     )
 }

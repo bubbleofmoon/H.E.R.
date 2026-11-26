@@ -434,7 +434,7 @@ pub fn media_hint(message_ref: &str, count: usize) -> String {
     if count == 0 || message_ref.is_empty() {
         return String::new();
     }
-    format!("\n【图片/表情】本条消息包含 {count} 个图片/表情（消息ID={message_ref}）。")
+    format!("\n【图文提示】该条消息附带 {count} 个图片或表情（消息ID={message_ref}）。")
 }
 
 // ───────────────────────── decisions ─────────────────────────
@@ -490,17 +490,17 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
                 ))
             }
             "/silent" | "/quiet" => {
-                return Decision::SetRoleMode { mode: "silent", say: "已进入静默模式：群友消息不再回复，仅管理员可对话。" }
+                return Decision::SetRoleMode { mode: "silent", say: "静默模式已启用：非管理员群友消息将忽略，仅回应管理员。" }
             }
-            "/active" | "/speak" => return Decision::SetRoleMode { mode: "active", say: "已退出静默模式，恢复正常回复。" },
+            "/active" | "/speak" => return Decision::SetRoleMode { mode: "active", say: "静默模式已取消，恢复正常发言。" },
             other if other == "/role" || other.starts_with("/role ") => {
                 let raw = f.plain.chars().skip(5).collect::<String>();
                 let name = crate::role::sanitize_name(crate::role::js_trim(&raw));
                 if name.is_empty() || name == "off" || name == "clear" {
-                    return Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".to_string() };
+                    return Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".to_string() };
                 }
                 if !role_exists(&name) {
-                    return Decision::Say(format!("角色「{name}」不存在。角色文件放 qq-bridge/roles/ 目录。"));
+                    return Decision::Say(format!("未找到所选角色卡「{name}」，请先把角色文件放进 roles 目录下再重试。"));
                 }
                 let say = format!("已切换角色：{name}。");
                 return Decision::SetRole { name: Some(name), say };
@@ -1141,7 +1141,7 @@ impl Hub {
             }
             Decision::Reset => {
                 match crate::social_state::reset_conversation(&self.context, &key) {
-                    Ok(_) => self.say(cfg, &key, "已重置会话，下次消息将开新上下文"),
+                    Ok(_) => self.say(cfg, &key, "会话已清理，下一条消息起将开启全新上下文"),
                     Err(crate::social_state::SocialError::NotFound(_)) => {}
                     Err(error) => {
                         println!("[chat] {key} 重置失败：{error}");
@@ -1215,7 +1215,7 @@ fn stale_job(context: &RuntimeContext, cfg: &Value, key: &str, job: &Job) -> Opt
     };
     match crate::turn_ledger::reset_count(context, key) {
         Ok(now) if now == seen => {}
-        Ok(_) => return Some("会话已重置或权限已撤销，丢弃排队的指令"),
+        Ok(_) => return Some("会话已被重置或授权变更，丢弃排队的指令"),
         Err(_) => return Some("读取会话重置记录失败，丢弃排队的指令"),
     }
     let Some(seen) = &job.mode_stamp else {
@@ -1620,10 +1620,10 @@ mod tests {
         assert_eq!(decide(&facts("切换角色", true), &exists), Decision::Forward, "the owner may say it");
         assert_eq!(decide(&facts("/reset", true), &exists), Decision::Reset);
         assert_eq!(decide(&facts("/new", true), &exists), Decision::Reset);
-        assert_eq!(decide(&facts("/role", true), &exists), Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".into() });
-        assert_eq!(decide(&facts("/role clear", true), &exists), Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".into() });
+        assert_eq!(decide(&facts("/role", true), &exists), Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".into() });
+        assert_eq!(decide(&facts("/role clear", true), &exists), Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".into() });
         assert_eq!(decide(&facts("/role  小鲸鱼 ", true), &exists), Decision::SetRole { name: Some("小鲸鱼".into()), say: "已切换角色：小鲸鱼。".into() });
-        assert_eq!(decide(&facts("/role 没有", true), &exists), Decision::Say("角色「没有」不存在。角色文件放 qq-bridge/roles/ 目录。".into()));
+        assert_eq!(decide(&facts("/role 没有", true), &exists), Decision::Say("未找到所选角色卡「没有」，请先把角色文件放进 roles 目录下再重试。".into()));
         assert_eq!(decide(&facts("/roles", true), &exists), Decision::Forward, "only `/role` and `/role <name>` are commands");
         assert_eq!(decide(&facts("/model", true), &exists), Decision::Forward, "other slash text goes to DSH");
         assert_eq!(decide(&facts("/update 一下进度", true), &exists), Decision::Forward, "only the whole-message update forms are commands");
@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn prompts_follow_the_old_layout() {
         assert_eq!(build_prompt("", false, Some("小明"), "你好", "").render(&Value::Null), "小明：你好");
-        assert_eq!(build_prompt("角色", true, Some("owner"), "你好", "\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。").render(&Value::Null), "角色\n\n【管理员】owner：你好\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。");
+        assert_eq!(build_prompt("角色", true, Some("owner"), "你好", "\n【图文提示】该条消息附带 2 个图片或表情（消息ID=7）。").render(&Value::Null), "角色\n\n【管理员】owner：你好\n【图文提示】该条消息附带 2 个图片或表情（消息ID=7）。");
         assert_eq!(build_prompt("", true, None, "私聊", "").render(&Value::Null), "【管理员】私聊");
         assert_eq!(media_hint("", 2), "");
         assert_eq!(media_hint("7", 0), "");

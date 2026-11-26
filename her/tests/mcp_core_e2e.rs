@@ -787,7 +787,7 @@ fn media_budgets_count_original_bytes_before_compaction_and_clamp_settings() {
     ]),false);
     let answer=f.mcp.call("qq_get_message_images",group(json!({"messageId":"budget"})));
     assert_eq!(image_blocks(&answer).len(),2,"{answer}");
-    assert!(text_of(&answer).contains("图片总大小超限") && text_of(&answer).contains("超过单条上限 3"));
+    assert!(text_of(&answer).contains("（图片体积超过上限，已略过）") && text_of(&answer).contains("超过单条上限 3"));
     assert_eq!(f.onebot.actions("get_image").len(),3);
     f.onebot.image("pixels.gif",&media_fixtures::gif(1,2000,1000));
     set_media(&f,"pixels",json!([{"kind":"image","file":"pixels.gif"}]),false);
@@ -1240,13 +1240,13 @@ fn get_prompt_sticker_total_and_context_belong_only_to_the_selected_root() {
 #[test]
 fn get_prompt_sticker_strategy_follows_include_in_prompt_even_when_disabled() {
     // Frozen JS sticker-lib.js::buildStickerStrategyHint, including every line.
-    const JS_STRATEGY: &str = "【表情包策略：像真人一样用，不刷屏】
-- 合适时机：被戳中笑点/槽点、接梗、怼人、赞同、自嘲、安慰、无语、赢了/输了、告别/晚安、别人发了表情时回一张，都可以自然用。
-- 频率：普通闲聊不用每条都配；大约每 3~5 轮来一张就够，热闹/玩梗时可以更密，但不要连续刷屏。
-- 选择：优先用备注（desc）和你的记忆（localNote/tags）能准确对上语境的；没有备注/不确定的表情，先 qq_get_sticker_image 看图再决定，不要瞎发。
-- 发送：用 qq_send_sticker；一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话先用 qq_send_message / qq_reply 作为单独气泡发出，再单独发表情。需要引用/点名时传 replyToMessageId / atUserId（群聊）。
-- 不要：在严肃/正式/敏感话题硬塞表情；不要每次都用同一个；不要一条消息里塞多个表情；不要把文字和表情混在同一个气泡里；不要把表情包当回复的唯一内容（偶尔可以，但别让群友觉得你在敷衍）。
-- 学习：看到新表情不确定含义时，先用 qq_get_sticker_image 看图，再用 qq_sticker_note 记下你的理解，下次就能更准地选。";
+    const JS_STRATEGY: &str = "【表情包策略：自然使用，别刷屏】
+- 使用时机：遇到搞笑、吐槽、接梗、附和、调侃、安抚、无言、道别、互怼或对方发图回应时，都可以顺手配一张。
+- 使用频率：日常对话不必每句都配图，隔三五轮挑准时机发一张即可；气氛热络玩梗时可略加密，但切忌连续刷屏。
+- 选图方法：优先从图库清单中挑出备注与情景合拍的图；若图库里缺乏文字描述或拿不准图意，先查看原图确认后再决定。
+- 发送规范：每次调用发表情工具都应单独发成一条气泡，切勿把图和字拼在一条里；想说话请先发文字气泡再另外配图，群内支持附带引用或点名对象。
+- 避坑事项：正经、敏感或严肃讨论时别硬插图；不要反复连发同一张；不要单条连塞多张或文字混排；不要长期只靠发表情敷衍回复。
+- 备注积累：碰到不熟悉的图意时，先看图核验画面内容，再写一条本地笔记把含义记下来方便以后挑图。";
     for (label, sticker, expected) in [
         ("disabled-included", json!({"enabled": false}), JS_STRATEGY),
         ("disabled-excluded", json!({"enabled": false, "includeInPrompt": false}), ""),
@@ -1524,7 +1524,7 @@ fn read_receipts_do_not_survive_a_console_restart_but_the_persisted_mark_does() 
     let console = Console::start(&root, console_port);
     let refused = mcp.call("qq_mark_read", group(json!({"throughSeq": 8})));
     assert!(is_error(&refused), "a receipt from before the restart must not authorise skipping unread messages");
-    assert!(text_of(&refused).contains("throughSeq 必须是不超过已展示连续消息水位的非负安全整数"), "{}", text_of(&refused));
+    assert!(text_of(&refused).contains("throughSeq 须为非负整数且不可越过已阅读的连续编号"), "{}", text_of(&refused));
     let state = root.state();
     assert_eq!(state["conversations"][GROUP_KEY]["unread"].as_array().expect("unread").len(), 3, "nothing was acknowledged");
 
@@ -1548,7 +1548,7 @@ fn a_rotated_session_token_voids_the_receipts_it_was_given() {
     assert!(is_error(&refused), "receipts given to the old session must not count for the new one: {refused}");
     let old = f.mcp.call("qq_mark_read", group(json!({"throughSeq": 8})));
     assert!(is_error(&old));
-    assert!(text_of(&old).contains("未授权：调用携带的会话令牌无效"), "{}", text_of(&old));
+    assert!(text_of(&old).contains("未授权：所附会话令牌校验不通过"), "{}", text_of(&old));
 }
 
 #[test]
@@ -1589,7 +1589,7 @@ fn pending_send_stops(change: &str, poke: bool) {
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{change}, poke={poke}: {answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{answer}");
+    assert!(text_of(&answer).contains("发送中止"), "{answer}");
     assert!(f.onebot.actions("group_poke").is_empty());
     assert_eq!(f.onebot.actions("send_group_msg").len(), if poke { 0 } else { 1 });
     assert_eq!(f.root.state()["conversations"][GROUP_KEY]["sendTimes"].as_array().expect("quota").len(), if poke { 0 } else { 1 });
@@ -1620,7 +1620,7 @@ fn a_poke_is_cancelled_when_the_session_token_changes_during_the_member_check() 
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("group_poke").is_empty(), "the cancelled poke must never reach the gateway");
     let sends = f.root.state()["conversations"][GROUP_KEY]["sendTimes"].as_array().expect("sendTimes").len();
     assert_eq!(sends, 0, "the quota reserved for the cancelled poke is given back");
@@ -1636,7 +1636,7 @@ fn a_quoted_direct_send_is_cancelled_when_the_mode_changes_during_the_quote_look
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("send_group_msg").is_empty(), "no request after the validity check failed");
 }
 
@@ -1652,7 +1652,7 @@ fn a_quoted_direct_send_is_cancelled_when_the_allow_list_changes_during_the_quot
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("send_group_msg").is_empty(), "revoked target must never reach the gateway");
     assert_eq!(f.root.state()["conversations"][GROUP_KEY]["sendTimes"], json!([]), "cancelled quota is released");
 }
@@ -1669,7 +1669,7 @@ fn revoking_a_target_keeps_the_confirmed_quoted_item_and_cancels_the_rest_of_the
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     let sent = f.onebot.actions("send_group_msg");
     assert_eq!(sent.len(), 1, "only the already submitted item reaches the gateway");
     assert_eq!(sent[0]["message"], json!([{"type": "reply", "data": {"id": "7003"}}, {"type": "text", "data": {"text": "已发送"}}]));
@@ -1748,7 +1748,7 @@ fn text_send_schemas_and_gateway_follow_merge_and_burst_policy() {
                 assert!(!is_error(&multi), "{multi}");
             } else {
                 assert!(is_error(&multi), "{multi}");
-                let reason = if label == "single-only" { "已禁用多条发送" } else { "合并后的消息不能超过 5" };
+                let reason = if label == "single-only" { "未开启分段发送" } else { "合并后的消息不能超过 5" };
                 assert!(text_of(&multi).contains(reason), "{multi}");
             }
             let exact = match label {
@@ -1788,7 +1788,7 @@ fn burst_merges_into_one_durable_message_and_the_duplicate_window_blocks_a_secon
     assert!(!is_error(&first), "burst does not open the window: {first}");
     let second = f.mcp.call("qq_send_message", group(json!({"messages": "第二次"})));
     assert!(is_error(&second));
-    assert!(text_of(&second).starts_with("发送失败：刚说过话了（"), "{}", text_of(&second));
+    assert!(text_of(&second).starts_with("发送失败：") && text_of(&second).contains("秒前刚发过消息"), "{}", text_of(&second));
     assert_eq!(f.onebot.actions("send_group_msg").len(), 2, "the blocked send never reached the gateway");
 }
 

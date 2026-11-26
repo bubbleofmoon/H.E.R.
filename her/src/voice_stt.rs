@@ -181,7 +181,7 @@ impl Failure {
     /// What the owner notice says about a helper failure (`helper_down`).
     fn owner_reason(self) -> &'static str {
         match self {
-            Self::NotConfigured => "没有配置本机转写引擎（config.json 的 voiceTranscription.helper，须为本机回环地址）",
+            Self::NotConfigured => "尚未配置本地语音识别服务地址（请在配置中填入本机回环服务地址）",
             Self::Unreachable => "本机转写引擎连接不上",
             Self::TimedOut => "本机转写引擎没有按时回复",
             Self::Refused => "本机转写引擎拒绝了请求",

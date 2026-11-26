@@ -78,7 +78,7 @@ fn closed_agent_approval_accept_and_reject_have_one_receipt_each() {
         assert!(wait_for(Duration::from_secs(12), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "synthetic reply")), "turn did not continue");
         let messages = rig.texts_to(OWNER_KEY);
         let interaction: Vec<_> = messages.iter().filter(|s| s.as_str() != ACK).map(String::as_str).collect();
-        assert_eq!(interaction, vec!["🔐 agent 请求审批：file_write\n理由：save report\n回复「通过」或「拒绝」", "synthetic reply"], "the frozen JS sends no approval confirmation");
+        assert_eq!(interaction, vec!["🔐 当前挂起待批操作：file_write\n理由：save report\n请回复「通过」或者「拒绝」", "synthetic reply"], "the frozen JS sends no approval confirmation");
         assert_eq!(rig.dsh.prompts().len(), 1);
         wait_pending(&rig, pending); // The frozen JS retains answered approvals until timeout or reset.
     }
@@ -110,7 +110,7 @@ fn closed_agent_expired_question_is_cancelled_once_and_clears_console() {
     assert!(wait_for(Duration::from_secs(10), || !rig.dsh.calls("$events/result").is_empty()), "expiration did not cancel question");
     assert_eq!(rig.dsh.calls("$events/result"), vec![json!({"clientId":"ticket13-client","eventId":"question-13","outcome":{"kind":"result","value":{"answers":[]}}})]);
     wait_pending(&rig, json!({"pending":[]}));
-    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待回答超时，已取消该请求（private:8808）")), "expiry notification missing");
+    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待超限，该请求已自动取消（private:8808）")), "expiry notification missing");
     thread::sleep(Duration::from_millis(500));
     assert_eq!(rig.dsh.calls("$events/result").len(), 1);
 }
@@ -263,7 +263,7 @@ fn closed_agent_delayed_receipt_does_not_block_next_waterfall_or_expiry() {
     let receipts = rig.dsh.calls("$events/result");
     assert_eq!(receipts.iter().filter(|c| c["eventId"] == "question-next").count(), 1);
     assert_eq!(receipts.iter().find(|c| c["eventId"] == "question-next").unwrap()["outcome"]["value"], json!({"answers":[]}));
-    assert!(wait_for(Duration::from_secs(3), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("等待回答超时"))));
+    assert!(wait_for(Duration::from_secs(3), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("⏰ 等待超限，该请求已自动取消"))));
     wait_pending(&rig, json!({"pending":[]}));
     assert!(wait_for(Duration::from_secs(3), || {
         fs::read(rig.root.join("data/pending-interactions.json"))
@@ -288,7 +288,7 @@ fn closed_agent_maintenance_continues_during_stalled_handshake() {
     assert!(wait_for(Duration::from_secs(6), || rig.dsh.calls("settings/describe").len() > settings_calls), "settings must refresh during the stalled handshake");
     assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], json!({"answers":[]}));
     wait_pending(&rig, json!({"pending":[]}));
-    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待回答超时，已取消该请求（private:8808）"));
+    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待超限，该请求已自动取消（private:8808）"));
     assert_eq!(rig.dsh.calls("$events/result").len(), 1);
     // Ticket 25: the event-stream reconnect is paced by the JS backoff (3 s, then 6 s after a failure without traffic), so the
     // second attempt starts about 19 s after the drop instead of 16 s; it must still happen.
@@ -485,7 +485,7 @@ fn closed_agent_invalid_approval_keeps_request_until_valid_owner_answer() {
     says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL#");
     assert!(wait_for(Duration::from_secs(10), || rig.console("GET", "/api/pending", None).1["pending"].as_array().is_some_and(|a| a.len() == 1)));
     says(&rig, OWNER_KEY, OWNER, "owner", "maybe");
-    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("请回复「通过」或「拒绝」"))));
+    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("以确认本次审批"))));
     assert!(rig.dsh.calls("$events/result").is_empty());
     assert_eq!(rig.console("GET", "/api/pending", None).1["pending"].as_array().unwrap().len(), 1);
     says(&rig, OWNER_KEY, OWNER, "owner", "拒绝");
@@ -502,7 +502,7 @@ fn closed_agent_expired_approval_is_rejected_once() {
     assert!(wait_for(Duration::from_secs(10), || rig.dsh.calls("$events/result").len() == 1));
     assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
     wait_pending(&rig, json!({"pending":[]}));
-    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("等待回答超时")));
+    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("⏰ 等待超限，该请求已自动取消")));
     thread::sleep(Duration::from_millis(500));
     assert_eq!(rig.dsh.calls("$events/result").len(), 1);
 }
@@ -873,7 +873,7 @@ fn closed_agent_expiry_notice_is_sent_after_the_original_turn_ended() {
             event(session, "turn/end", json!({"turn": 1, "reason": {"kind":"aborted"}}));
         }
         assert!(wait_for(Duration::from_secs(4), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏹️ 已停止")), "{tag} turn did not end before expiry");
-        assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待回答超时，已取消该请求（private:8808）")), "{tag} expiry notice missing after the turn ended: {:?}", rig.sends());
+        assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "⏰ 等待超限，该请求已自动取消（private:8808）")), "{tag} expiry notice missing after the turn ended: {:?}", rig.sends());
         assert!(wait_for(Duration::from_secs(5), || rig.dsh.calls("$events/result").len() == 1), "{tag} expiry receipt missing");
         wait_pending(&rig, json!({"pending":[]}));
     }
@@ -1052,7 +1052,7 @@ fn at_names_quotes_and_media_are_rendered_like_the_old_bridge() {
     let body = body_of(&rig.dsh.prompts()[0].text).to_string();
     assert_eq!(
         body,
-        "tester：[引用 bot：之前机器人说的话]@Alice 看这个[图片]\n【图片/表情】本条消息包含 1 个图片/表情（消息ID=2001）。"
+        "tester：[引用 bot：之前机器人说的话]@Alice 看这个[图片]\n【图文提示】该条消息附带 1 个图片或表情（消息ID=2001）。"
     );
 
     // A quote whose target belongs to another group is not resolved (plain placeholder).
@@ -1206,7 +1206,7 @@ fn status_role_silent_and_active_commands_have_the_old_texts_and_effects() {
     // /silent: members are ignored (not even a refusal), the owner still gets answers.
     says(&rig, OWNER_KEY, OWNER, "owner", "/silent");
     let t = rig.wait_texts(OWNER_KEY, 6);
-    assert_eq!(t[5], "已进入静默模式：群友消息不再回复，仅管理员可对话。");
+    assert_eq!(t[5], "静默模式已启用：非管理员群友消息将忽略，仅回应管理员。");
     assert_eq!(rig.data_json("current-role.json")["mode"], json!("silent"));
     says(&rig, GROUP_KEY, 1001, "tester", "silent 里说话");
     says(&rig, GROUP_KEY, 1001, "tester", "/reset");
@@ -1227,7 +1227,7 @@ fn status_role_silent_and_active_commands_have_the_old_texts_and_effects() {
 
     says(&rig, OWNER_KEY, OWNER, "owner", "/active");
     let t = rig.wait_texts(OWNER_KEY, 11);
-    assert_eq!(t[10], "已退出静默模式，恢复正常回复。");
+    assert_eq!(t[10], "静默模式已取消，恢复正常发言。");
     assert_eq!(rig.data_json("current-role.json")["mode"], json!("active"));
 }
 
@@ -1244,7 +1244,7 @@ fn reset_drops_the_session_stops_dsh_work_and_the_next_message_starts_fresh() {
 
     says(&rig, OWNER_KEY, OWNER, "owner", "/new");
     let t = rig.wait_texts(OWNER_KEY, 3);
-    assert_eq!(t[2], "已重置会话，下次消息将开新上下文");
+    assert_eq!(t[2], "会话已清理，下一条消息起将开启全新上下文");
     assert!(rig.data_json("sessions.json")["sessions"].get(OWNER_KEY).is_none(), "{}", rig.data_json("sessions.json"));
     assert_eq!(rig.dsh.calls("session/cancel").len(), 1);
     assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
@@ -1394,7 +1394,7 @@ fn a_reset_while_the_model_runs_cancels_the_turn_and_its_late_reply_is_not_sent(
     assert!(wait_for(LONG, || rig.data_json("sessions.json")["sessions"].get(OWNER_KEY).is_some()));
     says(&rig, OWNER_KEY, OWNER, "owner", "/reset");
     let t = rig.wait_texts(OWNER_KEY, 2);
-    assert_eq!(t[1], "已重置会话，下次消息将开新上下文", "the reset is handled while the turn is still running");
+    assert_eq!(t[1], "会话已清理，下一条消息起将开启全新上下文", "the reset is handled while the turn is still running");
     assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "cancelled")), "{:?}", rig.ledger());
     let t = rig.sentinel(OWNER_KEY, 2);
     assert_eq!(&t[2..], &[ACK.to_string(), "synthetic reply".to_string()], "no late reply and no 已停止 from the cancelled turn: {t:?}");
@@ -1450,7 +1450,7 @@ fn hotfix88_outbound_guard_absent_and_true_still_block_sensitive_reply() {
         let mut rig = Rig::new("guard88-on", Seed { config: json!({"security":security}), ..Seed::default() });
         rig.start();
         says(&rig, GROUP_KEY, 1001, "tester", "#GUARD88#");
-        assert!(rig.wait_texts(OWNER_KEY, 1)[0].contains("被安全策略拦截"));
+        assert!(rig.wait_texts(OWNER_KEY, 1)[0].contains("已拦截未发"));
         assert_eq!(rig.sentinel(GROUP_KEY, 1), vec![ACK.to_string(), ACK.to_string(), "synthetic reply".to_string()]);
     }
 }
@@ -1755,7 +1755,7 @@ fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
         200
     );
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+    assert!(rig.wait_prompts(1)[0].text.contains("群里好一会儿没人接茬了"));
     says(&rig, GROUP_KEY, 1001, "tester", "new-after-probe15");
     wait_phase(&rig, "active");
     assert!(rig.wait_prompts(2)[1].text.contains("【新消息】"));
@@ -1791,7 +1791,7 @@ fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
     assert!(rig.texts_to(GROUP_KEY).is_empty());
     seed_group_mute(&rig, 0);
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+    assert!(rig.wait_prompts(1)[0].text.contains("群里好一会儿没人接茬了"));
 }
 
 #[test]
@@ -1852,9 +1852,9 @@ fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
     );
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "context-for-proactive15");
-    assert!(rig.wait_prompts(1)[0].text.contains("你打算开启一个新话题"));
+    assert!(rig.wait_prompts(1)[0].text.contains("试着开启一段新话题吧"));
     let p = rig.wait_prompts(2);
-    assert!(p[1].text.contains("现在该自然地收尾/潜水了"));
+    assert!(p[1].text.contains("差不多可以顺势退场休息"));
     wait_phase(&rig, "idle");
     assert_eq!(
         rig.texts_to(GROUP_KEY),
@@ -2093,7 +2093,7 @@ fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncate
     assert!(
         prompts[1]
             .text
-            .split("【当前消息】")
+            .split("【此刻来信】")
             .nth(1)
             .unwrap()
             .contains("tail-marker15"),
@@ -2134,7 +2134,7 @@ fn reserved_selective_silence_is_seeded_and_carried_into_the_next_required_batch
     assert!(prompts[0].text.contains("ordinary-seen-but-unanswered15"));
     assert!(prompts[0].text.contains("在吗 #SPLIT15#"));
     assert!(
-        !prompts[0].text.contains("请只输出 [SILENT]"),
+        !prompts[0].text.contains("[SILENT]"),
         "required reply cannot opt out in its prompt"
     );
     assert_eq!(
@@ -3125,7 +3125,7 @@ fn queued_chat_waits_for_update_admission_without_losing_the_message() {
         .contains("obsolete-update-fence")));
     thread::sleep(Duration::from_millis(500));
     says(&rig, GROUP_KEY, OWNER, "owner", "/reset");
-    assert!(rig.wait_texts(GROUP_KEY, 5)[4].contains("已重置会话"));
+    assert!(rig.wait_texts(GROUP_KEY, 5)[4].contains("会话已清理"));
     drop(gate);
     says(&rig, GROUP_KEY, 1001, "tester", "after update reset");
     rig.wait_texts(GROUP_KEY, 7);
@@ -3659,11 +3659,11 @@ fn check_hotfix128_final_text(marker: &str, token: Option<&str>, guard: bool) {
         assert!(!summary.contains("private plan") && !summary.contains("thought"));
     } else {
         assert!(summary.ends_with("synthetic reply"), "ordinary text is unchanged: {summary}");
-        assert!(activity.contains("AI 内部输出：synthetic reply"));
+        assert!(activity.contains("对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：synthetic reply"));
     }
     if marker == "#REPEAT128#" {
         assert_eq!(summary.matches("***").count(), 2, "one fixed mask per repeated token");
-        let internal = activity.lines().find(|line| line.contains("AI 内部输出：")).unwrap();
+        let internal = activity.lines().find(|line| line.contains("对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：")).unwrap();
         assert_eq!(internal.matches("***").count(), 2, "Markdown must preserve both masks: {internal}");
     }
     assert!(rig.texts_to(OWNER_KEY).is_empty(), "local masking must not alert the owner: {:?}", rig.sends());

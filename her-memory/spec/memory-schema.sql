@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS memory (
   owner_id     TEXT NOT NULL,              -- group:7002 / private:7001
   scope        TEXT NOT NULL,              -- private | group
   kind         TEXT NOT NULL,              -- fact | topic | thought | impression | event | preference
-  subject      TEXT,                       -- 话题名/人名（模糊指代时靠它命中）
+  subject      TEXT,                       -- 主题名或人物称呼（用于匹配模糊指代）
   content      TEXT NOT NULL,
   tags         TEXT,
   source       TEXT NOT NULL,              -- agents-md | qq-memory | auto-digest | manual | import

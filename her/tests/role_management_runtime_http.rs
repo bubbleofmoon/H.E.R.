@@ -696,7 +696,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     );
     assert_eq!(
         empty_name["error"],
-        "人格名不能为空（仅限中文 / 字母 / 数字 / 横线）"
+        "角色名称不可为空（只允许中文、字母、数字或短横线）"
     );
     let reserved_name = post_json(
         port_a,
@@ -715,7 +715,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     );
     assert_eq!(
         device_name["error"],
-        "「CON」是系统保留名称（Windows 设备名），请换一个"
+        "「CON」命中系统保留设备名，请改用其他名称"
     );
     assert!(!root_a.join("resources/roles/README.md").exists());
     assert!(!root_a.join("resources/roles/CON.md").exists());
@@ -844,7 +844,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
         &json!({ "name": "Shared", "content": "   " }),
         400,
     );
-    assert_eq!(invalid_update_content["error"], "人格内容不能为空");
+    assert_eq!(invalid_update_content["error"], "角色设定正文不可为空");
 
     let rename_duplicate = post_json(
         port_a,
@@ -871,7 +871,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     );
     assert_eq!(
         rename_invalid["error"],
-        "人格名不能为空（仅限中文 / 字母 / 数字 / 横线）"
+        "角色名称不可为空（只允许中文、字母、数字或短横线）"
     );
 
     let select_missing = post_json(
@@ -883,7 +883,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     );
     assert_eq!(
         select_missing["error"],
-        "角色「Missing」不存在（roles/Missing.md）"
+        "找不到名为「Missing」的人格卡（roles 目录下查无对应文稿）"
     );
     assert!(
         !root_a.join("data/current-role.json").exists(),
@@ -1257,12 +1257,12 @@ fn role_management_rejects_bad_json_shapes_without_selected_root_writes() {
     let mut console_b = ConsoleProcess::start("bad JSON root B", &root_b, port_b, &dsh_home_b);
 
     let bodies = [
-        ("{malformed", "请求体必须是合法 JSON"),
-        ("null", "请求体必须是 JSON 对象"),
-        ("[]", "请求体必须是 JSON 对象"),
-        ("7", "请求体必须是 JSON 对象"),
-        ("\"scalar\"", "请求体必须是 JSON 对象"),
-        ("true", "请求体必须是 JSON 对象"),
+        ("{malformed", "请求正文未能解析为合法 JSON"),
+        ("null", "请求正文需为 JSON 对象"),
+        ("[]", "请求正文需为 JSON 对象"),
+        ("7", "请求正文需为 JSON 对象"),
+        ("\"scalar\"", "请求正文需为 JSON 对象"),
+        ("true", "请求正文需为 JSON 对象"),
     ];
     let routes = [
         "/api/roles/create",
@@ -1325,7 +1325,7 @@ fn role_management_rejects_bad_json_shapes_without_selected_root_writes() {
     assert_http_error(
         unauthorized_oversized_response,
         401,
-        "未授权：请提供控制台访问令牌",
+        "未通过鉴权：缺少有效控制台访问令牌",
         "POST /api/role-mode oversized Content-Length with invalid console token",
     );
 

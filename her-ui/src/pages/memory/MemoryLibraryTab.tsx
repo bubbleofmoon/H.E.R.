@@ -154,9 +154,9 @@ export const MemoryLibraryTab: React.FC = () => {
   const explainLongTermRestriction = (err: unknown, fallback: string) => {
     if (err instanceof ApiRequestError && err.status === 403) {
       const msg = err.message || '';
-      if (msg.includes('agent token') || msg.includes('会话自己的令牌')) {
+      if (msg.includes('会话令牌校验失败') || msg.includes('专属 token')) {
         setLongTermNotice(
-          '长期记忆检索/写入/预览/索引/遗忘在后端限定由对应会话的 agent token 调用，控制台会话未携带该会话令牌；上方可直接执行按 ID 归档、在会话抽屉中编辑轻记忆及调整记忆参数。',
+          '长期记忆检索/写入/预览/索引/遗忘在后端限定由对应对话的会话令牌调用，浏览器会话未携带该会话令牌；上方可直接执行按 ID 归档、在会话抽屉中编辑轻记忆及调整记忆参数。',
         );
       } else {
         setLongTermNotice(msg || '当前会话无权访问或删除该条记忆（不在可见范围）');
@@ -323,10 +323,10 @@ export const MemoryLibraryTab: React.FC = () => {
           if (!mountedRef.current || gen !== searchGenRef.current) return;
           if (err instanceof ApiRequestError && err.status === 403) {
             const msg = err.message || '';
-            if (msg.includes('agent token') || msg.includes('会话自己的令牌')) {
-              pushToast('缺少该会话的 agent token：浏览器管理员会话无法直接调用遗忘接口', 'warn');
+            if (msg.includes('会话令牌校验失败') || msg.includes('专属 token')) {
+              pushToast('该会话口令尚未就绪：浏览器会话无权替身调取遗忘接口', 'warn');
             } else {
-              pushToast(msg || '该条记忆不在当前会话可见范围内，无权删除', 'danger');
+              pushToast(msg || '该条记录不在本对话开放视野内，无权移除', 'danger');
             }
           } else {
             pushToast(formatErrorMessage(err, '永久遗忘失败'), 'danger');

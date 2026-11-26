@@ -123,8 +123,7 @@ impl Drop for Rig {
     }
 }
 
-/// A selected runtime whose owner's private chat runs closed-agent harness turns with `harness` as its settings and
-/// `answer` as its summariser.
+/// Test fixture whose owner conversation uses closed-agent mode with `harness` settings and `answer`.
 async fn rig(
     tag: &str,
     harness: Value,

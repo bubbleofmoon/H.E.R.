@@ -651,7 +651,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, authKind: null } : prev));
     inspectorDirtyRef.current = false;
     setInspectorState(null);
-    pushToast('已退出控制台会话', 'info');
+    pushToast('已退出浏览器会话', 'info');
     navigate('login');
   }, [navigate, pushToast]);
 

@@ -54,10 +54,9 @@ fn authority_of(base_url: &str) -> Option<String> {
     }
 }
 
-/// 读 DSH 的浏览器会话签名密钥（32 字节）。
+/// Read DSH's 32-byte browser session signing secret from `.credentials.yaml`.
 ///
-/// 不引入 YAML 依赖：`.credentials.yaml` 里 `secret:` 出现次数很少，
-/// 逐个取出来试着 base64url 解码，正好 32 字节的就是它。
+/// Scans `secret:` lines directly and base64url-decodes candidates until a 32-byte value is found.
 pub fn read_session_secret() -> Option<Vec<u8>> {
     // No DSH home configured means no DSH secret: never fall back to a relative path.
     let path = crate::runtime::dsh_home()?.join(".credentials.yaml");
@@ -196,7 +195,7 @@ impl Credential {
     /// Read the runtime's credentials and mint a fresh cookie for `base`.
     pub fn mint(context: &RuntimeContext, base: &str) -> Result<Self, String> {
         let cookie = session_cookie_for_runtime(context, base)
-            .ok_or_else(|| unavailable(context, "读不到签名密钥（~/.dsh/.credentials.yaml）"))?;
+            .ok_or_else(|| unavailable(context, "本地找不到签名私钥文稿（位于用户家目录的凭据文件）"))?;
         Ok(Self::with_cookie(base, cookie, context.clone()))
     }
 
@@ -276,7 +275,7 @@ impl Credential {
         for attempt in 0..4 {
             let cookie =
                 session_cookie_for_runtime(&self.context, &self.base).ok_or_else(|| {
-                    unavailable(&self.context, "重新读密钥失败（~/.dsh/.credentials.yaml）")
+                    unavailable(&self.context, "回写刷新 DSH 本地凭据文稿遇到错误")
                 })?;
             self.set_cookie(cookie);
             match verify() {

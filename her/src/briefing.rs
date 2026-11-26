@@ -253,7 +253,7 @@ mod tests {
             Section::groups("impressions", Some(Layer::Relationship), vec![("【对群友的印象】".into(), vec!["- 甲：爱猫".into(), "- 乙：爱狗".into()])]),
             Section::groups("memory", Some(Layer::Conversation), vec![
                 ("【进行中的话题】".into(), vec!["- 旧话题".into(), "- 新话题".into()]),
-                ("【你想说但还没说的】".into(), vec!["- 旧想法".into(), "- 新想法".into()])]),
+                ("【未说出的念头】".into(), vec!["- 旧想法".into(), "- 新想法".into()])]),
             Section::parts("participation", Some(Layer::Conversation), vec!["参与度\n\n".into()]),
             Section::parts("behaviour", None, vec!["行为规则\n\n".into()]),
         ]
@@ -264,7 +264,7 @@ mod tests {
         let a = assemble(layered(), &defaults());
         assert_eq!(a.sections["identity"], "【你的身份】小鲸鱼\n\n");
         assert_eq!(a.sections["impressions"], "【对群友的印象】\n- 甲：爱猫\n- 乙：爱狗\n\n");
-        assert_eq!(a.sections["memory"], "【进行中的话题】\n- 旧话题\n- 新话题\n【你想说但还没说的】\n- 旧想法\n- 新想法\n\n");
+        assert_eq!(a.sections["memory"], "【进行中的话题】\n- 旧话题\n- 新话题\n【未说出的念头】\n- 旧想法\n- 新想法\n\n");
         assert_eq!(a.sections["behaviour"], "行为规则\n\n");
         assert_eq!(a.counts, Counts { identity: 1, relationship: 3, conversation: 5, material: 0 });
         assert_eq!(a.cut, Counts::default());
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn conversation_is_cut_from_the_last_section_backwards_and_oldest_line_first() {
-        let kept = "【进行中的话题】\n- 旧话题\n- 新话题\n【你想说但还没说的】\n- 新想法\n\n";
+        let kept = "【进行中的话题】\n- 旧话题\n- 新话题\n【未说出的念头】\n- 新想法\n\n";
         let a = assemble(layered(), &Budgets { conversation: estimate_tokens(kept), ..defaults() });
         assert_eq!(a.sections["participation"], "");
         assert_eq!(a.sections["memory"], kept);

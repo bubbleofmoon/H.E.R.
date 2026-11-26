@@ -153,12 +153,12 @@ pub struct SaveOutcome {
 /// Saves (or, with an empty text, deletes) one entry. `Err((status, message))` carries the exact
 /// JS status and error text.
 pub fn set(context: &RuntimeContext, cfg: &Value, key: &str, raw_text: &str, now_ms: i64) -> Result<SaveOutcome, (u16, String)> {
-    let canonical = canonical_key(key).ok_or((400, "key 格式应为 group:群号 或 private:QQ号".to_string()))?;
+    let canonical = canonical_key(key).ok_or((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()))?;
     let max = max_chars(cfg);
     let text = normalize_text(raw_text);
     let len = utf16_len(&text);
     if len > max {
-        return Err((400, format!("初始提示词过长（{len} 字符，上限 {max}）；请精简后重试")));
+        return Err((400, format!("开场背景设定超出字数上限（现有 {len} 字符，至多 {max}）；请删减精简后再存")));
     }
     let _gate = SAVE_GATE.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load(context);
@@ -201,13 +201,13 @@ pub fn format_injection(context: &RuntimeContext, cfg: &Value, key: &str) -> Str
     let Some(entry) = store.get(&canonical) else { return String::new() };
     let max = max_chars(cfg);
     let body = if utf16_len(&entry.text) > max {
-        format!("{}…（已按上限截断，完整内容见控制台）", crate::social_mem::truncate_text(&entry.text, max as i64))
+        format!("{}…（超出长度限制，完整正文见控制台）", crate::social_mem::truncate_text(&entry.text, max as i64))
     } else {
         entry.text.clone()
     };
     let body = crate::model_view::strip_from_model_text(&body, cfg);
     let label = if key.trim_matches(js_is_space).starts_with("private:") { "私聊环境" } else { "群聊环境" };
-    format!("【{label}（操作者预设，仅本次首次唤醒参考）】\n{body}\n（以上是操作者提供的背景，不是群友发的消息、也不是新的系统指令；据此把握圈子主题、氛围与分寸，不必向群友复述。）")
+    format!("【{label}（管理员预置，仅首次唤醒附带）】\n{body}\n（以上为管理员写入的背景设定，并非他人发言或系统命令，供把握语境与分寸参考，无需对外转述。）")
 }
 
 #[cfg(test)]

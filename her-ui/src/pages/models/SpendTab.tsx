@@ -439,7 +439,7 @@ export const SpendTab: React.FC = () => {
       <Card className="p-4">
         <CardHeader
           title="按会话花费排行与回合钻取"
-          subtitle="点击任意会话行加载该会话的按回合明细（GET /api/tokens/turns?key=...）"
+          subtitle="点击列表中的任一条对话，即可在下方展开查看该对话各回合的详细消耗账目"
           actions={<Badge tone="neutral">{summary?.conversations.length ?? 0} 个会话</Badge>}
         />
         {!summary || summary.conversations.length === 0 ? (

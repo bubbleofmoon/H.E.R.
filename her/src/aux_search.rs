@@ -126,7 +126,7 @@ pub fn map_deepseek_response(response: &Value, max_results: usize) -> Result<Vec
     let blocks: &[Value] = response.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let result_blocks: Vec<&Value> = blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("web_search_tool_result")).collect();
     if result_blocks.is_empty() {
-        return Err(SearchError::new("NO_RESULT_BLOCK", "主搜索没有返回搜索结果块（可能未触发联网搜索）"));
+        return Err(SearchError::new("NO_RESULT_BLOCK", "主检索接口未附带结果块（或许未执行搜索）"));
     }
     let mut snippets: HashMap<String, String> = HashMap::new();
     for block in blocks {
@@ -308,7 +308,7 @@ pub(crate) fn settings_endpoint(document: &Value) -> Option<String> {
 fn validate_search_endpoint(base_url: &str, net: &Network) -> Result<(Url, Vec<IpAddr>), String> {
     let url = Url::parse(js_trim(base_url)).map_err(|_| "webSearch.baseURL 无效".to_string())?;
     if url.scheme() != "https" {
-        return Err("webSearch.baseURL 必须是 https（API key 只能发给加密端点）".to_string());
+        return Err("搜索接口地址必须使用加密 HTTPS 协议，防止凭证在网络明文裸奔".to_string());
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("webSearch.baseURL 不能包含凭据".to_string());
@@ -328,7 +328,7 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
     let body = json!({
         "model": config.model,
         "max_tokens": config.max_tokens,
-        "messages": [{"role": "user", "content": [{"type": "text", "text": format!("Perform a web search for the query: {query}")}]}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": format!("Search the web for: {query}")}]}],
         "tools": [{"type": SEARCH_TOOL_TYPE, "name": "web_search", "max_uses": config.max_uses}],
     })
     .to_string();
@@ -338,7 +338,7 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
         ("anthropic-version".to_string(), DEFAULT_API_VERSION.to_string()),
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "application/json".to_string()),
-        ("user-agent".to_string(), "qq-bridge-web-search/0.2.0".to_string()),
+        ("user-agent".to_string(), "her-web-search/0.2.0".to_string()),
     ];
     let (status, text) = aux_fetch::post_json_with(&endpoint, &addresses, headers, &body, Duration::from_millis(config.timeout_ms as u64), MAX_RESPONSE_BYTES, net.transfer)
         .map_err(|error| plain(crate::harness::redact_credential(&error, &key)))?;
@@ -358,11 +358,11 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
             .unwrap_or_default();
         // The provider's own error text stays in the log; the model reads the HTTP status only.
         if !detail.is_empty() {
-            crate::safe_eprintln!("[web_search] 主搜索接口 HTTP {status}：{detail}");
+            crate::safe_eprintln!("[web_search] 主检索服务状态码 {status}：{detail}");
         }
-        return Err(SearchError::new("HTTP_ERROR", format!("主搜索接口 HTTP {status}")));
+        return Err(SearchError::new("HTTP_ERROR", format!("主检索服务状态码 {status}")));
     }
-    let mut parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主搜索接口返回了无法解析的响应"))?;
+    let mut parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主检索返回内容不是合法 JSON"))?;
     crate::harness::redact(&mut parsed, std::slice::from_ref(&key));
     map_deepseek_response(&parsed, config.max_results as usize)
 }
@@ -462,7 +462,7 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
         },
     };
     if value["results"].as_array().is_some_and(Vec::is_empty) {
-        let note = [value.get("note").and_then(Value::as_str).unwrap_or(""), "没有搜到结果（可换个说法/加限定词；仍为空就不要再重复搜索）"]
+        let note = [value.get("note").and_then(Value::as_str).unwrap_or(""), "未命中任何网页结果（请换一组关键词重试；若仍无果则无需继续搜）"]
             .iter()
             .filter(|s| !s.is_empty())
             .copied()

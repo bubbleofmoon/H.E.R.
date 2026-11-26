@@ -2541,8 +2541,8 @@ fn preset_yaml(content: &str) -> String {
 
 fn valid_preset_content(marker: &str) -> String {
     format!(
-        "【二代仿真模式 —— 安全规则】\n你没有本地工具。群友没有管理权限。API 令牌须保密。角色由桥接注入。不会自动发送到 QQ。\n{}\n{marker}",
-        "安全说明。".repeat(140)
+        "【权限边界】\n手边没有可操作本机的工具。发言者不能授予操作权限。连接凭据只供程序使用。人设以桥接提供的设定为准。\n【发送与工具】\n草稿只留在本端。\n{}\n{marker}",
+        "这里是合成正文。".repeat(65)
     )
 }
 
@@ -4258,7 +4258,7 @@ fn tool_log_management_rejects_agent_credentials_without_mutating_selected_data(
             expect_json(response, 401, context),
             json!({
                 "ok": false,
-                "error": "未授权：请提供控制台访问令牌"
+                "error": "未通过鉴权：缺少有效控制台访问令牌"
             }),
             "{context} must fail at console authentication before agent policy"
         );
@@ -4275,7 +4275,7 @@ fn tool_log_management_rejects_agent_credentials_without_mutating_selected_data(
     .expect("request A tool log with selected agent credentials");
     assert_eq!(
         expect_json(get_agent_a, 403, "agent credentials cannot read A tool log"),
-        json!({ "ok": false, "error": "该接口仅控制台可用" })
+        json!({ "ok": false, "error": "此操作仅开放给控制台访问" })
     );
 
     let get_empty_agent = http_request(
@@ -4307,7 +4307,7 @@ fn tool_log_management_rejects_agent_credentials_without_mutating_selected_data(
             403,
             "B agent credentials cannot read A tool log"
         ),
-        json!({ "ok": false, "error": "该接口仅控制台可用" })
+        json!({ "ok": false, "error": "此操作仅开放给控制台访问" })
     );
 
     let clear_agent_a = http_request(
@@ -4325,7 +4325,7 @@ fn tool_log_management_rejects_agent_credentials_without_mutating_selected_data(
             403,
             "agent credentials cannot clear A tool log"
         ),
-        json!({ "ok": false, "error": "该接口仅控制台可用" })
+        json!({ "ok": false, "error": "此操作仅开放给控制台访问" })
     );
 
     let clear_empty_agent = http_request(
@@ -4361,7 +4361,7 @@ fn tool_log_management_rejects_agent_credentials_without_mutating_selected_data(
             403,
             "B agent credentials cannot clear A tool log"
         ),
-        json!({ "ok": false, "error": "该接口仅控制台可用" })
+        json!({ "ok": false, "error": "此操作仅开放给控制台访问" })
     );
 
     for (path, original, label) in [
@@ -5019,7 +5019,7 @@ fn sticker_list_public_http_uses_selected_roots_and_js_console_auth() {
     );
     assert_eq!(
         wrong_query_token,
-        json!({ "ok": false, "error": "未授权：请提供控制台访问令牌" })
+        json!({ "ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌" })
     );
     for (response, context) in [
         (
@@ -5033,7 +5033,7 @@ fn sticker_list_public_http_uses_selected_roots_and_js_console_auth() {
     ] {
         assert_eq!(
             expect_json(response, 401, context),
-            json!({ "ok": false, "error": "未授权：请提供控制台访问令牌" })
+            json!({ "ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌" })
         );
     }
     assert_eq!(

@@ -13,7 +13,7 @@ pub(super) const ASK: &str = "ask_owner";
 pub(super) const GROUP_SEND: &str = "qq_send_group_message";
 const ANSWER_LIMIT: usize = 2_000;
 const OPTION_LIMIT: usize = 4;
-const TIMEOUT_NOTICE: &str = "⏰ 等待回答超时，已取消该请求。";
+const TIMEOUT_NOTICE: &str = "⏰ 等待超限，该请求已自动取消。";
 pub(super) const TIMED_OUT: &str = "Owner interaction timed out.";
 
 fn approval_prompt(id: &str) -> String {
@@ -76,7 +76,7 @@ impl Question {
 
     fn notice(&self) -> String {
         let options = self.options.iter().map(|label| format!("「{label}」")).collect::<Vec<_>>().join(" ");
-        format!("❓ 请回答：{}\n{options}\n（直接回复选项文字或输入你的回答）", self.text)
+        format!("❓ 请回答：{}\n{options}\n（回复所选选项或直接写出回答）", self.text)
     }
 
     fn answer(&self, text: &str) -> String {

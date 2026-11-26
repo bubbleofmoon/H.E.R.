@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub(crate) const KEY_FORMAT_ERROR: &str = "key 格式应为 group:群号 或 private:QQ号";
+pub(crate) const KEY_FORMAT_ERROR: &str = "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>";
 pub(crate) const END_TURN: &str =
     "end this turn now: produce your final answer and make no further tool calls";
 pub(crate) const PENDING_REVOCATIONS: &str = "access-revocations-pending.json";
@@ -144,13 +144,13 @@ impl SessionStopper for DshSessionStopper {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 crate::safe_println!(
-                    "[console] ⚠️ 停止/归档旧会话失败 {key} -> {session_id}：{error}；请在 DSH 检查旧任务"
+                    "[console] ⚠️ 结束或归档旧会话失败 {key} -> {session_id}：{error}；请到引擎面板核查残留任务"
                 );
                 Err(error)
             }
             Err(_) => {
                 crate::safe_println!(
-                    "[console] ⚠️ 停止/归档旧会话超时 {key} -> {session_id}；请在 DSH 检查旧任务"
+                    "[console] ⚠️ 结束或归档旧会话超时 {key} -> {session_id}；请到引擎面板核查残留任务"
                 );
                 Err("停止旧会话超时".to_string())
             }
@@ -834,7 +834,7 @@ pub(crate) fn set_mode_with(
 ) -> Result<Value, SocialError> {
     let Some(normalized) = normalize_mode(raw_mode.trim()) else {
         return Err(SocialError::BadInput(
-            "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）"
+            "无效的运行模式：mode 仅允许设为 chat、reserved、reserved2 或 closed-agent 之一（若传入 simulation 则等效于二代模式）"
                 .to_string(),
         ));
     };
@@ -862,7 +862,7 @@ pub(crate) fn set_mode_with(
             false
         };
         if sync_dsh && !dsh_synced {
-            crate::safe_println!("[console] 模式写穿 DSH 失败；本次仅写本地，下次 DSH 轮询会覆盖回滚");
+            crate::safe_println!("[console] 模式未能写穿 DSH，当前仅落本地配置；下轮 DSH 同步可能还原");
         }
         crate::safe_println!("[console] 模式已设置为 {normalized}");
         return Ok(json!({
@@ -885,7 +885,7 @@ pub(crate) fn set_mode_isolated_locked(
 ) -> Result<Value, SocialError> {
     let Some(normalized) = normalize_mode(raw_mode.trim()) else {
         return Err(SocialError::BadInput(
-            "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）"
+            "无效的运行模式：mode 仅允许设为 chat、reserved、reserved2 或 closed-agent 之一（若传入 simulation 则等效于二代模式）"
                 .to_string(),
         ));
     };
@@ -1243,7 +1243,7 @@ pub(crate) fn authorize_read(
     };
     if agent_token.is_empty() || !token_ok(context, &key, &agent_token)? {
         return Err(SocialError::Forbidden(if agent_token.is_empty() {
-            "缺少会话令牌；旧只读工具在需要令牌的模式下不可用，请改用带会话令牌的 v2 读工具"
+            "缺少对话令牌；当前模式已关闭无令牌旧读接口，请改调携带令牌的 v2 只读工具"
                 .to_string()
         } else {
             "agent token 无效".to_string()
@@ -1252,7 +1252,7 @@ pub(crate) fn authorize_read(
     let current_mode = mode_checked(context)?;
     if !positive_id(id) || !access_allowed(cfg, &current_mode, &key) {
         return Err(SocialError::Forbidden(
-            "当前模式不允许读取该会话".to_string(),
+            "当前运行模式下无权查看此会话".to_string(),
         ));
     }
     Ok(key)
@@ -1938,7 +1938,7 @@ pub(crate) fn queue_admin_wake(
     let current_mode = mode_checked(context)?;
     if current_mode != "reserved2" {
         return Err(SocialError::Forbidden(
-            "该接口仅 reserved2 模式可用".to_string(),
+            "当前接口仅限 reserved2 模式调用".to_string(),
         ));
     }
     let Some((_, id)) = key_parts(&key) else {
@@ -1946,7 +1946,7 @@ pub(crate) fn queue_admin_wake(
     };
     if !positive_id(id) || !access_allowed(cfg, &current_mode, &key) {
         return Err(SocialError::Forbidden(
-            "目标不在当前模式允许范围内".to_string(),
+            "目标会话未被当前运行模式放行".to_string(),
         ));
     }
     let canonical = canonical_key(&key)
@@ -1956,14 +1956,14 @@ pub(crate) fn queue_admin_wake(
         .update_or_init(&canonical, |conversation| {
             let current_mode = mode_checked(context).map_err(SocialError::into_http)?;
             if current_mode != "reserved2" {
-                return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+                return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
             }
             let fresh = context.load_config().map_err(|e| (503, e.to_string()))?;
             if !still_authorized(&fresh) {
                 return Err((401, "console credential was revoked".to_string()));
             }
             if !access_allowed(&fresh, &current_mode, &key) {
-                return Err((403, "目标不在当前模式允许范围内".to_string()));
+                return Err((403, "目标会话未被当前运行模式放行".to_string()));
             }
             let first = conversation
                 .field("bootstrapSent")
@@ -1994,7 +1994,7 @@ pub(crate) fn queue_admin_wake(
     crate::safe_println!(
         "[console] 控制台：手动唤醒 {key}（{effective}{}）",
         if first && reason != effective {
-            format!("，首次唤醒，请求原因 {reason} 已升级为 bootstrap")
+            format!("，初次启动唤醒，已将原因 {reason} 转为 bootstrap")
         } else {
             String::new()
         }
@@ -2191,7 +2191,7 @@ pub(crate) fn reset_conversation_with(
             })
             .map_err(SocialError::from_http)?;
         crate::safe_println!(
-            "[console] 已清除会话上下文 {key}（旧会话 {old_session}；注意：未调用 DSH 归档/停止）"
+            "[console] 已清理会话上下文 {key}（原会话 {old_session}；未触发 DSH 停止或归档）"
         );
         return Ok(json!({ "ok": true, "key": key, "archived": old_session }));
     }
@@ -2393,7 +2393,7 @@ pub(crate) fn reset_all_v2_with(
             failures.join("；")
         )));
     }
-    crate::safe_println!("[console] 控制台：二代 AI 状态已重置（会话、定时器、唤醒配置已清空，工具日志保留）");
+    crate::safe_println!("[console] 二代社交状态已清零（已重置会话记录、计时与唤醒参数，保留工具日志）");
     Ok(json!({ "ok": true }))
 }
 

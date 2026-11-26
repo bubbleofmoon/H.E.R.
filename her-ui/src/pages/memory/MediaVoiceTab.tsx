@@ -414,7 +414,7 @@ export const MediaVoiceTab: React.FC = () => {
               <Badge tone="neutral">共 {stickerTotal} 个</Badge>
             </span>
           }
-          subtitle={`最近同步：${formatDateTimeMs(stickerSyncedAt)}。AI 主动发表情仅在二代仿真回合中通过 agent token 执行，管理员可在此同步、预览、标注备注与收藏。`}
+          subtitle={`最近同步：${formatDateTimeMs(stickerSyncedAt)}。AI 主动发表情仅在二代仿真回合中通过会话令牌执行，管理员可在此同步、预览、标注备注与收藏。`}
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <select

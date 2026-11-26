@@ -719,7 +719,7 @@ fn a_message_that_matches_no_memory_renders_no_recalled_memory() {
     st["unread"][0]["text"] = json!("今天中午吃什么好呢，想不出来");
     let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &st, key);
     assert!(!block.contains("\n- [推断·fact"), "no pinned or recent padding: {block}");
-    assert!(!block.contains("【记忆】你可能需要回顾"), "{block}");
+    assert!(!block.contains("【记忆】参考过往记录"), "{block}");
 }
 
 #[test]

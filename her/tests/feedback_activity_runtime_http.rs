@@ -325,7 +325,7 @@ fn feedback_is_rate_limited_per_session_and_the_sixth_in_a_minute_is_refused() {
         assert_eq!(s, 200, "{b}");
     }
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "sixth"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (429, "反馈过于频繁，请稍后再试"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (429, "触发反馈频率上限，请稍后再试"));
     // Another session's quota is separate.
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "fresh"}));
     assert_eq!(s, 200);
@@ -366,9 +366,9 @@ fn clear_is_console_only_and_agents_cannot_read_the_list() {
     fs::write(root.p("data/feedback.json"), history().to_string()).unwrap();
     let console = Console::start(&root);
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback-clear", json!({}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "该接口仅控制台可用"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
     let (s, b) = console.agent(AGENT_A, "GET", "/api/socialV2/feedback", Value::Null);
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "该接口仅控制台可用"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
     assert_eq!(entries(&console).len(), 2, "refused calls change nothing");
     let (s, b) = console.admin("POST", "/api/socialV2/feedback-clear", json!({}));
     assert_eq!((s, b), (200, json!({"ok": true})));
@@ -488,7 +488,7 @@ fn error_feedback_notifies_the_owner_once_per_window_only_when_enabled() {
     let sent = ob.wait_for("send_private_msg", 1);
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["user_id"], OWNER);
-    assert!(sent[0].to_string().contains("[group:70001] AI 报错反馈：broken tool"), "{}", sent[0]);
+    assert!(sent[0].to_string().contains("[group:70001] 对话端上报异常：broken tool"), "{}", sent[0]);
     // Same dedupe key within 60 s: recorded, not pushed again.
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "level": "error", "message": "second error"}));
     assert_eq!(s, 200);
@@ -565,9 +565,9 @@ fn sends_feedback_and_pokes_leave_activity_lines_the_status_shows_to_the_operato
     assert_eq!(
         texts,
         vec![
-            "group:70001 [reserved2] AI 反馈 [info]：hello there",
-            "group:70001 [reserved2] 工具统一发送：成功 1/1 条",
-            "group:70001 [reserved2] 工具分条发送：成功 1/1 条",
+            "group:70001 [reserved2] 对话端发来运行情况反馈记录，记录级别为 [info]，简要说明如下：hello there",
+            "group:70001 [reserved2] 工具通道已把本批消息合为一条并投递完毕，总计成功发出 1 条（计划共 1 条）",
+            "group:70001 [reserved2] 工具通道已把本批消息拆为逐条气泡投递完毕，总计成功发出 1 条（计划共 1 条）",
             "group:70001 [send] 成功 1/1 条：gamma",
             "private:9002 [reserved2] 工具拍一拍",
         ]
@@ -594,7 +594,7 @@ fn activity_text_is_redacted_and_the_log_rotates_at_five_hundred_lines() {
     let backup = root.text("data/qq-activity.log.1");
     assert_eq!(backup.lines().count(), 501);
     let last = backup.lines().last().unwrap();
-    assert_eq!(unclocked(last), "group:70001 [reserved2] AI 反馈 [info]：see *** and ***");
+    assert_eq!(unclocked(last), "group:70001 [reserved2] 对话端发来运行情况反馈记录，记录级别为 [info]，简要说明如下：see *** and ***");
     assert_eq!(status_activity(&console), Vec::<String>::new());
     drop(console);
 }
@@ -730,7 +730,7 @@ fn a_failed_write_is_reported_not_shown_as_success_and_nothing_is_lost_or_half_a
     assert_eq!(b["ok"], false);
     blocked_feedback.restore();
     assert_eq!(entries(&console), history().as_array().cloned().unwrap(), "history intact, the failed report is not listed");
-    assert!(!root.text("data/qq-activity.log").contains("AI 反馈"), "no activity line for a report that was not stored");
+    assert!(!root.text("data/qq-activity.log").contains("对话端发来运行情况反馈记录"), "no activity line for a report that was not stored");
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "stored after recovery"}));
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 3);

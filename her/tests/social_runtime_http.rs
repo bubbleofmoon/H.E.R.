@@ -437,7 +437,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         wrong_console_read,
         401,
-        "未授权：请提供控制台访问令牌",
+        "未通过鉴权：缺少有效控制台访问令牌",
         "B console token on A",
     );
     let wrong_console_write = http_request(
@@ -459,7 +459,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         wrong_console_write,
         401,
-        "未授权：请提供控制台访问令牌",
+        "未通过鉴权：缺少有效控制台访问令牌",
         "cross-root console token write",
     );
     assert_eq!(fs::read(&state_a_path).unwrap(), state_a_initial);
@@ -480,7 +480,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         agent_on_config,
         403,
-        "该接口仅控制台可用",
+        "此操作仅开放给控制台访问",
         "agent token on admin-only social config",
     );
     assert_eq!(fs::read(&config_a_path).unwrap(), config_a_initial);
@@ -575,7 +575,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         disallowed_agent_read,
         403,
-        "目标不在当前模式允许范围内",
+        "目标会话未被当前运行模式放行",
         "valid B agent token outside selected allow-list",
     );
     assert_eq!(fs::read(&state_a_path).unwrap(), state_a_initial);
@@ -639,7 +639,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     );
     assert_eq!(
         invalid_append["error"],
-        "category 必须是 activeTopic / pendingThought / memberImpression"
+        "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交"
     );
     assert_eq!(fs::read(&state_a_path).unwrap(), state_a_initial);
     assert_eq!(fs::read(&state_b_path).unwrap(), state_b_initial);
@@ -793,7 +793,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         wrong_console_config_write,
         401,
-        "未授权：请提供控制台访问令牌",
+        "未通过鉴权：缺少有效控制台访问令牌",
         "cross-root config write",
     );
     assert_eq!(fs::read(&config_a_path).unwrap(), config_a_initial);
@@ -1006,7 +1006,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     assert_http_error(
         mode_rejected_agent_read,
         403,
-        "该接口仅 reserved2 模式可用",
+        "当前接口仅限 reserved2 模式调用",
         "agent memory request while selected mode is chat",
     );
     assert_eq!(fs::read(&state_a_path).unwrap(), state_a_before_mode_probe);

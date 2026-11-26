@@ -916,7 +916,7 @@ fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
         assert_eq!(
             full["warnings"],
             json!([
-                "完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。",
+                "整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。",
                 "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。",
             ])
         );

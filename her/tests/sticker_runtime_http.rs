@@ -472,7 +472,7 @@ fn send_with_missing_image_or_removed_favorite_sends_nothing_and_changes_nothing
     // The CDN no longer serves the picture: nothing is sent, the quota slot is given back.
     let (status, result) = console.call("POST", "/api/socialV2/send-sticker", true, json!({"key": KEY, "stickerId": "stk1"}));
     assert_eq!(status, 500, "{result}");
-    assert!(result["error"].as_str().unwrap().contains("图片下载失败"), "{result}");
+    assert!(result["error"].as_str().unwrap().contains("拉取图片数据失败"), "{result}");
     assert_eq!(ob.count("send_group_msg"), 0);
     let state = root.json("data/social-v2.json");
     assert_eq!(state["conversations"][KEY]["sendTimes"], json!([]));
@@ -549,7 +549,7 @@ fn model_reads_a_favorite_image_and_gets_js_errors_for_missing_pictures() {
     // Known favorite whose CDN picture is gone.
     let (status, bad) = console.call("GET", &path("stk2"), true, Value::Null);
     assert_eq!(status, 500, "{bad}");
-    assert!(bad["error"].as_str().unwrap().starts_with("获取表情图片失败："), "{bad}");
+    assert!(bad["error"].as_str().unwrap().starts_with("读取表情图片出错："), "{bad}");
 
     // Unknown id: one forced refresh is attempted, then the JS error.
     let before = ob.count("fetch_custom_face_detail");
@@ -579,7 +579,7 @@ fn model_collects_a_chat_sticker_with_remark_and_it_becomes_usable() {
     fs::write(root.p("data/social-v2.json"), state.to_string()).unwrap();
     let console = Console::start(&root);
 
-    for (id, needle) in [("m101", "不能收藏自己发的表情"), ("m102", "没有可收藏的图片"), ("zzz", "找不到这条消息")] {
+    for (id, needle) in [("m101", "自己的表情无法收藏"), ("m102", "消息中未含可收藏的图像"), ("zzz", "找不到这条消息")] {
         let (status, bad) = console.call("POST", "/api/socialV2/collect-sticker", true, json!({"key": KEY, "messageId": id}));
         assert_eq!(status, 500, "{bad}");
         assert!(bad["error"].as_str().unwrap().contains(needle), "{bad}");

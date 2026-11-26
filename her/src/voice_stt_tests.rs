@@ -530,7 +530,7 @@ async fn no_helper_keeps_the_label_and_tells_the_owner_once() {
     std::fs::remove_dir_all(root).unwrap();
     assert_eq!((first, second), (None, None), "the messages keep [语音]");
     assert_eq!(told.len(), 1, "the owner is told once per outage: {told:?}");
-    assert!(told[0].contains("没有配置本机转写引擎"), "{told:?}");
+    assert!(told[0].contains("尚未配置本地语音识别服务地址"), "{told:?}");
     assert_eq!(edges.len(), 1, "one unavailable record: {edges:?}");
 }
 

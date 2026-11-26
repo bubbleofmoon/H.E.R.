@@ -87,7 +87,7 @@ const ROWS: &str = "- id: system-prompt\n  config:\n    includeHarnessIdentity: 
 
 /// The managed block (LF line endings, ends with a newline).
 pub(crate) fn render_block() -> String {
-    format!("{BEGIN}\n# 由 HER 维护：启动时整段写回并放在文件最后，请勿手工编辑内部条目。\n{ROWS}{END}\n")
+    format!("{BEGIN}\n# 由 HER 自动维护，启动时会在文件末尾整段重写，请勿手动修改此区块。\n{ROWS}{END}\n")
 }
 
 /// The profile patch text after installing HER's block into `existing`: any old block is taken out, everything

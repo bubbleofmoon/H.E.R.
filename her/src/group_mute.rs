@@ -40,8 +40,8 @@ impl Mute {
     /// Model-facing result of a locally refused send.
     pub fn refusal_text(&self, now: i64, cfg: &Value) -> String {
         let when = match (self.whole_group, self.until) {
-            (false, Some(until)) => { let t = clock(until, now, cfg); format!("被禁言至 {t}（muted in this group until {t}）") }
-            _ => "被禁言，结束时间未知（muted in this group, end unknown）".to_string(),
+            (false, Some(until)) => { let t = clock(until, now, cfg); format!("当前群内被禁言直到 {t} 为止（muted until {t}）") }
+            _ => "当前群内正处于禁言状态且解禁时间未明（muted end unknown）".to_string(),
         };
         format!("你在这个群{when}，消息没有发出，也不会重发。禁言结束前不要再在这个群发消息。{}", crate::social_state::END_TURN)
     }
@@ -615,7 +615,7 @@ mod tests {
         let timed = Mute { until: Some(NOW + 600_000), whole_group: false };
         let text = timed.refusal_text(NOW, &json!({"time":{"zone":"Asia/Shanghai"}}));
         assert!(
-            text.contains("muted in this group until")
+            text.contains("muted until")
                 && text.contains(crate::social_state::END_TURN),
             "{text}"
         );

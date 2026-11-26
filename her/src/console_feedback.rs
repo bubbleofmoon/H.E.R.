@@ -29,7 +29,7 @@ pub(super) fn get(context: &RuntimeContext) -> (u16, Value) {
 /// `POST /api/socialV2/feedback-clear`: console only.
 pub(super) fn clear(context: &RuntimeContext, headers: &HashMap<String, String>) -> (u16, Value) {
     if headers.contains_key("x-agent-token") {
-        return failure((403, "该接口仅控制台可用".to_string()));
+        return failure((403, "此操作仅开放给控制台访问".to_string()));
     }
     match crate::feedback::clear(context) {
         Ok(()) => {
@@ -70,14 +70,14 @@ fn post_inner(
             return Err((403, "agent token 无效".to_string()));
         }
         if !social_v2_projection_session_allowed(cfg, &key) {
-            return Err((403, "目标不在当前模式允许范围内".to_string()));
+            return Err((403, "目标会话未被当前运行模式放行".to_string()));
         }
         if !tool_enabled(cfg, "feedback") {
             return Err((403, "工具未启用：qq_report_feedback".to_string()));
         }
     }
     if !crate::feedback::allow(&scope_of(context), &key, now_ms()) {
-        return Err((429, "反馈过于频繁，请稍后再试".to_string()));
+        return Err((429, "触发反馈频率上限，请稍后再试".to_string()));
     }
     let max_length = agent::js_number_or(cfg.pointer("/socialV2/feedback/maxLength"), 500.0).max(1.0);
     let message = crate::social_mem::truncate_text(&raw, max_length as i64);
@@ -96,9 +96,9 @@ fn post_inner(
     )?;
     let head = crate::activity::slice(&safe_message, 80);
     crate::safe_println!("[reserved2] AI 反馈 ({key}) [{level}]: {}", crate::activity::redact(context, &head));
-    crate::activity::append(context, &format!("{key} [reserved2] AI 反馈 [{level}]：{head}"));
+    crate::activity::append(context, &format!("{key} [reserved2] 对话端发来运行情况反馈记录，记录级别为 [{level}]，简要说明如下：{head}"));
     if level == "error" && cfg.pointer("/socialV2/feedback/notifyOwnerOnError").is_some_and(truthy) {
-        crate::admin_alert::notify_owner(context, cfg, &format!("[{key}] AI 报错反馈：{safe_message}"), "agent-feedback");
+        crate::admin_alert::notify_owner(context, cfg, &format!("[{key}] 对话端上报异常：{safe_message}"), "agent-feedback");
     }
     Ok(json!({ "ok": true, "key": key, "level": level, "message": message }))
 }

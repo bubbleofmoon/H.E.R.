@@ -321,7 +321,7 @@ export const AccessToolsSection: React.FC<AccessToolsSectionProps> = ({
         <Card>
           <CardHeader
             title="会话读取鉴权诊断"
-            subtitle="验证指定会话 key 与 agent-token 对是否拥有读取授权 (/api/authorize/read)"
+            subtitle="核查所填的会话代号和会话口令组合有没有取得只读检索许可（调用读取鉴权探针）"
           />
           <form onSubmit={(e) => void handleReadCheck(e)} className="space-y-3 p-4">
             <div>
@@ -365,7 +365,7 @@ export const AccessToolsSection: React.FC<AccessToolsSectionProps> = ({
 
       <Card danger>
         <CardHeader
-          title="危险操作：轮换控制台令牌 (/api/console/token)"
+          title="高危管理动作：作废旧凭证并立即生成全新控制台令牌"
           subtitle="立即吊销所有历史浏览器会话并要求重新登录，且不可通过审计撤销"
         />
         <div className="space-y-3 p-4">

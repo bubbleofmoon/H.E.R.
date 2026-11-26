@@ -713,11 +713,11 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
     assert!(response_a.body["warn"]
         .as_str()
         .unwrap()
-        .contains("中文空格"));
+        .contains("全角空格"));
     assert!(response_a.body["splitWarn"]
         .as_str()
         .unwrap()
-        .contains("同一句话"));
+        .contains("一整句话"));
     let a_state_after_initial: Value =
         serde_json::from_slice(&fs::read(root_a.join("data/social-v2.json")).unwrap()).unwrap();
 
@@ -1236,7 +1236,7 @@ fn send_message_rejects_oversized_declared_body_after_auth_without_side_effects(
     assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
     assert_eq!(
         unauthorized.body["error"],
-        "未授权：请提供控制台访问令牌"
+        "未通过鉴权：缺少有效控制台访问令牌"
     );
 
     for (console, console_token) in [(&console_a, CONSOLE_A), (&console_b, CONSOLE_B)] {
@@ -1316,7 +1316,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
     assert_eq!(
         unauthorized.body["error"],
-        "未授权：请提供控制台访问令牌"
+        "未通过鉴权：缺少有效控制台访问令牌"
     );
 
     let empty_agent = http_request_with_chunked_oversize_body(
@@ -1362,7 +1362,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     )
     .expect("read the disabled-v2 gate response before the body limit");
     assert_eq!(disabled.status, 403, "v2 enabled gate must precede body limits");
-    assert_eq!(disabled.body["error"], "二代模式已关闭，当前不允许执行 v2 工具");
+    assert_eq!(disabled.body["error"], "二代社交功能已停用，禁止调用 v2 工具");
     assert_eq!(fs::read(&config_a).unwrap(), disabled_before);
     fs::write(&config_a, &config_a_before).unwrap();
 
@@ -1377,7 +1377,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     )
     .expect("read the mode gate response before the body limit");
     assert_eq!(wrong_mode.status, 403, "mode gate must precede body limits");
-    assert_eq!(wrong_mode.body["error"], "该接口仅 reserved2 模式可用");
+    assert_eq!(wrong_mode.body["error"], "当前接口仅限 reserved2 模式调用");
     assert_eq!(fs::read(&mode_a).unwrap(), mode_chat_before);
     fs::write(&mode_a, &mode_a_before).unwrap();
 
@@ -1858,7 +1858,7 @@ fn token_rotation_during_a_batch_cancels_the_remaining_items() {
     assert_eq!(response.status, 500, "cancel body: {}", response.body);
     assert_eq!(response.body["sent"], 1);
     assert_eq!(response.body["cancelled"], json!([1, 2]));
-    assert!(response.body["error"].as_str().unwrap().contains("发送已取消"));
+    assert!(response.body["error"].as_str().unwrap().contains("发送中止"));
 
     let requests = onebot.finish();
     assert_eq!(send_paths(&requests).len(), 1, "cancelled items never reach OneBot");
@@ -2106,7 +2106,7 @@ fn a_result_120_refusal_is_not_committed() {
     assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
     let refused: Vec<String> = read_outbox(&root).iter().filter(|r| r["k"] == "not_committed")
         .filter_map(|r| r["error"].as_str().map(str::to_string)).collect();
-    assert_eq!(refused, vec!["OneBot 发送失败：retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
+    assert_eq!(refused, vec!["OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
     drop(onebot);
 }
 
@@ -2133,7 +2133,7 @@ fn a_muted_group_is_refused_locally_without_a_onebot_call() {
     let refused = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
     assert_eq!(refused.status, 403, "{}", refused.body);
     let error = refused.body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("禁言") && error.contains("muted in this group until"), "{}", refused.body);
+    assert!(error.contains("禁言") && error.contains("muted until"), "{}", refused.body);
     assert!(refused.body.get("unknown").is_none(), "a local refusal is never unknown delivery: {}", refused.body);
     assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0);
     assert!(read_outbox(&root).iter().all(|r| r["k"] != "intent"), "no intent for a refused send");

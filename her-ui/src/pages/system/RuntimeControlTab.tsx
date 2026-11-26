@@ -175,7 +175,7 @@ export const RuntimeControlTab: React.FC<RuntimeControlTabProps> = ({
         }
       } else {
         setUnsupportedNotice(
-          `测试发送接口 /api/test-send 在当前隔离运行时暂不可用（HTTP ${res.status}）：${res.reason}`,
+          `本地测试发消息路由 /api/test-send 在当下隔离运行环境无法连通（状态码 ${res.status}）：${res.reason}`,
         );
         pushToast('当前隔离运行时未挂载 /api/test-send', 'warn');
       }

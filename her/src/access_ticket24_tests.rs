@@ -175,7 +175,7 @@ fn ticket24_audit_and_access_routes_refuse_agents_and_missing_credentials() {
         ("POST", "/api/socialV2/reset", Some("{}")),
     ] {
         let (status, reply) = http_json_with_agent(port, method, path, token, Some("old-group-token-abcdefghij"), body);
-        assert_eq!((status, reply["error"].as_str()), (403, Some("该接口仅控制台可用")), "{method} {path}");
+        assert_eq!((status, reply["error"].as_str()), (403, Some("此操作仅开放给控制台访问")), "{method} {path}");
     }
     assert_eq!(http_status_without_token(port, "/api/audit/recent"), 401);
     server.join().unwrap();

@@ -55,10 +55,9 @@ pub(super) fn receipts_of_conv(context: &RuntimeContext, key: &str, conv: &Conve
     seen.into_iter().collect()
 }
 
-/// Seqs the model has been offered in this process under the conversation's current token. They are
-/// deliberately not stored in `social-v2.json`: after a restart the model must fetch unread messages
-/// again (bridge.js `readThroughSeqV2` comment), so a persisted receipt could authorise skipping unseen
-/// messages. A token rotation (cancelled, replaced or reset turn) voids them as well.
+/// Seqs already delivered to the model under the conversation's active token. Deliberately kept
+/// in memory rather than `social-v2.json` so a process restart forces unread messages to be fetched
+/// anew instead of letting stale receipts skip unseen messages. Token rotation clears them too.
 fn tool_receipts(context: &RuntimeContext, key: &str, epoch: &str) -> Vec<i64> {
     let store = receipt_store().lock().unwrap_or_else(|p| p.into_inner());
     match store.get(&(receipt_scope(context), key.to_string())) {
@@ -350,11 +349,11 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
         if token_present {
             match is_live_agent_token(context, token.unwrap()) {
                 Ok(true) => {}
-                Ok(false) => return Some((403, "未授权：调用携带的会话令牌无效".to_string())),
+                Ok(false) => return Some((403, "未授权：所附会话令牌校验不通过".to_string())),
                 Err(error) => return Some(error),
             }
         } else if !(path == "/api/status" || path.starts_with("/api/send/") || path.starts_with("/api/images/")) {
-            return Some((403, "未授权：该接口的工具调用必须携带有效的会话令牌".to_string()));
+            return Some((403, "未授权：该接口的工具调用方须附上合法的会话令牌".to_string()));
         }
     }
     let token = token?;
@@ -372,13 +371,13 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
             Err(error) => return Some(error),
         }
         if cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) == Some(false) {
-            return Some((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+            return Some((403, "二代社交功能已停用，禁止调用 v2 工具".to_string()));
         }
     }
     if path.starts_with("/api/socialV2/") {
         match current_mode_for(context) {
             Ok(mode) if mode == "reserved2" => {}
-            Ok(_) => return Some((403, "该接口仅 reserved2 模式可用".to_string())),
+            Ok(_) => return Some((403, "当前接口仅限 reserved2 模式调用".to_string())),
             Err(error) => return Some(error),
         }
     }
@@ -388,7 +387,7 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
         || path == "/api/stickers"
         || path.starts_with("/api/stickers/");
     if admin_only || !agent_surface(path) {
-        return Some((403, "该接口仅控制台可用".to_string()));
+        return Some((403, "此操作仅开放给控制台访问".to_string()));
     }
     None
 }
@@ -424,12 +423,12 @@ pub(super) use crate::social_state::{
 fn assert_group_member(ob: &crate::onebot::OneBot, group_id: i64, user_id: &str) -> Option<String> {
     let reply = match ob.request("get_group_member_list", json!({ "group_id": group_id })) {
         Some(r) => r,
-        None => return Some(format!("无法获取群 {group_id} 的成员列表：OneBot get_group_member_list 请求失败")),
+        None => return Some(format!("拉取群 {group_id} 成员清单出错：OneBot 成员接口通讯异常")),
     };
     if reply.get("status").and_then(Value::as_str) != Some("ok") || reply.get("retcode").and_then(Value::as_i64) != Some(0) {
         let retcode = reply.get("retcode").map(social_policy_js_string).unwrap_or_else(|| "undefined".to_string());
         let wording = reply.get("wording").and_then(Value::as_str).unwrap_or("");
-        return Some(format!("无法获取群 {group_id} 的成员列表：OneBot get_group_member_list 失败: retcode={retcode} {wording}"));
+        return Some(format!("拉取群 {group_id} 成员清单出错：网关动作被拒（retcode={retcode} {wording}）"));
     }
     let data = reply.get("data").cloned().unwrap_or(Value::Null);
     let members: Vec<Value> = match &data {
@@ -442,12 +441,12 @@ fn assert_group_member(ob: &crate::onebot::OneBot, group_id: i64, user_id: &str)
         .filter(|s| !s.is_empty())
         .collect();
     if ids.is_empty() {
-        return Some(format!("群 {group_id} 的成员列表为空，无法校验拍一拍目标"));
+        return Some(format!("群 {group_id} 名单返回为空，无法核验拍一拍对象"));
     }
     if ids.iter().any(|id| id == user_id) {
         None
     } else {
-        Some(format!("QQ {user_id} 不是群 {group_id} 的成员，已拒绝拍一拍"))
+        Some(format!("账号 {user_id} 不在群 {group_id} 成员中，未执行拍一拍"))
     }
 }
 
@@ -481,35 +480,35 @@ fn send_poke_inner(
         return Err((400, "key 不能为空".to_string()));
     }
     if current_mode_for(context)? != "reserved2" {
-        return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+        return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if token.is_empty() {
-        return Err((403, "reserved2 模式发送拍一拍必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
     }
     if !social_v2_projection_session_allowed(cfg, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if !tool_enabled(cfg, "sendPoke") {
         return Err((403, "工具未启用：qq_send_poke".to_string()));
     }
     if ConversationState::for_runtime(context).read_document()?.paused() {
-        return Err((403, "当前已暂停，不能发送拍一拍".to_string()));
+        return Err((403, "当前处于暂停态，禁用拍一拍".to_string()));
     }
     let Some((kind, id_s, id)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
     };
     if !mode_allowed(cfg, "reserved2", &key) {
-        return Err((403, "当前模式不允许操作该会话".to_string()));
+        return Err((403, "当前运行模式无权改动此会话".to_string()));
     }
     if silent_blocks_send(context, cfg, &key)? {
-        return Err((403, "静默模式已开启，当前不允许拍一拍".to_string()));
+        return Err((403, "当前处于静默状态，暂停拍一拍动作".to_string()));
     }
     if kind == "group" && target.is_empty() {
-        return Err((400, "群聊拍一拍必须指定 targetUserId（要拍的群友 QQ 号）".to_string()));
+        return Err((400, "群聊场景发起拍一拍动作时必须写明目标群友编号（targetUserId）".to_string()));
     }
     let target_ok = target.as_bytes().first().map(|b| (b'1'..=b'9').contains(b)).unwrap_or(false) && target.bytes().all(|b| b.is_ascii_digit());
     if !target.is_empty() && !target_ok {
@@ -538,7 +537,7 @@ fn send_poke_inner(
         send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendPoke")
             .map_err(|(status, m)| (if status == 403 { 403 } else { 500 }, m))?;
         if silent_blocks_send(context, cfg, &key)? {
-            return Err((403, "静默模式已开启，当前不允许拍一拍".to_string()));
+            return Err((403, "当前处于静默状态，暂停拍一拍动作".to_string()));
         }
         let (action, params) = if kind == "group" {
             ("group_poke", json!({ "group_id": id, "user_id": target.parse::<f64>().unwrap_or(0.0) as i64 }))
@@ -560,7 +559,7 @@ fn send_poke_inner(
     })();
     match outcome {
         Ok(()) => {
-            let poke_text = if kind == "group" { format!("[拍一拍] 我拍了拍 {target}") } else { "[拍一拍] 我拍了拍你".to_string() };
+            let poke_text = if kind == "group" { format!("[拍一拍] 轻拍了 {target}") } else { "[拍一拍] 轻拍了你".to_string() };
             let recent_limit = cfg
                 .get("socialV2")
                 .and_then(|s| s.get("context"))
@@ -672,7 +671,7 @@ fn duplicate_window(context: &RuntimeContext, cfg: &Value, key: &str, mark: Opti
     let now = mark.unwrap_or_else(now_ms);
     let gap = now - sends.get(&scope).copied().unwrap_or(0);
     if window > 0 && gap < window {
-        return Some(format!("刚说过话了（{} 秒前），本轮别重复。要补充就合并进上一条。", ((gap as f64) / 1000.0).round() as i64));
+        return Some(format!("{} 秒前刚发过消息，同轮请勿连发；若有补充请并回上一句。", ((gap as f64) / 1000.0).round() as i64));
     }
     if mark.is_some() {
         sends.insert(scope, now);
@@ -793,7 +792,7 @@ pub(super) fn resolve_quote_js(
     None
 }
 
-pub(super) const UNRESOLVED_QUOTE: &str = "无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）";
+pub(super) const UNRESOLVED_QUOTE: &str = "查不到待引用的原消息，请核对编号是否正确且归属当前对话（可先查详情确认）";
 
 /// The process-wide send order (JS `sendChain`), owned by the recorded send.
 pub(super) use crate::recorded_send::send_chain;
@@ -1018,8 +1017,8 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     crate::activity::append(
         context,
         &match flavor {
-            SendFlavor::Message => format!("{key} [reserved2] 工具统一发送：成功 {sent}/{count} 条"),
-            SendFlavor::Burst => format!("{key} [reserved2] 工具分条发送：成功 {sent}/{count} 条"),
+            SendFlavor::Message => format!("{key} [reserved2] 工具通道已把本批消息合为一条并投递完毕，总计成功发出 {sent} 条（计划共 {count} 条）"),
+            SendFlavor::Burst => format!("{key} [reserved2] 工具通道已把本批消息拆为逐条气泡投递完毕，总计成功发出 {sent} 条（计划共 {count} 条）"),
             SendFlavor::Direct => format!("{key} [send] 成功 {sent}/1 条：{}", crate::activity::slice(&messages[0], 80)),
         },
     );
@@ -1057,11 +1056,11 @@ pub(super) fn prepare_text_batch(
     let policy = TextBatch::configured(cfg);
     let multiple = messages.len() > 1;
     if multiple && policy == TextBatch::Single {
-        return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
+        return Err((403, "未开启分段发送，请把内容并作一条发出".to_string()));
     }
     let max_chars = MAX_CHARS.integer(cfg) as usize;
     if messages.iter().any(|m| m.encode_utf16().count() > max_chars) {
-        return Err((400, format!("单条消息不能超过 {max_chars} 字")));
+        return Err((400, format!("单条文本长度上限为 {max_chars} 字")));
     }
     let merging = multiple && policy == TextBatch::Merge;
     let messages = merge_multi(messages, merging);
@@ -1075,7 +1074,7 @@ pub(super) fn prepare_text_batch(
     for message in &messages {
         if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, message, &[]) {
             crate::safe_println!("[console] {what} 被哨兵拦下：{why}");
-            return Err((403, "消息含敏感信息，已阻止发送".to_string()));
+            return Err((403, "内容触及敏感词限制，已拦截该次发送".to_string()));
         }
     }
     Ok(messages)
@@ -1090,7 +1089,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
         .map(|v| !v.is_null() && !social_policy_js_string(v).trim_matches(social_policy_js_trim_char).is_empty())
         .unwrap_or(false);
     if reply_given {
-        return Err((400, "qq_send_burst 暂不支持引用，请使用 qq_reply".to_string()));
+        return Err((400, "连续多条发送接口不支持直接引用，要引用请换用专用回复工具".to_string()));
     }
     if key.is_empty() || messages.is_empty() {
         return Err((400, "key 和 messages 不能为空".to_string()));
@@ -1101,26 +1100,26 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
             return Err((403, "agent token 无效".to_string()));
         }
         if !social_v2_projection_session_allowed(cfg, &key) {
-            return Err((403, "目标不在当前模式允许范围内".to_string()));
+            return Err((403, "目标会话未被当前运行模式放行".to_string()));
         }
         if !tool_enabled(cfg, "sendBurst") {
             return Err((403, "工具未启用：qq_send_burst".to_string()));
         }
     }
     if current_mode_for(context)? != "reserved2" {
-        return Err((403, "该接口仅 reserved2 模式可用".to_string()));
+        return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     let Some((kind, id_s, _)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
     };
     if !mode_allowed(cfg, "reserved2", &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if silent_blocks_send(context, cfg, &key)? {
-        return Err((403, "静默模式已开启，当前不允许发送".to_string()));
+        return Err((403, "当前处于静默状态，暂停对外发送".to_string()));
     }
     let messages = prepare_text_batch(cfg, messages, "send-burst")?;
     let storage_key = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
@@ -1185,11 +1184,11 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     let key = format!("{}:{}", if is_private { "private" } else { "group" }, target_id);
     let mode = current_mode_for(context)?;
     if mode == "chat" || mode == "reserved" {
-        return Err((403, "发送工具仅限 closed-agent / reserved2 模式使用".to_string()));
+        return Err((403, "该发件接口只在受控直连或二代仿真模式下开放使用".to_string()));
     }
     let doc = ConversationState::for_runtime(context).read_document()?;
     if doc.paused() && !token.is_empty() {
-        return Err((403, "当前已暂停，不允许执行发送工具".to_string()));
+        return Err((403, "当前处于暂停态，禁止调用发送接口".to_string()));
     }
     if target_id.is_empty() || message.is_empty() {
         return Err((400, "目标 id 和 message 不能为空".to_string()));
@@ -1201,7 +1200,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
         return Err((400, "replyToMessageId 不能为空".to_string()));
     }
     if mode == "reserved2" && token.is_empty() {
-        return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if !token.is_empty() && !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
@@ -1211,18 +1210,18 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
         return Err((403, format!("工具未启用：{flag}")));
     }
     if silent_blocks_send(context, cfg, &key)? {
-        return Err((403, "静默模式已开启，当前不允许发送".to_string()));
+        return Err((403, "当前处于静默状态，暂停对外发送".to_string()));
     }
     let Some((kind, id_s, _)) = parse_key(&key) else {
         return Err((400, "key 格式无效".to_string()));
     };
     if !mode_allowed(cfg, &mode, &key) {
-        return Err((403, "目标不在当前模式允许范围内".to_string()));
+        return Err((403, "目标会话未被当前运行模式放行".to_string()));
     }
     if reply_present {
         let digits = reply_ref.strip_prefix('-').unwrap_or(&reply_ref);
         if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Err((400, "replyToMessageId 必须是非零整数（消息 id 可能为负数）".to_string()));
+            return Err((400, "用于引用的消息编号须设为非零整数（平台部分编号允许为负）".to_string()));
         }
     }
     let storage_key = canonical_v2_key(&key).ok_or((400, "key 格式无效".to_string()))?;
@@ -1237,11 +1236,11 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     }
     let max_chars = crate::settings::send::MAX_CHARS.integer(cfg);
     if message.encode_utf16().count() as i64 > max_chars {
-        return Err((400, format!("单条消息不能超过 {max_chars} 字")));
+        return Err((400, format!("单条文本长度上限为 {max_chars} 字")));
     }
     if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, &message, &[]) {
         crate::safe_println!("[console] send 被哨兵拦下：{why}");
-        return Err((403, "消息含敏感信息，已阻止发送".to_string()));
+        return Err((403, "内容触及敏感词限制，已拦截该次发送".to_string()));
     }
     if token.is_empty() {
         // Closed-agent (administrator chat) sends carry no session token; JS creates the conversation lazily.
@@ -1297,9 +1296,9 @@ fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Conv
     if used >= wait_policy(cfg).max_per_turn { return None; }
     let remain_min = (remaining as f64 / 60_000.0).ceil() as i64;
     let error = if what == "mark_read" {
-        format!("还不能通过 qq_mark_read 直接回到潜水：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡。成功发言后按【互动窗口】重新计时。")
+        format!("尚不能提交已读收尾：静默等待还差约 {remain_min} 分钟，可传 timeoutMs={pre_sleep_ms} 走完睡前守候。守候期间一旦收到新消息先读再定，不用插话即可落盘休眠；每次成功发话后会按【互动窗口】重算余时。")
     } else {
-        format!("还不能立刻设置潜水/下一次唤醒：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡。成功发言后按【互动窗口】重新计时。")
+        format!("尚不能写入下次唤醒方案：静默等待还差约 {remain_min} 分钟，可传 timeoutMs={pre_sleep_ms} 走完睡前守候。守候期间收到新消息先读再定，确认无需接茬即可保存设定退入休眠；每次成功发话后会按【互动窗口】重算余时。")
     };
     Some((
         400,
@@ -1316,7 +1315,7 @@ fn requested_through(raw: Option<&Value>, conv: &Conversation, through_now: i64,
         Some(seq) if seq >= 0 && seq <= max && seq <= last_unread => Ok(Some(seq)),
         _ => Err((
             400,
-            "throughSeq 必须是不超过已展示连续消息水位的非负安全整数；请先读取未读消息并使用返回的 readThroughSeq".to_string(),
+            "throughSeq 须为非负整数且不可越过已阅读的连续编号；请先拉取未读列表再填入其 readThroughSeq".to_string(),
         )),
     }
 }
@@ -1395,7 +1394,7 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
             return Err((400, "clearAll=true 仅限管理端单独使用".to_string()));
         }
         if requested.is_none() && (is_agent || b["clearAll"] != true) {
-            return Err((400, "请使用已查看结果中的 readThroughSeq 作为 throughSeq".to_string()));
+            return Err((400, "提交的本地序号上限请直接填上一轮读取结果给出的已读水位数值".to_string()));
         }
         let through = requested_through(requested, &conv, through_of_conv(context, &storage_key, &conv), is_agent)
             .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
