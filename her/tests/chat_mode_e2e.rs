@@ -263,7 +263,7 @@ fn closed_agent_delayed_receipt_does_not_block_next_waterfall_or_expiry() {
     let receipts = rig.dsh.calls("$events/result");
     assert_eq!(receipts.iter().filter(|c| c["eventId"] == "question-next").count(), 1);
     assert_eq!(receipts.iter().find(|c| c["eventId"] == "question-next").unwrap()["outcome"]["value"], json!({"answers":[]}));
-    assert!(wait_for(Duration::from_secs(3), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("等待回答超时"))));
+    assert!(wait_for(Duration::from_secs(3), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("⏰ 等待超限，该请求已自动取消"))));
     wait_pending(&rig, json!({"pending":[]}));
     assert!(wait_for(Duration::from_secs(3), || {
         fs::read(rig.root.join("data/pending-interactions.json"))
@@ -485,7 +485,7 @@ fn closed_agent_invalid_approval_keeps_request_until_valid_owner_answer() {
     says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL#");
     assert!(wait_for(Duration::from_secs(10), || rig.console("GET", "/api/pending", None).1["pending"].as_array().is_some_and(|a| a.len() == 1)));
     says(&rig, OWNER_KEY, OWNER, "owner", "maybe");
-    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("确认该审批"))));
+    assert!(wait_for(Duration::from_secs(10), || rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("以确认本次审批"))));
     assert!(rig.dsh.calls("$events/result").is_empty());
     assert_eq!(rig.console("GET", "/api/pending", None).1["pending"].as_array().unwrap().len(), 1);
     says(&rig, OWNER_KEY, OWNER, "owner", "拒绝");
@@ -502,7 +502,7 @@ fn closed_agent_expired_approval_is_rejected_once() {
     assert!(wait_for(Duration::from_secs(10), || rig.dsh.calls("$events/result").len() == 1));
     assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
     wait_pending(&rig, json!({"pending":[]}));
-    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("等待回答超时")));
+    assert!(rig.texts_to(OWNER_KEY).iter().any(|s| s.contains("⏰ 等待超限，该请求已自动取消")));
     thread::sleep(Duration::from_millis(500));
     assert_eq!(rig.dsh.calls("$events/result").len(), 1);
 }

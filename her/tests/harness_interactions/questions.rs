@@ -61,7 +61,7 @@ fn unanswered_question_expires_without_a_model_continuation() {
     fs::write(path, cfg.to_string()).unwrap();
     rig.start();
     says(&rig, OWNER_KEY, OWNER, "owner", "ask and wait");
-    assert!(wait_for(Duration::from_secs(7), || rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("等待回答超时"))), "question did not use its configured expiry");
+    assert!(wait_for(Duration::from_secs(7), || rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("⏰ 等待超限，该请求已自动取消。"))), "question did not use its configured expiry");
     assert!(wait_for(LONG, || conversation_facts(&rig)["turns"][0]["state"] == "failed"));
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "refused");
     assert_eq!(rig.console("GET", "/api/pending", None), (200, json!({"pending":[]})));

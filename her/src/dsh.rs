@@ -668,7 +668,7 @@ fn blocks_to_text(content: &serde_json::Value) -> String {
     out
 }
 
-/// 一轮里的一条 provider usage 采样（`assistant/message` / `assistant/attempt`）。
+/// 单轮对话里的一笔模型用量采集记录（覆盖终稿响应与单次尝试事件）。
 ///
 /// 字段与 JS `token-ledger.js` 的 `ingestEvent` 输入一一对应：同一
 /// (turn, step, retry) 只保留一条，`seq` 严格变大才允许覆盖。

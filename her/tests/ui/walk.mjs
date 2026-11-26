@@ -610,7 +610,7 @@ export const walks = {
       await page.getByRole('button', { name: '收藏消息表情' }).click();
     },
     'stickers-send-policy': async ({ page }) => {
-      await usable(page.getByText(/AI 主动发表情仅在二代仿真回合中通过 agent token 执行/).first());
+      await usable(page.getByText(/AI 主动发表情仅在二代仿真回合中通过会话令牌执行/).first());
     },
     'voice-list': async ({ page }) => {
       await click(page, page.getByRole('button', { name: '刷新并探测' }), 'GET', '/api/voice/list');

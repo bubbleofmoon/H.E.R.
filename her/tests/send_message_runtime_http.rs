@@ -713,11 +713,11 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
     assert!(response_a.body["warn"]
         .as_str()
         .unwrap()
-        .contains("中文空格"));
+        .contains("全角空格"));
     assert!(response_a.body["splitWarn"]
         .as_str()
         .unwrap()
-        .contains("同一句话"));
+        .contains("一整句话"));
     let a_state_after_initial: Value =
         serde_json::from_slice(&fs::read(root_a.join("data/social-v2.json")).unwrap()).unwrap();
 
