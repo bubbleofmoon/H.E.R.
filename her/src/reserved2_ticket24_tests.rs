@@ -92,7 +92,7 @@ async fn a_manual_wake_bootstraps_once_then_wakes_as_admin_and_buffers_while_bus
     // Keep that turn running: the fixture DSH is unreachable and would end it at once.
     let first = hub.active.remove(key).unwrap();
     first.task.abort();
-    hub.active.insert(key.into(), Active { task: tokio::spawn(async { std::future::pending::<()>().await; (Ok(0), false) }), ..first });
+    hub.active.insert(key.into(), Active { task: tokio::spawn(std::future::pending::<DispatchResult>()), ..first });
     // While that turn runs, two identical manual wakes are buffered once (JS busy queue).
     let (_, reply) = wake(&hub.context);
     assert_eq!(reply["reason"], "operator");
@@ -126,7 +126,10 @@ async fn a_whole_reset_keeps_a_running_turn_attached_until_it_ends() {
     let state = hub.state().unwrap();
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
     hub.active.insert(key.into(), Active {
-        task: tokio::spawn(async move { let _ = wait.await; (Ok(0), false) }),
+        task: tokio::spawn(async move {
+            let _ = wait.await;
+            DispatchResult::new(Ok(0), false)
+        }),
         inbound: event.clone(), reason: "operatorMarker".into(), previous: state["conversations"][key].clone(),
         at: crate::now_ms() as i64, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted: Default::default(), cap_abort_at: None,
         route: Default::default(), admitted: Default::default(),

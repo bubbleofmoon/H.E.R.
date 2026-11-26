@@ -119,6 +119,10 @@ export function utf16Length(value: string): number {
   return value.length;
 }
 
+export function isSingleLineWithin(value: string, maxUnits: number): boolean {
+  return !/[\u0000-\u001F\u007F\u2028\u2029]/.test(value) && utf16Length(value) <= maxUnits;
+}
+
 export function unicodeScalarLength(value: string): number {
   return Array.from(value).length;
 }

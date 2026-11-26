@@ -1662,6 +1662,9 @@ pub(crate) fn record_reserved2_incoming(
         .map_err(SocialError::from_http)
 }
 
+pub(crate) const WAKE_ACCESS_REFUSED: &str = "wake refused by current access settings";
+pub(crate) const WAKE_SUSPENDED: &str = "wake suspended by current settings";
+
 pub(crate) fn claim_reserved2_wake(
     context: &RuntimeContext,
     key: &str,
@@ -1672,12 +1675,14 @@ pub(crate) fn claim_reserved2_wake(
     ConversationState::for_runtime(context)
         .update_document(|doc| {
             let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
+            if !inbound_admitted(&cfg, key) {
+                return Err((403, WAKE_ACCESS_REFUSED.to_string()));
+            }
             if mode(context) != "reserved2"
                 || doc.paused()
                 || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
-                || !inbound_admitted(&cfg, key)
             {
-                return Err((403, "wake invalidated by current settings".to_string()));
+                return Err((403, WAKE_SUSPENDED.to_string()));
             }
             let Some(mut conv) = doc.conversation(key) else {
                 return Err((503, "wake has no agent token".to_string()));

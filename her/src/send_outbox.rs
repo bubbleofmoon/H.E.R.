@@ -185,17 +185,43 @@ impl Batch {
     }
 }
 
+pub(crate) const PERSONA_FAILURE_SEND: &str = "persona-failure";
+
+/// A terminal line must not collide with an earlier reply or an unresolved delivery.
+pub(crate) fn blocks_persona_failure(records: &[Value], key: &str, epochs: &[String], began: i64) -> bool {
+    let mut batches = std::collections::HashMap::<&str, Vec<&Value>>::new();
+    for record in records {
+        if record["k"] == "intent" && record["key"] == key {
+            if !matches!(record["purpose"].as_str(), Some("ack" | PERSONA_FAILURE_SEND))
+                && record["epoch"].as_str().is_some_and(|epoch| epochs.iter().any(|e| e == epoch))
+                && record["t"].as_i64().is_some_and(|at| at >= began)
+            {
+                return true;
+            }
+            let Some(id) = record["batch"].as_str() else { return true };
+            batches.entry(id).or_default().push(record);
+        } else if let Some(events) = record["batch"].as_str().and_then(|id| batches.get_mut(id)) {
+            events.push(record);
+        }
+    }
+    batches.into_iter().any(|(id, events)| {
+        fold_matching_batch(events, id).is_none_or(|batch| batch.items.iter().any(ItemState::needs_verification))
+    })
+}
+
 fn record_idx(record: &Value) -> Option<usize> {
     record.get("idx").and_then(Value::as_u64).map(|v| v as usize)
 }
 
 /// Fold one batch. Later records override earlier ones, except terminal superseded items.
 pub fn fold_batch(records: &[Value], batch_id: &str) -> Option<Batch> {
+    let matching = records.iter().filter(|r| r["batch"].as_str() == Some(batch_id));
+    fold_matching_batch(matching, batch_id)
+}
+
+fn fold_matching_batch<'a>(records: impl IntoIterator<Item = &'a Value>, batch_id: &str) -> Option<Batch> {
     let mut batch: Option<Batch> = None;
     for record in records {
-        if record.get("batch").and_then(Value::as_str) != Some(batch_id) {
-            continue;
-        }
         match record.get("k").and_then(Value::as_str) {
             Some("intent") => {
                 let messages: Vec<String> = record

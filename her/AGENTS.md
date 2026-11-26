@@ -11,7 +11,7 @@ Read the topic doc before changing its implementation:
 - Harness admission, streamed tool execution, handler settlement after cancellation, uncertain-effect pauses, model image content, model routes and failover, one-shot model jobs, usage facts, route health, history budget and checkpoints, engine selection, canonical conversation storage, reset and administrator resolution: `docs/agents/harness.md`.
 - Personas, roles, prompt delivery, participation modes, interactions, slang learning and readiness probes: `docs/agents/prompts-modes.md`.
 - MCP protocol, QQ send confirmation, auxiliary servers, generated DSH config and the shared memory library: `docs/agents/mcp-memory.md`.
-- Media acquisition, normalization, stickers, required voice duration validation (SILK uses a 100 ms per-packet upper bound), delivery and inbound voice transcription: `docs/agents/media-transport.md`.
+- Media acquisition, normalization, stickers, required voice duration validation (SILK uses a 100 ms per-packet upper bound), delivery, inbound voice transcription and the shared `guarded_fetch.rs` HTTP/DNS guard (`safe_fetch.rs`/`aux_fetch.rs`/`release.rs` share `DnsResolver`/`HttpTransfer` and hardened `curl`): `docs/agents/media-transport.md`.
 - DSH credentials, cancellable RPC, retry/failover, relay health and alerts: `docs/agents/dependency-recovery.md`.
 - Releases and installs, dependency startup, ownership, recovery and stop; supervisor lifecycle, health checks, scheduled tasks, digest, backups, the Schedule store and page and task storage: `docs/agents/lifecycle-tasks.md`.
 - Owned child-process trees (Windows jobs and Unix process groups for isolated CLI backends, tasks and npm installs): `src/process_tree.rs`, `docs/agents/lifecycle-tasks.md`.

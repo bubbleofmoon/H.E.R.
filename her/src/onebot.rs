@@ -869,9 +869,8 @@ impl OneBot {
         }
     }
 
-    /// 发一条（不分条）。返回 OneBot 的 data。
-    pub fn send_one(&self, target: &Target, text: &str) -> Result<serde_json::Value, String> {
-        let payload = match target {
+    pub(crate) fn literal_payload(target: &Target, text: &str) -> serde_json::Value {
+        match target {
             Target::Group(id) => serde_json::json!({
                 "group_id": id,
                 "message": [{ "type": "text", "data": { "text": escape_cq(text) } }]
@@ -880,7 +879,12 @@ impl OneBot {
                 "user_id": id,
                 "message": [{ "type": "text", "data": { "text": escape_cq(text) } }]
             }),
-        };
+        }
+    }
+
+    /// 发一条（不分条）。返回 OneBot 的 data。
+    pub fn send_one(&self, target: &Target, text: &str) -> Result<serde_json::Value, String> {
+        let payload = Self::literal_payload(target, text);
         let raw = self
             .post_detailed(&format!("/{}", target.action()), &payload.to_string())
             .map_err(|error| self.send_connection_error(error))?;

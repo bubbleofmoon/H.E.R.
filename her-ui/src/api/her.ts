@@ -37,6 +37,7 @@ export interface PersonaVersionDetail {
   core: string;
   notes: string;
   compact: string;
+  failureLine?: string | null;
   names: string[];
   traits: { neediness: number };
   editMode: 'auto' | 'manual';
@@ -63,6 +64,7 @@ export interface PersonaCreatePayload {
   core: string;
   notes?: string;
   compact?: string;
+  failureLine?: string | null;
   names?: string[];
   traits?: { neediness: number };
   editMode?: 'auto' | 'manual';
