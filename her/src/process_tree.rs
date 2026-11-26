@@ -78,6 +78,11 @@ impl ProcessTree {
         self.terminate_and_reap()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn disarm_drop(&mut self) {
+        self.inner.disarm_drop();
+    }
+
     #[cfg(all(test, windows))]
     pub(crate) fn spawn_unassigned_for_test(command: Command) -> Result<Self, String> {
         os::Tree::spawn_unassigned_for_test(command).map(|inner| Self { inner })
@@ -893,6 +898,10 @@ mod os {
             self.finished
         }
 
+        pub(super) fn disarm_drop(&mut self) {
+            self.finished = true;
+        }
+
         pub(super) fn try_wait_root(&mut self) -> Result<Option<ExitStatus>, String> {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
@@ -1369,5 +1378,48 @@ mod tests {
 
         tree.terminate_and_reap().unwrap();
         assert!(!process_group_alive(root_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_disarm_drop_leaves_descendant_group_alive() {
+        let dir = TempRoot::new("unix-disarm-drop");
+        let cmd = probe_command(dir.path(), "exit-leaving-descendant");
+        let mut tree = ProcessTree::spawn(cmd, Duration::from_secs(10)).unwrap();
+        let root_pid = wait_for_pid_file(&dir.path().join("root.pid"), Duration::from_secs(5));
+        let child_pid = wait_for_pid_file(&dir.path().join("child.ready"), Duration::from_secs(5));
+        let child_handle = PinnedProcess::open(child_pid);
+        assert!(child_handle.is_alive());
+        write_marker(&dir.path().join("monitor.ack"), "ok\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = tree.try_wait_root().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "root did not exit within bound");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+
+        tree.disarm_drop();
+        drop(tree);
+
+        let group_alive = process_group_alive(root_pid);
+        let child_alive = child_handle.is_alive();
+        child_handle.cleanup_kill();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while process_group_alive(root_pid) && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            group_alive,
+            "disarm_drop must leave surviving Unix process group alive after drop"
+        );
+        assert!(
+            child_alive,
+            "disarm_drop must leave surviving descendant alive after drop"
+        );
     }
 }

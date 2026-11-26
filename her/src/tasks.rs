@@ -816,6 +816,7 @@ impl Executor for CommandExecutor {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if crate::task_runs::task_group_alive(pid) {
+                tree.disarm_drop();
                 return Finish::Unknown { reason: "task leader exited but its process group is still running; admission remains held".into() };
             }
         }
