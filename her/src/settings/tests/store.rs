@@ -897,14 +897,20 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
     let conn = std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(80));
-            let _ = std::fs::remove_file(&wal);
-            crate::settings::apply(&context, QUIET_KEY, &json!(4500), "administrator", "console")
-                .unwrap();
+            std::fs::remove_file(&wal).unwrap();
         });
         let conn = crate::settings::backup_source(&context).unwrap().unwrap();
         writer.join().unwrap();
         conn
     });
+    assert!(!wal.exists(), "backup_source waited for the synthetic WAL transition to clear");
+    let backup_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        backup_timeout > 0 && backup_timeout < 1000,
+        "backup_source busy_timeout must stay well below WAL_SWITCH_WAIT: {backup_timeout}"
+    );
     let stored: String = conn
         .query_row(
             "SELECT value FROM settings WHERE key=?1",
@@ -912,5 +918,5 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(stored, "4500");
+    assert_eq!(stored, "1000");
 }

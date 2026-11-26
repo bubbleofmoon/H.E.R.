@@ -302,7 +302,7 @@ pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, St
 ///
 /// A writer's last connection removes the WAL and its index when it closes, and the next writer creates them again,
 /// so a sidecar check can meet one halfway (on Windows a removed file refuses every open until its last handle
-/// closes). The sidecar checks, read-only open, and initial WAL attachment retry transient concurrent-writer
+/// closes). The sidecar checks, read-only open, and initial WAL open retry transient concurrent-writer
 /// transitions up to `WAL_SWITCH_WAIT`; genuine hard-link, containment, leftover-journal, or non-database refusals
 /// fail at once.
 pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
@@ -320,7 +320,7 @@ fn backup_source_attempt(
     let path = resolve_store_db_checked(context)?;
     let [wal_len, shm_len, _journal_len] = check_sidecars(context)?;
     let wal_len = wal_len.unwrap_or(0);
-    let shm_present = shm_len.is_some();
+    let shm_present = shm_len.unwrap_or(0) > 0;
     let Some(len) = file_len_checked(&path)? else {
         return Ok(None);
     };
@@ -641,7 +641,7 @@ fn inspect_attempt(
     let [wal_len, shm_len, journal_len] = check_sidecars(context)?;
     let journal_len = journal_len.unwrap_or(0);
     let wal_len = wal_len.unwrap_or(0);
-    let shm_present = shm_len.is_some();
+    let shm_present = shm_len.unwrap_or(0) > 0;
     let Some(len) = file_len_checked(path)? else {
         return if journal_len > 0 {
             Err(InspectError::Fatal(LEFTOVER_JOURNAL_ERROR.to_string()))
