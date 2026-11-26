@@ -777,56 +777,7 @@ fn surviving_task_group(run: &RunView) -> bool {
 }
 
 pub(crate) fn task_group_alive(pid: u32) -> bool {
-    if pid == 0 || pid > i32::MAX as u32 { return false; }
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(-(pid as i32), 0) };
-        if result == 0 {
-            #[cfg(target_os = "linux")]
-            {
-                // Reaped leaders can leave dead descendants awaiting their
-                // adoptive parent's wait. A zombie main thread can still have
-                // live sibling threads, so check those before declaring exit.
-                let Ok(entries) = std::fs::read_dir("/proc") else { return true };
-                for entry in entries {
-                    let Ok(entry) = entry else { return true };
-                    if entry.file_name().to_string_lossy().parse::<u32>().is_err() { continue; }
-                    let text = match std::fs::read_to_string(entry.path().join("stat")) {
-                        Ok(text) => text,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(_) => return true,
-                    };
-                    let Some((_, fields)) = text.rsplit_once(')') else { return true };
-                    let fields: Vec<&str> = fields.split_whitespace().collect();
-                    if fields.get(2).and_then(|field| field.parse::<u32>().ok()) != Some(pid) { continue; }
-                    if !matches!(fields.first(), Some(&"Z" | &"X")) { return true; }
-                    let threads = match std::fs::read_dir(entry.path().join("task")) {
-                        Ok(threads) => threads,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                        Err(_) => return true,
-                    };
-                    for thread in threads {
-                        let Ok(thread) = thread else { return true };
-                        let text = match std::fs::read_to_string(thread.path().join("stat")) {
-                            Ok(text) => text,
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                            Err(_) => return true,
-                        };
-                        let Some((_, fields)) = text.rsplit_once(')') else { return true };
-                        if !matches!(fields.split_whitespace().next(), Some("Z" | "X")) { return true; }
-                    }
-                }
-                return false;
-            }
-            #[cfg(not(target_os = "linux"))]
-            return true;
-        }
-        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-    }
-    #[cfg(windows)]
-    { false } // the owning Windows job object terminates its members when the handle closes
-    #[cfg(not(any(unix, windows)))]
-    { let _ = pid; true }
+    crate::process_tree::process_group_alive(pid)
 }
 
 impl RunHandle {

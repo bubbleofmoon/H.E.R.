@@ -585,52 +585,6 @@ impl AdmissionGuard {
 
 pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<AdmissionGuard>, String> + Send + Sync>;
 
-struct TaskChild {
-    #[cfg(windows)]
-    tree: crate::backend::windows_cli_lifecycle::CliProcessTree,
-    #[cfg(not(windows))]
-    child: std::process::Child,
-}
-
-impl TaskChild {
-    fn spawn(mut command: std::process::Command, timeout: Duration) -> Result<Self, String> {
-        #[cfg(windows)]
-        {
-            let tree = crate::backend::windows_cli_lifecycle::CliProcessTree::spawn_task(command, timeout)?;
-            Ok(Self { tree })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = timeout;
-            command.spawn().map(|child| Self { child }).map_err(|e| e.kind().to_string())
-        }
-    }
-
-    fn child(&mut self) -> &mut std::process::Child {
-        #[cfg(windows)] { self.tree.child_mut() }
-        #[cfg(not(windows))] { &mut self.child }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        { self.tree.stop_task() }
-        #[cfg(not(windows))]
-        {
-            #[cfg(unix)]
-            {
-                let pid = i32::try_from(self.child.id()).map_err(|_| "invalid child pid".to_string())?;
-                if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) { return Err(format!("cannot stop process group: {}", error.kind())); }
-                }
-            }
-            self.child.kill().or_else(|error| {
-                if self.child.try_wait()?.is_some() { Ok(()) } else { Err(error) }
-            }).map_err(|e| format!("cannot stop task process: {}", e.kind()))
-        }
-    }
-}
-
 impl CommandExecutor {
     pub fn new(resolve: Resolver, internal: InternalJob, clock: Arc<dyn Clock>) -> Self {
         Self { resolve, internal, clock, admission: None, running_allowed: None }
@@ -725,26 +679,25 @@ impl Executor for CommandExecutor {
                     Ok(())
                 });
             }
-            command.process_group(0);
         }
-        let mut tree = match TaskChild::spawn(command, def.timeout) {
+        let mut tree = match crate::process_tree::ProcessTree::spawn(command, def.timeout) {
             Ok(child) => child,
             Err(error) => return Finish::Failed { exit_code: None, reason: format!("task could not be started: {error}") },
         };
-        if let Err(error) = run.mark_running(Some(tree.child().id()), self.clock.now_ms()) {
-            if tree.stop().is_ok() { let _ = tree.child().wait(); }
+        if let Err(error) = run.mark_running(Some(tree.id()), self.clock.now_ms()) {
+            if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
             return Finish::Unknown { reason: error };
         }
         #[cfg(unix)]
         {
             if cancel.load(Ordering::SeqCst) || self.running_allowed.as_ref().is_some_and(|check| !check(def)) {
-                if tree.stop().is_ok() { let _ = tree.child().wait(); }
+                if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
                 return Finish::Cancelled { reason: "task was cancelled before execution".to_string() };
             }
-            let started = tree.child().stdin.take().ok_or_else(|| std::io::Error::other("task startup pipe is unavailable"))
+            let started = tree.take_stdin().ok_or_else(|| std::io::Error::other("task startup pipe is unavailable"))
                 .and_then(|mut pipe| std::io::Write::write_all(&mut pipe, b"her-start\n"));
             if let Err(error) = started {
-                if tree.stop().is_ok() { let _ = tree.child().wait(); }
+                if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
                 return Finish::Unknown { reason: format!("task startup could not be released: {}", error.kind()) };
             }
         }
@@ -754,8 +707,8 @@ impl Executor for CommandExecutor {
         let (tx, rx) = mpsc::sync_channel::<(LogStream, String)>(128);
         let mut readers = Vec::new();
         for (stream, pipe) in [
-            (LogStream::Out, tree.child().stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
-            (LogStream::Err, tree.child().stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+            (LogStream::Out, tree.child_mut().stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+            (LogStream::Err, tree.child_mut().stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
         ] {
             let Some(pipe) = pipe else { continue };
             let tx = tx.clone();
@@ -826,7 +779,7 @@ impl Executor for CommandExecutor {
                 }
             }
             if exited.is_none() {
-                match tree.child().try_wait() {
+                match tree.child_mut().try_wait() {
                     Ok(Some(status)) => exited = Some((Instant::now(), Ok(status))),
                     Ok(None) => {}
                     Err(error) => exited = Some((Instant::now(), Err(error))),
@@ -857,7 +810,7 @@ impl Executor for CommandExecutor {
             // SIGKILL and the leader's wait do not witness descendant exit.
             // Give a signalled tree a bounded interval to finish dying before
             // retaining an unresolved group; ordinary completion never kills it.
-            let pid = tree.child().id();
+            let pid = tree.id();
             let settled = Instant::now() + Duration::from_secs(1);
             while stopped.is_some() && crate::task_runs::task_group_alive(pid) && Instant::now() < settled {
                 std::thread::sleep(Duration::from_millis(20));

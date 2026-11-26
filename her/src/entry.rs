@@ -72,6 +72,7 @@ mod self_avatar;
 mod media_normalize;
 mod media;
 mod subprocess;
+mod process_tree;
 mod voice;
 mod voice_stt;
 mod forward_fmt;
