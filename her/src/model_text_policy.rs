@@ -1,6 +1,6 @@
 //! The #142 denied-term policy for model-bound text (#243). Text settings, history summaries, the DSH persona guard,
 //! upstream captures and rendered-surface tests call `denied_terms` on whole texts. The model-view strip calls
-//! `deletion_adds_denied_term` at each occurrence's join. Both checks share the term list and the matcher.
+//! `replacement_adds_denied_term` at each redaction boundary. Both checks share the term list and the matcher.
 
 use std::ops::Range;
 
@@ -140,53 +140,31 @@ impl<'a> StripRightContext<'a> {
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static DELETION_WINDOW_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn take_deletion_window_scan_count() -> usize {
-    DELETION_WINDOW_SCAN_COUNT.with(|count| count.replace(0))
-}
-
-/// Does deleting `removed` create a denied occurrence at the join? The sides have compacted format runs.
-/// Compare the same spans before and after so a term elsewhere in the window cannot excuse a new match.
-pub(crate) fn deletion_adds_denied_term(left: &str, removed: &str, right: &str) -> bool {
-    // A format run that remains nonempty has the same readings after deleting part of it.
-    if (left.chars().next_back().is_some_and(is_invisible_format)
-        || right.chars().next().is_some_and(is_invisible_format))
-        && removed.chars().all(is_invisible_format)
-    {
-        return false;
-    }
-
-    // Keep enough visible characters for the longest term and its word edge on either side. Each
-    // intervening format run is already one character and may disappear in some readings.
+/// A visible marker can expose a denied word by creating a word edge. Compare occurrences at
+/// the same source coordinates so a term elsewhere does not authorize that new match.
+pub(crate) fn replacement_adds_denied_term(left: &str, removed: &str, marker: &str, right: &str) -> bool {
     let context = DENIED_WORDS.iter().chain(&DENIED_PHRASES)
         .map(|term| term.len()).max().unwrap_or(2) + 1;
-    #[cfg(test)]
-    let scanned = std::cell::Cell::new(0);
-    let visible = |&(_, c): &(usize, char)| {
-        #[cfg(test)]
-        scanned.set(scanned.get() + 1);
-        !is_invisible_format(c)
-    };
+    let visible = |&(_, c): &(usize, char)| !is_invisible_format(c);
     let start = left.char_indices().rev().filter(visible).nth(context - 1).map_or(0, |(i, _)| i);
     let end = right.char_indices().filter(visible).nth(context).map_or(right.len(), |(i, _)| i);
-    #[cfg(test)]
-    DELETION_WINDOW_SCAN_COUNT.with(|count| count.set(count.get() + scanned.get()));
     let (left, right) = (&left[start..], &right[..end]);
-    let join = left.len();
-    let after = occurrences(&format!("{left}{right}"));
+    let after = occurrences(&format!("{left}{marker}{right}"));
     if after.is_empty() {
         return false;
     }
     let before = occurrences(&format!("{left}{removed}{right}"));
+    let marker_start = left.len();
+    let marker_end = marker_start + marker.len();
     after.into_iter().any(|(term, span)| {
-        let start = span.start + if span.start >= join { removed.len() } else { 0 };
-        let end = span.end + if span.end > join { removed.len() } else { 0 };
-        !before.contains(&(term, start..end))
+        if span.end <= marker_start {
+            !before.contains(&(term, span))
+        } else if span.start >= marker_end {
+            let offset = |at| at - marker.len() + removed.len();
+            !before.contains(&(term, offset(span.start)..offset(span.end)))
+        } else {
+            true
+        }
     })
 }
 

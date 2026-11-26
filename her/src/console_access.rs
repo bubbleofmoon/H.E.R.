@@ -30,19 +30,6 @@ pub(super) fn note_config_start(context: &RuntimeContext) {
     }
 }
 
-/// Whether `config.json` differs from what the console found at start.
-pub(super) fn config_changed_since_start(context: &RuntimeContext) -> bool {
-    CONFIG_START_STAMP
-        .get()
-        .and_then(|stamps| {
-            stamps
-                .lock()
-                .ok()
-                .and_then(|s| s.get(context.config_file()).cloned())
-        })
-        .is_some_and(|start| start != config_stamp(context))
-}
-
 /// `GET /api/whitelist` view.
 pub(super) fn whitelist_get(context: &RuntimeContext, cfg: &Value) -> Value {
     let list = |root: &str, kind: &str| json!(policy_list(cfg, root, kind).unwrap_or_default());

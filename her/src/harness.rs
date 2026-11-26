@@ -92,8 +92,27 @@ pub(crate) struct TurnDelivery {
     pub recorder: Option<crate::turn_ledger::Recorder>,
     pub briefing: Option<Value>,
     pub full_prompt: Option<String>,
+    pub prompt: Option<PromptSource>,
     pub recalled: Vec<i64>,
     pub reserved2_budget: Option<crate::pipeline::Reserved2Budget>,
+}
+
+/// How to produce a model copy of the first text part of a bridge user message.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(crate) enum PromptSource {
+    Rendered { snapshot: bool },
+    Chat(crate::chat::Prompt),
+}
+
+// Keep the existing text part for canonical readers and for replay with older versions.
+const PROMPT_SOURCE_TYPE: &str = "her_prompt_source";
+
+fn bridge_user_message(mut message: ChatMessage, source: &PromptSource) -> ChatMessage {
+    message.content.push(ContentPart::from_custom(
+        serde_json::json!({"type": PROMPT_SOURCE_TYPE, "source": source}),
+        None,
+    ));
+    message
 }
 
 impl TurnDelivery {
@@ -387,7 +406,14 @@ impl Harness {
         // The turn starts on the conversation's sticky degraded route (`routes::RouteMemory::start`).
         routes::select_start(&self.context, &mut request.route, &request.conversation, &request.generation);
         // The history after the session's newest checkpoint; the turn's task completes it (`handover::prepare`).
-        let history = self.store.admit_with_briefing(&request, delivery.briefing.take())?;
+        if let Some(PromptSource::Chat(prompt)) = &mut delivery.prompt {
+            prompt.map_text(|text| request.route.redact(text));
+        }
+        let mut user = request.user_message();
+        if let Some(source) = &delivery.prompt {
+            user = bridge_user_message(user, source);
+        }
+        let history = self.store.admit_with_briefing(&request, &user, delivery.briefing.take())?;
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
@@ -420,6 +446,7 @@ impl Harness {
                 &store,
                 &request,
                 history,
+                user,
                 &delivery,
                 instruction,
                 &notifications,
@@ -583,6 +610,7 @@ async fn tool_loop(
     store: &store::Store,
     request: &TurnRequest,
     history: store::History,
+    user: ChatMessage,
     delivery: &TurnDelivery,
     instruction: String,
     events: &broadcast::Sender<Event>,
@@ -597,7 +625,7 @@ async fn tool_loop(
     let mut attempt_id = history.attempt.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds, checkpoint_clipped) =
-        handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
+        handover::prepare(context, store, request, history, user, instruction, &mut cancelled, deadline).await?;
     let mut chain = routes::ChainExecutor::new(routes::ChainConfig {
         context: context.clone(),
         route: request.route.clone(),
@@ -887,7 +915,12 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
                     |last| last.end,
                 );
                 let mut with_full = self.messages.to_vec();
-                with_full[current] = user_message(full, &self.request.media);
+                let user = user_message(full, &self.request.media);
+                with_full[current] = if let Some(source) = &self.delivery.prompt {
+                    bridge_user_message(user, source)
+                } else {
+                    user
+                };
                 match fit(with_full) {
                     Ok(fitted) => (kept, delivered) = fitted,
                     Err(reason) => return abort(Failure::Failed(reason)),
@@ -1268,12 +1301,31 @@ fn filter_model_messages(
             result.push(message);
             continue;
         }
-        let mut parts = Vec::new();
-        for part in message.content {
+        let mut content: Vec<_> = message.content.into_iter().collect();
+        let source = match content.last() {
+            Some(ContentPart::Custom(meta)) if message.role == ChatRole::User && meta.typ() == Some(PROMPT_SOURCE_TYPE) => {
+                let source = serde_json::from_value(meta.data["source"].clone())
+                    .map_err(|_| "harness prompt source is invalid")?;
+                content.pop();
+                Some(source)
+            }
+            _ => None,
+        };
+        let mut parts = Vec::with_capacity(content.len());
+        for (index, part) in content.into_iter().enumerate() {
             parts.push(match part {
-                ContentPart::Text(text) => {
-                    ContentPart::Text(crate::model_view::strip_text(&text, &cfg))
+                ContentPart::Text(text) if message.role == ChatRole::User && index == 0 => {
+                    let delivered = match &source {
+                        Some(PromptSource::Chat(prompt)) => prompt.render(&cfg),
+                        Some(PromptSource::Rendered { snapshot: true }) => {
+                            crate::model_view::redact_snapshot(&text, &cfg).unwrap_or(text)
+                        }
+                        Some(PromptSource::Rendered { snapshot: false }) => text,
+                        None => crate::model_view::strip_text(&text, &cfg),
+                    };
+                    ContentPart::Text(delivered)
                 }
+                ContentPart::Text(text) => ContentPart::Text(crate::model_view::strip_from_model_text(&text, &cfg)),
                 ContentPart::ReasoningContent(text) => ContentPart::ReasoningContent(
                     crate::model_view::strip_from_model_text(&text, &cfg),
                 ),
@@ -1375,7 +1427,7 @@ fn preview_tool_results(messages: Vec<ChatMessage>, cap: usize) -> Vec<ChatMessa
 
 /// The model copy of one tool result. A result longer than `cap` characters becomes one MCP result:
 /// the longest leading part of its text that keeps the whole copy within `cap`, a note that the rest
-/// was omitted, and the original error flag. Canonical facts keep the whole result.
+/// was omitted, and the original error flag and class. Canonical facts keep the whole result.
 fn preview_tool_text(text: &str, cap: usize) -> String {
     if text.chars().count() <= cap {
         return text.to_string();
@@ -1393,7 +1445,8 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
                 .join("\n")
         })
         .unwrap_or_else(|| text.to_string());
-    let error_flag = data.as_ref().and_then(|data| data.get("isError")).cloned();
+    let error_flag = data.as_ref().and_then(|data| data.get("isError"));
+    let error_class = data.as_ref().and_then(|data| data.pointer("/structuredContent/class"));
     // Byte offsets of every character boundary, so a prefix never splits a character.
     let ends: Vec<usize> = body
         .char_indices()
@@ -1408,8 +1461,11 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
             {"type":"text","text":leading},
             {"type":"text","text":note}
         ]});
-        if let Some(flag) = &error_flag {
+        if let Some(flag) = error_flag {
             copy["isError"] = flag.clone();
+        }
+        if let Some(class) = error_class {
+            copy["structuredContent"] = serde_json::json!({"class": class});
         }
         copy.to_string()
     };
@@ -1520,13 +1576,13 @@ mod tests {
     fn qq_tool_text_schemas_filter_delivery_and_replay_without_mutating_facts() {
         let cfg = json!({"socialV2":{"context":{"stripFromModelText":["WORD"]}}});
         for (field, value, expected) in [
-            ("formatted", json!("WORD memory"), json!(" memory")),
-            ("block", json!("WORD slang"), json!(" slang")),
-            ("meaning", json!("WORD meaning"), json!(" meaning")),
-            ("usage", json!("WORD usage"), json!(" usage")),
-            ("example", json!("WORD example"), json!(" example")),
-            ("messages", json!("WORD message"), json!(" message")),
-            ("messages", json!(["WORD first","WORD second"]), json!([" first"," second"])),
+            ("formatted", json!("WORD memory"), json!("【已隐藏】 memory")),
+            ("block", json!("WORD slang"), json!("【已隐藏】 slang")),
+            ("meaning", json!("WORD meaning"), json!("【已隐藏】 meaning")),
+            ("usage", json!("WORD usage"), json!("【已隐藏】 usage")),
+            ("example", json!("WORD example"), json!("【已隐藏】 example")),
+            ("messages", json!("WORD message"), json!("【已隐藏】 message")),
+            ("messages", json!(["WORD first","WORD second"]), json!(["【已隐藏】 first","【已隐藏】 second"])),
         ] {
             let packet = json!({field:value,"messageId":"WORD-id"});
             let original = json!({"content":[{"type":"text","text":packet.to_string()}]}).to_string();
@@ -1544,7 +1600,7 @@ mod tests {
 
     #[test]
     fn prompt_text_delivery_filter_never_adds_a_denied_term() {
-        // A saved rule `D鲸鲸鱼鱼SH` reads `D鲸鱼SH` after the render's own strip; the harness strips the delivery copy again.
+        // Replaying prompt facts preserves instructions and redacts only the chat payload.
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
             "her-140-delivery-{}",
             crate::turn_ledger::mint_id("")
@@ -1562,8 +1618,11 @@ mod tests {
         .unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let sent = vec![
-            ChatMessage::user("【别像客服】D鲸鱼SH 鲸鱼好"),
-            ChatMessage::user("【别像客服】D\n\nSH"),
+            bridge_user_message(
+                ChatMessage::user("【别像客服】D鲸鱼SH\n\n鲸鱼好"),
+                &PromptSource::Chat(crate::chat::build_prompt("【别像客服】D鲸鱼SH", false, None, "鲸鱼好", "")),
+            ),
+            bridge_user_message(ChatMessage::user("【别像客服】D\n\nSH"), &PromptSource::Rendered { snapshot: false }),
             ChatMessage::assistant("a鲸鱼b"),
         ];
         let delivered = filter_model_messages(&context, sent).unwrap();
@@ -1572,8 +1631,7 @@ mod tests {
         for text in &texts {
             assert!(!crate::model_text_policy::denied_terms(text).contains(&"dsh".to_string()), "{text}");
         }
-        // Per occurrence (#239): the occurrence that would join "D" and "SH" stays, the safe one is stripped.
-        assert_eq!(texts, ["【别像客服】D鲸鱼SH 好", "【别像客服】D\n\nSH", "ab"]);
+        assert_eq!(texts, ["【别像客服】D鲸鱼SH\n\n【已隐藏】好", "【别像客服】D\n\nSH", "a【已隐藏】b"]);
     }
 
     #[test]

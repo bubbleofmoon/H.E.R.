@@ -100,6 +100,12 @@ fn settings_batch_sticker_chat_spelling_writes_the_live_sticker_switch() {
     assert_eq!(reply["value"], false);
     assert!(!crate::sticker::enabled(&context.load_config().unwrap()), "the chat change disables stickers");
     assert_eq!(stored_config(&root)["socialV2"]["sticker"]["enabled"], false, "rollback reads the canonical file member");
+    let cfg = context.load_config().unwrap();
+    assert!(!crate::prompt::sticker_parts_with_runtime(&context, &cfg).0, "the prompt reports the disabled feature");
+    let reply = chat(&context, "settings-set", json!({"settingKey":name,"value":true})).unwrap();
+    assert_eq!(reply["value"], true);
+    let cfg = context.load_config().unwrap();
+    assert!(crate::prompt::sticker_parts_with_runtime(&context, &cfg).0, "the next prompt reports the re-enabled feature");
     let key = "socialV2.sticker.collect.maxBytes";
     let answer = chat(&context, "settings-set", json!({"settingKey":key,"value":1024})).unwrap();
     assert_eq!(answer["value"], 1024);

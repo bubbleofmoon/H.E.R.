@@ -135,7 +135,7 @@ async fn ticket164_inbound_image_sticker_and_voice_label_reach_the_model_and_rep
     assert_eq!(
         sent,
         json!({"role":"user","content":[
-            {"type":"text","text":"看看这个  [语音]"},
+            {"type":"text","text":"看看这个 【已隐藏】 [语音]"},
             {"type":"text","text":"[图片1]"},
             image_url("image/png", PNG),
             {"type":"text","text":"[图片2]"},

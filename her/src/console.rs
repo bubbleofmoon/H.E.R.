@@ -1355,8 +1355,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         )
     };
     let none_if_empty = |text: String| if text.is_empty() { Value::Null } else { json!(text) };
-    let reserved2 = current_mode_for(context).map(|m| m == "reserved2").unwrap_or(true);
-    let role_hint = if reserved2 {
+    let mode = current_mode_for(context).ok();
+    let role_hint = if mode.as_deref().is_none_or(|mode| mode == "reserved2") {
         crate::prompt::role_hint_v2(context, cfg, key)
     } else {
         crate::prompt::role_hint_v1(context, cfg, key)
@@ -1368,71 +1368,15 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // enabledTools：flag → 工具名，顺序必须与 JS 的 toolMap 一致。
-    const TOOL_MAP: [(&str, &str); 30] = [
-        ("getPrompt", "qq_get_prompt"),
-        ("getUnread", "qq_get_unread_messages"),
-        ("getRecent", "qq_get_recent_messages"),
-        ("socialState", "qq_social_state"),
-        ("sendGroup", "qq_send_group_message"),
-        ("sendPrivate", "qq_send_private_message"),
-        ("reply", "qq_reply"),
-        ("sendBurst", "qq_send_burst"),
-        ("sendMessage", "qq_send_message"),
-        ("waitMessages", "qq_wait_for_messages"),
-        ("feedback", "qq_report_feedback"),
-        ("getMyRecent", "qq_get_my_recent_messages"),
-        ("getMessageDetail", "qq_get_message_detail"),
-        ("getActiveMembers", "qq_get_active_members"),
-        ("setWakeConfig", "qq_set_wake_config"),
-        ("markRead", "qq_mark_read"),
-        ("memory", "qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear"),
-        ("slangQuery", "qq_slang_query"),
-        ("slangSubmit", "qq_slang_submit"),
-        ("getImages", "qq_get_message_images"),
-        ("getForwardMsg", "qq_get_forward_msg"),
-        ("sendPoke", "qq_send_poke"),
-        ("listStickers", "qq_list_stickers"),
-        ("getStickerImage", "qq_get_sticker_image"),
-        ("sendSticker", "qq_send_sticker"),
-        ("setStickerRemark", "qq_set_sticker_remark"),
-        ("stickerNote", "qq_sticker_note"),
-        ("collectSticker", "qq_collect_sticker"),
-        ("getSelfImage", "qq_get_self_image"),
-        ("sendVoice", "qq_send_voice / qq_list_voices"),
-    ];
-    let tools = cfg
-        .get("socialV2")
-        .and_then(|v| v.get("tools"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let (sticker_enabled, _include, total, sticker_context, strategy) =
         crate::prompt::sticker_parts_with_runtime(context, cfg);
-    let sticker_flags = [
-        "listStickers",
-        "getStickerImage",
-        "sendSticker",
-        "setStickerRemark",
-        "stickerNote",
-        "collectSticker",
-    ];
-    let mut enabled_tools: Vec<String> = Vec::new();
-    for (flag, name) in TOOL_MAP {
-        // JS loadConfig defaults these two switches off before applying tools.
-        let on = tools.get(flag).map(|v| v != &Value::Bool(false))
-            .unwrap_or(!matches!(flag, "sendVoice" | "setStickerRemark"));
-        let sticker_blocked = sticker_flags.contains(&flag) && !sticker_enabled;
-        if on && !sticker_blocked {
-            enabled_tools.push(name.to_string());
-        }
-    }
+    let enabled_tools: Vec<Value> = crate::mcp::discovered_tools(cfg, mode.as_deref(), Some(key))
+        .into_iter()
+        .map(|mut tool| tool["name"].take())
+        .collect();
 
-    let sv2 = cfg.get("socialV2").cloned().unwrap_or_else(|| json!({}));
-    let provide_rec = sv2
-        .get("provideRecommendations")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let recommended = if provide_rec {
+    let recommended = if crate::prompt::provides_recommendations(cfg) {
+        let sv2 = effective_social_v2(cfg.get("socialV2"));
         json!({
             "wake": sv2.get("wake").cloned().unwrap_or_else(|| json!({})),
             "send": sv2.get("send").cloned().unwrap_or_else(|| json!({})),
@@ -5590,17 +5534,10 @@ fn handle_social_config_post_tx(
         };
         let file_before = file.clone();
         let file_section = file.get("socialV2").filter(|v| v.is_object());
-        let effective_before = in_memory_social_v2(ctx, file_section);
-        let new_section = file_section.is_none();
-        let current = file_section
-            .cloned()
-            .unwrap_or_else(|| effective_social_v2(None));
-        let normalization_base = if new_section {
-            &effective_before
-        } else {
-            &current
-        };
-        normalize_social_timing_post(&mut body_v, normalization_base);
+        let current = file_section.cloned().unwrap_or_else(|| json!({}));
+        let overlaid = ctx.overlay_config(file_before.clone());
+        let effective_before = effective_social_v2(overlaid.get("socialV2"));
+        normalize_social_timing_post(&mut body_v, &effective_before);
         let mut merged = current.as_object().cloned().unwrap_or_default();
         if let Some(b) = body_v.as_object() {
             for (k, v) in b {
@@ -5630,14 +5567,13 @@ fn handle_social_config_post_tx(
         // tools：只接受布尔开关；缺省沿用当前值（**默认 false 的项不能被静默打开**）
         if body_v.get("tools").and_then(js_object_like).is_some() {
             let mut tools = merge_sub(&current, "tools", &body_v);
-            let effective = crate::settings::overlay(ctx, file_before.clone());
             for (flag, setting) in crate::settings::tool_switches() {
                 let posted = body_v
                     .pointer(&format!("/tools/{flag}"))
                     .and_then(Value::as_bool);
                 tools.insert(
                     flag.to_string(),
-                    posted.map_or_else(|| setting.read(&effective), Value::Bool),
+                    posted.map_or_else(|| setting.read(&overlaid), Value::Bool),
                 );
             }
             merged.insert("tools".into(), Value::Object(tools));
@@ -5866,25 +5802,12 @@ fn handle_social_config_post_tx(
             isolated_write_error_503: false,
             wake_error_prefix: "配置已保存，但沿用默认唤醒配置的会话未能同步：",
             finish: Box::new(move |finish_ctx, written| {
-                let mut effective = crate::settings::overlay(finish_ctx, written.clone());
-                crate::settings::resolve_live_batch(&mut effective);
-                for name in ["tools", "voice", "sticker", "media"] {
-                    if body_v.get(name).and_then(js_object_like).is_some() {
-                        merged_v[name] = effective["socialV2"][name].clone();
-                    }
-                }
                 crate::safe_println!("[console] 二代仿真配置已更新");
-                // JS answers `{ ...cfg.socialV2, ...merged }`: the effective section on top.
-                let mut shown = effective_before;
-                if let (Some(shown), Some(saved)) = (shown.as_object_mut(), merged_v.as_object()) {
-                    for (name, value) in saved {
-                        shown.insert(name.clone(), value.clone());
-                    }
+                let mut effective = finish_ctx.overlay_config(written.clone());
+                if finish_ctx.is_isolated() {
+                    crate::settings::resolve_live_batch(&mut effective);
                 }
-                if new_section {
-                    shown = social_with_timing(shown);
-                }
-                Ok(json!({ "ok": true, "config": shown }))
+                Ok(handle_social_config(&effective))
             }),
         })
     })
@@ -8922,20 +8845,6 @@ fn send_message_inner(
     if key.is_empty() || (messages.is_empty() && resume_batch.is_none()) {
         return Err((400, "key 和 messages 不能为空".to_string()));
     }
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
-    let burst_enabled = send_cfg.get("burstEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
-    // 多条 → 合并成一条、换行分隔（与 bridge.js 同一策略，管理员 2026-10-22 定）。
-    // 模型想分几句说，但 QQ 上连发多条会变成刷屏；拼成一条带换行的消息，
-    // 它的表达没被砍，群里看到的还是一条完整的话。
-    // 只有 `mergeMultiIntoOne: false` 才回到"真分多条"（那时再看 burstEnabled）。
-    let merge_into_one = send_cfg
-        .get("mergeMultiIntoOne")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if messages.len() > 1 && !merge_into_one && !burst_enabled {
-        return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
-    }
-    let messages = merge_multi(messages, merge_into_one);
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if !token.is_empty() && !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
@@ -8994,20 +8903,7 @@ fn send_message_inner(
             ));
         }
     }
-    let max_msgs = send_cfg.get("burstMaxMessages").and_then(|v| v.as_i64()).unwrap_or(8).max(1);
-    let max_chars = send_cfg.get("maxMessageChars").and_then(|v| v.as_i64()).unwrap_or(500).max(1);
-    if messages.len() as i64 > max_msgs {
-        return Err((400, format!("最多发送 {max_msgs} 条")));
-    }
-    for m in &messages {
-        if m.encode_utf16().count() as i64 > max_chars {
-            return Err((400, format!("单条消息不能超过 {max_chars} 字")));
-        }
-        if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, m, &[]) {
-            crate::safe_println!("[console] send-message 被哨兵拦下：{why}");
-            return Err((403, "消息含敏感信息，已阻止发送".to_string()));
-        }
-    }
+    let messages = agent::prepare_text_batch(cfg, messages, "send-message")?;
     let storage_key = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
     let call = agent::SendCall {
         key: &storage_key,
@@ -9072,7 +8968,7 @@ fn find_cjk_space_warning(messages: &[String]) -> Option<String> {
         )
     };
     Some(format!(
-        "{label}消息内部有中文空格，真人一般不这么打；可删掉空格用标点，或拆成数组多条。"
+        "{label}消息内部有中文空格；可以用标点分隔短句。"
     ))
 }
 
@@ -9877,36 +9773,12 @@ fn slang_item_action(context: &RuntimeContext, method: &str, tail: &str, body: &
     )
 }
 
-/// `/api/socialV2/config`：二代仿真的全部可调参数。
-///
-/// JS 回的是 `cfg.socialV2` 整个对象（文件 + 默认值合并后的运行时配置）。
-/// 早先这里挑了一个 16 键的固定表，结果静默吞掉了 `abFull`（对拍报
-/// 「Rust 还没实现的字段」）—— 固定键表在「配置会长新键」的前提下一定是错的。
-fn handle_social_config(context: &RuntimeContext, cfg: &Value) -> Value {
-    json!({ "ok": true, "config": in_memory_social_v2(context, cfg.get("socialV2")) })
+/// Both social-config routes show the same effective values on every read.
+fn handle_social_config(cfg: &Value) -> Value {
+    json!({ "ok": true, "config": effective_social_v2(cfg.get("socialV2")) })
 }
 
-/// JS `cfg.socialV2` as the console sees it: the effective section built at start; once
-/// `config.json` has changed, `maybeReloadConfig` has replaced it with the raw file section when
-/// the file has one. The normalized input already contains the effective live controls.
-fn in_memory_social_v2(context: &RuntimeContext, file_section: Option<&Value>) -> Value {
-    match file_section {
-        Some(raw) if raw.is_object() && access::config_changed_since_start(context) => social_with_timing(raw.clone()),
-        _ => social_with_timing(effective_social_v2(file_section)),
-    }
-}
-
-fn social_with_timing(section: Value) -> Value {
-    let mut document = json!({"socialV2": section});
-    crate::settings::complete_timing(&mut document);
-    document["socialV2"].take()
-}
-
-/// The JS `loadConfig` `cfg.socialV2`: the built-in defaults, the file's section on top of them
-/// member by member (a member present in the file replaces the default member whole), and then
-/// the members JS deep-merges with their defaults (`tools`, `voice`, `sticker` with
-/// `sticker.collect`, `media`) and `initialPromptMaxChars` clamped to 100..=8000. The console
-/// reads settings back from this, so a config without a member must still show what is in force.
+/// Preserve configured sections and fill view defaults from the runtime policy.
 fn effective_social_v2(file_section: Option<&Value>) -> Value {
     let Value::Object(mut section) = json!({
         "enabled": true,
@@ -9914,24 +9786,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
         "agentPreset": "qq-chat-v2",
         "provideRecommendations": true,
         "tools": {},
-        "wake": {
-            "defaultMode": "diving",
-            "recommendedDefaultInfinite": true,
-            "sleepMinMs": 60000,
-            "sleepMaxMs": 0,
-            "recommendedSleepMinMs": 300000,
-            "recommendedSleepMaxMs": 7200000,
-            "recommendedKeywords": ["小鲸鱼", "大肥鱼", "鲸鱼"],
-            "recommendedAtMention": true,
-            "recommendedNameMention": true,
-            "recommendedQuestion": true,
-            "recommendedPoke": true,
-            "recommendedHint": "潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
-        },
-        "send": {
-            "recommendedHint": "普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。"
-        },
-        "wait": { "defaultMs": 30000, "defaultQuietMs": 8000, "batchWindowMs": 8000, "maxPerTurn": 4 },
+        "wait": {},
         "sticker": {},
         "proactive": {},
         "feedback": { "maxLength": 500, "notifyOwnerOnError": false },
@@ -9958,6 +9813,17 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     }
     // JS: `{ defaults, ...(cfg.socialV2.x ?? {}) }`; a value that is not an object adds nothing.
     let members = |value: Option<&Value>| value.and_then(Value::as_object).cloned().unwrap_or_default();
+    // Registry timing can materialize a partial wait section before this view is built.
+    let mut wait = members(section.get("wait"));
+    for (name, default) in [
+        ("defaultMs", 30_000),
+        ("defaultQuietMs", 8_000),
+        ("batchWindowMs", 8_000),
+        ("maxPerTurn", 4),
+    ] {
+        wait.entry(name).or_insert_with(|| json!(default));
+    }
+    section.insert("wait".to_string(), Value::Object(wait));
     let mut tools = serde_json::Map::new();
     for (flag, setting) in crate::settings::tool_switches() {
         tools.insert(flag.to_string(), setting.default_value());
@@ -10006,7 +9872,13 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     section.insert("initialPromptMaxChars".to_string(), json!(prompt_chars as i64));
     let mut section = Value::Object(section);
     voice_http::apply_config_defaults(&mut section);
-    section
+    let mut document = json!({"socialV2": section});
+    crate::settings::complete_timing(&mut document);
+    let wake = crate::wake::effective_wake_defaults(&document);
+    let mut members = members(document.pointer("/socialV2/wake"));
+    members.extend(wake.as_object().expect("wake defaults are an object").clone());
+    document["socialV2"]["wake"] = Value::Object(members);
+    document["socialV2"].take()
 }
 
 /// 取请求里的会话 `key`：JSON body 优先（与 `memory-*` 合并参数的口径一致），其次 query。
@@ -11766,7 +11638,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
         ("GET", "/api/socialV2/config") => (
             200,
             "application/json; charset=utf-8".to_string(),
-            handle_social_config(context, cfg).to_string(),
+            handle_social_config(cfg).to_string(),
         ),
         ("GET", "/api/slang") => (
             200,
@@ -25384,9 +25256,7 @@ pub(super) mod tests {
     #[test]
     fn social_config_post_answers_the_full_effective_section() {
         let (root, context) = fixture_runtime("gap social config", "fixture-gap-social-config-abcdefghij");
-        // The file has no socialV2 section: JS merges against the effective (defaults) section,
-        // so a tools save cannot open the switches that default off, and the answer is the whole
-        // effective section with the saved members on top.
+        // With no socialV2 section, the saved edits still read back with the effective defaults.
         let body = json!({"send": {"maxSendPerMinute": 7}, "tools": {"feedback": false}}).to_string();
         let answer = handle_social_config_post(&context, &body).unwrap();
         assert_eq!(answer["ok"], true);
@@ -25408,18 +25278,17 @@ pub(super) mod tests {
         assert_eq!(config["agentPreset"], "qq-chat-v2");
         assert_eq!(config["autoReplyCheckMs"], 30000);
         assert_eq!(config["enabled"], true);
-        // JS persists the merged section, which started from the effective one.
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"]["tools"].get("setStickerRemark").is_none());
         assert_eq!(file["socialV2"]["send"]["maxSendPerMinute"], 7);
         // A later GET of the same file shows the same effective section.
-        let read = handle_social_config(&context, &context.load_config().unwrap());
+        let read = handle_social_config(&context.load_config().unwrap());
         assert_eq!(read["config"]["send"]["maxSendPerMinute"], 7);
         assert_eq!(read["config"]["wake"]["defaultMode"], "diving");
     }
 
     #[test]
-    fn social_config_post_with_a_file_section_overlays_the_effective_defaults_shallowly() {
+    fn social_config_post_and_get_show_the_same_defaults_for_a_partial_file() {
         let (root, context) = fixture_runtime("gap social config file", "fixture-gap-social-file-abcdefghij");
         let path = root.0.join("config/config.json");
         let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -25428,16 +25297,15 @@ pub(super) mod tests {
         let answer = handle_social_config_post(&context, &json!({"send": {"burstEnabled": false}}).to_string()).unwrap();
         let config = &answer["config"];
         assert_eq!(config["enabled"], false);
-        assert_eq!(config["wake"], json!({"defaultMode": "active"}), "a file section replaces the default section as a whole (JS spread)");
-        // JS answers `{...cfg.socialV2, ...merged}`: the file's partial `tools` replaces the deep-merged
-        // one in this answer; a GET (the section loaded again) shows the deep merge.
-        assert_eq!(config["tools"], json!({"sendSticker": false}), "{config}");
+        assert_eq!(config["wake"]["defaultMode"], "active");
+        assert_eq!(config["wake"]["recommendedProbability"], 0.0);
+        assert_eq!(config["tools"]["sendSticker"], false);
+        assert_eq!(config["tools"]["getPrompt"], true);
+        assert_eq!(config["tools"]["setStickerRemark"], false);
         assert_eq!(config["send"]["burstEnabled"], false);
-        assert_eq!(config["context"]["recentLimit"], 100, "untouched sections come from the defaults");
-        let read = handle_social_config(&context, &context.load_config().unwrap());
-        assert_eq!(read["config"]["tools"]["sendSticker"], false);
-        assert_eq!(read["config"]["tools"]["getPrompt"], true, "tools stay deep-merged with the defaults: {read}");
-        assert_eq!(read["config"]["tools"]["setStickerRemark"], false);
+        assert_eq!(config["context"]["recentLimit"], 100);
+        let read = handle_social_config(&context.load_config().unwrap());
+        assert_eq!(answer, read);
     }
 
     #[test]
@@ -25453,17 +25321,69 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn social_config_wake_defaults_match_the_plan_across_an_unrelated_save() {
+        for (label, section) in [
+            ("omitted", None),
+            ("partial", Some(json!({
+                "wake": {"recommendedDefaultInfinite": false, "recommendedAtMention": false,
+                    "recommendedKeywords": [], "recommendedProbability": 0, "recommendedSleepMinMs": 0},
+                "proactive": {"enabled": false, "probability": 0}
+            }))),
+        ] {
+            let (_root, context) = fixture_runtime(label, "fixture-social-config-wake-defaults");
+            if let Some(section) = section {
+                let mut file = context.load_config_document().unwrap();
+                file["socialV2"] = section;
+                context.write_atomic(RuntimeArea::Config, "config.json", file.to_string().as_bytes()).unwrap();
+            }
+            access::note_config_start(&context);
+            let check = |display: &Value, config: &Value| {
+                let plan = crate::wake::default_wake_config(config, 1_000, 0.0);
+                let wake = &display["wake"];
+                assert_eq!(wake["recommendedKeywords"], plan["triggers"]["keywords"], "displayed wake keywords must match the runtime plan ({label})");
+                assert_eq!(wake["defaultMode"], plan["mode"]);
+                assert_eq!(wake["recommendedDefaultInfinite"], plan["infinite"]);
+                assert_eq!(wake["recommendedAtMention"], plan["triggers"]["atMention"]);
+                assert_eq!(wake["recommendedProbability"], plan["triggers"]["probability"]);
+                assert_eq!(wake["recommendedProbability"], 0.0);
+                assert_eq!(wake["batchWindowMs"], plan["batchWindowMs"]);
+                assert_eq!(wake["batchWindowMs"], 8000);
+                let scheduler = crate::wake_cfg_of(config);
+                assert_eq!(wake["batchWindowMs"], scheduler.batch_window_ms);
+                assert_eq!(display["proactive"]["enabled"], scheduler.proactive_enabled);
+                assert_eq!(display["proactive"]["probability"], scheduler.proactive_probability);
+                assert_eq!(scheduler.proactive_enabled, label == "omitted");
+                assert_eq!(scheduler.proactive_probability, if label == "omitted" { 0.4 } else { 0.0 });
+                assert_eq!(wake["sleepMinMs"], 0);
+                assert_eq!(wake["recommendedSleepMinMs"], if label == "omitted" { 300_000 } else { 0 });
+                if label == "partial" {
+                    assert_eq!(plan["sleepUntil"], crate::sticker::iso_at(1_000));
+                }
+                plan
+            };
+
+            let before = context.load_config().unwrap();
+            let first = handle_social_config(&before);
+            let plan = check(&first["config"], &before);
+            let saved = handle_social_config_post(&context, r#"{"feedback":{"maxLength":400}}"#).unwrap();
+            let after = context.load_config().unwrap();
+            let read = handle_social_config(&after);
+            assert_eq!(saved, read);
+            assert_eq!(first["config"]["wake"], read["config"]["wake"]);
+            assert_eq!(first["config"]["proactive"], read["config"]["proactive"]);
+            assert_eq!(plan, check(&read["config"], &after));
+        }
+    }
+
+    #[test]
     fn social_config_get_resolves_registry_defaults_after_a_file_reload() {
         let (root, context) = fixture_runtime("gap social config reload", "fixture-gap-social-reload-abcdefghij");
         access::note_config_start(&context);
-        // Unchanged since start: the effective section (defaults included).
-        let first = handle_social_config(&context, &context.load_config().unwrap());
+        let first = handle_social_config(&context.load_config().unwrap());
         assert_eq!(first["config"]["initialPromptMaxChars"], 2000);
         assert_eq!(first["config"]["wake"]["batchWindowMs"], 8000);
         assert_eq!(first["config"]["send"]["firstGapBaseMs"], 1000);
         assert_eq!(first["config"]["send"]["maxSendPerMinute"], 8);
-        // After a save, the console overlays the timing defaults on the raw section.
-        // The unnormalized initialPromptMaxChars still comes back as saved.
         let saved = handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
@@ -25471,30 +25391,14 @@ pub(super) mod tests {
         for pointer in ["/socialV2/tools/sendVoice", "/socialV2/voice/maxSeconds", "/socialV2/sticker/collect/maxBytes", "/socialV2/media/maxCount"] {
             assert!(file.pointer(pointer).is_none(), "{pointer} default stays out of the saved file");
         }
-        let send = file["socialV2"]["send"].as_object().unwrap();
-        assert_eq!(send.keys().map(String::as_str).collect::<Vec<_>>(), ["recommendedHint"], "send defaults stay out of the saved file");
-        let mut effective = file.clone();
-        crate::settings::complete_timing(&mut effective);
-        effective["socialV2"]["wake"]["batchWindowMs"] = json!(8000);
-        effective["socialV2"]["reply"] = json!({
-            "wakeQuietMs": 3000,
-            "quietMinMs": 4000,
-            "quietMedianMs": 10000,
-            "quietMaxMs": 25000,
-            "urgentQuietMinMs": 1000,
-            "urgentQuietMedianMs": 3000,
-            "urgentQuietMaxMs": 6000,
-            "stickerPauseMinMs": 800,
-            "stickerPauseMaxMs": 2000,
-        });
-        assert_eq!(saved["config"]["reply"], effective["socialV2"]["reply"]);
-        assert_eq!(saved["config"]["wake"]["batchWindowMs"], 8000);
-        assert_eq!(saved["config"]["send"], effective["socialV2"]["send"]);
-        let read = handle_social_config(&context, &context.load_config().unwrap());
-        crate::settings::resolve_live_batch(&mut effective);
-        assert_eq!(read["config"], effective["socialV2"], "timing defaults overlay the reloaded file section");
+        assert!(file["socialV2"].get("send").is_none(), "send defaults stay out of the saved file");
+        let read = handle_social_config(&context.load_config().unwrap());
+        assert_eq!(saved, read);
+        assert_eq!(read["config"]["reply"], first["config"]["reply"]);
+        assert_eq!(read["config"]["wake"], first["config"]["wake"]);
+        assert_eq!(read["config"]["send"], first["config"]["send"]);
         assert_eq!(read["config"]["tools"]["sendVoice"], false, "live controls are resolved after a reload");
-        assert_eq!(read["config"]["initialPromptMaxChars"], 5);
+        assert_eq!(read["config"]["initialPromptMaxChars"], 100);
     }
 
     mod memory_ticket17_tests { include!("memory_ticket17_tests.rs"); }

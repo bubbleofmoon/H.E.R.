@@ -1174,11 +1174,8 @@ pub fn normalize_wake_config(
         .and_then(|s| s.get("wake"))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let num = |k: &str, d: i64| -> i64 {
-        wake_cfg.get(k).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(d)
-    };
-    let min_ms = num("sleepMinMs", 0).max(0);
-    let max_ms = num("sleepMaxMs", 0).max(0);
+    let sleep = SleepSettings::read(&wake_cfg);
+    let (min_ms, max_ms) = (sleep.minimum, sleep.maximum);
 
     if is_infinite(&Value::Object(next.clone())) {
         next.insert("sleepUntil".into(), Value::Null);
@@ -1196,8 +1193,8 @@ pub fn normalize_wake_config(
         }
         next.insert("sleepUntil".into(), Value::String(crate::sticker::iso_at(now + ms)));
     } else if next.get("sleepUntil").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_none() {
-        let rec_min = num("recommendedSleepMinMs", 300_000);
-        let rec_max = num("recommendedSleepMaxMs", 7_200_000);
+        let rec_min = sleep.recommended_minimum;
+        let rec_max = sleep.recommended_maximum;
         let span = (rec_max - rec_min).max(0) as f64;
         let ms = rec_min + (rand01.clamp(0.0, 0.999_999) * span).round() as i64;
         next.insert("sleepUntil".into(), Value::String(crate::sticker::iso_at(now + ms)));
@@ -1257,15 +1254,32 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
     plan
 }
 
-// Keep the legacy draw (sample the recommendation, then apply the hard bounds).
+struct SleepSettings {
+    minimum: i64,
+    maximum: i64,
+    recommended_minimum: i64,
+    recommended_maximum: i64,
+}
+
+impl SleepSettings {
+    fn read(wake: &Value) -> Self {
+        let number = |key: &str, fallback| wake[key].as_i64().filter(|n| *n >= 0).unwrap_or(fallback);
+        Self {
+            minimum: number("sleepMinMs", 0),
+            maximum: number("sleepMaxMs", 0),
+            recommended_minimum: number("recommendedSleepMinMs", 300_000),
+            recommended_maximum: number("recommendedSleepMaxMs", 7_200_000),
+        }
+    }
+}
+
+// Sample the recommendation, then apply the hard bounds.
 fn sleep_duration(cfg: &Value, fraction: f64) -> i64 {
-    let w = &cfg["socialV2"]["wake"];
-    let num = |key: &str, fallback| w[key].as_i64().filter(|n| *n != 0).unwrap_or(fallback);
-    let low = num("recommendedSleepMinMs", 300_000);
-    let high = num("recommendedSleepMaxMs", 7_200_000).max(low);
+    let sleep = SleepSettings::read(&cfg["socialV2"]["wake"]);
+    let low = sleep.recommended_minimum;
+    let high = sleep.recommended_maximum.max(low);
     let drawn = low as f64 + fraction * (high as f64 - low as f64);
-    let minimum = num("sleepMinMs", 0);
-    let maximum = num("sleepMaxMs", 0);
+    let (minimum, maximum) = (sleep.minimum, sleep.maximum);
     let drawn = if minimum > 0 { drawn.max(minimum as f64) } else { drawn };
     let drawn = if maximum > 0 { drawn.min(maximum as f64) } else { drawn };
     drawn.round() as i64
@@ -1313,6 +1327,28 @@ pub(crate) fn default_wake_plan(cfg: &Value) -> Value {
         plan["inheritsKeywords"] = json!(true);
     }
     plan
+}
+
+/// Project the effective inherited plan back onto the configuration field names.
+pub(crate) fn effective_wake_defaults(cfg: &Value) -> Value {
+    let plan = default_wake_plan(cfg);
+    let triggers = &plan["triggers"];
+    let sleep = SleepSettings::read(&cfg["socialV2"]["wake"]);
+    json!({
+        "defaultMode": plan["mode"],
+        "recommendedDefaultInfinite": plan["infinite"],
+        "recommendedAtMention": triggers["atMention"],
+        "recommendedNameMention": triggers["nameMention"],
+        "recommendedQuestion": triggers["question"],
+        "recommendedPoke": triggers["poke"],
+        "recommendedKeywords": triggers["keywords"],
+        "recommendedProbability": triggers["probability"],
+        "batchWindowMs": plan["batchWindowMs"],
+        "sleepMinMs": sleep.minimum,
+        "sleepMaxMs": sleep.maximum,
+        "recommendedSleepMinMs": sleep.recommended_minimum,
+        "recommendedSleepMaxMs": sleep.recommended_maximum,
+    })
 }
 
 /// JS 的 `ensureWakeableV2`：配置里一个触发条件都没有时重置为默认，避免永眠。

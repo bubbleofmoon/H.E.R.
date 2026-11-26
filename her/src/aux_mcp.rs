@@ -77,7 +77,7 @@ pub fn serve_web_search(context: &RuntimeContext) -> std::io::Result<()> {
             _ => web_fetch_tool(args["url"].as_str().unwrap_or("")),
         }
     });
-    serve_stdio("web-search-safe", tools, dispatch)
+    serve_stdio("web-search-safe", Arc::new(move || tools.as_ref().clone()), dispatch)
 }
 
 fn web_search_tool(query: &str, context: &RuntimeContext) -> Value {
@@ -111,7 +111,7 @@ pub fn serve_host(context: &RuntimeContext) -> std::io::Result<()> {
         }
         outcome(pretty(&snowluma_status(&context)), false)
     });
-    serve_stdio("snowluma-host", tools, dispatch)
+    serve_stdio("snowluma-host", Arc::new(move || tools.as_ref().clone()), dispatch)
 }
 
 /// Where the gateway answers: an isolated runtime uses only its selected OneBot dependency, a legacy one

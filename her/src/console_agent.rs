@@ -1007,9 +1007,6 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
         SendFlavor::Direct => json!({ "ok": true, "key": key, "batchId": batch_id, "sent": sent, "failed": if sent > 0 { 0 } else { 1 }, "quoted": quoted }),
     };
     if flavor != SendFlavor::Direct {
-        if count >= 3 {
-            out["hint"] = json!("你已经连发了多条，确认是必要的吗？真人很少一口气补完。");
-        }
         if let Some(w) = find_cjk_space_warning(messages) {
             out["warn"] = json!(w);
         }
@@ -1049,23 +1046,39 @@ pub(super) fn first_typing_delay(cfg: &Value, text: &str) -> i64 {
     base.saturating_add((text.encode_utf16().count() as i64).saturating_mul(per)).clamp(min, max)
 }
 
-/// Message count, per-message length (UTF-16 units, as JS) and the outbound sensitive-text check.
-pub(super) fn check_limits_and_text(cfg: &Value, messages: &[String], what: &str) -> Result<(), (u16, String)> {
-    let max_msgs = crate::settings::send::BURST_MAX.integer(cfg);
-    let max_chars = crate::settings::send::MAX_CHARS.integer(cfg);
-    if messages.len() as i64 > max_msgs {
+/// Validate the text parts and the final bubbles before running any send.
+pub(super) fn prepare_text_batch(
+    cfg: &Value,
+    messages: Vec<String>,
+    what: &str,
+) -> Result<Vec<String>, (u16, String)> {
+    use crate::settings::send::{TextBatch, BURST_MAX, MAX_CHARS};
+
+    let policy = TextBatch::configured(cfg);
+    let multiple = messages.len() > 1;
+    if multiple && policy == TextBatch::Single {
+        return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
+    }
+    let max_chars = MAX_CHARS.integer(cfg) as usize;
+    if messages.iter().any(|m| m.encode_utf16().count() > max_chars) {
+        return Err((400, format!("单条消息不能超过 {max_chars} 字")));
+    }
+    let merging = multiple && policy == TextBatch::Merge;
+    let messages = merge_multi(messages, merging);
+    if merging && messages[0].encode_utf16().count() > max_chars {
+        return Err((400, format!("合并后的消息不能超过 {max_chars} 字（包括换行）")));
+    }
+    let max_msgs = BURST_MAX.integer(cfg) as usize;
+    if messages.len() > max_msgs {
         return Err((400, format!("最多发送 {max_msgs} 条")));
     }
-    for m in messages {
-        if m.encode_utf16().count() as i64 > max_chars {
-            return Err((400, format!("单条消息不能超过 {max_chars} 字")));
-        }
-        if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, m, &[]) {
+    for message in &messages {
+        if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, message, &[]) {
             crate::safe_println!("[console] {what} 被哨兵拦下：{why}");
             return Err((403, "消息含敏感信息，已阻止发送".to_string()));
         }
     }
-    Ok(())
+    Ok(messages)
 }
 
 fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, String>, body: &str) -> Result<(u16, Value), (u16, String)> {
@@ -1082,14 +1095,6 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
     if key.is_empty() || messages.is_empty() {
         return Err((400, "key 和 messages 不能为空".to_string()));
     }
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
-    let merge_into_one = send_cfg.get("mergeMultiIntoOne").and_then(Value::as_bool) != Some(false);
-    if messages.len() > 1 && !merge_into_one && !crate::settings::send::BURST.switch(cfg) {
-        return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
-    }
-    // The frozen JS assigns to a `const` here and answers 500 "Assignment to constant variable." for any
-    // multi-message burst while merging is on (a defect); the documented behaviour is to merge.
-    let messages = merge_multi(messages, merge_into_one);
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if !token.is_empty() {
         if !agent_token_ok_for(context, &key, &token)? {
@@ -1117,7 +1122,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
     if silent_blocks_send(context, cfg, &key)? {
         return Err((403, "静默模式已开启，当前不允许发送".to_string()));
     }
-    check_limits_and_text(cfg, &messages, "send-burst")?;
+    let messages = prepare_text_batch(cfg, messages, "send-burst")?;
     let storage_key = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
     let call = SendCall {
         key: &storage_key,

@@ -13,8 +13,17 @@ use crate::runtime::RuntimeContext;
 
 /// The MCP memory tools use the same authorization and mutations as the HTTP surface.
 /// No console credential is supplied: a session cannot acquire administrator authority.
+#[cfg(test)]
 pub(crate) fn tool_action(context: &RuntimeContext, action: &str, args: &Value) -> Result<Value, String> {
-    let cfg = context.load_config().map_err(|e| e.to_string())?;
+    tool_action_with_status(context, action, args).map_err(|(_, error)| error)
+}
+
+pub(crate) fn tool_action_with_status(
+    context: &RuntimeContext,
+    action: &str,
+    args: &Value,
+) -> Result<Value, (u16, String)> {
+    let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
     let mut body = args.clone();
     if let Some(obj) = body.as_object_mut() {
         // Keep old Rust callers usable while exposing the frozen JS parameter names.
@@ -28,7 +37,7 @@ pub(crate) fn tool_action(context: &RuntimeContext, action: &str, args: &Value) 
     }
     let headers = HashMap::from([("x-agent-token".to_string(), args["token"].as_str().unwrap_or("").to_string())]);
     handle_inner(action, &headers, &HashMap::new(), &body.to_string(), &cfg, context,
-        ConsoleCapability::Conversation, None, &mut None).map_err(|(_, error)| error)
+        ConsoleCapability::Conversation, None, &mut None)
 }
 
 #[derive(Default)]

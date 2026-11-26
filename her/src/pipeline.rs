@@ -495,7 +495,7 @@ pub struct Pipeline {
     #[cfg(test)]
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
-    completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    completion_observed_hook: Option<Box<dyn FnMut(&str) + Send>>,
     #[cfg(test)]
     pub(crate) harness_cap_poll_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
     /// The scripted adapter the next admitted turn runs on, instead of its selected engine.
@@ -541,6 +541,7 @@ pub struct Pipeline {
 
 /// State of a chat turn while it runs.
 struct ChatRun {
+    prompt: Option<crate::chat::Prompt>,
     /// The turn-engine adapter this turn runs on (captured before the turn begins).
     adapter: crate::turn_engine::Adapter,
     reserved: Option<crate::reserved::Authority>,
@@ -1552,7 +1553,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     pub(crate) async fn run_chat_turn(
         &mut self,
         key: &str,
-        prompt: &str,
+        prompt: crate::chat::Prompt,
         ack: Option<String>,
         cfg: &serde_json::Value,
         inbound: &[String],
@@ -1591,6 +1592,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         }
         self.begin_ledger_turn_as(key, adapter.id(), false)?;
         self.chat = Some(ChatRun {
+            prompt: Some(prompt),
             adapter,
             reserved: None,
             mode: mode.to_string(),
@@ -1599,7 +1601,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             media_parts,
             owner_started,
         });
-        let result = self.run_chat_inner(key, prompt, cfg).await;
+        let result = self.run_chat_inner(key, "", cfg).await;
         self.chat = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         if result.is_err() && uses_dsh && self.defer_unsubmitted_dsh_chat(key, cfg) {
@@ -1654,6 +1656,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         self.chat = Some(ChatRun {
             adapter,
             reserved: Some(authority),
+            prompt: None,
             mode: "reserved".to_string(),
             silent,
             ack,
@@ -1879,6 +1882,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let mut delivery = crate::harness::TurnDelivery {
             recorder: Some(recorder.clone()),
             reserved2_budget: self.reserved2_budget,
+            prompt: Some(self.chat.as_ref().and_then(|chat| chat.prompt.clone())
+                .map_or(crate::harness::PromptSource::Rendered { snapshot: false }, crate::harness::PromptSource::Chat)),
             ..Default::default()
         };
         let (prompt, layers) = if mode == "reserved2" && self.current_reason != "wakeReminder" {
@@ -1915,6 +1920,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             crate::briefing::alert_empty(&self.context, cfg, key, session_id, authority_epoch, plan.generation, &wake.layers);
             delivery.briefing = Some(record);
             delivery.full_prompt = wake.full_text;
+            delivery.prompt = Some(crate::harness::PromptSource::Rendered { snapshot: wake.has_snapshot });
             delivery.recalled = wake.recalled;
             (wake.text, Some(layers))
         } else if mode == "reserved2" {
@@ -2083,9 +2089,20 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     }
 
     async fn run_chat_inner(&mut self, key: &str, prompt: &str, cfg: &serde_json::Value) -> Result<(), String> {
-        let delivered =
-            crate::prompt::wrap_for_delivery_with_runtime(&self.context, prompt, cfg, crate::parity_clock::now_ms());
         let adapter = self.chat.as_ref().map_or(crate::turn_engine::Adapter::Dsh, |c| c.adapter.clone());
+        let at = crate::parity_clock::now_ms();
+        let delivered = if let Some(chat_prompt) = self.chat.as_mut().and_then(|chat| chat.prompt.as_mut()) {
+            let prefix = crate::prompt::wrap_for_delivery_with_runtime(&self.context, "", cfg, at);
+            chat_prompt.prefix.insert_str(0, &prefix);
+            let view = if adapter.uses_dsh() {
+                crate::model_view::with_blacklist(&self.context, cfg)
+            } else {
+                serde_json::Value::Null
+            };
+            chat_prompt.render(&view)
+        } else {
+            crate::prompt::wrap_for_delivery_with_runtime(&self.context, prompt, cfg, at)
+        };
         let timeout = std::time::Duration::from_secs(turn_timeout_secs(cfg));
         let text = self.run_admitted_turn(&adapter, key, &delivered, timeout, cfg).await?;
         let report = self.last_report.take().unwrap_or_default();
@@ -2165,10 +2182,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let mut draft_prompt = cli_prompt.to_owned();
         // Match the shared hold's three revisions. The fourth draft uses its fixed deadline.
         for revision in 0..=3 {
-            let delivered = crate::model_view::strip_text_with_runtime(&self.context, &draft_prompt, cfg);
             let started = std::time::Instant::now();
             self.dispatch_unsubmitted = false;
-            let result = provider(&delivered);
+            let result = provider(&draft_prompt);
             let elapsed_ms = started.elapsed().as_millis() as i64;
             let record = serde_json::json!({
                 "ts": crate::turn_ledger::now_ms(), "key": key, "backend": id, "mode": "text-only",
@@ -2182,15 +2198,14 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 Err(note) => {
                     let failure = crate::model_failure::Failure::classify("", &note);
                     let (provider, model) = crate::model_failure::cli_identity(cfg,id);
-                    self.report_backend_failure(cfg,&key,id,&provider,&model,&failure.code,&note);
+                    self.report_backend_failure(cfg,&key,id,&provider,&model,"",&note);
                     if failure.class != "refusal" {
                         self.send_persona_failure_line(&key, None);
                     }
                     return Err(failure.summary());
                 }
             };
-            let text = text.trim().to_owned();
-            if text.is_empty() { return Ok(if revision == 0 { None } else { Some(0) }); }
+            if text.trim().is_empty() { return Ok(if revision == 0 { None } else { Some(0) }); }
             if is_silent_marker(&text) { return Ok(Some(0)); }
             if let Some(turn) = &self.cur_turn {
                 turn.attempt(&format!("cli:{}",crate::dsh::mint_request_id()),"")
@@ -2224,6 +2239,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 if revision == 3 { return Err("CLI reply revision budget is exhausted".to_owned()); }
                 crate::model_failure::merge_refs(&mut self.carried_messages,
                     crate::model_failure::message_refs(&response["newMessages"]));
+                let response = crate::model_view::strip_chat_with_runtime(&self.context, &response, &fresh);
                 draft_prompt = format!("{draft_prompt}\n\n上一条草稿没有发送：等待期间又有新消息。请据此重写回复，只输出要发到 QQ 的正文；无需回复就输出 [SILENT]。\n【本次消息快照】\n{response}");
                 continue;
             }
@@ -3975,7 +3991,7 @@ mod tests {
             let result = pipe
                 .run_chat_turn(
                     "group:42",
-                    "hello chat",
+                    "hello chat".into(),
                     None,
                     &fx.cfg,
                     &["e1".into()],

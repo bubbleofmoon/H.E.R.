@@ -78,7 +78,7 @@ impl Tools {
         };
         authority.check().map_err(String::from)?;
         // #140: read from the settings store with this turn's configuration, so an edit is in
-        // effect from the next turn; the model-view strip applies, and the stripped text is checked again.
+        // effect from the next turn under the prompt text and credential checks.
         let mode_prompt = profile
             .prompt_key()
             .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
@@ -178,10 +178,9 @@ impl Tools {
         Ok(self
             .definitions
             .iter()
-            .filter(|d| {
-                current
-                    .as_ref()
-                    .is_none_or(|current| current.iter().any(|c| c["name"] == d["name"]))
+            .filter_map(|captured| match &current {
+                Some(current) => current.iter().find(|tool| tool["name"] == captured["name"]),
+                None => Some(captured),
             })
             .map(|d| {
                 Tool::new(d["name"].as_str().unwrap_or_default())
@@ -344,7 +343,6 @@ impl Authority {
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
 /// configuration switches off (#153) drops out of every menu, the direct-send switches included.
 fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> {
-    let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
         .as_array()
         .cloned()
@@ -356,10 +354,7 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
         .into_iter()
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
-                menu.contains(&name)
-                    && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
-                        || crate::social_state::reserved2_menu_tool(cfg, conversation, name))
-                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
+                profile.allows_tool(cfg, Some(conversation), name)
             })
         })
         .map(|mut definition| {
@@ -376,19 +371,6 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
             }
         })
         .collect()
-}
-
-/// The `socialV2.tools` switch the console checks for a token-bound direct send
-/// (`console_agent::direct_inner`). The shared MCP registration (`qq_tools::registered`) does not
-/// gate these three tools, and the harness always binds the turn's token into them, so the menu
-/// applies the switch. As in the console, only an explicit `false` switches a send off.
-fn direct_send_switch(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "qq_send_private_message" => "sendPrivate",
-        "qq_send_group_message" => "sendGroup",
-        "qq_reply" => "reply",
-        _ => return None,
-    })
 }
 
 pub(super) fn error(reason: &str) -> Value {
@@ -593,22 +575,38 @@ mod tests {
         assert_eq!(listed["items"], json!([existing]));
     }
 
-    /// The table row and its registered tools for a private chat with optional media enabled.
+    /// Check the profile table and the offered private-chat tools with and without an owner.
     fn assert_menu(profile: Profile, expected: &[&str]) {
-        let cfg = json!({
+        let mut cfg = json!({
             "socialV2": {
                 "voice": {"enabled": true},
                 "tools": {"sendVoice": true, "setStickerRemark": true}
             }
         });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
-        assert_eq!(
-            names(&definitions(&cfg, profile, OWNER_KEY)),
-            expected.iter().copied().filter(|name| {
+        let private_menu: Vec<_> = expected
+            .iter()
+            .copied()
+            .filter(|name| {
                 !matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
                     || !matches!(*name, "qq_send_group_message" | "qq_reply" | "qq_send_burst")
-            }).collect::<Vec<_>>(),
-            "{profile:?} offered"
+            })
+            .collect();
+        let without_owner: Vec<_> = private_menu
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "memory_acl" | "settings_get" | "settings_set"))
+            .collect();
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            without_owner,
+            "{profile:?} offered without an owner"
+        );
+        cfg["ownerQQ"] = json!(8808);
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            private_menu,
+            "{profile:?} offered to the configured owner"
         );
     }
 
@@ -1154,17 +1152,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_prompt_strip_that_makes_a_denied_term_falls_back_to_the_last_good_text() {
+    fn mode_prompt_keeps_its_validated_text_when_chat_redaction_changes() {
         let fixture = Fixture::new("mode-prompt-strip", "closed-agent");
         let save = |text: &str| {
             crate::settings::apply(&fixture.context, "prompt.mode.closedAgent", &json!(text), "administrator", "console")
         };
         save("封闭模式说明 140").unwrap();
-        // Accepted on save, when the strip has no term to remove; the strip below makes `DSH` of it.
         save("D鲸SH").unwrap();
         fixture.edit_config(|cfg| cfg["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
         let instruction = fixture.capture("closed-agent", OWNER_KEY).unwrap().instruction();
-        assert_eq!(instruction, format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY)));
+        assert_eq!(instruction, format!("D鲸SH\n\n{}", session_instruction(OWNER_KEY)));
         assert!(!instruction.contains("DSH"), "a denied term reached the model: {instruction}");
     }
 
@@ -1218,14 +1215,14 @@ mod tests {
             instruction("closed-agent", OWNER_KEY),
             format!("{}\n\n{}", "鲸".repeat(8000), session_instruction(OWNER_KEY))
         );
-        // The model-view strip applies to the mode prompt.
+        // Chat redaction leaves the saved mode prompt intact.
         save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
         fixture.edit_config(|cfg| {
             cfg["socialV2"] = json!({"context": {"stripFromModelText": ["封闭"]}})
         });
         assert_eq!(
             instruction("closed-agent", OWNER_KEY),
-            format!("模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+            format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY))
         );
         // An emptied prompt sends the session line alone again.
         save("prompt.mode.closedAgent", "").unwrap();

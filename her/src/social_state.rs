@@ -681,10 +681,18 @@ pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> b
 }
 
 /// Additional menu gates imposed by the reserved2 runtime/console contract.
-pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
+pub(crate) fn reserved2_menu_tool(cfg: &Value, key: Option<&str>, name: &str) -> bool {
+    if name.starts_with("qq_")
+        && name != "qq_status"
+        && cfg.pointer("/socialV2/enabled").and_then(Value::as_bool) == Some(false)
+    {
+        return false;
+    }
     match name {
-        "qq_send_private_message" => key.starts_with("private:"),
-        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
+        "qq_send_private_message" => key.is_none_or(|key| key.starts_with("private:")),
+        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => {
+            key.is_none_or(|key| key.starts_with("group:"))
+        }
         "qq_send_voice" | "qq_list_voices" => {
             crate::settings::VOICE_ENABLED.switch(cfg)
                 && crate::settings::tool_enabled(cfg, "sendVoice")
@@ -3417,9 +3425,9 @@ mod tests {
         assert!(approved_group_allowed(&cfg, "group:42", "hello"));
         assert!(!approved_group_allowed(&cfg, "private:7001", "hello"));
         assert!(!approved_group_allowed(&cfg, "group:042", "hello"));
-        assert!(reserved2_menu_tool(&cfg, "group:42", "qq_send_group_message"));
-        assert!(!reserved2_menu_tool(&cfg, "private:7001", "qq_send_group_message"));
-        assert!(!reserved2_menu_tool(&cfg, "group:42", "qq_set_sticker_remark"));
+        assert!(reserved2_menu_tool(&cfg, Some("group:42"), "qq_send_group_message"));
+        assert!(!reserved2_menu_tool(&cfg, Some("private:7001"), "qq_send_group_message"));
+        assert!(!reserved2_menu_tool(&cfg, Some("group:42"), "qq_set_sticker_remark"));
 
         let root = TestDir::new("authority");
         let context = test_context(&root, cfg.clone());

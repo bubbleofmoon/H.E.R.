@@ -143,79 +143,50 @@ pub fn strip_text_with_runtime(context: &crate::runtime::RuntimeContext, text: &
 }
 
 pub fn strip_text(text: &str, cfg: &Value) -> String {
-    // The packet is already structured bridge data: apply the chat-field filter so IDs,
-    // cursors and tokens are never treated as chat text, even for a numeric strip entry.
-    if let Some((before, packet)) = text.rsplit_once("【本次消息快照】\n") {
-        let mut values = serde_json::Deserializer::from_str(packet).into_iter::<Value>();
-        if let Some(Ok(value)) = values.next() {
-            let consumed = values.byte_offset();
-            return format!("{}【本次消息快照】\n{}{}", strip_from_model_text(before, &cfg),
-                strip_model_chat_data(&value, &cfg), strip_from_model_text(&packet[consumed..], &cfg));
-        }
-    }
-    strip_from_model_text(text, &cfg)
+    redact_snapshot(text, cfg).unwrap_or_else(|| strip_from_model_text(text, cfg))
+}
+
+/// Filter only the JSON packet within a rendered wake, preserving its surrounding instructions.
+pub(crate) fn redact_snapshot(text: &str, cfg: &Value) -> Option<String> {
+    const HEADER: &str = "【本次消息快照】\n";
+    let (before, packet) = text.rsplit_once(HEADER)?;
+    let mut values = serde_json::Deserializer::from_str(packet).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    let consumed = values.byte_offset();
+    Some(format!("{before}{HEADER}{}{}", strip_model_chat_data(&value, cfg), &packet[consumed..]))
 }
 
 pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &Value, cfg: &Value) -> Value {
     strip_model_chat_data(data, &with_blacklist(context, cfg))
 }
 
-/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse an occurrence or did not
-/// settle within `MODEL_STRIP_ROUNDS` (`strip_model_text`): then `None`, and the caller uses its accepted fallback.
-pub fn strip_checked(text: &str, delivery: &Value) -> Option<String> {
-    let (stripped, refused) = strip_model_text(text, delivery);
-    (!refused).then_some(stripped)
-}
+/// The visible replacement for a configured literal in model-facing chat data.
+const REDACTION: &str = "【已隐藏】";
 
-/// Filter only the copy delivered to a model. Transport codes and media markers are atoms. See `strip_model_text`.
+/// Filter only the copy delivered to a model. Transport codes, media labels and redaction markers are atoms.
 pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
-    strip_model_text(text, cfg).0
-}
-
-/// The most rounds of the model-text strip. A round applies every entry once, so an input nested deeper than the
-/// rounds (`鲸鲸鲸鱼鱼鱼` under the entry `鲸鱼` needs one round per level) costs a bounded amount, however long it is.
-const MODEL_STRIP_ROUNDS: usize = 4;
-
-/// The model-text strip applies the entries in order, outside atoms, for up to `MODEL_STRIP_ROUNDS`.
-/// Each occurrence is checked at its join. Other occurrences of the same literal can still be removed.
-/// The flag is true when a round settles with a refusal or the last allowed round still changes the text.
-fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
+    let mut current = text.to_owned();
     let Some(items) = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array) else {
-        return (text.to_string(), false);
+        return current;
     };
-    let strips: Vec<&str> = items.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).collect();
-    if strips.is_empty() {
-        return (text.to_string(), false);
-    }
     static ATOMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let atoms = ATOMS.get_or_init(|| regex::Regex::new(
-        r"【会话令牌】[^\r\n]*|\[CQ:[^\]\r\n]*\]|\[(?:图片|语音|视频|媒体|卡片消息|表情[^\]\r\n]*|文件[^\]\r\n]*|转发消息[^\]\r\n]*)\]"
+        r"【已隐藏】|【会话令牌】[^\r\n]*|\[CQ:[^\]\r\n]*\]|\[(?:图片[0-9]*|语音|视频|媒体|卡片消息|表情[^\]\r\n]*|文件[^\]\r\n]*|转发消息[^\]\r\n]*)\]"
     ).unwrap());
-    let mut current = text.to_string();
-    for _ in 0..MODEL_STRIP_ROUNDS {
-        let starting_len = current.len();
-        let mut refused = false;
-        for &item in &strips {
-            if current.contains(item) {
-                let (next, refused_item) = strip_occurrences(&current, item, atoms);
-                current = next;
-                refused |= refused_item;
-            }
-        }
-        if current.len() == starting_len {
-            return (current, refused);
+    for item in items.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+        if current.contains(item) {
+            current = redact_occurrences(&current, item, atoms);
         }
     }
-    (current, true)
+    current
 }
 
-fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, bool) {
-    use crate::model_text_policy::{StripRightContext, deletion_adds_denied_term, push_compact_format_runs};
+fn redact_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> String {
+    use crate::model_text_policy::{StripRightContext, push_compact_format_runs, replacement_adds_denied_term};
 
     let mut out = String::with_capacity(text.len());
     let mut left = String::new();
     let mut right = StripRightContext::new(text);
-    let mut refused = false;
     let mut copied = 0;
     let atom_ranges = atoms.find_iter(text).map(|atom| (atom.start(), atom.end()));
     for (atom_start, atom_end) in atom_ranges.chain(std::iter::once((text.len(), text.len()))) {
@@ -225,10 +196,12 @@ fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, b
             let end = start + item.len();
             out.push_str(&text[copied..start]);
             push_compact_format_runs(&mut left, &text[copied..start]);
-            if deletion_adds_denied_term(&left, item, right.at(end)) {
+            if replacement_adds_denied_term(&left, item, REDACTION, right.at(end)) {
                 out.push_str(item);
                 push_compact_format_runs(&mut left, item);
-                refused = true;
+            } else {
+                out.push_str(REDACTION);
+                push_compact_format_runs(&mut left, REDACTION);
             }
             copied = end;
         }
@@ -236,7 +209,7 @@ fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, b
         push_compact_format_runs(&mut left, &text[copied..atom_end]);
         copied = atom_end;
     }
-    (out, refused)
+    out
 }
 
 /// Keep JSON keys, cursors, tokens and media references intact; filter chat-bearing values.
@@ -247,10 +220,11 @@ pub fn strip_model_chat_data(data: &Value, cfg: &Value) -> Value {
             let filtered = match (key.as_str(), value) {
                 ("text" | "plain" | "tail" | "sender" | "nickname" | "card" | "ownerLabel"
                     | "raw_message" | "message" | "messages" | "content" | "subject" | "query" | "q"
-                    | "formatted" | "block" | "meaning" | "usage" | "example", Value::String(text)) => {
+                    | "formatted" | "block" | "meaning" | "usage" | "example"
+                    | "pendingQuestion" | "motivation", Value::String(text)) => {
                     Value::String(strip_from_model_text(text, cfg))
                 }
-                ("terms" | "messages", Value::Array(items)) => Value::Array(items.iter().map(|v| match v {
+                ("terms" | "messages" | "keywords" | "pendingQuestions" | "traits", Value::Array(items)) => Value::Array(items.iter().map(|v| match v {
                     Value::String(text) => Value::String(strip_from_model_text(text, cfg)),
                     _ => strip_model_chat_data(v, cfg),
                 }).collect()),
@@ -382,14 +356,14 @@ mod tests {
     fn tool_result_chat_schemas_filter_every_text_field_and_keep_transport() {
         let cfg = json!({"socialV2":{"context":{"stripFromModelText":["WORD"]}}});
         for (field, original, expected) in [
-            ("formatted", json!("WORD memory"), json!(" memory")),
-            ("block", json!("WORD slang"), json!(" slang")),
-            ("meaning", json!("WORD meaning"), json!(" meaning")),
-            ("usage", json!("WORD usage"), json!(" usage")),
-            ("example", json!("WORD example"), json!(" example")),
-            ("messages", json!("WORD message"), json!(" message")),
+            ("formatted", json!("WORD memory"), json!("【已隐藏】 memory")),
+            ("block", json!("WORD slang"), json!("【已隐藏】 slang")),
+            ("meaning", json!("WORD meaning"), json!("【已隐藏】 meaning")),
+            ("usage", json!("WORD usage"), json!("【已隐藏】 usage")),
+            ("example", json!("WORD example"), json!("【已隐藏】 example")),
+            ("messages", json!("WORD message"), json!("【已隐藏】 message")),
             ("messages", json!(["WORD first", "WORD second", {"text":"WORD nested","messageId":"WORD-id"}]),
-                json!([" first", " second", {"text":" nested","messageId":"WORD-id"}])),
+                json!(["【已隐藏】 first", "【已隐藏】 second", {"text":"【已隐藏】 nested","messageId":"WORD-id"}])),
         ] {
             let data = json!({field:original,"messageId":"WORD-id","token":"WORD-token"});
             let filtered = strip_model_chat_data(&data, &cfg);
@@ -415,21 +389,21 @@ mod tests {
         let original = json!({"messages":[{"messageId":"83002","seq":3,"sender":"WORD name","text":"CFG WORD NEW 83002 [图片]"}]});
         let file = root.join("config/model-text-blacklist.json");
         let render = || strip_chat_with_runtime(&context, &original, &cfg);
-        assert_eq!(render()["messages"][0]["text"], " WORD NEW 83002 [图片]");
+        assert_eq!(render()["messages"][0]["text"], "【已隐藏】 WORD NEW 83002 [图片]");
         std::fs::write(&file, r#"{"strip":["WORD","83002"]}"#).unwrap();
         let filtered = render();
-        assert_eq!(filtered["messages"][0]["text"], "  NEW  [图片]");
+        assert_eq!(filtered["messages"][0]["text"], "【已隐藏】 【已隐藏】 NEW 【已隐藏】 [图片]");
         assert_eq!(filtered["messages"][0]["messageId"], "83002");
         assert_eq!(filtered["messages"][0]["seq"], 3);
         std::fs::write(&file, r#"{"strip":["NEW"]}"#).unwrap();
-        assert_eq!(render()["messages"][0]["text"], " WORD  83002 [图片]");
+        assert_eq!(render()["messages"][0]["text"], "【已隐藏】 WORD 【已隐藏】 83002 [图片]");
         for invalid in ["invalid JSON".to_string(), json!({"strip":["WORD"],"padding":"x".repeat(65536)}).to_string(), json!({"strip":vec!["WORD";501]}).to_string(), json!({"strip":["WORD","字".repeat(65)]}).to_string()] {
             std::fs::write(&file, invalid).unwrap();
-            for _ in 0..2 { assert_eq!(render()["messages"][0]["text"], " WORD NEW 83002 [图片]"); }
+            for _ in 0..2 { assert_eq!(render()["messages"][0]["text"], "【已隐藏】 WORD NEW 83002 [图片]"); }
         }
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
-        for _ in 0..2 { assert_eq!(render()["messages"][0]["text"], " WORD NEW 83002 [图片]"); }
+        for _ in 0..2 { assert_eq!(render()["messages"][0]["text"], "【已隐藏】 WORD NEW 83002 [图片]"); }
         assert_eq!(original["messages"][0]["text"], "CFG WORD NEW 83002 [图片]");
         assert_eq!(std::fs::read_to_string(root.join("config/config.json")).unwrap(), cfg.to_string());
         std::fs::remove_dir_all(root).unwrap();
@@ -512,7 +486,7 @@ mod tests {
             assert_eq!(strip_from_model_text(text, &cfg), text);
         }
         let cfg = json!({"socialV2":{"context":{"stripFromModelText":["奸","坏词","bad","😀","",null,3]}}});
-        assert_eq!(strip_from_model_text(text, &cfg), "  ");
+        assert_eq!(strip_from_model_text(text, &cfg), "【已隐藏】【已隐藏】 【已隐藏】【已隐藏】 【已隐藏】");
     }
 
     fn strip_cfg(items: &[&str]) -> Value {
@@ -520,147 +494,36 @@ mod tests {
     }
 
     #[test]
-    fn prompt_text_model_strip_repeats_until_nothing_more_goes() {
-        // One pass over `x鲸鲸鱼鱼y` takes the inner `鲸鱼` and leaves a new one behind.
-        assert_eq!(strip_from_model_text("x鲸鲸鱼鱼y", &strip_cfg(&["鲸鱼"])), "xy");
-        assert_eq!(strip_from_model_text("a鲸鲸鲸鱼鱼鱼b", &strip_cfg(&["鲸鱼"])), "ab");
-        // The first literal's removal makes a match for the second one.
-        assert_eq!(strip_from_model_text("甲乙X丙丁", &strip_cfg(&["乙丙", "X"])), "甲丁");
-    }
-
-    #[test]
-    fn model_strip_join_regression_removes_safe_occurrences_of_the_same_literal() {
-        let cfg = strip_cfg(&["鲸"]);
-        let text = "鲸头 D鲸SH 鲸尾";
-        assert_eq!(
-            strip_from_model_text(text, &cfg),
-            "头 D鲸SH 尾",
-            "safe occurrences must be stripped even when another occurrence is refused"
-        );
-        assert_eq!(strip_checked(text, &cfg), None, "checked text must report a refused occurrence");
-        // The check sees earlier removals in the same pass.
-        assert_eq!(strip_from_model_text("D鲸鲸SH", &cfg), "D鲸SH");
-        // Carry the whole longest word and its edge, including across a long invisible format run.
-        let split = format!("ANTIGRAVIT{}鲸Y", "\u{200b}".repeat(32));
-        assert_eq!(strip_from_model_text(&split, &cfg), split);
-        assert_eq!(strip_from_model_text("xANTIGRAVIT鲸Y", &cfg), "xANTIGRAVITY");
-    }
-
-    #[test]
-    fn model_strip_round1_keeps_a_join_that_would_create_a_denied_phrase() {
-        assert_eq!(strip_from_model_text("模鲸型", &strip_cfg(&["鲸"])), "模鲸型");
-    }
-
-    #[test]
-    fn model_strip_round1_refuses_a_join_with_a_format_word_edge() {
-        assert_eq!(strip_checked("x\u{200b}D鲸SH", &strip_cfg(&["鲸"])), None);
-    }
-
-    #[test]
-    fn model_strip_round1_bounds_window_scans_across_a_growing_format_run() {
-        use crate::model_text_policy::take_deletion_window_scan_count;
-
-        let pairs = 20_000;
-        let text = "\u{200b}x".repeat(pairs);
-        let cfg = strip_cfg(&["x"]);
-        take_deletion_window_scan_count();
-        let stripped = strip_checked(&text, &cfg);
-        let scanned = take_deletion_window_scan_count();
-
-        assert_eq!(stripped, Some("\u{200b}".repeat(pairs)));
-        assert!(scanned <= pairs * 256, "join windows scanned {scanned} characters");
-    }
-
-    #[test]
-    fn prompt_text_model_strip_never_adds_a_denied_term() {
+    fn redaction_marks_original_spans_without_joining_former_neighbors() {
         let strip = |text: &str, items: &[&str]| strip_from_model_text(text, &strip_cfg(items));
-        // The strip would make `DSH` of a text that held none: the literal is not applied.
-        assert_eq!(strip("D鲸SH", &["鲸"]), "D鲸SH");
-        // The first pass is harmless and kept; the second would make `DSH`.
-        assert_eq!(strip("D鲸鲸鱼鱼SH", &["鲸鱼"]), "D鲸鱼SH");
-        // A literal that is harmless still applies.
-        assert_eq!(strip("D鲸SH 坏", &["鲸", "坏"]), "D鲸SH ");
-        // A strip that joins text across a line break makes the term too.
-        assert_eq!(strip("D\n\nSH", &["\n\n"]), "D\n\nSH");
-        assert_eq!(strip("甲\n\n乙", &["\n\n"]), "甲乙");
-        // A term the text already held is not protected, and is not a reason to keep other strips out.
-        assert_eq!(strip("DSH 鲸x", &["鲸"]), "DSH x");
-        // Applying the strip again changes nothing, so a delivery strip after a checked one adds no term.
-        for (text, items) in [
-            ("D鲸鲸鱼鱼SH", &["鲸鱼"][..]),
-            ("D鲸SH 坏", &["鲸", "坏"][..]),
-            ("D\n\nSH", &["\n\n"][..]),
-            ("x鲸鲸鱼鱼y", &["鲸鱼"][..]),
+        assert_eq!(strip("x鲸鲸鱼鱼y", &["鲸鱼"]), "x鲸【已隐藏】鱼y");
+        assert_eq!(strip("甲乙X丙丁", &["X", "乙丙"]), "甲乙【已隐藏】丙丁");
+        assert_eq!(strip("x鲸【已隐藏】鱼y", &["鲸鱼", "隐藏"]), "x鲸【已隐藏】鱼y");
+        assert_eq!(strip("D鲸SH 模鲸型 D\n\nSH", &["鲸", "\n\n"]), "D【已隐藏】SH 模【已隐藏】型 D【已隐藏】SH");
+    }
+
+    #[test]
+    fn redaction_preserves_denied_term_edges_without_refusing_other_matches() {
+        let strip = |text: &str| strip_from_model_text(text, &strip_cfg(&["x", "鲸"]));
+        for (text, expected) in [
+            ("xＤＳＨ 鲸尾", "xＤＳＨ 【已隐藏】尾"),
+            ("dsh xDSH 鲸头", "dsh xDSH 【已隐藏】头"),
+            ("xDS\u{200b}H 鲸尾", "xDS\u{200b}H 【已隐藏】尾"),
+            ("xai 鲸尾", "xai 【已隐藏】尾"),
+            ("D鲸S\u{200b}H", "D【已隐藏】S\u{200b}H"),
         ] {
-            let once = strip(text, items);
-            assert_eq!(strip(&once, items), once, "{text:?}");
+            assert_eq!(strip(text), expected);
         }
+        let split = format!("xANTIGRAVIT{}Y 鲸", "\u{200b}".repeat(20_000));
+        assert_eq!(strip(&split), format!("xANTIGRAVIT{}Y 【已隐藏】", "\u{200b}".repeat(20_000)));
     }
 
     #[test]
-    fn denied_term_policy_the_strip_never_makes_a_full_width_zero_width_or_lower_case_term() {
-        let strip = |text: &str, items: &[&str]| strip_from_model_text(text, &strip_cfg(items));
-        assert_eq!(strip("Ｄ鲸ＳＨ", &["鲸"]), "Ｄ鲸ＳＨ", "full-width");
-        assert_eq!(strip("D\u{200b}鲸SH", &["鲸"]), "D\u{200b}鲸SH", "split by a zero-width space");
-        assert_eq!(strip("我是a鲸i", &["鲸"]), "我是a鲸i", "lower-case ai");
-        assert_eq!(strip("Ｄ鲸x", &["鲸"]), "Ｄx", "a harmless strip still applies");
-    }
-
-    #[test]
-    fn prompt_text_checked_strip_refuses_a_text_the_strip_would_turn_into_a_denied_term() {
-        let delivery = strip_cfg(&["鲸鱼"]);
-        // The second pass would make `DSH`, so the text is refused whole, not delivered half stripped.
-        assert_eq!(strip_checked("D鲸鲸鱼鱼SH", &delivery), None);
-        assert_eq!(strip_checked("D鲸鱼SH", &delivery), None);
-        assert_eq!(strip_checked("D鲸SH", &strip_cfg(&["鲸"])), None);
-        assert_eq!(strip_checked("a鲸鱼b", &delivery), Some("ab".to_string()));
-        assert_eq!(strip_checked("a鲸鲸鱼鱼b", &delivery), Some("ab".to_string()));
-        // A term the text already held is not the strip's doing.
-        assert_eq!(strip_checked("DSH 鲸鱼x", &delivery), Some("DSH x".to_string()));
-    }
-
-    #[test]
-    fn prompt_text_model_strip_stops_after_its_rounds_on_a_deeply_nested_input() {
-        let delivery = strip_cfg(&["鲸鱼"]);
-        // One level goes per round: 2500 levels take the four rounds there are, not 2500 of them.
-        let nested = format!("{}{}", "鲸".repeat(2500), "鱼".repeat(2500));
-        let expected = format!("{}{}", "鲸".repeat(2500 - MODEL_STRIP_ROUNDS), "鱼".repeat(2500 - MODEL_STRIP_ROUNDS));
-        assert_eq!(strip_from_model_text(&nested, &delivery), expected);
-        assert_eq!(strip_checked(&nested, &delivery), None, "a text that did not settle is refused to a checked read");
-        // The depth the rounds settle: the last allowed round finds nothing more.
-        assert_eq!(strip_checked("a鲸鲸鲸鱼鱼鱼b", &delivery), Some("ab".to_string()));
-        assert_eq!(strip_from_model_text("a鲸鲸鲸鲸鱼鱼鱼鱼b", &delivery), "ab");
-        assert_eq!(strip_checked("a鲸鲸鲸鲸鱼鱼鱼鱼b", &delivery), None);
-    }
-
-    fn delivery_fixture(name: &str, strip: &[&str]) -> (std::path::PathBuf, crate::runtime::RuntimeContext, Value) {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
-            "her-{name}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        )));
-        for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
-        let mut cfg = strip_cfg(strip);
-        cfg["consoleToken"] = json!("delivery-fixture");
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
-        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = crate::runtime::RuntimeContext::from_root(&root).unwrap();
-        (root, context, cfg)
-    }
-
-    #[test]
-    fn prompt_text_dsh_delivery_strip_never_adds_a_denied_term() {
-        // The compatibility render passed its check as `D鲸鱼SH`; the DSH delivery strips the prompt again.
-        let (root, context, cfg) = delivery_fixture("prompt-text-dsh", &["鲸鱼"]);
-        let delivered = strip_text_with_runtime(&context, "【别像客服】D鲸鱼SH\n\n后文", &cfg);
-        assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "{delivered}");
-        assert_eq!(delivered, "【别像客服】D鲸鱼SH\n\n后文");
-        // The snapshot packet form strips its chat fields and the text around it the same way.
+    fn snapshot_redaction_preserves_the_prompt_and_structural_fields() {
+        let cfg = strip_cfg(&["鲸鱼"]);
         let packet = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 鲸鱼好\"}]}后D鲸鱼SH";
-        let delivered = strip_text_with_runtime(&context, packet, &cfg);
-        assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "{delivered}");
-        let expected = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 好\"}]}后D鲸鱼SH";
-        assert_eq!(delivered, expected, "only the occurrences that would make a denied term are kept");
-        std::fs::remove_dir_all(root).unwrap();
+        let expected = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D【已隐藏】SH 【已隐藏】好\"}]}后D鲸鱼SH";
+        assert_eq!(redact_snapshot(packet, &cfg).as_deref(), Some(expected));
     }
 
     #[test]
@@ -675,18 +538,18 @@ mod tests {
         let out = strip_model_chat_data(&data, &cfg);
         assert_eq!(out["key"], "group:text");
         assert_eq!(out["token"], "bad-token");
-        assert_eq!(out["query"], " query");
-        assert_eq!(out["q"], " q");
+        assert_eq!(out["query"], "【已隐藏】【已隐藏】 query");
+        assert_eq!(out["q"], "【已隐藏】【已隐藏】 q");
         assert_eq!(out["messages"][0]["seq"], 82);
         assert_eq!(out["messages"][0]["messageId"], "bad-id");
-        assert_eq!(out["messages"][0]["sender"], "昵称");
-        assert_eq!(out["messages"][0]["text"], " [CQ:image,file=bad.png] [图片] [语音] [视频] [表情14] [文件bad.png]");
-        assert_eq!(out["messages"][0]["reply"], json!({"nickname":"人","text":"原话"}));
+        assert_eq!(out["messages"][0]["sender"], "【已隐藏】昵称");
+        assert_eq!(out["messages"][0]["text"], "【已隐藏】【已隐藏】【已隐藏】【已隐藏】【已隐藏】 [CQ:image,file=bad.png] [图片] [语音] [视频] [表情14] [文件bad.png]");
+        assert_eq!(out["messages"][0]["reply"], json!({"nickname":"【已隐藏】人","text":"【已隐藏】【已隐藏】原话"}));
         assert_eq!(out["messages"][0]["media"], data["messages"][0]["media"]);
         assert_eq!(data["messages"][0]["sender"], "奸昵称");
         let encoded = serialize_model_data(&out);
         let _: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(strip_from_model_text("【会话令牌】bad-token\n奸bad", &cfg), "【会话令牌】bad-token\n");
+        assert_eq!(strip_from_model_text("【会话令牌】bad-token\n奸bad", &cfg), "【会话令牌】bad-token\n【已隐藏】【已隐藏】");
     }
 
     #[test]

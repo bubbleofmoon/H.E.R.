@@ -150,14 +150,56 @@ fn memory_tools() -> Value {
     })
 }
 
-/// `tools/list` result: the registered `qq_*` tools (JS registration order, config-gated at start-up),
-/// then the memory / settings tools.
+/// The QQ and memory/settings call schemas in registration order.
 pub fn tool_list(cfg: &Value) -> Value {
     let mut tools = crate::qq_tools::registered_tools(cfg);
     if let Some(extra) = memory_tools().get("tools").and_then(|t| t.as_array()) {
         tools.extend(extra.iter().cloned());
     }
     json!({ "tools": tools })
+}
+
+/// The model-visible snowluma-safe tools for the selected mode. DSH's shared server can
+/// serve several conversations, so without a bound key it offers the mode's union.
+pub(crate) fn discovered_tools(cfg: &Value, mode: Option<&str>, key: Option<&str>) -> Vec<Value> {
+    use crate::harness::profile::Profile;
+
+    let mode = match mode {
+        Some("reserved") => "chat",
+        Some(mode) => mode,
+        None => return Vec::new(),
+    };
+    let profile = if let Some(key) = key {
+        if !crate::social_state::access_allowed(cfg, mode, key) {
+            return Vec::new();
+        }
+        Profile::of_conversation(cfg, mode, key)
+    } else {
+        let has_owner = !crate::chat::owner_qq(cfg).is_empty();
+        match mode {
+            "chat" if has_owner => Some(Profile::OwnerPrivate),
+            "chat" => Some(Profile::Chat),
+            "closed-agent" if has_owner => Some(Profile::ClosedAgent),
+            "reserved2" if has_owner => Some(Profile::Reserved2Owner),
+            "reserved2" => Some(Profile::Reserved2),
+            _ => None,
+        }
+    };
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    tool_list(cfg)["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|tool| {
+            let name = tool["name"].as_str().unwrap_or_default();
+            // The Admin agent's approved group send belongs to the harness interaction handler.
+            !(mode == "closed-agent" && name == "qq_send_group_message")
+                && profile.allows_tool(cfg, key, name)
+        })
+        .cloned()
+        .collect()
 }
 
 #[allow(dead_code)] // Keep the no-context wrapper for existing in-crate callers.
@@ -171,10 +213,14 @@ pub fn call_tool_with_context(
     args: &Value,
     context: &RuntimeContext,
 ) -> Result<String, String> {
-    call_tool_with_source(name, args, context).map(|(text, _)| text)
+    call_tool_with_source(name, args, context).map(|(text, _)| text).map_err(|(_, error)| error)
 }
 
-fn call_tool_with_source(name: &str, args: &Value, context: &RuntimeContext) -> Result<(String, Value), String> {
+fn call_tool_with_source(
+    name: &str,
+    args: &Value,
+    context: &RuntimeContext,
+) -> Result<(String, Value), (u16, String)> {
     let action = match name {
         "memory_write" => "write",
         "memory_search" => "search",
@@ -183,16 +229,17 @@ fn call_tool_with_source(name: &str, args: &Value, context: &RuntimeContext) -> 
         "memory_acl" => "acl",
         "settings_get" => "settings-get",
         "settings_set" => "settings-set",
-        _ => return Err(format!("未知工具：{name}")),
+        _ => return Err((404, format!("未知工具：{name}"))),
     };
-    let source = crate::memory_actions::tool_action(context, action, args)?;
+    let source = crate::memory_actions::tool_action_with_status(context, action, args)?;
     let result = if matches!(name, "memory_search" | "memory_index") {
-        let cfg = context.load_config().map_err(str::to_string)?;
+        let cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
         crate::model_view::strip_chat_with_runtime(context, &source, &cfg)
     } else {
         source.clone()
     };
-    Ok((format_tool_result(name, args, &result)?, source))
+    let text = format_tool_result(name, args, &result).map_err(|error| (500, error))?;
+    Ok((text, source))
 }
 
 /// Render generated IDs/counters only after filtering the structured chat fields.
@@ -421,11 +468,11 @@ fn request_issues(method: &str, params: Option<&Value>) -> Vec<Issue> {
     issues
 }
 
-/// Result (or `Err((code, message))`) of one request. `tools` is the start-up registration.
+/// Result (or `Err((code, message))`) of one request.
 fn handle_request(
     method: &str,
     params: Option<&Value>,
-    tools: &[Value],
+    tools: &ToolDiscovery,
     server_name: &str,
     dispatch: &ToolDispatch,
 ) -> Result<Value, (i64, String)> {
@@ -451,7 +498,7 @@ fn handle_request(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools })),
+        "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => {
             let params = params.expect("validated above");
             let name = params.get("name").and_then(Value::as_str).expect("validated above");
@@ -553,7 +600,7 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
             }
             outcome
         },
-        Err(e) => {
+        Err((status, error)) => {
             let prefix = match name {
                 "memory_write" => "写入失败",
                 "memory_search" => "检索失败",
@@ -562,7 +609,10 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
                 "settings_set" => "改配置失败",
                 _ => "读取失败",
             };
-            text_outcome(format!("{prefix}：{e}"), false)
+            let class = if (400..500).contains(&status) { "refusal" } else { "error" };
+            let mut outcome = text_outcome(format!("{prefix}：{error}"), true);
+            outcome["structuredContent"] = json!({"class": class});
+            outcome
         }
     }
 }
@@ -571,24 +621,33 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
 /// `qq_wait_for_messages` must not hold up another session's tool calls); responses are written whole.
 pub fn serve_with_context(context: &RuntimeContext) -> std::io::Result<()> {
     use std::sync::Arc;
-    let cfg = served_config(context);
-    let tools: Arc<Vec<Value>> = Arc::new(
-        tool_list(&cfg)
-            .get("tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-    );
+    let discovery_context = context.clone();
+    let key = std::env::var("QQ_SESSION_KEY").unwrap_or_default();
+    let tools: ToolDiscovery = Arc::new(move || {
+        let cfg = match discovery_context.load_config_document() {
+            Ok(cfg) => cfg,
+            Err(_) if !discovery_context.is_isolated() => json!({}),
+            Err(_) => return Vec::new(),
+        };
+        let mode = crate::social_state::mode_checked(&discovery_context).ok();
+        let key = key.trim();
+        discovered_tools(&cfg, mode.as_deref(), (!key.is_empty()).then_some(key))
+    });
     let context = context.clone();
-    let registered = Arc::clone(&tools);
-    let dispatch: ToolDispatch = Arc::new(move |name, arguments| call_registered(name, arguments, &registered, &context));
+    let dispatch: ToolDispatch = Arc::new(move |name, arguments| {
+        let registered = tool_list(&served_config(&context));
+        let tools = registered["tools"].as_array().map(Vec::as_slice).unwrap_or_default();
+        call_registered(name, arguments, tools, &context)
+    });
     serve_stdio(SERVER_NAME, tools, dispatch)
 }
 
-/// The config document the served tool list is built from, from the loader (`{}` when it cannot be read).
+/// The config document the served tool list and call schemas are built from, from the loader (`{}` when it cannot be read).
 pub(crate) fn served_config(context: &RuntimeContext) -> Value {
     context.load_config_document().unwrap_or_else(|_| json!({}))
 }
+
+pub(crate) type ToolDiscovery = std::sync::Arc<dyn Fn() -> Vec<Value> + Send + Sync>;
 
 /// How a server answers `tools/call` for a tool name (after the protocol layer has parsed the request).
 pub(crate) type ToolDispatch = std::sync::Arc<dyn Fn(&str, Option<&Value>) -> Value + Send + Sync>;
@@ -596,7 +655,7 @@ pub(crate) type ToolDispatch = std::sync::Arc<dyn Fn(&str, Option<&Value>) -> Va
 /// The stdio JSON-RPC protocol shared by every MCP server of this binary (SDK-compatible envelope handling).
 pub(crate) fn serve_stdio(
     server_name: &'static str,
-    tools: std::sync::Arc<Vec<Value>>,
+    tools: ToolDiscovery,
     dispatch: ToolDispatch,
 ) -> std::io::Result<()> {
     use std::sync::{Arc, Mutex};

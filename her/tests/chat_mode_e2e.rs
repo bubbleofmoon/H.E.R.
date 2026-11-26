@@ -2903,8 +2903,8 @@ exit ([int][IO.File]::ReadAllText([IO.Path]::Combine($dir,'cli-exit.txt')))
 "#).unwrap();
     let cases=[
         (r#"{"response":"ordinary safety discussion"}"#,0,false),
-        ("The prompt could not be submitted: Google Generative AI Prohibited Use Policy CHAT_SECRET",0,true),
-        ("Error: quota exhausted CHAT_SECRET",0,true),
+        (r#"{"type":"refusal","message":"CHAT_SECRET"}"#,0,true),
+        (r#"{"error":{"code":429,"message":"CHAT_SECRET"}}"#,0,true),
         ("   ",0,true),
         (r#"{"ok":false,"message":"backend failed CHAT_SECRET"}"#,0,true),
         (r#"{"candidates":[]}"#,0,true),
@@ -2935,10 +2935,11 @@ exit ([int][IO.File]::ReadAllText([IO.Path]::Combine($dir,'cli-exit.txt')))
 
 #[cfg(windows)]
 #[test]
-fn hotfix81_exit_zero_diagnostics_are_not_answers() {
+fn cli_exit_zero_distinguishes_prose_from_typed_errors() {
     for (name, output, failed) in [
-        ("traceback", "Traceback (most recent call last):\n  File \"cli.py\", line 12, in main\nRuntimeError: CHAT_SECRET", true),
-        ("http", "HTTP 503 Service Unavailable\n<html>CHAT_SECRET</html>", true),
+        ("traceback", "Traceback (most recent call last):\n  File \"cli.py\", line 12, in main\nRuntimeError: example", false),
+        ("http", "HTTP 503 Service Unavailable\n<html>example</html>", false),
+        ("relay", r#"{"error":{"code":503,"message":"CHAT_SECRET"}}"#, true),
         ("events", "{\"type\":\"start\"}\n{\"type\":\"error\",\"error\":{\"code\":\"UPSTREAM_ERROR\",\"message\":\"CHAT_SECRET\"}}\n", true),
         ("policy", "We can discuss policy and how it works.", false),
     ] {

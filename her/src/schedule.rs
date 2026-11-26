@@ -960,7 +960,12 @@ fn reminder_prompt_text(text: &str) -> String {
 
 /// The model-facing line for a reminder wake: the reminder text, or a note that it was cancelled or deleted.
 /// Empty for other reasons and when the store cannot be read.
+#[cfg(test)]
 pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
+    reminder_line_for_model(context, reason, &serde_json::Value::Null)
+}
+
+pub(crate) fn reminder_line_for_model(context: &RuntimeContext, reason: &str, view: &serde_json::Value) -> String {
     let Some(id) = reason.strip_prefix(REMINDER_REASON) else {
         return String::new();
     };
@@ -971,7 +976,7 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
                 Creator::Her => ("你自己", reminder_prompt_text(&item.text)),
                 Creator::System => ("系统", item.text),
             };
-            format!("【提醒内容】{text}\n（由{label}设置）\n\n")
+            format!("【提醒内容】{}\n（由{label}设置）\n\n", crate::model_view::strip_from_model_text(&text, view))
         }
         Ok(_) => REMINDER_GONE.to_string(),
         Err(_) => String::new(),

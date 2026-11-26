@@ -876,9 +876,6 @@ impl Pipeline {
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
     ) -> Result<String, DshTurnError> {
-        // Work on a delivery copy, after chat logging/storage and before either backend.
-        let model_prompt = crate::model_view::strip_text_with_runtime(&self.context, prompt, cfg);
-        let prompt = model_prompt.as_str();
         // CLI adapters accept seconds; the DSH collector retains the exact millisecond budget.
         let timeout_secs = timeout.as_secs().saturating_add(u64::from(timeout.subsec_nanos() > 0));
         if key.starts_with("ab:") {
@@ -1075,7 +1072,7 @@ impl Pipeline {
                 }
             }
             let handed_over = self.dsh_switch_summary(key, &sid, cfg)?.map(|summary| {
-                crate::model_view::strip_text_with_runtime(&self.context, &format!("{summary}\n\n{prompt_text}"), cfg)
+                format!("{summary}\n\n{prompt_text}")
             });
             if let Some(turn) = &self.cur_turn {
                 turn.attempt_with_layers(&rpc_id, &sid, layers.as_ref())
@@ -1221,7 +1218,7 @@ impl Pipeline {
                         follow.next_turn_with_lifecycle(timeout, on_start, on_end).await
                     };
                     #[cfg(test)]
-                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(); }
+                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(&rpc_id); }
                     seg_turn += t0.elapsed().as_millis() as i64
                         - seg_cli
                         - seg_sess
@@ -1274,12 +1271,7 @@ impl Pipeline {
                     refusal_sources = std::mem::take(&mut follow.refusal);
                     follow.close().await;
                     let end_kind = ended.pointer("/reason/kind").and_then(|k| k.as_str());
-                    let classified_failure = reply.as_ref().ok().and_then(|text| {
-                        failover::classify_turn_end(&ended).or_else(|| {
-                            if end_kind.is_some_and(|kind| kind != "completed") || text.trim().is_empty() { return None; }
-                            crate::backend::plain_output_failure(text).map(|f| (failover::FailureKind::TurnError, f.code.clone(), f.summary()))
-                        })
-                    });
+                    let classified_failure = failover::classify_turn_end(&ended);
                     if reply.is_err() || classified_failure.is_some() {
                         if let Some(turn) = &self.cur_turn {
                             if let Err(error) = turn.release_completion(&rpc_id) {
@@ -1315,7 +1307,7 @@ impl Pipeline {
                     else { None };
                     // The DSH adapter's reported facts become the turn timing record.
                     self.report_facts(key, &crate::turn_engine::Facts {
-                        ok: reply.is_ok() && cancel_reason.is_none() && failover::classify_turn_end(&ended).is_none(),
+                        ok: reply.is_ok() && cancel_reason.is_none() && classified_failure.is_none(),
                         end_kind: end_kind.map(str::to_string),
                         cancel_reason,
                         attempt: rpc_id.clone(),

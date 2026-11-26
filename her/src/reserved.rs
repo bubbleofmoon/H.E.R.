@@ -66,7 +66,7 @@ fn range(seed: &mut u32, cfg: &Value, lo: &str, hi: &str) -> i64 {
     a.saturating_add((random(seed) * (b.saturating_sub(a) as f64 + 1.0)).floor() as i64)
 }
 
-fn message_line(message: &Message, owner: bool) -> String {
+fn message_line(message: &Message, owner: bool, view: &Value) -> String {
     format!(
         "{}{}：{}{}",
         if owner && message.is_owner {
@@ -74,8 +74,8 @@ fn message_line(message: &Message, owner: bool) -> String {
         } else {
             ""
         },
-        message.sender,
-        message.text,
+        crate::model_view::strip_from_model_text(&message.sender, view),
+        crate::model_view::strip_from_model_text(&message.text, view),
         chat::media_hint(&message.message_id, message.media.len())
     )
 }
@@ -110,7 +110,7 @@ fn finish_exit(c: &mut Conversation) {
     c.active_deadline_at = 0;
     c.active_exit_at = 0;
 }
-fn context_block(c: &Conversation, cfg: &Value) -> String {
+fn context_block(c: &Conversation, cfg: &Value, view: &Value) -> String {
     let lines = c
         .recent
         .iter()
@@ -119,7 +119,7 @@ fn context_block(c: &Conversation, cfg: &Value) -> String {
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|m| message_line(m, true))
+        .map(|m| message_line(m, true, view))
         .collect::<Vec<_>>()
         .join("\n");
     if lines.is_empty() {
@@ -736,6 +736,7 @@ impl Hub {
                 crate::activity::slice(&text, 80)
             ),
         );
+        let view = crate::model_view::with_blacklist(&self.context, &cfg);
         if sc["enabled"] == false {
             let prompt = chat::build_prompt(
                 &crate::prompt::identity_hint_v1(&self.context, &cfg, &key),
@@ -750,7 +751,7 @@ impl Hub {
                     inb.message_id.as_deref().unwrap_or(""),
                     chat::media_count(&inb.message),
                 ),
-            );
+            ).render(&view);
             let state = mutate(&self.context, |s| {
                 s.conversations.entry(key.clone()).or_default();
                 Ok(s.clone())
@@ -830,12 +831,13 @@ impl Hub {
                 c.active_exit_at = now();
                 c.generation.retire();
                 c.summary.push(message.clone());
-                job=Some((format!("{prefix}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",context_block(c,&sc)),true));
+                job=Some((format!("{prefix}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",context_block(c,&sc,&view)),true));
             } else if c.phase == "active" || c.phase == "probing" {
                 c.phase = "active".into();
                 c.last_active_message_at = now();
                 c.probe_deadline = 0;
                 if inb.kind == "private" {
+                    let text = crate::model_view::strip_from_model_text(&text, &view);
                     job = Some((
                         format!(
                             "{prefix}{}{text}{}",
@@ -854,12 +856,15 @@ impl Hub {
                     job = Some((
                         format!(
                             "{prefix}【群聊上下文】\n{}\n【当前消息】{}\n\n{}\n{}{SPLIT_HINT}",
-                            context_block(c, &sc),
-                            Message {
-                                text: text.clone(),
-                                ..message.clone()
-                            }
-                            .line(owner && inb.kind == "private"),
+                            context_block(c, &sc, &view),
+                            message_line(
+                                &Message {
+                                    text: text.clone(),
+                                    ..message.clone()
+                                },
+                                owner && inb.kind == "private",
+                                &view,
+                            ),
                             instruction(direct),
                             if text.contains("[引用") {
                                 format!("{DIRECTION}\n")
@@ -980,6 +985,7 @@ impl Hub {
         if crate::social_state::mode(&self.context) != "reserved" {
             return Ok(());
         }
+        let view = crate::model_view::with_blacklist(&self.context, &cfg);
         let scan = sc["enabled"] != false && now() - self.last_tick >= 5000;
         if scan {
             self.last_tick = now();
@@ -1002,10 +1008,10 @@ impl Hub {
                     let lines = c
                         .summary
                         .iter()
-                        .map(|m| message_line(m, true))
+                        .map(|m| message_line(m, true, &view))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    planned.push((key.clone(),format!("{prefix}【群聊摘要】过去一段时间群里发生了这些（你未逐条参与）：\n{lines}\n\n【最近对话】\n{}\n\n你不需要回复，只需记住这些内容，后续聊天会更自然。",context_block(c,&sc)),false,c.summary.clone(),id.clone(),0));
+                    planned.push((key.clone(),format!("{prefix}【群聊摘要】过去一段时间群里发生了这些（你未逐条参与）：\n{lines}\n\n【最近对话】\n{}\n\n你不需要回复，只需记住这些内容，后续聊天会更自然。",context_block(c,&sc,&view)),false,c.summary.clone(),id.clone(),0));
                     f.remaining += 1;
                 }
                 f.status = if f.remaining == 0 { "done" } else { "running" }.into();
@@ -1049,7 +1055,7 @@ impl Hub {
                                     );
                                 if random(&mut s.seed) < probability(&sc, "proactiveProbability") {
                                     enter(c, &mut s.seed, &sc, key, now());
-                                    prompt=Some(format!("{}【群聊上下文】\n{}\n\n群内已经长时间没人说话了，你打算开启一个新话题。优先结合你的人格/角色设定的兴趣，其次结合群里大家的兴趣，挑一个合适的话题。可以联网搜索一些新鲜话题来聊。如果你觉得现在不适合开口，可以只输出 [SILENT]。\n{SPLIT_HINT}",role_prefix(&context,&cfg,key),context_block(c,&sc)));
+                                    prompt=Some(format!("{}【群聊上下文】\n{}\n\n群内已经长时间没人说话了，你打算开启一个新话题。优先结合你的人格/角色设定的兴趣，其次结合群里大家的兴趣，挑一个合适的话题。可以联网搜索一些新鲜话题来聊。如果你觉得现在不适合开口，可以只输出 [SILENT]。\n{SPLIT_HINT}",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
                                 }
                             }
                         }
@@ -1063,7 +1069,7 @@ impl Hub {
                             c.active_exit_at = now();
                             c.generation.retire();
                             farewell = true;
-                            prompt=Some(format!("{}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",role_prefix(&context,&cfg,key),context_block(c,&sc)));
+                            prompt=Some(format!("{}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
                         } else if now() >= c.next_check_at {
                             let new = c
                                 .recent
@@ -1103,7 +1109,7 @@ impl Hub {
                                     messages.extend(new);
                                     let lines = messages
                                         .iter()
-                                        .map(|m| message_line(m, true))
+                                        .map(|m| message_line(m, true, &view))
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     media = messages;
@@ -1121,7 +1127,7 @@ impl Hub {
                                 if random(&mut s.seed) < probability(&sc, "idleRetryProbability") {
                                     c.phase = "probing".into();
                                     c.probe_deadline = now() + n(&sc, "idleRetryWaitMs");
-                                    prompt=Some(format!("【群聊上下文】\n{}\n\n群里安静了一会儿，你可以说点什么。如果不想说，请只输出 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc)));
+                                    prompt=Some(format!("【群聊上下文】\n{}\n\n群里安静了一会儿，你可以说点什么。如果不想说，请只输出 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc,&view)));
                                 } else {
                                     leave(c);
                                 }

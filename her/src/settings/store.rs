@@ -937,7 +937,7 @@ fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> 
 
 /// The newest audited text of text setting `key` that the registry accepts and that `accepted` takes, read through the
 /// store's read-only connection; `None` when there is no store, no such row, or the search ends (`last_good`). Used when
-/// a text that passed the load check fails a later check, such as the model-view strip.
+/// a text that passed the load check fails the delivery credential check.
 pub(crate) fn last_good_text(
     context: &RuntimeContext,
     key: &str,

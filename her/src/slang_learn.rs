@@ -3163,7 +3163,7 @@ if (-not [string]::Equals((Normalize-TestPath $homeRoot), (Normalize-TestPath $e
 }
 $promptPath = [IO.Path]::Combine($runtimeRootFull, 'data', 'auto-learning-prompt.txt')
 [IO.File]::WriteAllText($promptPath, $prompt, $utf8)
-if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">') { exit 39 }
+if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="[^"]*selected-sender">') { exit 39 }
 [Console]::Out.Write('[{"content":"ticket04-learning-term","meaning":"synthetic meaning","source_id":' + $Matches[1] + '}]')
 "#;
         std::fs::write(selected_root.join("resources/learn-fixture.ps1"), script).unwrap();
@@ -3254,8 +3254,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let captured_prompt = selected_context
             .read_text(RuntimeArea::Data, "auto-learning-prompt.txt")
             .unwrap();
-        assert!(captured_prompt.contains("selected-learning-marker 消息 [引用 人：原话] [图片] [CQ:at,qq=123]"));
-        assert!(captured_prompt.contains("<message source_id=\"12\" speaker=\"selected-sender\"> selected-learning-marker"), "source IDs are transport metadata: {captured_prompt}");
+        assert!(captured_prompt.contains("selected-learning-marker 【已隐藏】消息 [引用 【已隐藏】人：【已隐藏】原话] [图片] [CQ:at,qq=123]"));
+        assert!(captured_prompt.contains("<message source_id=\"12\" speaker=\"【已隐藏】selected-sender\">【已隐藏】 selected-learning-marker"), "source IDs are transport metadata: {captured_prompt}");
         assert!(!captured_prompt.contains(">1 selected-learning-marker"));
         assert!(!captured_prompt.contains('奸'), "{captured_prompt}");
         assert!(!captured_prompt.contains("decoy-learning-marker"));

@@ -2,6 +2,8 @@
 use support::install_root;
 use support::hide_window as hide_process_window;
 mod support;
+#[path = "fixtures/model_copy.rs"]
+mod model_copy;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -1114,12 +1116,12 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     selected_runtime_fixture(ambient_root.path(), &dependencies);
     let config_path = root.path().join("config/config.json");
     let mut cfg: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    cfg["socialV2"]["context"] = json!({"stripFromModelText":["奸"]});
+    cfg["socialV2"]["context"] = json!({"stripFromModelText":[model_copy::MATCH]});
     fs::write(config_path, cfg.to_string()).unwrap();
     let state_path = root.path().join("data/social-v2.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    let strip_fixture = json!({"messageId":"strip82","sender":"奸昵称",
-        "text":"奸消息 [引用 奸人：奸原话] [图片] [CQ:at,qq=123]"});
+    let strip_fixture = json!({"messageId":model_copy::ID,"sender":model_copy::SENDER,
+        "text":model_copy::CHAT});
     state["conversations"]["group:420042"]["recentMessages"] = json!([strip_fixture]);
     fs::write(&state_path, state.to_string()).unwrap();
     fs::write(
@@ -1298,9 +1300,8 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     assert_eq!(model.body["sessionToken"], SESSION_TOKEN);
     let received_prompt = model.body["prompt"].as_str()
         .unwrap_or_else(|| panic!("fake model received no text prompt; request body={}", model.body));
-    assert!(!received_prompt.contains('奸'), "{received_prompt}");
-    assert!(received_prompt.contains("昵称"), "{received_prompt}");
-    assert!(received_prompt.contains("[引用 人：原话] [图片] [CQ:at,qq=123]"), "{received_prompt}");
+    model_copy::assert_snapshot(received_prompt);
+    assert!(received_prompt.contains("不要调用工具"), "the CLI instruction must survive: {received_prompt}");
     let stored: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert!(stored["conversations"]["group:420042"]["recentMessages"].as_array().unwrap().contains(&strip_fixture));
     assert!(
