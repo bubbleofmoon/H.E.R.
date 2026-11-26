@@ -939,14 +939,22 @@ fn media_sticker_and_face_routes_normalize_downloads_and_hide_bad_data() {
     let source=dir.join("curl.cs"); let exe=dir.join("curl.exe"); let input=dir.join("input.bin");
     fs::write(&source,r#"using System; using System.IO;
 class Curl { static int Main(string[] args) {
-  string output=null, headers=null;
-  for(int i=0;i+1<args.Length;i++) { if(args[i]=="-o")output=args[i+1]; if(args[i]=="-D")headers=args[i+1]; }
+  string cfg=Console.In.ReadToEnd();
+  string url="";
+  foreach(string line in cfg.Split('\n')) {
+    string t=line.Trim();
+    if(t.StartsWith("url = \"") && t.EndsWith("\"")) url=t.Substring(7,t.Length-8).Replace("\\\"","\"").Replace("\\\\","\\");
+  }
   string input=Environment.GetEnvironmentVariable("TICKET19_CURL_INPUT");
-  File.WriteAllText(Path.Combine(Path.GetDirectoryName(input),"acquire-"+Guid.NewGuid()+".log"),String.Join(" ",args));
+  File.WriteAllText(Path.Combine(Path.GetDirectoryName(input),"acquire-"+Guid.NewGuid()+".log"),url+" "+String.Join(" ",args));
   if(File.Exists(input+".delay"))System.Threading.Thread.Sleep(2000);
-  File.WriteAllBytes(output,File.ReadAllBytes(input));
-  File.WriteAllText(headers,"HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\n\r\n");
-  Console.Write("200"); return File.Exists(input+".fail") ? 7 : 0;
+  using(var stdout=Console.OpenStandardOutput()) {
+    byte[] head=System.Text.Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\n\r\n");
+    byte[] body=File.ReadAllBytes(input);
+    stdout.Write(head,0,head.Length);
+    stdout.Write(body,0,body.Length);
+  }
+  return File.Exists(input+".fail") ? 7 : 0;
 } }"#).unwrap();
     let mut csc=Command::new("C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe");
     csc.args(["/nologo","/target:exe"]).arg(format!("/out:{}",exe.display())).arg(&source);

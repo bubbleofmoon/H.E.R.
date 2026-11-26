@@ -7025,7 +7025,7 @@ fn handle_sticker_image(
         .ok_or_else(|| (500, "获取表情图片失败：（表情获取失败）".to_string()))?;
     let fetched = crate::safe_fetch::fetch_bytes(&url, limits.bytes)
         .map_err(|_| (500, "获取表情图片失败：（表情获取失败）".to_string()))?;
-    if let Some((w, h)) = crate::safe_fetch::image_dimensions(&fetched.bytes) {
+    if let Some((w, h)) = crate::media_normalize::image_dimensions(&fetched.bytes) {
         if w * h > limits.pixels {
             return Err((400, format!("表情图片像素超限（{w}x{h}），已拒绝")));
         }

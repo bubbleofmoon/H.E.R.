@@ -417,8 +417,8 @@ pub(crate) fn transfer_folder(context: &RuntimeContext) -> Result<PathBuf, Failu
 
 #[cfg(not(test))]
 fn download(context: &RuntimeContext, url: &str, max_bytes: usize, budget: Duration) -> Result<Vec<u8>, Failure> {
-    let folder = transfer_folder(context)?;
-    crate::safe_fetch::fetch_voice(url, max_bytes, budget, &folder).map(|fetched| fetched.bytes).map_err(|_| Failure::Download)
+    let _ = transfer_folder(context)?;
+    crate::safe_fetch::fetch_voice(url, max_bytes, budget).map(|fetched| fetched.bytes).map_err(|_| Failure::Download)
 }
 
 /// Unit tests' records by URL; no test downloads anything.

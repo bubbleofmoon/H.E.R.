@@ -9,9 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 use std::{
-    io::Read,
     path::Path,
-    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -42,102 +40,70 @@ pub fn settings(cfg: &Value) -> Result<Value, String> {
 }
 
 pub(crate) fn validate_url(raw: &str) -> Result<(), String> {
-    let url = url::Url::parse(raw).map_err(|_| "release URL is invalid")?;
-    let loopback = url.host_str().is_some_and(|h| {
-        h == "localhost"
-            || h.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
-    {
-        return Err("release URL requires HTTPS or a loopback HTTP fixture, without credentials or fragment".into());
-    }
-    Ok(())
+    crate::guarded_fetch::validate_url_syntax(
+        raw,
+        crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+    )
+    .map(|_| ())
 }
 
-/// Curl owns TLS, runs hidden, has no inherited curlrc, and is bounded in time and bytes.
+fn fetch_with_policy(
+    raw: &str,
+    max: usize,
+    policy: crate::guarded_fetch::FetchPolicy,
+) -> Result<Vec<u8>, String> {
+    let options = crate::guarded_fetch::FetchOptions {
+        policy,
+        max_bytes: max,
+        max_redirects: 5,
+        budget: crate::guarded_fetch::BudgetMode::PerHop {
+            hop_timeout: Duration::from_secs(30),
+            attempt_cap: Some(Duration::from_secs(10)),
+        },
+        connect_timeout: Some(Duration::from_secs(5)),
+        max_addresses: 4,
+        min_remaining: Duration::ZERO,
+        headers: vec![("user-agent".into(), "HER-release-manager".into())],
+        strip_fragment_on_redirect: true,
+        pass_max_filesize: true,
+        accept: None,
+        #[cfg(test)]
+        allow_loopback_pin_for_test: false,
+    };
+    crate::guarded_fetch::fetch_bytes_with(
+        raw,
+        &options,
+        &crate::guarded_fetch::SystemDnsResolver,
+        &crate::guarded_fetch::CurlTransfer,
+    )
+    .map(|out| out.bytes)
+}
+
+/// Guarded release download over `guarded_fetch` (HTTPS or loopback HTTP fixture, public IP
+/// pinning, revalidated redirects, bounded time and bytes, hardened curl).
 pub(crate) fn fetch(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_url(raw)?;
-    transfer(raw,max,"=https")
+    fetch_with_policy(
+        raw,
+        max,
+        crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+    )
 }
 
 /// Preserve the managed npm install's existing HTTP(S), credential-free registry contract.
 pub(crate) fn validate_registry_url(raw: &str) -> Result<(), String> {
-    let url=url::Url::parse(raw).map_err(|_|"dependencies.dsh.registry is invalid")?;
-    if !matches!(url.scheme(),"http"|"https") || !url.username().is_empty() || url.password().is_some() {
-        return Err("dependencies.dsh.registry must be an http(s) URL without credentials".into());
-    }
-    Ok(())
+    crate::guarded_fetch::validate_url_syntax(
+        raw,
+        crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
+    )
+    .map(|_| ())
 }
+
 pub(crate) fn fetch_registry(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_registry_url(raw)?;
-    transfer(raw,max,"=https,http")
-}
-fn transfer(raw: &str, max: usize, redirects: &str) -> Result<Vec<u8>, String> {
-    let mut child =
-        crate::subprocess::command_without_console(if cfg!(windows) { "curl.exe" } else { "curl" })
-            .args([
-                "-q",
-                "--silent",
-                "--fail",
-                "--location",
-                "--max-redirs",
-                "5",
-                "--proto",
-                "=https,http",
-                "--proto-redir",
-                redirects,
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "30",
-                "--user-agent",
-                "HER-release-manager",
-                "--max-filesize",
-                &max.to_string(),
-                "--url",
-                raw,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "release transfer could not start")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("release transfer pipe unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(max as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(35);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("release transfer timed out or became unavailable");
-            }
-        }
-    };
-    let bytes = reader
-        .join()
-        .map_err(|_| "release transfer reader failed")?
-        .map_err(|_| "release transfer read failed")?;
-    if !status?.success() || bytes.len() > max {
-        return Err("release transfer failed or exceeded its size limit".into());
-    }
-    Ok(bytes)
+    fetch_with_policy(
+        raw,
+        max,
+        crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1768,5 +1734,60 @@ mod tests {
             .unwrap();
         assert_eq!(approved["ok"], true);
         assert_eq!(approved["approved"], "v1.2.3");
+    }
+
+    #[test]
+    fn release_fetch_enforces_private_host_policy_and_curl_hardening() {
+        assert!(validate_url("https://169.254.169.254/feed").is_err(), "link-local metadata IP must be refused");
+        assert!(validate_url("https://10.0.0.1/feed").is_err(), "RFC1918 private IP must be refused");
+        assert!(validate_url("https://printer.local/feed").is_err(), ".local host must be refused");
+        assert!(validate_registry_url("http://10.0.0.1/npm").is_err(), "private registry IP must be refused");
+        assert!(validate_registry_url("http://printer.local/npm").is_err(), ".local registry host must be refused");
+        assert!(validate_url(DEFAULT_FEED).is_ok());
+        assert!(validate_registry_url("http://registry.example.invalid/npm/?view=versions").is_ok());
+
+        let url = url::Url::parse("https://api.github.com/repos/bubbleofmoon/H.E.R./releases?token=s").unwrap();
+        let req = crate::guarded_fetch::TransferRequest {
+            url: &url,
+            pin: "140.82.112.5".parse().unwrap(),
+            headers: vec![("user-agent".into(), "HER-release-manager".into())],
+            body: None,
+            budget: Duration::from_secs(30),
+            connect_timeout: Some(Duration::from_secs(5)),
+            max_filesize: Some(1024),
+        };
+        let (command, config) = crate::guarded_fetch::build_curl_command(&req).unwrap();
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+        assert!(args.windows(2).any(|w| w == ["-K", "-"]), "release curl must read URL via -K -: {args:?}");
+        assert!(!args.iter().any(|a| a.contains("api.github.com/repos")), "release URL must not appear in CLI args: {args:?}");
+        assert!(args.windows(2).any(|w| w == ["--noproxy", "*"]), "release curl must pass --noproxy *: {args:?}");
+        assert!(config.contains("url = \"https://api.github.com/repos/bubbleofmoon/H.E.R./releases?token=s\""));
+    }
+
+    #[test]
+    fn release_fetch_loopback_fixture_enforces_size_cap_and_refuses_private_redirects() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let response = match path {
+                    "/ok" => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+                    "/big" => "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij".to_string(),
+                    "/redir-private" => "HTTP/1.1 302 Found\r\nLocation: https://169.254.169.254/latest\r\nConnection: close\r\n\r\n".to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        assert_eq!(fetch(&format!("http://127.0.0.1:{port}/ok"), 16).unwrap(), b"ok");
+        assert!(fetch(&format!("http://127.0.0.1:{port}/big"), 4).is_err(), "oversized release response must fail");
+        assert!(fetch(&format!("http://127.0.0.1:{port}/redir-private"), 1024).is_err(), "redirect to private IP must fail");
     }
 }

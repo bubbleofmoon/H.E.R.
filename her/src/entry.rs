@@ -7,6 +7,7 @@ mod outbound_message;
 mod mcp;
 mod aux_text;
 mod aux_fetch;
+mod guarded_fetch;
 mod aux_search;
 mod aux_mcp;
 mod dsh_mcp_config;
