@@ -1236,7 +1236,7 @@ fn send_message_rejects_oversized_declared_body_after_auth_without_side_effects(
     assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
     assert_eq!(
         unauthorized.body["error"],
-        "未授权：请提供控制台访问令牌"
+        "未通过鉴权：缺少有效控制台访问令牌"
     );
 
     for (console, console_token) in [(&console_a, CONSOLE_A), (&console_b, CONSOLE_B)] {
@@ -1316,7 +1316,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
     assert_eq!(
         unauthorized.body["error"],
-        "未授权：请提供控制台访问令牌"
+        "未通过鉴权：缺少有效控制台访问令牌"
     );
 
     let empty_agent = http_request_with_chunked_oversize_body(
@@ -1362,7 +1362,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     )
     .expect("read the disabled-v2 gate response before the body limit");
     assert_eq!(disabled.status, 403, "v2 enabled gate must precede body limits");
-    assert_eq!(disabled.body["error"], "二代模式已关闭，当前不允许执行 v2 工具");
+    assert_eq!(disabled.body["error"], "二代社交功能已停用，禁止调用 v2 工具");
     assert_eq!(fs::read(&config_a).unwrap(), disabled_before);
     fs::write(&config_a, &config_a_before).unwrap();
 
@@ -1377,7 +1377,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     )
     .expect("read the mode gate response before the body limit");
     assert_eq!(wrong_mode.status, 403, "mode gate must precede body limits");
-    assert_eq!(wrong_mode.body["error"], "该接口仅 reserved2 模式可用");
+    assert_eq!(wrong_mode.body["error"], "当前接口仅限 reserved2 模式调用");
     assert_eq!(fs::read(&mode_a).unwrap(), mode_chat_before);
     fs::write(&mode_a, &mode_a_before).unwrap();
 

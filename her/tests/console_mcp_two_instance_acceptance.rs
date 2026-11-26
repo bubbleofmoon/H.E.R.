@@ -1108,7 +1108,7 @@ fn two_isolated_console_and_mcp_instances_interleave_without_crossing_roots() {
     );
     assert!(foreign_mcp_error, "MCP must mark the refusal as an error: {foreign_mcp_text}");
     assert_eq!(
-        foreign_mcp_text, "检索失败：agent token 无效（必须是该会话自己的令牌）",
+        foreign_mcp_text, "检索失败：会话令牌校验失败（须携带对应会话的专属令牌）",
         "A MCP accepted B token"
     );
     let ledger_a_before = fs::read(a.root.join("data/token-usage.jsonl")).unwrap();

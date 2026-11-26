@@ -220,7 +220,7 @@ pub(super) fn security_post_tx(
             wake_error_prefix: "",
             finish: Box::new(move |_, _| {
                 crate::safe_println!(
-                    "[console] 控制台：安全拦截通知已更新（interceptNotify={}）",
+                    "[console] 控制台：拦截提醒配置已刷新（interceptNotify={}）",
                     view.get("interceptNotify")
                         .map(js_string)
                         .unwrap_or_default()

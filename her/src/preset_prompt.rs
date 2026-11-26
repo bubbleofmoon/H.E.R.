@@ -14,7 +14,7 @@ const BLOCKING_V2: &[(&str, &str)] = &[
     MEMBER_AUTHORITY,
     CREDENTIALS,
     ("人设以桥接提供的设定为准", "角色由桥接注入"),
-    ("草稿只留在模型侧", "不会自动发送到 QQ"),
+    ("草稿只留在本端", "不会自动发送到 QQ"),
 ];
 const BLOCKING_V1: &[(&str, &str)] = &[
     MEMBER_AUTHORITY,
@@ -215,7 +215,7 @@ pub fn preset_warnings(content: &str) -> Vec<String> {
 
 /// 用字面量块把新提示词写回 YAML 全文，并**读回校验**（不一致就报错，不写盘）。
 pub fn render_preset_prompt_yaml(text: &str, content: &str, preset_v1: bool) -> Result<String, String> {
-    let block = locate_prefix_block(text).ok_or_else(|| "无法定位预设里的 prefix 块（文件结构可能已变化）".to_string())?;
+    let block = locate_prefix_block(text).ok_or_else(|| "未能在预设文件内识别 prefix 字段块（格式可能已调整）".to_string())?;
     let normalized = content.replace("\r\n", "\n").trim_end_matches('\n').to_string();
     let bytes = normalized.len();
     if bytes > MAX_BYTES {

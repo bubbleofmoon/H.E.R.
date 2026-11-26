@@ -530,8 +530,8 @@ fn ai_send_route_checks_follow_the_baseline_order_and_messages() {
     assert_eq!(s, 403, "{b}");
     for (voice, expect) in [
         ("", "请填写音频参数：指定语音库内的文件名（可通过 qq_list_voices 列出）"),
-        ("http://example.invalid/a.mp3", "不支持 base64://、data: 或 http(s):// 来源，请传入语音库中的本地文件名"),
-        ("base64://AAAA", "不支持 base64://、data: 或 http(s):// 来源，请传入语音库中的本地文件名"),
+        ("http://example.invalid/a.mp3", "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名"),
+        ("base64://AAAA", "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名"),
         ("../outside.mp3", "已拒绝越界路径：此通道不可传入「..」或根目录路径读取库外文件"),
         ("/etc/passwd", "此通道仅限发送语音库（audio）内的文件：绝对路径同样须落在该目录中，socialV2.voice.allowAbsolutePath 对当前工具无效；库外文件请先移入目录或由 CLI / 控制台发送。"),
         #[cfg(windows)]
@@ -1354,7 +1354,7 @@ fn the_per_item_guard_treats_a_missing_send_voice_flag_as_off_after_a_config_rel
     fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     assert_eq!(first.join().unwrap().0, 200);
     let (s, b) = second.join().unwrap();
-    assert_eq!((s, b["error"].as_str()), (500, Some("发送已取消：会话、模式或白名单已变化")), "{b}");
+    assert_eq!((s, b["error"].as_str()), (500, Some("发送中止：会话状态、运行模式或访问名单已变动")), "{b}");
     assert_eq!(bot.requests("send_group_msg").len(), 1, "the cancelled voice never reached the gateway");
 }
 

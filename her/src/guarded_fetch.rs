@@ -375,11 +375,11 @@ pub(crate) fn resolve_public_addresses_with(
         return Err("主机名为空".to_string());
     }
     if is_local_name(&h) {
-        return Err("禁止访问内网/本机地址".to_string());
+        return Err("已拦截内网或本地地址".to_string());
     }
     if let Ok(ip) = h.parse::<IpAddr>() {
         if !ip_allowed(ip) {
-            return Err("禁止访问内网/本机地址".to_string());
+            return Err("已拦截内网或本地地址".to_string());
         }
         return Ok(vec![ip]);
     }
@@ -387,10 +387,10 @@ pub(crate) fn resolve_public_addresses_with(
         .resolve(&h, port)
         .map_err(|e| format!("域名解析失败：{e}"))?;
     if addresses.is_empty() {
-        return Err("域名没有解析结果".to_string());
+        return Err("DNS 未返回任何记录".to_string());
     }
     if addresses.iter().any(|a| !ip_allowed(*a)) {
-        return Err("域名解析到内网/本机地址，已阻止".to_string());
+        return Err("解析结果命中私有或本地 IP，已拦截".to_string());
     }
     let ordered = order_addresses(&addresses);
     Ok(if ordered.is_empty() {
@@ -475,7 +475,7 @@ pub(crate) fn validate_url_syntax(raw: &str, policy: FetchPolicy) -> Result<Url,
                 .ok_or_else(|| "主机名为空".to_string())?;
             let h = normalize_host(host);
             if is_local_name(&h) || (h.parse::<IpAddr>().is_ok() && is_private_ip(&h)) {
-                return Err("禁止访问内网/本机地址".to_string());
+                return Err("已拦截内网或本地地址".to_string());
             }
         }
         FetchPolicy::ReleaseHttpsOrLoopbackFixture => {
@@ -561,7 +561,7 @@ pub(crate) fn validate_and_resolve_with(
                 .resolve(&h, port)
                 .map_err(|e| format!("域名解析失败：{e}"))?;
             if resolved.is_empty() {
-                return Err("域名没有解析结果".to_string());
+                return Err("DNS 未返回任何记录".to_string());
             }
             if resolved.iter().any(|ip| !ip.is_loopback()) {
                 return Err("localhost resolved to a non-loopback address".to_string());
@@ -589,7 +589,7 @@ pub(crate) fn validate_and_resolve_with(
             .resolve(&h, port)
             .map_err(|e| format!("域名解析失败：{e}"))?;
         if resolved.is_empty() {
-            return Err("域名没有解析结果".to_string());
+            return Err("DNS 未返回任何记录".to_string());
         }
         return Ok(Validated {
             url,
@@ -1140,7 +1140,7 @@ pub(crate) fn fetch_bytes_with(
         let (status, body) = match hop_result {
             Some(Ok(BytesHopOutcome::Redirect(status, loc))) => {
                 if hop == options.max_redirects {
-                    return Err("重定向次数过多，已停止".to_string());
+                    return Err("重定向超出次数限制，已中止".to_string());
                 }
                 if loc.is_empty() {
                     return Err(format!("重定向缺少 Location：{status}"));
@@ -1180,7 +1180,7 @@ pub(crate) fn fetch_bytes_with(
             url: current,
         });
     }
-    Err("重定向次数过多，已停止".to_string())
+    Err("重定向超出次数限制，已中止".to_string())
 }
 
 pub(crate) fn fetch_text_with(
@@ -1265,7 +1265,7 @@ pub(crate) fn fetch_text_with(
             Some(Ok(HopOutcome::Page(page))) => return Ok(page),
             Some(Ok(HopOutcome::Redirect(status, location))) => {
                 if hop == options.max_redirects {
-                    return Err("重定向次数过多，已停止".to_string());
+                    return Err("重定向超出次数限制，已中止".to_string());
                 }
                 if location.is_empty() {
                     return Err(format!("重定向缺少 Location: {status}"));
@@ -1280,7 +1280,7 @@ pub(crate) fn fetch_text_with(
             None => return Err(format_attempts_error(last_error, &host, attempts)),
         }
     }
-    Err("重定向次数过多，已停止".to_string())
+    Err("重定向超出次数限制，已中止".to_string())
 }
 
 pub(crate) fn post_json_with(
@@ -1295,7 +1295,7 @@ pub(crate) fn post_json_with(
     let deadline = Instant::now() + timeout;
     let attempts = addresses.len().min(2);
     if attempts == 0 {
-        return Err("没有任何可用地址".to_string());
+        return Err("缺少可用的目标地址".to_string());
     }
     let mut last_error: Option<String> = None;
     for pin in addresses.iter().take(attempts) {
@@ -1322,7 +1322,7 @@ pub(crate) fn post_json_with(
         let mut on_head = |head: &Head| {
             if (300..400).contains(&head.status) {
                 aborted_by_policy.set(true);
-                Flow::Abort(format!("联网搜索端点返回重定向（HTTP {}），已拒绝跟随", head.status))
+                Flow::Abort(format!("搜索接口返回跳转状态（HTTP {}），拒绝跟随", head.status))
             } else {
                 Flow::Continue
             }
@@ -1331,7 +1331,7 @@ pub(crate) fn post_json_with(
             bytes.extend_from_slice(chunk);
             if bytes.len() > max_bytes {
                 aborted_by_policy.set(true);
-                Flow::Abort("联网搜索响应体过大，已中止".to_string())
+                Flow::Abort("搜索返回体超出体积上限，已切断".to_string())
             } else {
                 Flow::Continue
             }
@@ -1340,11 +1340,11 @@ pub(crate) fn post_json_with(
             Ok((head, _)) => return Ok((head.status, String::from_utf8_lossy(&bytes).into_owned())),
             Err(TransferError::Timeout) => {
                 last_error = Some(format!(
-                    "联网搜索请求超时（{}s）",
+                    "搜索请求超时（{}s）",
                     budget.as_secs_f64().round() as u64
                 ));
             }
-            Err(TransferError::Interrupted) => last_error = Some("联网搜索响应中断".to_string()),
+            Err(TransferError::Interrupted) => last_error = Some("搜索响应传输断开".to_string()),
             Err(TransferError::Other(message)) => {
                 if aborted_by_policy.get() {
                     return Err(message);
@@ -1353,7 +1353,7 @@ pub(crate) fn post_json_with(
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| "联网搜索请求失败".to_string()))
+    Err(last_error.unwrap_or_else(|| "搜索调用异常".to_string()))
 }
 
 #[cfg(test)]

@@ -236,7 +236,7 @@
       ]
     },
     "initial-prompt-save": {
-      "label": "保存会话初始提示词",
+      "label": "写入会话起始提示",
       "area": "conversations",
       "section": "prompts",
       "sources": [
@@ -602,7 +602,7 @@
       ]
     },
     "wake-state-all": {
-      "label": "列出全部会话状态",
+      "label": "获取全部会话摘要",
       "area": "conversations",
       "section": "wake",
       "sources": [
@@ -1221,7 +1221,7 @@
       ]
     },
     "v1-timeout": {
-      "label": "群聊活跃超时主动退出",
+      "label": "群聊活跃期满自动退场",
       "area": "legacy",
       "section": "social-v1",
       "sources": [

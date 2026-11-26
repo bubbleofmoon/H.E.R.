@@ -2623,6 +2623,12 @@
       "reason": "Integer encoding of loopback IPv4 used by SSRF refusal tests"
     },
     {
+      "path": "her/src/aux_fetch.rs",
+      "value": "2-1-3-0-7-0-6-4-3-3",
+      "line_sha256": "ff5b-ca14-afb1-d2dc-e235-636f-4158-3549-3d05-3066-83c7-f226-31c1-ce5d-f959-a20b",
+      "reason": "Integer encoding of loopback IPv4 used by SSRF refusal tests"
+    },
+    {
       "path": "her/src/aux_search.rs",
       "value": "2-0-2-5-0-3-0-5",
       "line_sha256": "8cc9-4433-f10a-6829-71f2-f461-3ce2-c1aa-4cec-aa7e-fa0e-dfbd-2745-b0af-af68-5d6c",

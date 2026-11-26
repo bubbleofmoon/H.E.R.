@@ -3799,9 +3799,9 @@ impl Hub {
                 crate::activity::append(
                     &self.context,
                     &if muted {
-                        format!("{key} [reserved2] 禁言中，消息仅入库不唤醒：{preview}")
+                        format!("{key} [reserved2] 禁言期间仅留存消息，暂不唤醒：{preview}")
                     } else if state["paused"] == true {
-                        format!("{key} [reserved2] AI 已暂停，消息仅入库不唤醒：{preview}")
+                        format!("{key} [reserved2] 自动处理已暂停，仅留存消息不唤醒：{preview}")
                     } else {
                         format!("{key} [reserved2] 消息已入未读：{preview}")
                     },
@@ -4279,7 +4279,7 @@ impl Hub {
             if still_valid && !held && !access_refused {
                 if let (Err(message), None) = (&result, &model_error) {
                     let shown = if crate::pipeline::configured_outbound_violation(&cfg, message, &[]).is_some() {
-                        "（含敏感信息，已隐藏）".to_string()
+                        "（涉及敏感内容，已遮蔽）".to_string()
                     } else {
                         crate::activity::slice(message, 500)
                     };

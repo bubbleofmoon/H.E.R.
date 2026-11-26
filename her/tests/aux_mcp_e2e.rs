@@ -458,7 +458,7 @@ fn status_text(mcp: &mut Mcp, id: u64) -> String {
     answer["result"]["content"][0]["text"].as_str().unwrap().to_string()
 }
 
-const UNREACHABLE_HINT: &str = "SnowLuma 网关不可达。请自行启动 SnowLuma（本程序不代装、不代启，原因见项目文档的合规说明 L6）。 若 config.json 的 snowluma.httpUrl 与实际端口不一致，也请一并检查。";
+const UNREACHABLE_HINT: &str = "无法连接 SnowLuma 网关，请手动确认 SnowLuma 已启动（遵守合规约定，本工具不代装或代启网关）。 同时请核对 config.json 的 snowluma.httpUrl 与网关监听端口是否匹配。";
 
 #[test]
 fn status_reports_the_online_account_and_authenticates_with_the_configured_token() {
@@ -523,7 +523,7 @@ fn status_reports_gateway_failures_with_the_operator_hint() {
     let text = status_text(&mut mcp, 2);
     assert_eq!(
         text,
-        "{\n  \"reachable\": false,\n  \"error\": \"fetch failed\",\n  \"hint\": \"SnowLuma 网关不可达。请自行启动 SnowLuma（本程序不代装、不代启，原因见项目文档的合规说明 L6）。\"\n}"
+        "{\n  \"reachable\": false,\n  \"error\": \"fetch failed\",\n  \"hint\": \"无法连接 SnowLuma 网关，请手动确认 SnowLuma 已启动（遵守合规约定，本工具不代装或代启网关）。\"\n}"
     );
     assert_eq!(mcp.finish(), Some(0));
 }

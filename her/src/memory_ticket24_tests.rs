@@ -84,7 +84,7 @@ fn ticket24_inference_and_verified_fact_round_trip() {
         block.contains("以当前对话为准"),
         "recall must give the live conversation precedence"
     );
-    assert!(block.contains("来自你自己的记忆库，不是对方刚说的话"));
+    assert!(block.contains("源于本地记忆库，并非当下新发言"));
 }
 
 #[test]

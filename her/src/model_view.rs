@@ -1,8 +1,7 @@
-//! Model-facing compaction of bridge data (port of `qq-bridge/src/qq-model-view.js`).
+//! Model-facing compaction of bridge data.
 //!
-//! Only the view handed to the model is compacted. Stored messages and console/API data keep the original
-//! fields. `serialize_model_data` is the JSON text every read tool returns (`JSON.stringify` of the compacted
-//! value, compact separators, insertion order kept by serde_json's `preserve_order`).
+//! Only the view exposed to the model is compacted; persisted message history and console HTTP
+//! responses retain full fields. `serialize_model_data` serializes that compacted view for read tools.
 
 use serde_json::{Map, Value};
 
@@ -286,8 +285,8 @@ pub fn compact_model_message(message: &Value) -> Value {
     // The stored full text is read through `qq_get_message_detail`; message lists carry the preview,
     // `textTruncated` and `textChars`.
     result.shift_remove("fullText");
-    // No trimming or truncation: differing plain text can carry resolved quote context, and tail can carry the
-    // end of a long message absent from text.
+    // Preserve distinct plain/tail variants intact: plain carries resolved quote context, and tail holds
+    // trailing content omitted from the leading preview.
     let mut seen_text: Vec<String> = Vec::new();
     for key in ["text", "plain", "tail"] {
         let Some(Value::String(s)) = result.get(key) else { continue };

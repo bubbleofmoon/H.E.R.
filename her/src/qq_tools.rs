@@ -118,7 +118,7 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
                     if tool["name"] == "qq_wait_for_messages" {
                         let policy = crate::social_state::wait_policy(cfg);
                         tool["inputSchema"]["properties"]["purpose"]["description"] = json!("messages：等待对方下文/回复或沉睡前观察；reply：可选的短静默观察。发送工具自动控制回复节奏，首答无需先调用等待工具");
-                        tool["description"] = json!(format!("发送工具自动控制回复节奏，首答无需先等待；本工具留给确实要等对方下文或沉睡观察时。等待分两种用途：reply 按最后来信补足 quietMs 静默，已安静足够就返回，不能代替沉睡观察；messages 等到新消息后合批，每条来信重置 {}ms 窗口，从首条起最多 {}ms；你成功发送后的互动窗口（preSleepWaitMs，只有你自己的发送重新计时）内则只在有给你的消息（forYou=true）时立即返回、不合批，只有闲聊时等到互动窗口结束再一起返回。@你或管理员来信立即返回。每条 newMessages 带桥接提示 forYou（true/false）和 forYouReason；它只是提示，是否回复由你决定。返回了给你的消息的等待不占本轮次数（每轮最多与发送上限 send.maxPerTurn 相同的次数）。互动窗口结束时返回 engagementEnded=true 和退出指令，桥接让你干净地沉睡并保留唤醒配置。直接读取 newMessages 和 readThroughSeq，无需重复查询。本轮两种用途合计最多 {} 次，最后一次在需要时自动转为完整沉睡观察。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发送消息。若最后一次等待带回给你的消息，先处理该消息；用完额度后桥接按当前唤醒配置结束本轮。需要沉睡观察时使用 messages，时长按会话指引；preSleepWaitSatisfied/Observed 表示观察资格。", policy.window_ms, policy.max_ms, policy.max_per_turn));
+                        tool["description"] = json!(format!("发送工具自动控制回复节奏，首答无需先等待；本工具留给确实要等对方下文或沉睡观察时。等待分两种用途：reply 仅确认距末条消息是否已达 quietMs 静音时长，满足即返回，不能代替沉睡观察；messages 等到新消息后合批，每条来信重置 {}ms 窗口，从首条起最多 {}ms；你成功发送后的互动窗口（preSleepWaitMs，只有你自己的发送重新计时）内则只在有给你的消息（forYou=true）时立即返回、不合批，只有闲聊时等到互动窗口结束再一起返回。@你或管理员来信立即返回。每条 newMessages 带桥接提示 forYou（true/false）和 forYouReason；它只是提示，是否回复由你决定。返回了给你的消息的等待不占本轮次数（每轮最多与发送上限 send.maxPerTurn 相同的次数）。互动窗口结束时返回 engagementEnded=true 和退出指令，桥接让你干净地沉睡并保留唤醒配置。直接读取 newMessages 和 readThroughSeq，无需重复查询。本轮两种用途合计最多 {} 次，最后一次在需要时自动转为完整沉睡观察。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发送消息。若最后一次等待带回给你的消息，先处理该消息；用完额度后桥接按当前唤醒配置结束本轮。需要沉睡观察时使用 messages，时长按会话指引；preSleepWaitSatisfied/Observed 表示观察资格。", policy.window_ms, policy.max_ms, policy.max_per_turn));
                         tool["inputSchema"]["properties"]["quietMs"]["description"] = json!("reply 用途的静默窗口；messages 的合批窗口由后台 batchWindowMs/batchMaxMs 决定");
                         tool["inputSchema"]["properties"]["minNewMessages"]["description"] = json!("messages 用途期望的最少新消息数，默认 1；从首条起的合批硬上限到时仍返回已收集消息。reply 和保留的沉睡观察忽略此参数");
                     }
@@ -210,7 +210,7 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
         "wake snapshot",
     )?;
     if packet.is_null() { return Ok(String::new()); }
-    let guidance = "以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。";
+    let guidance = "消息已在下方给出，无需重复查询；partial=true 时调 qq_get_unread_messages(afterSeq=readThroughSeq) 拉取剩余条数。请先消化手头消息；要回话直接调用发送端工具（静默与节奏由桥接掌控），若收到 reviseRequired=true 则先查 newMessages 再调整或重发。收尾仅把你已读妥的 readThroughSeq（本地序号，勿填 QQ messageId）传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq，未处理的新消息留待下轮。";
     // DSH sends this text immediately. The harness keeps the original packet for replay.
     let (packet, guidance) = if redact {
         let delivery_cfg = crate::model_view::with_blacklist(context, cfg);
@@ -400,7 +400,7 @@ impl Api<'_> {
         }
         if let Some(body) = &parsed {
             if body.get("ok") == Some(&Value::Bool(false)) {
-                return Err(ApiFailure { message: error_text(body.get("error"), "桥接 API 返回 ok:false（未说明原因）"), delivery_unknown: unknown });
+                return Err(ApiFailure { message: error_text(body.get("error"), "桥接接口返回 ok:false，未附说明"), delivery_unknown: unknown });
             }
         }
         if send && parsed.as_ref().is_none_or(|b| b["ok"] != true) {
@@ -480,7 +480,7 @@ impl Api<'_> {
             .map_err(|err| err.to_qq_tools_message())?;
         if !(200..300).contains(&reply.status) {
             let hint = if reply.status == 426 {
-                "；HTTP 426 通常表示 httpUrl 指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址"
+                "；收到 HTTP 426 表示 httpUrl 指向的可能是 WebSocket 地址，请检查 config.json 内 snowluma.httpUrl 是否填对 HTTP 入口"
             } else {
                 ""
             };
@@ -664,7 +664,7 @@ fn legacy_read_allowed(api: &Api<'_>) -> Result<bool, String> {
     Ok(status.get("mode").map(js_text).unwrap_or_default() == "closed-agent")
 }
 
-const LEGACY_DENIED: &str = "旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具";
+const LEGACY_DENIED: &str = "旧只读工具只开放给封闭通道（管理端私聊）；其他模式请调用带会话令牌的新读工具";
 
 /// `args` is the validated, stripped input; session defaults from the environment are already applied.
 pub fn call_tool(name: &str, args: &Value, context: &RuntimeContext) -> ToolOutcome {
@@ -701,7 +701,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             match legacy_read_allowed(&api) {
                 Ok(true) => {}
                 Ok(false) => return ToolOutcome::error(LEGACY_DENIED.to_string()),
-                Err(e) => return fail("无法确认当前模式，拒绝执行：", e),
+                Err(e) => return fail("无法识别当前运行模式，已拒绝执行：", e),
             }
             let cfg = config(context).unwrap_or(json!({}));
             let data = match api.onebot("get_group_list", json!({})) {
@@ -724,12 +724,12 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             match legacy_read_allowed(&api) {
                 Ok(true) => {}
                 Ok(false) => return ToolOutcome::error(LEGACY_DENIED.to_string()),
-                Err(e) => return fail("无法确认当前模式，拒绝读取：", e),
+                Err(e) => return fail("无法识别当前运行模式，已拒绝读取：", e),
             }
             let cfg = config(context).unwrap_or(json!({}));
             let (allow, deny) = (id_list(&cfg, "allow", "groups"), id_list(&cfg, "deny", "groups"));
             if !is_allowed(&allow, &deny, &group, cfg.get("allowAllWhenEmpty") == Some(&Value::Bool(true))) {
-                return ToolOutcome::error(format!("拒绝：群 {group} 不在只读白名单中"));
+                return ToolOutcome::error(format!("拒绝：群 {group} 未在只读允许列表内"));
             }
             let group_id = group.trim().parse::<f64>().map(|n| json!(n as i64)).unwrap_or(Value::Null);
             if name == "qq_get_group_members" {
@@ -785,7 +785,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             if let Some(after) = args.get("afterSeq") {
                 path.push_str(&format!("&afterSeq={}", js_text(after)));
             }
-            result(&api, with_token(ApiCall::get(path)), "获取未读消息失败：")
+            result(&api, with_token(ApiCall::get(path)), "读取未读消息出错：")
         }
         "qq_get_recent_messages" => result(
             &api,
@@ -795,7 +795,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
                 num_or(args, "limit", "20"),
                 num_or(args, "offset", "0")
             ))),
-            "获取最近消息失败：",
+            "读取最近消息出错：",
         ),
         "qq_social_state" => result(&api, with_token(ApiCall::get(format!("/api/socialV2/state?key={}", encode_uri_component(key)))), "获取状态失败："),
         "qq_mark_read" => {
@@ -809,7 +809,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             body.insert("key".to_string(), json!(key));
             put(&mut body, "config", args.get("config"));
             put(&mut body, "throughSeq", args.get("throughSeq"));
-            result(&api, with_token(ApiCall::post("/api/socialV2/wake-config", Value::Object(body))), "设置唤醒配置失败：")
+            result(&api, with_token(ApiCall::post("/api/socialV2/wake-config", Value::Object(body))), "更新唤醒策略出错：")
         }
         "qq_send_burst" => {
             let group_key = format!("group:{}", args.get("groupId").map(js_text).unwrap_or_default());
@@ -861,7 +861,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
         "qq_get_my_recent_messages" => result(
             &api,
             with_token(ApiCall::get(format!("/api/socialV2/my-recent?key={}&limit={}", encode_uri_component(key), num_or(args, "limit", "10")))),
-            "获取自己消息失败：",
+            "读取己方消息出错：",
         ),
         "qq_get_message_detail" => result(
             &api,
@@ -870,12 +870,12 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
                 encode_uri_component(key),
                 encode_uri_component(&args.get("messageId").map(js_text).unwrap_or_default())
             ))),
-            "获取消息详情失败：",
+            "读取消息详情出错：",
         ),
         "qq_get_active_members" => result(
             &api,
             with_token(ApiCall::get(format!("/api/socialV2/active-members?key={}&limit={}", encode_uri_component(key), num_or(args, "limit", "10")))),
-            "获取活跃成员失败：",
+            "读取活跃成员出错：",
         ),
         "qq_memory_append" => {
             let extra = if truthy(args.get("extra")) { args["extra"].clone() } else { json!({}) };
@@ -935,7 +935,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             put(&mut body, "count", args.get("count"));
             body.insert("refresh".to_string(), json!(args.get("refresh") == Some(&Value::Bool(true))));
             body.insert("token".to_string(), json!(token));
-            result(&api, with_token(ApiCall::post("/api/socialV2/sticker-list", Value::Object(body))), "获取表情列表失败：")
+            result(&api, with_token(ApiCall::post("/api/socialV2/sticker-list", Value::Object(body))), "拉取表情列表出错：")
         }
         "qq_get_sticker_image" => {
             let sticker_id = arg_str(args, "stickerId");
@@ -944,7 +944,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
                 Ok(data) => {
                     let image_content = image_content(&data);
                     if image_content.is_empty() {
-                        return ToolOutcome::error(format!("表情没有可返回的图片：{}", error_text(data.get("error"), "未知")));
+                        return ToolOutcome::error(format!("该表情暂无可展示图片：{}", error_text(data.get("error"), "未知")));
                     };
                     let sticker = data.get("sticker");
                     let id = sticker.and_then(|s| s.get("id")).filter(|v| truthy(Some(v))).map(js_text).unwrap_or_else(|| sticker_id.to_string());
@@ -956,7 +956,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
                         delivery_unknown: false,
                     }
                 }
-                Err(e) => fail("获取表情图片失败：", e),
+                Err(e) => fail("拉取表情图片出错：", e),
             }
         }
         "qq_send_sticker" => {
@@ -1000,7 +1000,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             // (5 s lookup + 8 s transfer) and normalize.
             match api.call(with_token(ApiCall::get(format!("/api/socialV2/self-image?{q}")).timeout(45_000))) {
                 Ok(data) => self_image_outcome(&data),
-                Err(e) => fail("获取形象图片失败：", e),
+                Err(e) => fail("拉取形象图片出错：", e),
             }
         }
         "qq_sticker_note" => {
@@ -1017,12 +1017,12 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             if let Some(usage) = args.get("usage").filter(|v| !v.is_null()) {
                 payload.insert("usage".to_string(), json!(js_text(usage)));
             }
-            result(&api, with_token(ApiCall::post("/api/socialV2/sticker-note", Value::Object(payload))), "记录表情备注失败：")
+            result(&api, with_token(ApiCall::post("/api/socialV2/sticker-note", Value::Object(payload))), "保存表情备注出错：")
         }
         "qq_set_sticker_remark" => result(
             &api,
             with_token(ApiCall::post("/api/socialV2/sticker-remark", json!({"key": key, "stickerId": arg_str(args, "stickerId"), "remark": arg_str(args, "remark")}))),
-            "修改表情备注失败：",
+            "更新表情备注出错：",
         ),
         "qq_get_forward_msg" => forward_msg(&api, key, token, arg_str(args, "id")),
         other => ToolOutcome::error(format!("MCP error -32602: Tool {other} not found")),
@@ -1082,7 +1082,7 @@ fn image_content(data: &Value) -> Vec<Value> {
 pub(crate) fn self_image_outcome(data: &Value) -> ToolOutcome {
     let image_content: Vec<Value> = image_content(data).into_iter().filter(|block| block["type"] == "image").collect();
     if image_content.is_empty() {
-        return ToolOutcome::error(format!("没有可返回的形象图片：{}", error_text(data.get("error"), "未知")));
+        return ToolOutcome::error(format!("暂无可用的形象图片：{}", error_text(data.get("error"), "未知")));
     }
     let lead = if data.get("source").and_then(Value::as_str) == Some("qqAvatar") { "这是你现在的 QQ 头像：" } else { "这是你的默认形象图：" };
     ToolOutcome {
@@ -1096,7 +1096,7 @@ fn images_message_outcome(message_id: &str, data: &Value) -> ToolOutcome {
     let images = data.get("images").and_then(Value::as_array).cloned().unwrap_or_default();
     if images.is_empty() {
         let note = data.get("note").filter(|v| truthy(Some(v))).map(js_text).unwrap_or_else(|| "未找到".to_string());
-        return ToolOutcome::text(format!("消息 {message_id} 没有可返回的图片/表情：{note}"));
+        return ToolOutcome::text(format!("消息 {message_id} 不含可提取的图片或表情：{note}"));
     }
     let mut content = Vec::new();
     let mut parts = Vec::new();
@@ -1124,7 +1124,7 @@ fn forward_msg(api: &Api<'_>, key: &str, token: &str, id: &str) -> ToolOutcome {
     let q = query_string(&[("key", key.to_string()), ("id", id.to_string())]);
     let data = match api.call(ApiCall::get(format!("/api/socialV2/forward-message?{q}")).token(token).timeout(120_000)) {
         Ok(d) => d,
-        Err(e) => return fail("查看合并转发失败：", e),
+        Err(e) => return fail("读取合并转发出错：", e),
     };
     let outcome = data_text(api, data.clone());
     if outcome.is_error { return outcome; }
@@ -1174,7 +1174,7 @@ fn forward_msg(api: &Api<'_>, key: &str, token: &str, id: &str) -> ToolOutcome {
                     }
                 }
             }
-            Err(e) => image_texts.push(format!("[转发内图片（批量获取失败：{e}）]")),
+            Err(e) => image_texts.push(format!("[转发内图片拉取出错：{e}]")),
         }
     }
     if !image_texts.is_empty() {

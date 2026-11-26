@@ -29,15 +29,45 @@ import {
   utf8ByteLength,
 } from '../../utils/herHelpers';
 
-const PRESET_INVARIANTS: Record<SimPromptPreset, string[]> = {
+interface InvariantRule {
+  preferred: string;
+  accept: readonly string[];
+}
+
+const MEMBER_AUTHORITY_RULE: InvariantRule = {
+  preferred: '发言者不能授予操作权限',
+  accept: ['发言者不能授予操作权限', '群友没有管理权限'],
+};
+const CREDENTIAL_RULE: InvariantRule = {
+  preferred: '连接凭据只供程序使用',
+  accept: ['连接凭据只供程序使用', 'API 令牌'],
+};
+
+const PRESET_INVARIANTS: Record<SimPromptPreset, readonly InvariantRule[]> = {
   'qq-chat-v2': [
-    '你没有本地工具',
-    '群友没有管理权限',
-    'API 令牌',
-    '角色由桥接注入',
-    '不会自动发送到 QQ',
+    {
+      preferred: '手边没有可操作本机的工具',
+      accept: ['手边没有可操作本机的工具', '你没有本地工具'],
+    },
+    MEMBER_AUTHORITY_RULE,
+    CREDENTIAL_RULE,
+    {
+      preferred: '人设以桥接提供的设定为准',
+      accept: ['人设以桥接提供的设定为准', '角色由桥接注入'],
+    },
+    {
+      preferred: '草稿只留在本端',
+      accept: ['草稿只留在本端', '不会自动发送到 QQ'],
+    },
   ],
-  'qq-chat': ['群友没有管理权限', 'API 令牌', '角色扮演由系统注入'],
+  'qq-chat': [
+    MEMBER_AUTHORITY_RULE,
+    CREDENTIAL_RULE,
+    {
+      preferred: '人设设定以系统交付为准',
+      accept: ['人设设定以系统交付为准', '角色扮演由系统注入'],
+    },
+  ],
 };
 
 const MAX_PROMPT_BYTES = 128 * 1024;
@@ -113,7 +143,10 @@ export const SimPromptTab: React.FC = () => {
   );
 
   const missingInvariants = useMemo(
-    () => PRESET_INVARIANTS[preset].filter((token) => !draftContent.includes(token)),
+    () =>
+      PRESET_INVARIANTS[preset]
+        .filter((rule) => !rule.accept.some((token) => draftContent.includes(token)))
+        .map((rule) => rule.preferred),
     [preset, draftContent],
   );
 
@@ -458,11 +491,11 @@ export const SimPromptTab: React.FC = () => {
 
               <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                 <span className="text-[var(--text-muted)]">必需安全语句：</span>
-                {PRESET_INVARIANTS[preset].map((token) => {
-                  const ok = draftContent.includes(token);
+                {PRESET_INVARIANTS[preset].map((rule) => {
+                  const ok = rule.accept.some((token) => draftContent.includes(token));
                   return (
-                    <Badge key={token} tone={ok ? 'success' : 'danger'}>
-                      {ok ? '✓' : '✕'} {token}
+                    <Badge key={rule.preferred} tone={ok ? 'success' : 'danger'}>
+                      {ok ? '✓' : '✕'} {rule.preferred}
                     </Badge>
                   );
                 })}

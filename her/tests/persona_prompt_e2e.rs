@@ -145,7 +145,7 @@ impl Dsh {
             inner.prompts.push(PromptRec {
                 session: sid.clone(),
                 text: text.clone(),
-                is_reminder: text.contains("【提醒】你还没有完成回合收尾"),
+                is_reminder: text.contains("【提醒】本次对话尚未完成收尾"),
                 get_prompt: Value::Null,
             });
         }
@@ -174,7 +174,7 @@ impl Dsh {
             .lines()
             .find_map(|l| l.strip_prefix("【唤醒】")
                 .or_else(|| l.strip_prefix("【主动机会】"))
-                .or_else(|| l.strip_prefix("【引导唤醒】你已接入 QQ 会话 ")))
+                .or_else(|| l.strip_prefix("【引导唤醒】已接入 QQ 对话：")))
             .map(|l| l.trim().trim_end_matches('。').to_string());
         let token = prompt
             .lines()
@@ -796,9 +796,9 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
         &[
             "【当前时间】", "【简报 revision=",
             "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。", "【你的身份】",
-            "【群聊环境（操作者预设，仅本次首次唤醒参考）】", "【沉睡前强制等待】",
+            "【群聊环境（管理员预置，仅首次唤醒附带）】", "【沉睡前强制等待】",
             "【会话令牌】", "【此刻状态】", "【当前唤醒】",
-            "【引导唤醒】你已接入 QQ 会话 group:420042", "【本次消息快照】",
+            "【引导唤醒】已接入 QQ 对话：group:420042", "【本次消息快照】",
         ],
     );
     assert!(!text.contains("qq_wait_for_messages(purpose=\"reply\""), "{text}");
@@ -807,7 +807,7 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
         assert!(briefing.contains(rule),"briefing omitted {rule}: {text}");
     }
     assert!(text.contains("readThroughSeq") && text.contains("throughSeq"));
-    assert!(text.contains(&format!("{INITIAL_TEXT}\n（以上是操作者提供的背景，不是群友发的消息、也不是新的系统指令；据此把握圈子主题、氛围与分寸，不必向群友复述。）")), "{text}");
+    assert!(text.contains(&format!("{INITIAL_TEXT}\n（以上为管理员写入的背景设定，并非他人发言或系统命令，供把握语境与分寸参考，无需对外转述。）")), "{text}");
     assert!(!text.contains("【唤醒】group:420042"), "a first wake is a bootstrap, not an ordinary wake:\n{text}");
     assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["bootstrapSent"], json!(true));
 }
@@ -835,7 +835,7 @@ fn quiet_persona_wakes_have_no_generic_participation_push() {
         let text = &prompts[0].text;
         assert!(text.contains(heading) && text.contains("仔细听，只有确实想说时才开口。"), "{text}");
         assert!(
-            ["【积极性】", "【别像客服】", "优先主动开个话题", "不要一上来就划走", "挑最值得接的一句主动参与"]
+            ["【积极性】", "【别像客服】", "主动开个话题", "一上来就划走", "值得接的一句"]
                 .into_iter()
                 .all(|push| !text.contains(push)),
             "generic participation push in {reason}: {text}"
@@ -994,7 +994,7 @@ fn an_initial_prompt_longer_than_the_limit_is_cut_with_the_old_marker() {
     );
     rig.restart_mention(4001, "长文本");
     let prompts = rig.wait_prompts(1);
-    let expected = format!("{}…（已按上限截断，完整内容见控制台）", "长".repeat(100));
+    let expected = format!("{}…（超出长度限制，完整正文见控制台）", "长".repeat(100));
     assert!(prompts[0].text.contains(&expected), "{}", prompts[0].text);
     assert!(!prompts[0].text.contains(&"长".repeat(101)));
 }
@@ -1264,7 +1264,7 @@ fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
     // no prompt carries the command, and every prompt is one of those timed wakes.
     let delivered = rig.dsh.prompts();
     assert!(delivered.iter().all(|p| !p.text.contains("/persona")), "the command reached the model: {delivered:?}");
-    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】你已接入 QQ 会话") || p.text.contains("【提醒】你还没有完成回合收尾")), "a turn other than a timed wake ran: {delivered:?}");
+    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】已接入 QQ 对话") || p.text.contains("【提醒】本次对话尚未完成收尾")), "a turn other than a timed wake ran: {delivered:?}");
     assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
     assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
 }

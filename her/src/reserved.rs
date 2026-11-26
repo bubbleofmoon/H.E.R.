@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-const SPLIT_HINT: &str = "想分多条消息时用空格分隔；不想分条就不要加空格，用标点连接。注意：中英文/数字之间的空格也会被当作分条信号。";
-const DIRECTION: &str = "注意：消息里的 [引用 某人：...] 表示这句话是在回应被引用的人；引用的是你的消息才是在找你，引用别人时别默认是在找你。";
+const SPLIT_HINT: &str = "需要拆发多段时请以空格隔开；若整段发送请勿留空格，改用标点衔接（中英文或数字间的空格同样会触发分段）。";
+const DIRECTION: &str = "提示：消息中的 [引用 某人：...] 代表该句在回应所引之人；只有引用了你才是在对你说话，引用他人请勿误以为找你。";
 fn now() -> i64 {
     crate::parity_clock::now_ms()
 }
@@ -140,7 +140,7 @@ fn instruction(direct: bool) -> String {
     if direct {
         "请回复消息。".into()
     } else {
-        "请根据情况决定是否回复。如果不需要回应、想潜水/不接话，请只输出 [SILENT]；否则正常回复。"
+        "请自行判断是否搭话：若无需回应当面聊天，仅输出 [SILENT]；否则直接答复。"
             .into()
     }
 }
@@ -235,7 +235,7 @@ pub fn admin_state(context: &RuntimeContext, body: &str) -> Result<Value, (u16, 
     }
     let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
     if !chat::allowed_key(&cfg, key) {
-        return Err((403, "会话不在白名单内".into()));
+        return Err((403, "会话未在允许列表中".into()));
     }
     mutate(context, |s| {
         let c = s.conversations.entry(key.into()).or_default();
@@ -671,7 +671,7 @@ impl Hub {
                         s.conversations.remove(&key);
                         Ok(())
                     })?;
-                    Some("已重置会话，下次消息将开新上下文".into())
+                    Some("会话已清理，下一条消息起将开启全新上下文".into())
                 } else {
                     self.journal.mark_handled(vec![event.into()], now()).await?;
                     return Ok(());
@@ -831,7 +831,7 @@ impl Hub {
                 c.active_exit_at = now();
                 c.generation.retire();
                 c.summary.push(message.clone());
-                job=Some((format!("{prefix}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",context_block(c,&sc,&view)),true));
+                job=Some((format!("{prefix}【群聊上下文】\n{}\n\n你在群里活跃有一阵了，差不多可以顺势退场休息：简短道别一句（如「我先歇了」「你们慢慢聊」），说完后安静退下，不再接续。",context_block(c,&sc,&view)),true));
             } else if c.phase == "active" || c.phase == "probing" {
                 c.phase = "active".into();
                 c.last_active_message_at = now();
@@ -1011,7 +1011,7 @@ impl Hub {
                         .map(|m| message_line(m, true, &view))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    planned.push((key.clone(),format!("{prefix}【群聊摘要】过去一段时间群里发生了这些（你未逐条参与）：\n{lines}\n\n【最近对话】\n{}\n\n你不需要回复，只需记住这些内容，后续聊天会更自然。",context_block(c,&sc,&view)),false,c.summary.clone(),id.clone(),0));
+                    planned.push((key.clone(),format!("{prefix}【群聊摘要】前段时间群内有如下动态（你未逐一参与）：\n{lines}\n\n【最近对话】\n{}\n\n以上仅供知悉背景，无需作答，自然衔接后续对话即可。",context_block(c,&sc,&view)),false,c.summary.clone(),id.clone(),0));
                     f.remaining += 1;
                 }
                 f.status = if f.remaining == 0 { "done" } else { "running" }.into();
@@ -1055,7 +1055,7 @@ impl Hub {
                                     );
                                 if random(&mut s.seed) < probability(&sc, "proactiveProbability") {
                                     enter(c, &mut s.seed, &sc, key, now());
-                                    prompt=Some(format!("{}【群聊上下文】\n{}\n\n群内已经长时间没人说话了，你打算开启一个新话题。优先结合你的人格/角色设定的兴趣，其次结合群里大家的兴趣，挑一个合适的话题。可以联网搜索一些新鲜话题来聊。如果你觉得现在不适合开口，可以只输出 [SILENT]。\n{SPLIT_HINT}",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
+                                    prompt=Some(format!("{}【群聊上下文】\n{}\n\n群内冷清许久，试着开启一段新话题吧：优先结合角色自身兴趣，再参考群友常聊的方向，需要时可联网搜索近期话题；若认为此时不宜发言，仅输出 [SILENT]。\n{SPLIT_HINT}",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
                                 }
                             }
                         }
@@ -1069,7 +1069,7 @@ impl Hub {
                             c.active_exit_at = now();
                             c.generation.retire();
                             farewell = true;
-                            prompt=Some(format!("{}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
+                            prompt=Some(format!("{}【群聊上下文】\n{}\n\n你在群里活跃有一阵了，差不多可以顺势退场休息：简短道别一句（如「我先歇了」「你们慢慢聊」），说完后安静退下，不再接续。",role_prefix(&context,&cfg,key),context_block(c,&sc,&view)));
                         } else if now() >= c.next_check_at {
                             let new = c
                                 .recent
@@ -1127,7 +1127,7 @@ impl Hub {
                                 if random(&mut s.seed) < probability(&sc, "idleRetryProbability") {
                                     c.phase = "probing".into();
                                     c.probe_deadline = now() + n(&sc, "idleRetryWaitMs");
-                                    prompt=Some(format!("【群聊上下文】\n{}\n\n群里安静了一会儿，你可以说点什么。如果不想说，请只输出 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc,&view)));
+                                    prompt=Some(format!("【群聊上下文】\n{}\n\n群里冷清了一阵，可以试着接一句或搭话；若没有想说的，仅输出 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc,&view)));
                                 } else {
                                     leave(c);
                                 }

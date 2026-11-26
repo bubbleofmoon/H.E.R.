@@ -258,7 +258,7 @@ fn simulation_alias_is_the_reserved2_gate() {
         .unwrap();
         assert_eq!(status, 403);
         assert!(
-            text.contains("必须携带 agent token"),
+            text.contains("须附带 agent token"),
             "simulation must pass the mode gate: {text}"
         );
     }
@@ -276,7 +276,7 @@ fn simulation_alias_is_the_reserved2_gate() {
     .unwrap();
     assert_eq!(status, 403);
     assert!(
-        text.contains("该接口仅 reserved2 模式可用"),
+        text.contains("当前接口仅限 reserved2 模式调用"),
         "chat must fail the gate: {text}"
     );
 }

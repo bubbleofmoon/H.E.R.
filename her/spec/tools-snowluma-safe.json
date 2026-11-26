@@ -344,7 +344,7 @@
   },
   {
    "name": "qq_mark_read",
-   "description": "将指定会话已查看的未读消息标记为已读。必须把已查看结果中的 readThroughSeq 作为 throughSeq；更晚到达的消息保持未读。群聊需要观察时，按会话指引处理。",
+   "description": "把当前会话里已读过的未读消息标成已读，必须传入最近一次读取结果返回的 readThroughSeq 作为 throughSeq；其后新到消息保持未读。若群聊需要观察，请依会话提示处理。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -376,7 +376,7 @@
   },
   {
    "name": "qq_set_wake_config",
-   "description": "更新指定会话的二代唤醒策略，包含 mode、有限/无限休眠开关与提前唤醒条件（提及、称呼、关键词、提问、拍一拍、随机概率、anyMessage、指定发言人）。其中 triggers.speakerIds 可选填入若干成员 QQ 号，任意一位开口即触发唤醒（留空则不启用，适合在等特定对象回复时开启）；开启 triggers.poke 则群内任意拍一拍动作都会唤醒。群聊需要观察时，按会话指引处理。",
+   "description": "更新该会话的二代唤醒策略，可设置 mode、限时/永久休眠状态以及触发恢复的条件（如 @、昵称、触发词、直问、戳一戳、概率、anyMessage 或指定成员发言）。triggers.speakerIds 可选填入若干成员 QQ 号，任一成员发言即唤醒（不填则关闭，常用于等候特定对象回复）；打开 triggers.poke 后群内任何拍一拍动作都会唤醒。若群聊需观察，依会话提示操作。",
    "inputSchema": {
     "type": "object",
     "properties": {

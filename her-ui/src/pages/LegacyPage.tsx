@@ -81,7 +81,7 @@ const DEFAULT_EFFORT_LABELS: Record<string, string> = {
 };
 
 const DSH_MCP_TOOL_REFERENCE: { name: string; purpose: string }[] = [
-  { name: 'qq_status', purpose: '查询当前 QQ 登录状态与账号信息（只读）' },
+  { name: 'qq_status', purpose: '只读查看当前 QQ 连接态及本号基础资料' },
   { name: 'qq_list_groups', purpose: '列出所在 QQ 群的群号与群名（只读）' },
   { name: 'qq_get_group_members', purpose: '列出指定 QQ 群成员的 QQ 号、昵称与群名片（只读）' },
   { name: 'qq_get_group_history', purpose: '按可选 messageSeq 读取指定 QQ 群的最近历史消息（只读）' },

@@ -71,7 +71,7 @@ fn dsh_wake_snapshot_applies_model_view_strip() {
     let packet: Value = serde_json::from_str(packet).unwrap();
     assert_eq!(packet["messages"][0]["text"], "deepseek-v4.1-flash 【已隐藏】");
     assert_eq!(packet["readThroughSeq"], 1);
-    assert!(guidance.contains("以上消息已提供"));
+    assert!(guidance.contains("消息已在下方给出"));
     assert!(!guidance.contains("无需重复查询"), "snapshot guidance retained the configured strip literal");
 }
 
@@ -253,7 +253,7 @@ fn a_redacted_operator_field_retains_the_relationship_item() {
     server.join().unwrap();
     assert!(!w.text.contains("层级背景丁"), "the redaction must cover the operator text:\n{}", w.text);
     assert!(w.text.contains("层级印象丙"), "{}", w.text);
-    assert!(w.text.contains("【已隐藏】") && w.text.contains("操作者预设"));
+    assert!(w.text.contains("【已隐藏】") && w.text.contains("管理员预置"));
     assert_eq!(w.layers.relationship, 2);
 }
 

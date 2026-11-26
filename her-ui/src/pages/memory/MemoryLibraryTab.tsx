@@ -326,7 +326,7 @@ export const MemoryLibraryTab: React.FC = () => {
             if (msg.includes('agent token') || msg.includes('会话自己的令牌')) {
               pushToast('缺少该会话的 agent token：浏览器管理员会话无法直接调用遗忘接口', 'warn');
             } else {
-              pushToast(msg || '该条记忆不在当前会话可见范围内，无权删除', 'danger');
+              pushToast(msg || '该条记录不在本对话开放视野内，无权移除', 'danger');
             }
           } else {
             pushToast(formatErrorMessage(err, '永久遗忘失败'), 'danger');

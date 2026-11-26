@@ -333,7 +333,7 @@ export const SlangTab: React.FC = () => {
       return;
     }
     if (newStatus === 'confirmed' && !newMeaning.trim()) {
-      pushToast('已确认黑话必须填写含义，否则不会注入 AI 上下文', 'warn');
+      pushToast('已确认黑话需补全释义，未填含义不会带入对话背景', 'warn');
       return;
     }
     if (
@@ -453,7 +453,7 @@ export const SlangTab: React.FC = () => {
         sources: [...entry.sources],
         sourceDraft: '',
       });
-      pushToast('请先填写含义后再确认，否则不会注入 AI 上下文', 'warn');
+      pushToast('请先写明释义再确认，无含义词条不会带入对话背景', 'warn');
       return;
     }
     setBusy(true);
@@ -640,7 +640,7 @@ export const SlangTab: React.FC = () => {
       <Card>
         <CardHeader
           title="黑话词库"
-          subtitle="审核群聊沉淀的候选词汇，确认释义后才会注入 AI 上下文。"
+          subtitle="审阅群聊中收集到的候选词条；补齐并确认释义后才会带入对话背景。"
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <select

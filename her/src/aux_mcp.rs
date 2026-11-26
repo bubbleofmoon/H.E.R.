@@ -83,7 +83,7 @@ pub fn serve_web_search(context: &RuntimeContext) -> std::io::Result<()> {
 fn web_search_tool(query: &str, context: &RuntimeContext) -> Value {
     let clean = sanitize_query(query);
     if clean.is_empty() {
-        return outcome("查询词为空，已拒绝。".to_string(), true);
+        return outcome("未提供有效搜索词，请求已拒绝。".to_string(), true);
     }
     let net = Network { resolver: &aux_fetch::system_resolver, transfer: &aux_fetch::curl_transfer };
     match aux_search::web_search(&clean, &read_config(context), context, &net) {
@@ -181,7 +181,7 @@ fn gateway_info(context: &RuntimeContext, cfg: &Value) -> Map<String, Value> {
         info.insert("reachable".into(), json!(false));
         info.insert("httpStatus".into(), json!(reply.status));
         if reply.status == 426 {
-            info.insert("hint".into(), json!("（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请改为 OneBot HTTP API 地址）"));
+            info.insert("hint".into(), json!("（HTTP 426：snowluma.httpUrl 疑似设成了 WebSocket 地址，请调整为 OneBot HTTP 接口）"));
         }
         return info;
     }
@@ -224,9 +224,9 @@ fn snowluma_status(context: &RuntimeContext) -> Value {
             Some(Value::Null) | None => cfg.pointer("/snowluma/launcherPath").is_some_and(js_truthy),
             Some(v) => js_truthy(v),
         };
-        let mut hint = "SnowLuma 网关不可达。请自行启动 SnowLuma（本程序不代装、不代启，原因见项目文档的合规说明 L6）。".to_string();
+        let mut hint = "无法连接 SnowLuma 网关，请手动确认 SnowLuma 已启动（遵守合规约定，本工具不代装或代启网关）。".to_string();
         if !home_configured {
-            hint.push_str(" 若 config.json 的 snowluma.httpUrl 与实际端口不一致，也请一并检查。");
+            hint.push_str(" 同时请核对 config.json 的 snowluma.httpUrl 与网关监听端口是否匹配。");
         }
         payload.insert("hint".into(), json!(hint));
     }

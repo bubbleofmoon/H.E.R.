@@ -275,7 +275,7 @@ impl Credential {
         for attempt in 0..4 {
             let cookie =
                 session_cookie_for_runtime(&self.context, &self.base).ok_or_else(|| {
-                    unavailable(&self.context, "重新读密钥失败（~/.dsh/.credentials.yaml）")
+                    unavailable(&self.context, "刷新 DSH 凭据文件失败（~/.dsh/.credentials.yaml）")
                 })?;
             self.set_cookie(cookie);
             match verify() {

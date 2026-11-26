@@ -680,7 +680,7 @@ fn isolated_mcp_processes_keep_config_memory_owner_and_acl_state_separate() {
         "memory_search",
         json!({"key":group_key, "token":group_token, "query":"aclsharemarker"}),
     );
-    assert!(result_text(&before_acl).contains("没有找到相关记忆"));
+    assert!(result_text(&before_acl).contains("未查到匹配的长期记忆"));
     let grant = b.call(
         10,
         "memory_acl",
@@ -723,7 +723,7 @@ fn isolated_mcp_processes_keep_config_memory_owner_and_acl_state_separate() {
         "memory_search",
         json!({"key":group_key, "token":group_token, "query":"aclsharemarker"}),
     );
-    assert!(result_text(&after_revoke).contains("没有找到相关记忆"));
+    assert!(result_text(&after_revoke).contains("未查到匹配的长期记忆"));
 
     onebot_a.assert_no_request();
     onebot_b.assert_no_request();

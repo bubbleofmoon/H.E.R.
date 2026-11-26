@@ -1240,13 +1240,13 @@ fn get_prompt_sticker_total_and_context_belong_only_to_the_selected_root() {
 #[test]
 fn get_prompt_sticker_strategy_follows_include_in_prompt_even_when_disabled() {
     // Frozen JS sticker-lib.js::buildStickerStrategyHint, including every line.
-    const JS_STRATEGY: &str = "【表情包策略：像真人一样用，不刷屏】
-- 合适时机：被戳中笑点/槽点、接梗、怼人、赞同、自嘲、安慰、无语、赢了/输了、告别/晚安、别人发了表情时回一张，都可以自然用。
-- 频率：普通闲聊不用每条都配；大约每 3~5 轮来一张就够，热闹/玩梗时可以更密，但不要连续刷屏。
-- 选择：优先用备注（desc）和你的记忆（localNote/tags）能准确对上语境的；没有备注/不确定的表情，先 qq_get_sticker_image 看图再决定，不要瞎发。
-- 发送：用 qq_send_sticker；一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话先用 qq_send_message / qq_reply 作为单独气泡发出，再单独发表情。需要引用/点名时传 replyToMessageId / atUserId（群聊）。
-- 不要：在严肃/正式/敏感话题硬塞表情；不要每次都用同一个；不要一条消息里塞多个表情；不要把文字和表情混在同一个气泡里；不要把表情包当回复的唯一内容（偶尔可以，但别让群友觉得你在敷衍）。
-- 学习：看到新表情不确定含义时，先用 qq_get_sticker_image 看图，再用 qq_sticker_note 记下你的理解，下次就能更准地选。";
+    const JS_STRATEGY: &str = "【表情包策略：自然使用，别刷屏】
+- 使用时机：遇到搞笑、吐槽、接梗、附和、调侃、安抚、无言、道别、互怼或对方发图回应时，都可以顺手配一张。
+- 使用频率：日常对话不必每句都配图，隔三五轮挑准时机发一张即可；气氛热络玩梗时可略加密，但切忌连续刷屏。
+- 选图方法：优先挑选描述（desc）或个人备注（localNote/tags）契合当前语境的图；若缺乏说明或拿不准图意，先调 qq_get_sticker_image 看图再决定。
+- 发送规范：调 qq_send_sticker 单独成条发出，表情气泡内不能混带文字；需要说话时先调 qq_send_message / qq_reply 发文字气泡，再另发一条表情。若需引用或点名，请附带 replyToMessageId / atUserId（群内）。
+- 避坑事项：正经、敏感或严肃讨论时别硬插图；不要反复连发同一张；不要单条连塞多张或文字混排；不要长期只靠发表情敷衍回复。
+- 备注积累：碰到不熟悉的图意时，先用 qq_get_sticker_image 查验画面，再通过 qq_sticker_note 补录含义便于日后挑图。";
     for (label, sticker, expected) in [
         ("disabled-included", json!({"enabled": false}), JS_STRATEGY),
         ("disabled-excluded", json!({"enabled": false, "includeInPrompt": false}), ""),
@@ -1524,7 +1524,7 @@ fn read_receipts_do_not_survive_a_console_restart_but_the_persisted_mark_does() 
     let console = Console::start(&root, console_port);
     let refused = mcp.call("qq_mark_read", group(json!({"throughSeq": 8})));
     assert!(is_error(&refused), "a receipt from before the restart must not authorise skipping unread messages");
-    assert!(text_of(&refused).contains("throughSeq 必须是不超过已展示连续消息水位的非负安全整数"), "{}", text_of(&refused));
+    assert!(text_of(&refused).contains("throughSeq 须为非负整数且不可越过已阅读的连续编号"), "{}", text_of(&refused));
     let state = root.state();
     assert_eq!(state["conversations"][GROUP_KEY]["unread"].as_array().expect("unread").len(), 3, "nothing was acknowledged");
 
@@ -1548,7 +1548,7 @@ fn a_rotated_session_token_voids_the_receipts_it_was_given() {
     assert!(is_error(&refused), "receipts given to the old session must not count for the new one: {refused}");
     let old = f.mcp.call("qq_mark_read", group(json!({"throughSeq": 8})));
     assert!(is_error(&old));
-    assert!(text_of(&old).contains("未授权：调用携带的会话令牌无效"), "{}", text_of(&old));
+    assert!(text_of(&old).contains("未授权：所附会话令牌校验不通过"), "{}", text_of(&old));
 }
 
 #[test]
@@ -1748,7 +1748,7 @@ fn text_send_schemas_and_gateway_follow_merge_and_burst_policy() {
                 assert!(!is_error(&multi), "{multi}");
             } else {
                 assert!(is_error(&multi), "{multi}");
-                let reason = if label == "single-only" { "已禁用多条发送" } else { "合并后的消息不能超过 5" };
+                let reason = if label == "single-only" { "未开启分段发送" } else { "合并后的消息不能超过 5" };
                 assert!(text_of(&multi).contains(reason), "{multi}");
             }
             let exact = match label {

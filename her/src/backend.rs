@@ -197,9 +197,7 @@ impl Backend for CliBackend {
         if self.context.is_isolated() {
             configure_isolated_cli_environment(&mut cmd, &self.context)?;
         }
-        // 会话身份：CLI 后端（尤其 opencode）把自己的 MCP 工具接过去之后，
-        // 模型并不知道当前会话的 key 和令牌 —— 不注入就只能靠模型瞎猜，
-        // 实测会得到「未授权：智能体调用携带的会话令牌无效」。
+        // Pass session key and token via environment so CLI backends need not guess them.
         for (k, v) in session_env_for_runtime(&self.context, &req.key) {
             cmd.env(k, v);
         }

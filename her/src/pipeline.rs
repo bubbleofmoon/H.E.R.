@@ -603,8 +603,8 @@ pub fn is_cancellation_error(error: &str) -> bool {
         "会话或白名单已变化",
         "会话映射已变化",
         "会话令牌已变化",
-        "会话创建期间已重置或权限已变化",
-        "等待期间会话已重置或权限已变化",
+        "创建对话过程中发生重置或权限变动",
+        "候场等待期间对话发生重置或权限变动",
     ];
     OWN_PREFIXES.iter().any(|p| error.starts_with(p))
         || error.ends_with("丢弃排队的指令")
@@ -1079,7 +1079,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             &self.context,
             cfg,
             "blocked-reply",
-            &format!("⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，未发出。（{key}）"),
+            &format!("⚠️ 外发内容触发安全校验（疑似含路径、凭据或会话令牌），已拦截未发。（{key}）"),
         );
         recovery_log::record(&self.context, Trigger::Turn, Component::Alert, "reply-blocked", Outcome::Skipped, &format!("{key}: a reply was stopped by the outbound sentinel"));
     }
@@ -2144,10 +2144,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 let has_token = secrets.iter().any(|t| !t.is_empty() && plain.contains(t.as_str()));
                 crate::activity::append(
                     &self.context,
-                    &format!("{key} agent 回复被拦截（疑似敏感信息{}）", if has_token { "/会话令牌" } else { "" }),
+                    &format!("{key} 对外发送已被安全规则拦下（含敏感片段{}）", if has_token { "或会话令牌" } else { "" }),
                 );
                 self.alert_blocked_reply(cfg, key);
-                println!("[chat] {key} 回复被安全策略拦截（{why}），未发出")
+                println!("[chat] {key} 外发回复未通过安全检查（{why}），已阻断")
             }
             crate::chat::Reply::Stopped => {
                 println!("[chat] {key} 回合被中止");
@@ -2159,8 +2159,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     .is_some_and(|state| state.get("mode").and_then(|m| m.as_str()) == Some("silent"))
                     && !crate::chat::is_owner_key(cfg, key);
                 if silent_for_members {
-                    crate::activity::append(&self.context, &format!("{key} 静默模式，拦截在途回复"));
-                    println!("[chat] {key} 静默模式，拦截在途回复");
+                    crate::activity::append(&self.context, &format!("{key} 处于静默状态，截停在途回复"));
+                    println!("[chat] {key} 处于静默状态，截停在途回复");
                 } else {
                     self.log_reply_activity(key, &plain);
                     self.send_chat_text(key, &sid, "reply", &plain);
@@ -3220,9 +3220,9 @@ mod tests {
             "模式已变化",
             "会话或白名单已变化",
             "会话令牌已变化（重置、取消或被替代）",
-            "会话创建期间已重置或权限已变化，丢弃新会话",
+            "创建对话过程中发生重置或权限变动，放弃新建会话",
             "模式已切换，丢弃排队的指令",
-            "会话已重置或权限已撤销，丢弃排队的指令",
+            "会话已被重置或授权变更，丢弃排队的指令",
         ] {
             assert!(is_cancellation_error(real), "{real}");
         }

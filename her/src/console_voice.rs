@@ -18,7 +18,7 @@ use crate::voice::{self, AudioOptions, Loudness};
 use std::path::{Path, PathBuf};
 
 const OPERATOR_SCOPE: &str = "operator:cli";
-const NOT_FROM_LIBRARY: &str = "不支持 base64://、data: 或 http(s):// 来源，请传入语音库中的本地文件名";
+const NOT_FROM_LIBRARY: &str = "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名";
 
 // ----- configuration ---------------------------------------------------------------------------------------
 
@@ -369,7 +369,7 @@ pub(super) fn handle_voice_list(
             return Err((403, "agent token 无效".to_string()));
         }
         if !social_v2_projection_session_allowed(cfg, &key) {
-            return Err((403, "目标不在当前模式允许范围内".to_string()));
+            return Err((403, "目标会话未被当前运行模式放行".to_string()));
         }
         if !send_voice_tool_enabled(cfg) {
             return Err((403, "工具未启用：qq_send_voice".to_string()));
@@ -840,18 +840,18 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         return err(403, "工具未启用：qq_send_voice");
     }
     if !social_v2_projection_session_allowed(cfg, &key) {
-        return err(403, "目标不在当前模式允许范围内");
+        return err(403, "目标会话未被当前运行模式放行");
     }
     match silent_blocks_send(context, cfg, &key) {
         Ok(false) => {}
-        Ok(true) => return err(403, "静默模式已开启，当前不允许发送"),
+        Ok(true) => return err(403, "当前处于静默状态，暂停对外发送"),
         Err((status, message)) => return err(status, message),
     }
     let Some((kind, id_s, id)) = agent::parse_key(&key) else {
         return err(400, "key 格式须为 group:群号 或 private:QQ号");
     };
     if id <= 0 || !agent::mode_allowed(cfg, "reserved2", &key) {
-        return err(403, "目标不在当前模式允许范围内");
+        return err(403, "目标会话未被当前运行模式放行");
     }
     let lib = match open_library(context, &vc) {
         Ok(lib) => lib,

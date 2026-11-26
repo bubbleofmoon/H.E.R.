@@ -366,9 +366,9 @@ fn clear_is_console_only_and_agents_cannot_read_the_list() {
     fs::write(root.p("data/feedback.json"), history().to_string()).unwrap();
     let console = Console::start(&root);
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback-clear", json!({}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "该接口仅控制台可用"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
     let (s, b) = console.agent(AGENT_A, "GET", "/api/socialV2/feedback", Value::Null);
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "该接口仅控制台可用"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
     assert_eq!(entries(&console).len(), 2, "refused calls change nothing");
     let (s, b) = console.admin("POST", "/api/socialV2/feedback-clear", json!({}));
     assert_eq!((s, b), (200, json!({"ok": true})));
@@ -566,8 +566,8 @@ fn sends_feedback_and_pokes_leave_activity_lines_the_status_shows_to_the_operato
         texts,
         vec![
             "group:70001 [reserved2] AI 反馈 [info]：hello there",
-            "group:70001 [reserved2] 工具统一发送：成功 1/1 条",
-            "group:70001 [reserved2] 工具分条发送：成功 1/1 条",
+            "group:70001 [reserved2] 工具合并发送成功： 1/1 条",
+            "group:70001 [reserved2] 工具分段发送成功： 1/1 条",
             "group:70001 [send] 成功 1/1 条：gamma",
             "private:9002 [reserved2] 工具拍一拍",
         ]

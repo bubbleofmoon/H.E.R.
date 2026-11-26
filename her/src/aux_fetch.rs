@@ -255,7 +255,7 @@ mod tests {
         let to_loopback: Script =
             Box::new(|_| Ok((302, Some("http://127.0.0.1:8080/admin".into()), vec![])));
         let (result, log) = run("http://public.test/", 100, to_loopback);
-        assert_eq!(result.unwrap_err(), "禁止访问内网/本机地址");
+        assert_eq!(result.unwrap_err(), "已拦截内网或本地地址");
         assert_eq!(log.len(), 1);
         let hops = std::cell::Cell::new(0);
         let relative: Script = Box::new(move |t| {
@@ -271,7 +271,7 @@ mod tests {
         let rebind: Script = Box::new(|_| Ok((307, Some("http://rebind.test/".into()), vec![])));
         assert_eq!(
             run("http://public.test/", 100, rebind).0.unwrap_err(),
-            "域名解析到内网/本机地址，已阻止"
+            "解析结果命中私有或本地 IP，已拦截"
         );
         let missing: Script = Box::new(|_| Ok((302, None, vec![])));
         assert_eq!(
@@ -280,7 +280,7 @@ mod tests {
         );
         let endless: Script = Box::new(|_| Ok((302, Some("/again".into()), vec![])));
         let (result, log) = run("http://public.test/", 100, endless);
-        assert_eq!(result.unwrap_err(), "重定向次数过多，已停止");
+        assert_eq!(result.unwrap_err(), "重定向超出次数限制，已中止");
         assert_eq!(log.len(), 6, "the first request plus five redirects");
     }
 
@@ -290,16 +290,16 @@ mod tests {
             ("ftp://public.test/", "仅允许 http/https"),
             ("not a url", "URL 无效"),
             ("http://user:pw@public.test/", "URL 不能包含凭据"),
-            ("http://localhost/", "禁止访问内网/本机地址"),
-            ("http://printer.local/", "禁止访问内网/本机地址"),
-            ("http://a.localhost./", "禁止访问内网/本机地址"),
-            ("http://127.0.0.1/", "禁止访问内网/本机地址"),
-            ("http://2130706433/", "禁止访问内网/本机地址"),
-            ("http://0x7f.1/", "禁止访问内网/本机地址"),
-            ("http://[::1]/", "禁止访问内网/本机地址"),
-            ("http://[::ffff:10.0.0.1]/", "禁止访问内网/本机地址"),
-            ("http://rebind.test/", "域名解析到内网/本机地址，已阻止"),
-            ("http://empty.test/", "域名没有解析结果"),
+            ("http://localhost/", "已拦截内网或本地地址"),
+            ("http://printer.local/", "已拦截内网或本地地址"),
+            ("http://a.localhost./", "已拦截内网或本地地址"),
+            ("http://127.0.0.1/", "已拦截内网或本地地址"),
+            ("http://2130706433/", "已拦截内网或本地地址"),
+            ("http://0x7f.1/", "已拦截内网或本地地址"),
+            ("http://[::1]/", "已拦截内网或本地地址"),
+            ("http://[::ffff:10.0.0.1]/", "已拦截内网或本地地址"),
+            ("http://rebind.test/", "解析结果命中私有或本地 IP，已拦截"),
+            ("http://empty.test/", "DNS 未返回任何记录"),
             ("http://nx.test/", "域名解析失败：getaddrinfo ENOTFOUND"),
         ] {
             assert_eq!(

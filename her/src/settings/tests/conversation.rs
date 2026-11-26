@@ -11,7 +11,7 @@ const ROUTE: &str = "conversation.route";
 const NOT_ADMITTED: &str = "conversation is not admitted; admit it first";
 const CONVERSATION_REFUSED: &str = "conversation must be group:<id> or private:<id>";
 const ENGINE_REFUSED: &str = "conversation.engine must be one of dsh, harness";
-const CHAT_WRITE_REFUSED_TEXT: &str = "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）";
+const CHAT_WRITE_REFUSED_TEXT: &str = "禁止在对话中更改此项（仅允许调整 settings_get 列出的配置；白名单、访问令牌及路径类须本地修改）";
 const KEPT_GROUP: &str = "group:7001";
 const LOST_GROUP: &str = "group:7002";
 

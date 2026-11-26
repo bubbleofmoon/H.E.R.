@@ -128,5 +128,3 @@ them, and the public rule they follow is in [docs/agents/production-ops.md](docs
 ## License
 
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (decision: [ADR 0002](docs/adr/0002-public-repo-polyform-noncommercial.md)). Source-available, not open source: commercial use is not allowed, and redistribution must keep the license and the notices.
-
-Third-party notices: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

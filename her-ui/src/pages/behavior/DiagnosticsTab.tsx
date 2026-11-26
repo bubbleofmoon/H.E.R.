@@ -67,7 +67,7 @@ export const DiagnosticsTab: React.FC = () => {
         setToolLog(Array.isArray(res.entries) ? res.entries : []);
       } catch (err) {
         if (mountedRef.current && seq === toolSeqRef.current) {
-          pushToast(formatErrorMessage(err, '加载工具调用日志失败'), 'danger');
+          pushToast(formatErrorMessage(err, '读取工具执行记录失败'), 'danger');
         }
       } finally {
         if (mountedRef.current && seq === toolSeqRef.current) {

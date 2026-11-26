@@ -478,7 +478,7 @@ fn assert_error(response: HttpResponse, status: u16, message: &str, context: &st
 }
 
 fn assert_unauthorized(response: HttpResponse, context: &str) {
-    assert_error(response, 401, "未授权：请提供控制台访问令牌", context);
+    assert_error(response, 401, "未通过鉴权：缺少有效控制台访问令牌", context);
 }
 
 fn projection<'a>(response: &'a Value, key: &str) -> &'a Value {
@@ -803,7 +803,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
         assert_error(
             response,
             400,
-            "afterSeq 必须是非负安全整数；从最早未读开始请传 0",
+            "afterSeq 须为非负整数；从首条未读起请传 0",
             &format!("invalid cursor {cursor}"),
         );
     }
@@ -921,7 +921,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
     assert_error(
         disallowed_agent,
         403,
-        "目标不在当前模式允许范围内",
+        "目标会话未被当前运行模式放行",
         "agent session outside selected allow list",
     );
 
@@ -943,7 +943,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
             before_b,
             "console-only {path} must not write B"
         );
-        assert_error(agent_response, 403, "该接口仅控制台可用", path);
+        assert_error(agent_response, 403, "此操作仅开放给控制台访问", path);
     }
 
     let before_paused_a = bytes(&state_path_a);
@@ -991,7 +991,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
     assert_error(
         disabled_agent,
         403,
-        "二代模式已关闭，当前不允许执行 v2 工具",
+        "二代社交功能已停用，禁止调用 v2 工具",
         "agent request when selected socialV2 is disabled",
     );
 
@@ -1063,7 +1063,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
     assert_error(
         mode_agent,
         403,
-        "该接口仅 reserved2 模式可用",
+        "当前接口仅限 reserved2 模式调用",
         "agent request outside reserved2 mode",
     );
     fs::write(&mode_path_b, mode_b_before).expect("restore B selected mode fixture");

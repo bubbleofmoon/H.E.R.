@@ -1667,7 +1667,7 @@ fn owner_tokenless_image_lookup_keeps_the_closed_agent_permission() {
     assert_eq!(facts["tools"][0]["state"], "completed", "{facts}");
     assert!(facts["tools"][0]["result"]
         .to_string()
-        .contains("没有可返回的图片"));
+        .contains("不含可提取的图片或表情"));
     assert_eq!(rig.wait_texts(OWNER_KEY, 2)[1], "image lookup complete");
 }
 

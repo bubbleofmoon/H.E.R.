@@ -1,7 +1,7 @@
 //! 二代「轻量记忆」的状态改写：进行中的话题 / 想说未说 / 群友印象。
 //!
-//! 逐条移植自 `qq-bridge/src/bridge.js` 的 `appendMemoryV2` / `memory-update` /
-//! `memory-remove` / `memory-clear`，以及 `md-to-plain.js` 的 `truncateText`。
+//! Lightweight conversation memory updates (`append` / `update` / `remove` / `clear`)
+//! plus UTF-16 bounded tail/head helpers and shared prompt formatting.
 //!
 //! 为什么单独一个模块：这些改动看着小，但全是「上限 + 去重 + 淘汰」的细节，
 //! 散在 HTTP handler 里既测不了也改不动。`memory_formatted` 复用 `prompt` 里那份
@@ -42,7 +42,7 @@ pub fn truncate_text(value: &str, max: i64) -> String {
     String::from_utf16_lossy(&units[..cut])
 }
 
-/// JS 的 `truncateTextTail(value, max)`：保留最后 `max` 个 UTF-16 码元；切点落在代理对中间时整对保留。
+/// Retain the trailing `max` UTF-16 code units, preserving a complete surrogate pair if `start` falls in the middle.
 pub fn truncate_text_tail(value: &str, max: i64) -> String {
     let limit = if max <= 0 { 0 } else { max as usize };
     if limit == 0 {

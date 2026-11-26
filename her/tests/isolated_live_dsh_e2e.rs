@@ -314,7 +314,7 @@ fn post_public_console_tool(
         .and_then(|(_, suffix)| suffix.lines().next())
         .or_else(|| {
             prompt
-                .split_once("【引导唤醒】你已接入 QQ 会话 ")
+                .split_once("【引导唤醒】已接入 QQ 对话：")
                 .and_then(|(_, suffix)| suffix.lines().next())
                 .map(|line| line.trim_end_matches('。'))
         })
@@ -482,7 +482,7 @@ async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Resu
             .ok_or_else(|| "session/prompt omitted request.content[0].text".to_string())?
             .to_string();
         // Only the first prompt (the bootstrap wake) is observed and relayed. The reserved-mode
-        // runner may deliver a `wakeReminder` prompt (frozen JS `bridge.js` "你还没有完成回合收尾")
+        // runner may deliver a `wakeReminder` prompt (unfinished-turn wakeReminder prompt)
         // before the bridge exits; it carries no wake key and must not replace the first prompt or
         // its tool observation.
         let first_prompt = {
@@ -1545,7 +1545,7 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     assert_eq!(model_select.args.pointer("/request/reasoningEffort").and_then(Value::as_str), Some("medium"));
     let prompt = dsh.prompt.as_deref().expect("actual prompt delivered through session/prompt");
     // The fixture conversation has never woken (`bootstrapSent` absent), so this first wake is the bootstrap wake.
-    assert!(prompt.contains(&format!("【引导唤醒】你已接入 QQ 会话 group:{GROUP_ID}")), "selected group key missing from prompt");
+    assert!(prompt.contains(&format!("【引导唤醒】已接入 QQ 对话：group:{GROUP_ID}")), "selected group key missing from prompt");
     assert!(prompt.contains(INBOUND_TEXT), "real OneBot inbound text missing from the DSH prompt");
     // Live 114e5c25 replaces the compatibility full render at DSH submission, including
     // bootstrap wakes: concise status plus one authenticated packet carry the live event.
@@ -2023,7 +2023,7 @@ fn isolated_live_dsh_background_io_stays_in_selected_root_and_ignores_config_end
     assert!(prompt.contains("【可用表情包】"), "enabled sticker context missing from the live DSH prompt");
     assert!(prompt.contains(STICKER_SENTINEL), "live DSH prompt did not read the selected sticker store");
     assert!(
-        prompt.contains("你的 QQ 收藏表情里有 1 个表情"),
+        prompt.contains("已收录 1 个表情"),
         "sticker context counted entries outside the selected store"
     );
     assert_eq!(run.selected_bytes("data/stickers.json"), stickers, "prompt sticker read rewrote the selected store");

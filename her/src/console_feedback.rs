@@ -29,7 +29,7 @@ pub(super) fn get(context: &RuntimeContext) -> (u16, Value) {
 /// `POST /api/socialV2/feedback-clear`: console only.
 pub(super) fn clear(context: &RuntimeContext, headers: &HashMap<String, String>) -> (u16, Value) {
     if headers.contains_key("x-agent-token") {
-        return failure((403, "该接口仅控制台可用".to_string()));
+        return failure((403, "此操作仅开放给控制台访问".to_string()));
     }
     match crate::feedback::clear(context) {
         Ok(()) => {
@@ -70,7 +70,7 @@ fn post_inner(
             return Err((403, "agent token 无效".to_string()));
         }
         if !social_v2_projection_session_allowed(cfg, &key) {
-            return Err((403, "目标不在当前模式允许范围内".to_string()));
+            return Err((403, "目标会话未被当前运行模式放行".to_string()));
         }
         if !tool_enabled(cfg, "feedback") {
             return Err((403, "工具未启用：qq_report_feedback".to_string()));

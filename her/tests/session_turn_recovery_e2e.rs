@@ -758,7 +758,7 @@ fn prompt_key(prompt:&str)->Option<&str> {
         .and_then(|(_, rest)| rest.lines().next())
         .or_else(|| {
             prompt
-                .split_once("【引导唤醒】你已接入 QQ 会话 ")
+                .split_once("【引导唤醒】已接入 QQ 对话：")
                 .and_then(|(_, rest)| rest.lines().next())
                 .map(|line| line.trim_end_matches('。'))
         })
@@ -1655,7 +1655,7 @@ fn scheduling_unclosed_wake_gets_one_reminder_then_resets_its_counter() {
         let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
         state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"] == 0
     }), "scheduler did not reset the completed unclosed wake");
-    assert!(rig.dsh.applied()[1].text.contains("【提醒】你还没有完成回合收尾"));
+    assert!(rig.dsh.applied()[1].text.contains("【提醒】本次对话尚未完成收尾"));
     assert!(!rig.dsh.applied()[1].text.contains("【本次消息快照】"), "JS reminders do not offer a wake snapshot");
     let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
     assert_eq!(state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"], 0);
@@ -3641,7 +3641,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
         assert!(text.contains("【唤醒增量】"), "wake {i}: {text}");
         assert!(!text.contains("【替换简报节 behaviour】"), "wake {i} repeated unchanged rules");
         assert!(!text.contains("operator-briefing-85"));
-        assert!(!text.contains("【首回复节奏】先处理") && !text.contains("【沉睡前强制等待】这是"));
+        assert!(!text.contains("【首回复节奏】") && !text.contains("前强制等待】这是"));
         assert!(text.contains("【会话令牌】"));
         assert!(text.contains("【本轮发送】") && text.contains("文本输出不会发送到 QQ"), "wake {i} lost current-turn tool-only delivery instruction");
         assert!(text.contains("【本次消息快照】"));

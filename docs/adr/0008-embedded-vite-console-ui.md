@@ -16,5 +16,5 @@ Compiled build output (`her-ui/dist/`) is gitignored rather than committed: CI w
 ## Consequences
 
 - Release builds, UI-test builds and hosted CI run a frontend build step in `her-ui/` ahead of Cargo (`HER_REQUIRE_UI_DIST=1`).
-- Frontend dependencies must use permissive licenses compatible with ADR 0002, be recorded in `THIRD_PARTY_NOTICES.md`, and work without inline scripts or styles under the strict CSP.
+- Frontend dependencies must use permissive licenses compatible with ADR 0002, be recorded in `her/THIRD_PARTY_NOTICES.md`, and work without inline scripts or styles under the strict CSP.
 - The console UI test harness (`#316`) runs against the embedded Vite build rather than a zero-build HTML shell.

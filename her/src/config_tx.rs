@@ -729,7 +729,7 @@ pub(crate) fn commit_whitelist_with(
     let groups = ids("group");
     let private = ids("private");
     crate::safe_println!(
-        "[console] 控制台：白名单已更新（群: {}，私聊: {}，管理员: {}）{}",
+        "[console] 控制台已更新访问名单（群聊: {}，私聊: {}，管理端: {}）{}",
         if groups.is_empty() { "无" } else { &groups },
         if private.is_empty() { "无" } else { &private },
         if file["ownerQQ"].is_null() {
@@ -1605,7 +1605,7 @@ pub(crate) const SETTINGS_WRITABLE: [&str; 3] = [
 ];
 
 const SETTINGS_READONLY_HINT: &str =
-    "白名单 allow.* / ownerQQ / 后端与网关配置 / consoleToken / 任何路径类字段只能本地改";
+    "白名单 allow.*、ownerQQ、后端及网关配置、consoleToken 与所有本机路径项仅允许本地修改";
 
 const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 
@@ -1854,7 +1854,7 @@ pub(crate) fn settings_action(
     if !is_setting_writable(&path) {
         return Err((
             403,
-            "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）"
+            "禁止在对话中更改此项（仅允许调整 settings_get 列出的配置；白名单、访问令牌及路径类须本地修改）"
                 .to_string(),
         ));
     }

@@ -62,7 +62,7 @@ fn store_error(error: StoreError) -> (u16, String) {
 fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, String)> {
     match serde_json::from_str::<Value>(body) {
         Ok(Value::Object(fields)) => Ok(fields),
-        _ => Err((400, "请求体必须是 JSON 对象".to_string())),
+        _ => Err((400, "请求正文需为 JSON 对象".to_string())),
     }
 }
 

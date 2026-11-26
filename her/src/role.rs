@@ -413,8 +413,7 @@ pub fn first_meaningful_line(content: &str) -> String {
     String::new()
 }
 
-/// JS 的 `GEN1_ROLE_LINE_RE`（`/\[SILENT\]|空格分隔|按空格|用空格|空格分句|空格代表|自动转发|回复会自动|输出\s*\[SILENT\]/i`）。
-/// 注意最后那个 `输出\s*\[SILENT\]` 被前面的 `\[SILENT\]` 完全覆盖，是冗余分支。
+/// Matches legacy first-generation role-card instructions (silent markers, space-splitting, auto-forwarding) to strip them.
 pub fn gen1_role_line(text: &str) -> bool {
     let lower = text.to_lowercase();
     const NEEDLES: [&str; 7] = [
@@ -473,7 +472,7 @@ pub fn role_warnings(content: &str, mode: &str, inject_max: usize) -> Vec<String
         .join("\n");
     if gen1_role_line(&untagged) {
         warnings.push(
-            "发现未标明适用范围的小节含有初代规则词句（[SILENT] / 空格分句 / 自动转发等），当前模式下这些行会被过滤；建议为其加上 〔一代〕 标记"
+            "发现未标明适用范围的小节含有初代规则词句（[SILENT]、空格分句、自动转发等），当前模式下这些行会被过滤；建议为其加上 〔一代〕 标记"
                 .to_string(),
         );
     }

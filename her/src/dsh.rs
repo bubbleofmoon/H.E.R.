@@ -1,6 +1,6 @@
 //! DSH 客户端（P2-A）：RPC 调用、会话创建与 prompt 投递。登录 Cookie 归 `dsh_credential`。
 //!
-//! 与 JS 版 `src/dsh-client.js` 逐项对齐：
+//! DSH HTTP-RPC wire contract:
 //!   信封  {type:"client-request", rpcId, method:"session/list", payload:{args:{...}}}`
 //!   路径  POST /api/<method 点号换斜杠>`
 //!   包装  session/list -> args._request；多数 session/* -> args.request；其余 -> args 平铺
@@ -758,14 +758,14 @@ fn canonical_usage(buckets: &crate::pricing::Buckets) -> serde_json::Value {
     })
 }
 
-/// 快照里的账本事实（照抄 JS `ingestBaseline` / `ingestSnapshotRecords`）。
+/// Baseline and per-turn token usage harvest from DSH session snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct UsageHarvest {
     pub samples: Vec<TurnUsage>,
     pub base: Option<BaseFact>,
 }
 
-/// `projections.tokenUsage`：整条会话日志的权威累计，截至 `as_of_seq`。
+/// Authoritative cumulative usage from `projections.tokenUsage` through `as_of_seq`.
 #[derive(Debug, Clone)]
 pub struct BaseFact {
     pub as_of_seq: i64,
@@ -1581,7 +1581,7 @@ async fn probe_prompt_with(rpc: &Rpc, session_id: &str, rpc_ids: &[String], harv
     let mut inbox: Option<Vec<serde_json::Value>> = None;
     match rpc.call("session/projections", serde_json::json!({ "sessionId": session_id })) {
         Ok(value) => {
-            // null = 会话不在宿主注册表里（没有活动 agent），没有待处理项。
+            // null means no active session is registered on the host; pending queue is empty.
             inbox = Some(if value.is_null() {
                 Vec::new()
             } else {

@@ -62,7 +62,7 @@ fn settings_get_reads_only_writable_settings_and_never_a_secret() {
     assert!(all.contains("sendDelayMs = 321") && !all.contains("fixture-"), "{all}");
     // A refused write does not name the key either.
     let refused = crate::mcp::call_prepared("settings_set", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": "dsh.model", "value": "x"}), &context).to_string();
-    assert!(refused.contains("该项不可通过对话修改") && !refused.contains("dsh"), "{refused}");
+    assert!(refused.contains("禁止在对话中更改此项") && !refused.contains("dsh"), "{refused}");
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     assert_eq!(image_error.0, 404, "{image_error:?}");
     surfaces.push(("self image error".into(), image_error.1));
     let settings = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
-    assert!(settings.contains("不可通过对话修改"), "{settings}");
+    assert!(settings.contains("禁止在聊天中更改"), "{settings}");
     surfaces.push(("settings_get result".into(), settings));
     for setting in ["socialV2.send.burstEnabled", "dsh.model", "relay.credentials.0"] {
         let read = crate::mcp::call_prepared("settings_get", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": setting}), &context);

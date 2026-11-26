@@ -21,7 +21,7 @@
         "tools": [
           {
             "name": "web_search",
-            "description": "只读网页检索：优先调用内置主检索接口（精度更高，且不会将群聊词汇传给外部检索广告网络），不可用时回退 Bing。仅返回标题、链接与摘要，不触发本机写入或命令执行，适用于查询网络用语、热梗与事实问题。",
+            "description": "只读检索网络公开信息：优先走内置主搜索通道（准确度较高，且不会将群聊词条外泄给第三方广告检索源），失败时回退 Bing。结果仅包含标题、链接与摘要，不触发本地写入或指令执行，适合查证网络热梗、流行词与事实。",
             "inputSchema": {
               "$schema": "http://json-schema.org/draft-07/schema#",
               "type": "object",
@@ -41,7 +41,7 @@
           },
           {
             "name": "web_fetch",
-            "description": "只读拉取 HTTP(S) 页面文本，截取纯文本或 HTML 的前 50000 个字符。拦截内网及本机回环地址，不执行任何本机操作。",
+            "description": "只读读取 HTTP(S) 网页正文（纯文本或 HTML 截取前 50000 字符），自动拦截私有网段与本地回环，不触发任何本机操作。",
             "inputSchema": {
               "$schema": "http://json-schema.org/draft-07/schema#",
               "type": "object",
@@ -69,7 +69,7 @@
         "content": [
           {
             "type": "text",
-            "text": "查询词为空，已拒绝。"
+            "text": "未提供有效搜索词，请求已拒绝。"
           }
         ],
         "isError": true
@@ -82,7 +82,7 @@
         "content": [
           {
             "type": "text",
-            "text": "抓取失败：禁止访问内网/本机地址"
+            "text": "抓取失败：已拦截内网或本地地址"
           }
         ],
         "isError": true

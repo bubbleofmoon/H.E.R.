@@ -371,7 +371,7 @@ pub fn images(context: &RuntimeContext, cfg: &Value, media_list: &[Value]) -> Ve
         if let Some((n, raw_len)) = image {
             if total + raw_len > limits.bytes {
                 base["text"] = json!(format!(
-                    "（{}总大小超限，已跳过）",
+                    "（{}体积超过上限，已略过）",
                     if kind == "sticker" {
                         "表情"
                     } else {

@@ -36,8 +36,8 @@ pub fn wake_priority(reason: &str) -> i32 {
     }
 }
 
-/// 与「未读消息」无关的唤醒原因（定时器/引导）。
-/// 这类原因在繁忙时被暂存后，不能靠 unread 里还有没有对应 seq 来判断要不要补发。
+/// Wake reasons not tied to an unread message (timers or bootstrap triggers).
+/// Deferred copies cannot be revalidated solely by unread seq lookup.
 pub fn is_timer_reason(reason: &str) -> bool {
     matches!(
         reason.split(':').next().unwrap_or(""),
@@ -45,29 +45,29 @@ pub fn is_timer_reason(reason: &str) -> bool {
     )
 }
 
-/// 一条被暂存的唤醒原因。
+/// Deferred wake entry queued while the conversation was busy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWake {
     pub reason: String,
     pub seq: i64,
 }
 
-/// 调度动作的结果，调用方据此决定要不要发消息。
+/// Scheduling outcome instructing the caller on timer or wake emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// 立刻唤醒（例如睡眠已过期）。
+    /// Wake immediately (for example, an already-elapsed sleep deadline).
     FireNow(String),
-    /// 已排定定时器，到点由 `fire_due` 取。
+    /// Timer armed for later dispatch via `fire_due`.
     Armed,
-    /// 会话忙，原因进队列，等回合结束补发。
+    /// Conversation busy; reason queued for end-of-turn replay.
     Buffered,
-    /// 合并窗口内已有待发唤醒，本次按优先级升级了原因。
+    /// Pending coalesced wake upgraded in place to a higher-priority reason.
     Upgraded { from: String, to: String },
-    /// 条件不满足，什么都没做。
+    /// Preconditions not met; no action taken.
     Skipped(&'static str),
-    /// 已有定时器，本次忽略。
+    /// A timer is already scheduled.
     AlreadyArmed,
-    /// 打断当前回合：新来的确定性触发比「等它跑完」更值得。
+    /// Preempt the running turn when an urgent deterministic trigger supersedes an idle wait.
     /// 只有「回合还没发出任何消息」时才允许，避免把已经说出去的话再改口。
     Preempt { reason: String },
     /// 唤醒频率超限：已排了重试定时器，到点再走 `fire_due`。
@@ -304,15 +304,14 @@ impl WakeScheduler {
                 return true;
             }
         }
-        // 回合只按「起始时间 + 租约」判忙：起始时间过期就解除忙碌，
-        // 但不能因为 Map 里还有键就判忙（DSH 重启会把回合丢掉）。
+        // Lease-based busy check: prevents leaked map keys from keeping a conversation stuck busy.
         match self.turn_started_at {
             Some(t) if t > 0 => now - t < self.cfg.turn_lease_ms,
             _ => false,
         }
     }
 
-    /// 对应 JS 的 scheduleWakeV2。
+    /// Schedule a wake reason with coalescing, preemption, and rate-limit deferral.
     pub fn schedule_wake(&mut self, reason: &str, now: i64) -> Outcome {
         if !self.cfg.enabled {
             return Outcome::Skipped("socialV2 已关闭");
@@ -321,8 +320,7 @@ impl WakeScheduler {
             return Outcome::Skipped("已暂停");
         }
 
-        // 合并窗口内已有待发唤醒：按优先级升级最终原因，
-        // 避免「先概率后 @」却仍按概率唤醒。
+        // Upgrade pending wake in place if a higher-priority reason arrives within the batch window.
         if self.pending_wake_at.is_some() {
             let cur = self
                 .pending_wake_reason
@@ -339,11 +337,7 @@ impl WakeScheduler {
         }
 
         if self.is_busy(now) {
-            // 打断判定：新来的是确定性触发 + 回合还在跑 + 还没发过话 + 已经跑够久。
-            // 四个条件缺一不可 —— 少了「还没发过话」会把说出口的话再改口；
-            // 少了「跑够久」会为了一句 @ 反复丢弃已经花掉的思考。
-            // **另外 `preempt_after_ms == 0` 表示这个机制整个关掉（默认）**：
-            // JS 没有打断，自己加一套会让 A/B 的"偏差为 0"永远做不到，还有点饿死风险。
+            // Preempt only when configured (>0), urgent, turn has not spoken yet, and lease age passed threshold.
             if self.cfg.preempt_after_ms > 0 && wake_priority(reason) >= 60 {
                 if let Some(started) = self.turn_started_at {
                     if started > 0 && !self.turn_has_sent && now - started >= self.cfg.preempt_after_ms {
@@ -364,7 +358,7 @@ impl WakeScheduler {
                     reason: reason.to_string(),
                     seq,
                 });
-                // 有界队列：最多 20 条，防止消息洪峰下无限增长。
+                // Bound pending queue to 20 entries under burst load.
                 while self.pending.len() > 20 {
                     self.pending.pop_front();
                 }
@@ -372,13 +366,11 @@ impl WakeScheduler {
             return Outcome::Buffered;
         }
 
-        // 真实唤醒已接管，取消回复检查，避免几十秒后再补一刀。
+        // Cancel deferred sleep/reply-check timers once an active wake is scheduled.
         self.reply_check_at = None;
         self.sleep_at = None;
 
-        // 唤醒频率硬限制（JS 的 maxWakePerMinute / maxWakePerHour）。
-        // 超限**不能直接丢弃**：丢掉的可能是唯一一次 @，而且 sleepTimer 已经清了，
-        // 会话会停在「没有任何定时器」的静默态。这里按 JS 的做法排一个短重试。
+        // Enqueue a short retry instead of dropping a wake when per-minute/hour rate limits trigger.
         if let Some(wait_ms) = self.rate_limit_wait(now) {
             self.pending_wake_reason = Some(reason.to_string());
             self.pending_wake_at = Some(now + wait_ms);
@@ -427,7 +419,7 @@ impl WakeScheduler {
                 retry_after = retry_after.max(3_600_000 - (now - *oldest) + 500);
             }
         }
-        // 每次只等一小段（最长 60s）：小时级限频不该一口气睡满一小时、错过中途的空档。
+        // Retry in bounded chunks (<= 60s) so hourly windows reopen promptly.
         Some(retry_after.clamp(1_000, 60_000))
     }
 
@@ -435,13 +427,12 @@ impl WakeScheduler {
         self.wake_times.retain(|t| now - *t < 3_600_000);
     }
 
-    /// 对应 JS 的 scheduleReplyCheckV2。
-    /// `recent_self` 是最近 15 秒内自己发的消息，用来判断要不要拉长延迟。
+    /// Schedule a deferred reply check, extending delay for recent questions or multi-part replies.
     pub fn schedule_reply_check(&mut self, now: i64, recent_self: &[SelfMessage]) -> Outcome {
         if !self.cfg.enabled || self.paused {
             return Outcome::Skipped("不满足条件");
         }
-        // 已有真实唤醒 / 有限睡眠 / 回复检查在排队时不再重复安排。
+        // Skip scheduling when a wake, finite sleep, or reply-check timer is already pending.
         if self.pending_wake_at.is_some() || self.sleep_at.is_some() || self.reply_check_at.is_some()
         {
             return Outcome::AlreadyArmed;
@@ -452,7 +443,7 @@ impl WakeScheduler {
             .filter(|m| now - m.at_ms < 15_000)
             .collect();
         let asked = recent.iter().any(|m| {
-            // 与 JS 的 /[?？吗呢怎么有没有能不能]/ 逐字对齐：**不含 '不'**
+            // Match question markers and interrogation particles, intentionally excluding '不'.
             m.text
                 .chars()
                 .any(|c| matches!(c, '?' | '？' | '吗' | '呢' | '怎' | '么' | '有' | '没' | '能'))
@@ -472,7 +463,7 @@ impl WakeScheduler {
         if !self.cfg.enabled {
             return Outcome::Skipped("socialV2 已关闭");
         }
-        // 有限睡眠配置已接管，取消回复检查。
+        // Cancel any pending reply check once finite sleep takes over.
         self.reply_check_at = None;
         self.sleep_at = None;
         if self.paused {
@@ -488,8 +479,7 @@ impl WakeScheduler {
         if delay <= 0 {
             return Outcome::FireNow("timeout".to_string());
         }
-        // 远未来定时器先等一小段再续期，而不是提前唤醒。
-        // 每次续期都用 now 重新算剩余，系统时钟被校正时能很快纠正。
+        // Cap each sleep timer slice and recompute remaining duration on wakeup to survive clock jumps.
         const MAX_TIMEOUT_MS: i64 = 100_009;
         if delay > MAX_TIMEOUT_MS {
             self.sleep_at = Some(now + MAX_TIMEOUT_MS);
@@ -556,7 +546,7 @@ impl WakeScheduler {
         rand01.clamp(0.0, 1.0) < prob && !self.is_busy(now)
     }
 
-    /// 对应 JS 的 replayPendingWakeReasonsV2：一次排空。
+    /// Drain queued wake reasons in priority order.
     /// `unread_seqs` is retained unread state, not urgent-delivery evidence.
     /// The live hub removes positively delivered urgent wakes before replay.
     pub fn replay_pending(
@@ -574,17 +564,13 @@ impl WakeScheduler {
             .into_iter()
             .partition(|item| is_timer_reason(&item.reason));
 
-        // ① 定时器类：逐个处理，不发消息。
+        // Timer triggers are handled individually without waking immediately.
         let mut timer_count = 0usize;
-        //
-        // 注意 replyCheck：JS 的 scheduleReplyCheckV2 会**重新读状态**再算延迟
-        // （近 15 秒自己说过话、说过问句都会拉长）。这里必须把 recent_self 传进去，
-        // 早先传的是空切片 —— 延迟恒按基础值算，比 JS 更早唤醒。
+        // Recompute reply-check delay from recent_self so recent questions retain longer waits.
 
         for item in &timers {
             match item.reason.as_str() {
                 "timeout" => {
-                    // 睡眠定时器可能在繁忙期间被清掉，这里重新按剩余时间续上。
                     self.setup_sleep_timer(now);
                     timer_count += 1;
                 }
@@ -593,7 +579,7 @@ impl WakeScheduler {
                     timer_count += 1;
                 }
                 "proactiveCheck" => {
-                    // 繁忙期间的主动机会已过期，直接丢掉（不补发，避免翻旧账）。
+                    // Discard stale proactive opportunities accumulated while busy.
                 }
                 _ => {
                     self.schedule_wake(&item.reason, now);
@@ -661,9 +647,7 @@ impl WakeScheduler {
         if let Some(at) = self.reply_check_at {
             if at <= now {
                 self.reply_check_at = None;
-                // 已经回复过最新消息就别再唤醒。
-                // 根因：群友喊一句 → AI 回复 → 回复检查又醒 → AI 不知道
-                // 自己刚回过（出站消息不在上下文里），于是对同一条消息回第二遍。
+                // Suppress redundant replyCheck when an outbound reply already covered the latest inbound.
                 let already_replied =
                     self.last_ai_reply_at > 0 && self.last_ai_reply_at >= self.last_incoming_at;
                 if !already_replied {
@@ -765,9 +749,9 @@ pub fn parse_iso_ms(text: &str) -> Option<i64> {
     Some(civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?.timestamp().as_millisecond())
 }
 
-// ---- wake-config 的纯函数部分（从 bridge.js 的 POST /api/socialV2/wake-config 抽出）----
+// ---- Pure wake-config normalization helpers ----
 
-/// triggers 的合法字段（JS 的 `WAKE_TRIGGER_KEYS`）：写入与加载都只认这几个。
+/// Allowed trigger keys accepted when saving or loading wake configurations.
 pub const WAKE_TRIGGER_KEYS: [&str; 8] = [
     "atMention",
     "nameMention",
@@ -1232,7 +1216,7 @@ pub fn normalize_wake_config(
     if is_infinite(&out) && !has_any_trigger(&out) {
         return Err((
             400,
-            "无限期潜水必须至少保留一个唤醒条件（@/名字/拍一拍/关键词/提问/anyMessage/概率>0），否则你可能再也不会被唤醒"
+            "长期潜水须保留至少一项唤醒触发（如 @、昵称、拍一拍、关键词、提问、anyMessage 或概率大于 0），以免无法恢复"
                 .to_string(),
         ));
     }
@@ -1481,8 +1465,7 @@ mod tests {
 
     #[test]
     fn reply_check_delay_matches_js_question_charset() {
-        // JS 的 /[?？吗呢怎么有没有能不能]/ 里**没有 '不'**。
-        // 含「不」的消息不该被当成「问过问题」而拉长 1.5 倍。
+        // The question-extension charset intentionally omits '不', so negated phrases do not trigger the 1.5x delay.
         let mut s = sched();
         s.cfg.auto_reply_check_ms = 30_000;
         let say = |text: &str| SelfMessage { text: text.to_string(), at_ms: 1_000_000 };
