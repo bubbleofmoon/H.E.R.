@@ -109,8 +109,8 @@ fn search_errors(context: &RuntimeContext) -> (String, String) {
 fn web_search_errors_never_copy_the_provider_text() {
     let (_root, context) = fixture_runtime("search errors", "fixture-console-token-142w");
     let (primary, auto) = search_errors(&context);
-    assert_eq!(primary, "主搜索接口 HTTP 401");
-    assert_eq!(auto, "主搜索不可用：主搜索接口 HTTP 401；Bing 兜底也失败", "the Bing failure detail must not reach the model");
+    assert_eq!(primary, "主检索服务状态码 401");
+    assert_eq!(auto, "主搜索不可用：主检索服务状态码 401；Bing 兜底也失败", "the Bing failure detail must not reach the model");
     for text in [&primary, &auto] {
         assert!(denied_terms(text).is_empty() && !text.contains("API key invalid"), "{text}");
     }

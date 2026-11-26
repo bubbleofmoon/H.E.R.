@@ -193,7 +193,7 @@ pub fn preset_blockers(content: &str, preset_v1: bool) -> Vec<String> {
     let chars = content.trim().chars().count();
     if chars < MIN_BODY_CHARS {
         out.push(format!(
-            "预设正文至少需要 {MIN_BODY_CHARS} 字，目前有 {chars} 字"
+            "仿真预设正文篇幅过短，最少需写满 {MIN_BODY_CHARS} 个字符，当前仅 {chars} 字"
         ));
     }
     out
@@ -251,7 +251,7 @@ pub fn render_preset_prompt_yaml(text: &str, content: &str, preset_v1: bool) -> 
     next_lines.extend_from_slice(&block.lines[block.block_end..]);
     let next = next_lines.join("\n");
     match extract_prefix(&next) {
-        None => Err("回写后的 YAML 无法解析或缺失 persona.prefix 节点".to_string()),
+        None => Err("改写生成的配置文档无法重新解析，或缺失了预设正文键值".to_string()),
         Some(back) if back != normalized => {
             Err("回写后校验不一致：读出的正文与提交内容不同，已中止保存".to_string())
         }
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn render_rejects_too_short_body() {
         let err = render_preset_prompt_yaml(SAMPLE, "太短", false).unwrap_err();
-        assert!(err.contains("预设正文至少需要 500 字"));
+        assert!(err.contains("仿真预设正文篇幅过短，最少需写满 500 个字符"));
     }
 
     #[test]

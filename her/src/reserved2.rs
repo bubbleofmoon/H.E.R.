@@ -721,7 +721,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         let heard = crate::voice_stt::label("今天吃什么");
         assert!(
-            activity.contains("group:420042 [reserved2] 消息已入未读：[语音]"),
+            activity.contains("group:420042 [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：[语音]"),
             "the activity log keeps the voice label: {activity}"
         );
         assert!(!activity.contains("今天吃什么"), "the transcript never reaches the activity log: {activity}");
@@ -2864,7 +2864,7 @@ mod tests {
         // After a restart the journal hands the same event back with `replayed` set.
         hub.handle(&ev, &frame.to_string(), true, 9001, "bot", &HashMap::new()).await.unwrap();
         let log = std::fs::read_to_string(root.join("data/qq-activity.log")).unwrap_or_default();
-        assert_eq!(log.matches("[reserved2] 消息已入未读：logged once").count(), 1, "{log}");
+        assert_eq!(log.matches("[reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：logged once").count(), 1, "{log}");
         drop(hub);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3799,11 +3799,11 @@ impl Hub {
                 crate::activity::append(
                     &self.context,
                     &if muted {
-                        format!("{key} [reserved2] 禁言期间仅留存消息，暂不唤醒：{preview}")
+                        format!("{key} [reserved2] 当前所在群聊正处于禁言阶段，消息已记入待阅档案而暂不唤起：{preview}")
                     } else if state["paused"] == true {
-                        format!("{key} [reserved2] 自动处理已暂停，仅留存消息不唤醒：{preview}")
+                        format!("{key} [reserved2] 当前会话的自动处理处于暂停状态，来信仅作留存记档而暂不唤起：{preview}")
                     } else {
-                        format!("{key} [reserved2] 消息已入未读：{preview}")
+                        format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}")
                     },
                 );
             }
@@ -3896,7 +3896,7 @@ impl Hub {
         }
 
         if !is_poke && !replayed {
-            crate::activity::append(&self.context, &format!("{key} [reserved2] 消息已入未读：{preview}"));
+            crate::activity::append(&self.context, &format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}"));
         }
         Ok(())
     }
@@ -4302,7 +4302,7 @@ impl Hub {
                 .mark_handled(active.inbound.clone(), now)
                 .await?;
             if wait_for_dsh {
-                println!("[reserved2] {key} DSH 不可用，唤醒排队等待恢复");
+                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
                 let keys = active.inbound;
                 self.awaiting.entry(key.clone()).or_default().extend(keys.clone());
                 self.journal.run(move |j| j.settle_events(&keys, "received", now)).await?;
@@ -4439,7 +4439,7 @@ impl Hub {
             if let crate::wake::Outcome::Armed = d.sched.schedule_wake(&reason, now) {
                 d.sched.pending_wake_at = Some(now);
             }
-            println!("[reserved2] {key} 手动唤醒（{reason}）");
+            println!("[reserved2] 收到后台操作指令，主动唤醒会话 {key}，原因说明：{reason}");
         }
         if !suspended {
             self.pump_timers(&cfg, now);
@@ -4470,13 +4470,13 @@ impl Hub {
             }
             if crate::group_mute::active(&self.context, &key).is_some() {
                 // #46: no wake while muted; its messages stay unread for the first wake after the mute.
-                println!("[reserved2] {key} 禁言中，唤醒跳过（{reason}）");
+                println!("{key} [reserved2] 该群当前依然处在管理员禁言期间之内，所以这次唤醒调度已自动跳过（触发原因为 {reason}）");
                 continue;
             }
             if crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key) {
                 // DSH-dependent work waits without a call. A pinned CLI is an independent backend
                 // and must not be prevented from handling its conversation by a DSH outage.
-                println!("[reserved2] {key} DSH 不可用，唤醒排队等待恢复");
+                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
                 self.park_for_dsh(&key, now, reason);
                 continue;
             }

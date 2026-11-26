@@ -192,7 +192,7 @@ async fn ticket159_reserved2_harness_late_first_response_does_not_count_recall()
     assert_eq!(hits, 0, "a response rejected at the effective cap must not count recall");
 }
 
-/// A selected runtime whose owner's private chat runs closed-agent harness turns with `harness` as its settings.
+/// Test fixture whose owner conversation uses closed-agent mode with `harness` settings.
 async fn rig(tag: &str, harness: Value, console: Option<u16>) -> Rig {
     let root = crate::install_root::development_root(
         std::env::temp_dir().join(format!("her-7-{tag}-{}", crate::turn_ledger::mint_id(""))),

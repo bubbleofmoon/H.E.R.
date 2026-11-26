@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub(crate) const KEY_FORMAT_ERROR: &str = "key 须符合 group:<群号> 或 private:<QQ号> 格式";
+pub(crate) const KEY_FORMAT_ERROR: &str = "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>";
 pub(crate) const END_TURN: &str =
     "end this turn now: produce your final answer and make no further tool calls";
 pub(crate) const PENDING_REVOCATIONS: &str = "access-revocations-pending.json";
@@ -144,13 +144,13 @@ impl SessionStopper for DshSessionStopper {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 crate::safe_println!(
-                    "[console] ⚠️ 停止/归档旧会话失败 {key} -> {session_id}：{error}；请在 DSH 检查旧任务"
+                    "[console] ⚠️ 结束或归档旧会话失败 {key} -> {session_id}：{error}；请到引擎面板核查残留任务"
                 );
                 Err(error)
             }
             Err(_) => {
                 crate::safe_println!(
-                    "[console] ⚠️ 停止/归档旧会话超时 {key} -> {session_id}；请在 DSH 检查旧任务"
+                    "[console] ⚠️ 结束或归档旧会话超时 {key} -> {session_id}；请到引擎面板核查残留任务"
                 );
                 Err("停止旧会话超时".to_string())
             }
@@ -834,7 +834,7 @@ pub(crate) fn set_mode_with(
 ) -> Result<Value, SocialError> {
     let Some(normalized) = normalize_mode(raw_mode.trim()) else {
         return Err(SocialError::BadInput(
-            "mode 取值仅限 chat、reserved、reserved2 或 closed-agent（其中 simulation 视为 reserved2 别名）"
+            "无效的运行模式：mode 仅允许设为 chat、reserved、reserved2 或 closed-agent 之一（若传入 simulation 则等效于二代模式）"
                 .to_string(),
         ));
     };
@@ -885,7 +885,7 @@ pub(crate) fn set_mode_isolated_locked(
 ) -> Result<Value, SocialError> {
     let Some(normalized) = normalize_mode(raw_mode.trim()) else {
         return Err(SocialError::BadInput(
-            "mode 取值仅限 chat、reserved、reserved2 或 closed-agent（其中 simulation 视为 reserved2 别名）"
+            "无效的运行模式：mode 仅允许设为 chat、reserved、reserved2 或 closed-agent 之一（若传入 simulation 则等效于二代模式）"
                 .to_string(),
         ));
     };

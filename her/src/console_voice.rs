@@ -1,7 +1,5 @@
-//! Voice surface of the console (ticket 21): the library list, the AI send route, the operator
-//! send route and the prompt summary, ported from `bridge.js` (`voiceCfg`, `sendVoiceV2`,
-//! `sendVoiceForV2`, `/api/socialV2/send-voice`, `/api/voice/send`, `/api/send/voice`,
-//! `/api/socialV2/voices`, `/api/voice/list`).
+//! Voice surface of the console (ticket 21): library listing, agent/operator playback routes,
+//! and prompt summary.
 //!
 //! This module is a child of `console.rs` (`#[path]`) and uses that file's private helpers.
 //!
@@ -18,7 +16,7 @@ use crate::voice::{self, AudioOptions, Loudness};
 use std::path::{Path, PathBuf};
 
 const OPERATOR_SCOPE: &str = "operator:cli";
-const NOT_FROM_LIBRARY: &str = "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名";
+const NOT_FROM_LIBRARY: &str = "此处谢绝远端网址或编码串输入，仅受理本地语音曲库里的文件名";
 
 // ----- configuration ---------------------------------------------------------------------------------------
 
@@ -260,7 +258,7 @@ impl Library {
 fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Result<PathBuf, String> {
     let raw = input.trim();
     if raw.is_empty() {
-        return Err("请填写音频参数：指定语音库内的文件名（可通过 qq_list_voices 列出）".to_string());
+        return Err("音频文件名不可为空，请填入曲库里存在的条目名称（可先列出曲库查名）".to_string());
     }
     let lower = raw.to_lowercase();
     if lower.starts_with("base64://") || lower.starts_with("data:") || lower.starts_with("http://") || lower.starts_with("https://") {
@@ -276,7 +274,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
             None => {
                 // Only the directory name: this message goes back to a model facing untrusted chat.
                 return Err(format!(
-                    "此通道仅限发送语音库（{}）内的文件：绝对路径同样须落在该目录中，socialV2.voice.allowAbsolutePath 对当前工具无效；库外文件请先移入目录或由 CLI / 控制台发送。",
+                    "该工具通道只放行语音库目录（{}）里的音频；就算传入完整磁盘路径也必须位于此目录内，放开任意路径的全局开关对本工具不生效。库外录音请先挪进库中或改经管理台发。",
                     lib.dir_name()
                 ));
             }
@@ -325,7 +323,7 @@ fn resolve_for_operator(lib: &Library, input: &str) -> Result<(PathBuf, String),
     }
     let lower = raw.to_lowercase();
     if lower.starts_with("base64://") || lower.starts_with("data:") || lower.starts_with("http://") || lower.starts_with("https://") {
-        return Err("此处仅限本地文件路径，不支持 base64://、data: 或 http(s):// 来源".to_string());
+        return Err("本接口只接受本机磁盘文件路径，禁止传入网址或内联编码数据".to_string());
     }
     let found = voice::resolve_audio_source(raw, Some(&lib.root), &lib.cwd);
     if let Some(path) = found.path {
@@ -398,7 +396,7 @@ pub(super) fn handle_voice_list(
         items.push(entry);
     }
     let hint = if !items.is_empty() {
-        "将任一条目的 name 传给 qq_send_voice 即可发出语音".to_string()
+        "任选条目名填入发语音工具参数即可播发对应录音".to_string()
     } else if agent_call {
         "语音列表为空：请联系管理端先向语音库放入音频文件".to_string()
     } else {
@@ -432,7 +430,7 @@ pub(super) fn prompt_summary(context: &RuntimeContext, cfg: &Value) -> Value {
         "total": names.len(),
         "names": names.iter().take(12).collect::<Vec<_>>(),
         "maxSeconds": voice::json_number(vc.max_seconds),
-        "hint": "先调 qq_list_voices 浏览可用文件名，再通过 qq_send_voice 传 name 发送",
+        "hint": "请先调用曲库列表接口挑选合规文件名，再交给发语音工具传入对应条目名播发",
     })
 }
 
@@ -725,11 +723,11 @@ pub(super) fn operator_send(
     let agent_token = headers.get("x-agent-token").map(|t| t.trim().to_string()).unwrap_or_default();
     // /api/send/voice is the AI tool entrance when a token is present: never a way around "own session only".
     if path == "/api/send/voice" && !agent_token.is_empty() {
-        return err(403, "请改经 /api/socialV2/send-voice 调用（需附带 key 与 token）");
+        return err(403, "这个接口口令仅限发起二代仿真语音投递时使用，填报参数请写齐目标对话和口令密码后再递交");
     }
     let key = first_member(&b, &["target", "key"]).trim().to_string();
     let Some((kind, id_s)) = voice::parse_target_key(&key) else {
-        return err(400, "target 参数须为 group:群号 或 private:QQ号");
+        return err(400, "收件对象标识写得不对，须按群号或好友号标准格式给出");
     };
     let mode = match current_mode_for(context) {
         Ok(mode) => mode,
@@ -744,7 +742,7 @@ pub(super) fn operator_send(
                 .unwrap_or_default();
             if joined.is_empty() { "空".to_string() } else { joined }
         };
-        return err(403, format!("目标 {key} 未列入允许名单（见 config.json allow.groups / allow.private；群：{}；私聊：{}）", list("groups"), list("private")));
+        return err(403, format!("所选会话 {key} 不在放行白名单里（请核对配置中的允许群组与好友清单；群：{}；私聊：{}）", list("groups"), list("private")));
     }
     let lib = match open_library(context, &vc) {
         Ok(lib) => lib,
@@ -789,7 +787,7 @@ pub(super) fn operator_send(
         Err(failure) => return failure.reply(),
     };
     crate::safe_println!(
-        "[voice] (操作者) {key} 已发送语音 {} ({}{}, messageId={})",
+        "[voice] (操作者) 会话 {key} 已顺利发出指定音频条目 {} ({}{})，回执消息序号={}",
         file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         sent.detail,
         if sent.audio_mode == "original" { String::new() } else { format!("，{}", sent.audio_processing) },
@@ -821,7 +819,7 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         return err(403, "语音功能已关闭");
     }
     if key.is_empty() {
-        return err(400, "必须填写 key（格式为 group:群号 或 private:QQ号）");
+        return err(400, "请求体缺少会话标识（须按群组或私聊规范写明）");
     }
     match current_mode_for(context) {
         Ok(mode) if mode == "reserved2" => {}
@@ -829,7 +827,7 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         Err((status, message)) => return err(status, message),
     }
     if token.is_empty() {
-        return err(403, "reserved2 模式调用此接口须附带 agent token");
+        return err(403, "处于二代仿真态调用该动作时，必须附带对应会话口令");
     }
     match agent_token_ok_for(context, &key, &token) {
         Ok(true) => {}
@@ -848,7 +846,7 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         Err((status, message)) => return err(status, message),
     }
     let Some((kind, id_s, id)) = agent::parse_key(&key) else {
-        return err(400, "key 格式须为 group:群号 或 private:QQ号");
+        return err(400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>");
     };
     if id <= 0 || !agent::mode_allowed(cfg, "reserved2", &key) {
         return err(403, "目标会话未被当前运行模式放行");
@@ -906,12 +904,12 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
     let label: String = js_member(&b, "label").chars().take(100).collect();
     let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     crate::safe_println!(
-        "[voice] {key} 已发送语音 {file_name} ({}, messageId={})",
+        "[voice] 会话 {key} 已顺利向对方递出语音条 {file_name} ({})，回执消息序号={}",
         sent.detail,
         sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())
     );
     if let Err((_, message)) = record_voice_sent(context, &storage_key, &sent, &label) {
-        return err(500, format!("语音已发送（messageId={}），但会话记录更新失败：{message}", sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())));
+        return err(500, format!("语音已送出（id={}），可本地聊天纪录写回受阻：{message}", sent.message_id.map(|id| id.to_string()).unwrap_or_else(|| "?".into())));
     }
     let readback = if b.get("readback") == Some(&json!(true)) { fetch_transcription(cfg, context, sent.message_id) } else { None };
     let want_verify = b.get("verify") == Some(&json!(true)) || (b.get("verify") != Some(&json!(false)) && vc.auto_readback);

@@ -345,7 +345,7 @@ fn guard179_a_preset_missing_a_guarded_row_refuses() {
     edit_preset(&context, |text| text.replacen(agent_row, "", 1));
     assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "missing agent-instructions");
     write(&context, PRESET_FILE, PRESET);
-    // Omitting the local-tool rows (as `qq-chat` and `qq-chat-v2` do) passes because presets mount only listed
+    // Omitting the local-tool rows (like the first-gen and second-gen chat presets) passes because presets mount only listed
     // plugins and HER's profile block disables them globally; any local-tool row that is present still must disable.
     let tool_rows = [
         "          - id: tool-bash\n            name: '@deepseek-ai/dsh-tool-bash'\n            disabled: true\n",

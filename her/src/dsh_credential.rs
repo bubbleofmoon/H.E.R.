@@ -195,7 +195,7 @@ impl Credential {
     /// Read the runtime's credentials and mint a fresh cookie for `base`.
     pub fn mint(context: &RuntimeContext, base: &str) -> Result<Self, String> {
         let cookie = session_cookie_for_runtime(context, base)
-            .ok_or_else(|| unavailable(context, "读不到签名密钥（~/.dsh/.credentials.yaml）"))?;
+            .ok_or_else(|| unavailable(context, "本地找不到签名私钥文稿（位于用户家目录的凭据文件）"))?;
         Ok(Self::with_cookie(base, cookie, context.clone()))
     }
 
@@ -275,7 +275,7 @@ impl Credential {
         for attempt in 0..4 {
             let cookie =
                 session_cookie_for_runtime(&self.context, &self.base).ok_or_else(|| {
-                    unavailable(&self.context, "刷新 DSH 凭据文件失败（~/.dsh/.credentials.yaml）")
+                    unavailable(&self.context, "回写刷新 DSH 本地凭据文稿遇到错误")
                 })?;
             self.set_cookie(cookie);
             match verify() {

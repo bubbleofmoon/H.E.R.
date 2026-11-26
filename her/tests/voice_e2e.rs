@@ -523,19 +523,19 @@ fn ai_send_route_checks_follow_the_baseline_order_and_messages() {
     let post = |body: Value| console.agent("POST", "/api/socialV2/send-voice", body);
     let key = "group:111";
     let (s, b) = post(json!({"voice": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("必须填写 key（格式为 group:群号 或 private:QQ号）")));
+    assert_eq!((s, b["error"].as_str()), (400, Some("请求体缺少会话标识（须按群组或私聊规范写明）")));
     let (s, b) = request(console.port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), None, &json!({"key": key, "voice": "a.mp3"})).unwrap();
-    assert_eq!((s, b["error"].as_str()), (403, Some("reserved2 模式调用此接口须附带 agent token")), "{b}");
+    assert_eq!((s, b["error"].as_str()), (403, Some("处于二代仿真态调用该动作时，必须附带对应会话口令")), "{b}");
     let (s, b) = request(console.port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), Some("wrong"), &json!({"key": key, "voice": "a.mp3"})).unwrap();
     assert_eq!(s, 403, "{b}");
     for (voice, expect) in [
-        ("", "请填写音频参数：指定语音库内的文件名（可通过 qq_list_voices 列出）"),
-        ("http://example.invalid/a.mp3", "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名"),
-        ("base64://AAAA", "暂不接受 base64://、data: 或 http(s):// 地址，请提供语音库内的本地文件名"),
+        ("", "音频文件名不可为空，请填入曲库里存在的条目名称（可先列出曲库查名）"),
+        ("http://example.invalid/a.mp3", "此处谢绝远端网址或编码串输入，仅受理本地语音曲库里的文件名"),
+        ("base64://AAAA", "此处谢绝远端网址或编码串输入，仅受理本地语音曲库里的文件名"),
         ("../outside.mp3", "已拒绝越界路径：此通道不可传入「..」或根目录路径读取库外文件"),
-        ("/etc/passwd", "此通道仅限发送语音库（audio）内的文件：绝对路径同样须落在该目录中，socialV2.voice.allowAbsolutePath 对当前工具无效；库外文件请先移入目录或由 CLI / 控制台发送。"),
+        ("/etc/passwd", "该工具通道只放行语音库目录（audio）里的音频；就算传入完整磁盘路径也必须位于此目录内，放开任意路径的全局开关对本工具不生效。库外录音请先挪进库中或改经管理台发。"),
         #[cfg(windows)]
-        (r"\etc\passwd", "此通道仅限发送语音库（audio）内的文件：绝对路径同样须落在该目录中，socialV2.voice.allowAbsolutePath 对当前工具无效；库外文件请先移入目录或由 CLI / 控制台发送。"),
+        (r"\etc\passwd", "该工具通道只放行语音库目录（audio）里的音频；就算传入完整磁盘路径也必须位于此目录内，放开任意路径的全局开关对本工具不生效。库外录音请先挪进库中或改经管理台发。"),
         ("nothing", "未在语音库找到「nothing」。语音库里现有：a.mp3"),
     ] {
         let (s, b) = post(json!({"key": key, "voice": voice}));
@@ -1093,7 +1093,7 @@ fn definite_refusal_is_reported_as_not_committed_with_an_outbox_trail() {
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["ok"], false);
     assert_eq!(b["outcome"], "not_committed");
-    assert!(b["error"].as_str().unwrap().starts_with("OneBot 发送失败：retcode=1404"), "{b}");
+    assert!(b["error"].as_str().unwrap().starts_with("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=1404"), "{b}");
     let kinds: Vec<String> = fx.outbox().iter().map(|r| r["k"].as_str().unwrap().to_string()).collect();
     assert_eq!(kinds, ["intent", "attempt", "not_committed"]);
     assert_eq!(fx.outbox()[0]["kind"], "voice");
@@ -1216,14 +1216,14 @@ fn operator_send_validates_target_allow_list_and_previews_with_dry_run() {
     let console = Console::start(&fx);
     let post = |path: &str, body: Value| console.operator("POST", path, body);
     let (s, b) = post("/api/voice/send", json!({"target": "nonsense", "file": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("target 参数须为 group:群号 或 private:QQ号")));
+    assert_eq!((s, b["error"].as_str()), (400, Some("收件对象标识写得不对，须按群号或好友号标准格式给出")));
     let (s, b) = post("/api/voice/send", json!({"target": "group:999", "file": "a.mp3"}));
     assert_eq!(s, 403);
-    assert_eq!(b["error"], "目标 group:999 未列入允许名单（见 config.json allow.groups / allow.private；群：111；私聊：222）");
+    assert_eq!(b["error"], "所选会话 group:999 不在放行白名单里（请核对配置中的允许群组与好友清单；群：111；私聊：222）");
     let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "missing.mp3"}));
     assert_eq!((s, b["error"].as_str()), (400, Some("找不到音频「missing.mp3」")));
     let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "http://x/a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("此处仅限本地文件路径，不支持 base64://、data: 或 http(s):// 来源")));
+    assert_eq!((s, b["error"].as_str()), (400, Some("本接口只接受本机磁盘文件路径，禁止传入网址或内联编码数据")));
     let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "volume": 99}));
     assert_eq!((s, b["error"].as_str()), (400, Some("音量倍率限制为 0.1~4（1.0 表示原音量），当前收到 99")));
     // Dry run previews the resolved file, limits and warnings.
@@ -1273,7 +1273,7 @@ fn operator_send_works_even_when_the_ai_voice_switch_is_off_and_does_not_need_a_
     assert_eq!((s, b["error"].as_str()), (500, Some("已达每分钟语音配额上限（2 条），请稍后重试")), "{b}");
     // The AI is told to use its own route.
     let (s, b) = console.agent("POST", "/api/send/voice", json!({"target": "private:222", "file": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (403, Some("请改经 /api/socialV2/send-voice 调用（需附带 key 与 token）")), "{b}");
+    assert_eq!((s, b["error"].as_str()), (403, Some("这个接口口令仅限发起二代仿真语音投递时使用，填报参数请写齐目标对话和口令密码后再递交")), "{b}");
 }
 
 #[test]
@@ -1438,7 +1438,7 @@ fn prompt_summarises_the_library_for_the_model_when_voice_is_enabled() {
     assert_eq!(voices["names"].as_array().unwrap().len(), 12);
     assert_eq!(voices["names"][0], "v00.mp3");
     assert_eq!(voices["maxSeconds"], 60);
-    assert_eq!(voices["hint"], "先调 qq_list_voices 浏览可用文件名，再通过 qq_send_voice 传 name 发送");
+    assert_eq!(voices["hint"], "请先调用曲库列表接口挑选合规文件名，再交给发语音工具传入对应条目名播发");
 }
 
 #[test]

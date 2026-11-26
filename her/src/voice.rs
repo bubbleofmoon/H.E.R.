@@ -709,7 +709,7 @@ pub fn process_audio_volume(file: &Path, plan: &Plan, ffmpeg_configured: Option<
             Run::Exit(code) => Outcome::Code(code),
             Run::TimedOut => Outcome::Error("ffmpeg 超时".into()),
             Run::SpawnFailed(error) if first && error.kind() == std::io::ErrorKind::NotFound => Outcome::Error(
-                "未检测到 ffmpeg 可执行文件（可通过 FFMPEG_PATH 或 config.json 的 socialV2.voice.ffmpegPath 指定）".into(),
+                "本机找不到 ffmpeg 转码程序（请在环境变量或配置中指明可用路径）".into(),
             ),
             Run::SpawnFailed(error) => Outcome::Error(format!("ffmpeg 不可用：{}", io_reason(&ffmpeg, &error))),
         }

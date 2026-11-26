@@ -425,7 +425,7 @@ export const DiagnosticsTab: React.FC = () => {
                 setOutboxBatches([]);
                 setOutboxError(null);
               }}
-              placeholder="输入会话键（如 group:... 或 private:...）"
+              placeholder="填入打算查询的对话标识，例如以 group: 开头的群聊或 private: 开头的单聊"
               className={INPUT_CLASS}
             />
           )}

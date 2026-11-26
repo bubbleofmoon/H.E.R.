@@ -855,7 +855,7 @@ impl Hub {
                     enter(c, &mut s.seed, &sc, &key, now());
                     job = Some((
                         format!(
-                            "{prefix}【群聊上下文】\n{}\n【当前消息】{}\n\n{}\n{}{SPLIT_HINT}",
+                            "{prefix}【近期群内动向】\n{}\n【此刻来信】{}\n\n{}\n{}{SPLIT_HINT}",
                             context_block(c, &sc, &view),
                             message_line(
                                 &Message {
@@ -1127,7 +1127,7 @@ impl Hub {
                                 if random(&mut s.seed) < probability(&sc, "idleRetryProbability") {
                                     c.phase = "probing".into();
                                     c.probe_deadline = now() + n(&sc, "idleRetryWaitMs");
-                                    prompt=Some(format!("【群聊上下文】\n{}\n\n群里冷清了一阵，可以试着接一句或搭话；若没有想说的，仅输出 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc,&view)));
+                                    prompt=Some(format!("【近期群内动向】\n{}\n\n群里好一会儿没人接茬了，看看能不能顺势搭一句；实在没啥可聊就只回 [SILENT]。\n{SPLIT_HINT}",context_block(c,&sc,&view)));
                                 } else {
                                     leave(c);
                                 }
@@ -1197,7 +1197,7 @@ impl Hub {
                 // DSH is known down: no call is made for waiting work. Its authority was re-checked just above; it is
                 // checked again, with everything else, on the pass that finds DSH back.
                 if self.waiting_noted.insert(job.key.clone()) {
-                    println!("[reserved] {} DSH 不可用，消息排队等待恢复", job.key);
+                    println!("[reserved] {} 引擎眼下离线，来信先存进待办列队", job.key);
                 }
                 self.pending.push_back(job);
                 continue;

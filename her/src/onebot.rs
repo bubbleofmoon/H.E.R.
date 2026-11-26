@@ -2,7 +2,7 @@
 //!
 //! 与 JS 版对齐：
 //!   端点   POST {httpUrl}/{send_group_msg|send_private_msg}
-//!   参数   { group_id | user_id, message: [{type:"text", data:{text}}] }
+//!   载荷   群号或好友 QQ 号 + 纯文本消息段数组
 //!   鉴权   Authorization: Bearer <accessToken>
 //!   成功   { status:"ok", retcode:0 }
 //!   转义   只把 "[CQ:" 换成 "[CQ："（与 escapeCqText 一致）
@@ -176,7 +176,7 @@ const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 fn send_failure_text(v: &serde_json::Value, retcode: i64) -> String {
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
     let marker = if is_mute_reply(v) { MUTE_REFUSAL } else { "" };
-    format!("OneBot 发送失败：retcode={retcode} {wording}{marker}")
+    format!("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode={retcode} {wording}{marker}")
 }
 
 /// Marker in a not-committed error for a group-mute refusal (#46).
@@ -229,7 +229,7 @@ pub(crate) fn classify_send_reply(http_status: u16, raw: &str) -> Result<serde_j
         return Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null));
     }
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
-    let message = format!("OneBot 发送失败：retcode={} {wording}", retcode.unwrap_or(-1));
+    let message = format!("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode={} {wording}", retcode.unwrap_or(-1));
     if is_mute_reply(&v) {
         return Err(SendError::NotCommitted(format!("{message}{MUTE_REFUSAL}")));
     }

@@ -210,7 +210,7 @@ fn a_ban_inside_the_batch_window_cancels_the_armed_wake() {
     );
 
     let skipped = wait_for(Duration::from_secs(30), || {
-        fs::read_to_string(root.path().join("candidate-out.log")).unwrap_or_default().contains("禁言中，唤醒跳过")
+        fs::read_to_string(root.path().join("candidate-out.log")).unwrap_or_default().contains("唤醒调度已自动跳过")
     });
     let log = fs::read_to_string(root.path().join("candidate-out.log")).unwrap_or_default();
     assert!(skipped, "the armed wake was not skipped for the mute; candidate log:\n{log}");

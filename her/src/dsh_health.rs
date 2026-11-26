@@ -185,7 +185,7 @@ pub fn observe(context: &RuntimeContext, cfg: &Value, ok: bool, error: &str, fro
             if *ready { "settings/describe answered" } else { error },
         ),
         Edge::WentDown => {
-            crate::safe_println!("[health] ⚠️ DSH 不可用（重启中？），要提交的消息将排队等待：{}", crate::activity::redact(context, error));
+            crate::safe_println!("[health] ⚠️ DSH 引擎暂未就绪，待发消息会先排队等它回来：{}", crate::activity::redact(context, error));
             crate::recovery_log::record(
                 context,
                 if from_probe { Trigger::Timer } else { Trigger::Turn },
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn only_an_unanswered_call_marks_dsh_down() {
         assert!(is_unreachable("HTTP 连接失败：session/prompt"));
-        assert!(is_unreachable("响应不是 JSON（session/create）：expected value；原文 <html>503"));
+        assert!(is_unreachable("响应不是 JSON（session/create）：服务端返回网页异常正文 <html>503"));
         assert!(!is_unreachable("session/prompt 被拒：not-found: gone"));
         assert!(!is_unreachable("401 未授权：session/create"));
     }
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(probe_verdict(Ok(json!({}))), Ok(()));
         assert_eq!(probe_verdict(Err("settings/describe 被拒：unknown-method: no such method".into())), Ok(()), "DSH answered");
         assert!(probe_verdict(Err("HTTP 连接失败：settings/describe".into())).is_err());
-        assert!(probe_verdict(Err("响应不是 JSON（settings/describe）：eof".into())).is_err());
+        assert!(probe_verdict(Err("响应不是 JSON（settings/describe）：远端连接未传完完整结构正文即被中途截断并触发流结束 eof".into())).is_err());
         assert!(probe_verdict(Err("401 未授权：settings/describe".into())).is_err());
     }
 

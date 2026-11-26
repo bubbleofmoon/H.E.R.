@@ -168,7 +168,7 @@ impl Prepared {
         let mut warnings = Vec::new();
         if !memory_only {
             if !credentials.has_endpoints {
-                warnings.push("完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。");
+                warnings.push("整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。");
             }
             let password_warning = if credentials.has_password {
                 "完全恢复会使用备份中的管理员密码，并退出所有浏览器会话。"

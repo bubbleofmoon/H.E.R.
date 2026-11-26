@@ -488,7 +488,7 @@ fn error_feedback_notifies_the_owner_once_per_window_only_when_enabled() {
     let sent = ob.wait_for("send_private_msg", 1);
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["user_id"], OWNER);
-    assert!(sent[0].to_string().contains("[group:70001] AI 报错反馈：broken tool"), "{}", sent[0]);
+    assert!(sent[0].to_string().contains("[group:70001] 对话端上报异常：broken tool"), "{}", sent[0]);
     // Same dedupe key within 60 s: recorded, not pushed again.
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "level": "error", "message": "second error"}));
     assert_eq!(s, 200);
@@ -565,9 +565,9 @@ fn sends_feedback_and_pokes_leave_activity_lines_the_status_shows_to_the_operato
     assert_eq!(
         texts,
         vec![
-            "group:70001 [reserved2] AI 反馈 [info]：hello there",
-            "group:70001 [reserved2] 工具合并发送成功： 1/1 条",
-            "group:70001 [reserved2] 工具分段发送成功： 1/1 条",
+            "group:70001 [reserved2] 对话端发来运行情况反馈记录，记录级别为 [info]，简要说明如下：hello there",
+            "group:70001 [reserved2] 工具通道已把本批消息合为一条并投递完毕，总计成功发出 1 条（计划共 1 条）",
+            "group:70001 [reserved2] 工具通道已把本批消息拆为逐条气泡投递完毕，总计成功发出 1 条（计划共 1 条）",
             "group:70001 [send] 成功 1/1 条：gamma",
             "private:9002 [reserved2] 工具拍一拍",
         ]

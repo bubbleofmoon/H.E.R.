@@ -500,7 +500,7 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
                     return Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".to_string() };
                 }
                 if !role_exists(&name) {
-                    return Decision::Say(format!("未找到角色「{name}」，请将角色文件置于 qq-bridge/roles/ 目录。"));
+                    return Decision::Say(format!("未找到所选角色卡「{name}」，请先把角色文件放进 roles 目录下再重试。"));
                 }
                 let say = format!("已切换角色：{name}。");
                 return Decision::SetRole { name: Some(name), say };
@@ -1623,7 +1623,7 @@ mod tests {
         assert_eq!(decide(&facts("/role", true), &exists), Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".into() });
         assert_eq!(decide(&facts("/role clear", true), &exists), Decision::SetRole { name: None, say: "角色设定已清除，已切回默认人设。".into() });
         assert_eq!(decide(&facts("/role  小鲸鱼 ", true), &exists), Decision::SetRole { name: Some("小鲸鱼".into()), say: "已切换角色：小鲸鱼。".into() });
-        assert_eq!(decide(&facts("/role 没有", true), &exists), Decision::Say("未找到角色「没有」，请将角色文件置于 qq-bridge/roles/ 目录。".into()));
+        assert_eq!(decide(&facts("/role 没有", true), &exists), Decision::Say("未找到所选角色卡「没有」，请先把角色文件放进 roles 目录下再重试。".into()));
         assert_eq!(decide(&facts("/roles", true), &exists), Decision::Forward, "only `/role` and `/role <name>` are commands");
         assert_eq!(decide(&facts("/model", true), &exists), Decision::Forward, "other slash text goes to DSH");
         assert_eq!(decide(&facts("/update 一下进度", true), &exists), Decision::Forward, "only the whole-message update forms are commands");

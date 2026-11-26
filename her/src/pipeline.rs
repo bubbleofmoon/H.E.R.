@@ -1318,7 +1318,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         crate::activity::append(
             &self.context,
             &format!(
-                "{key} [reserved2] AI 内部输出：{}{}",
+                "{key} [reserved2] 对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：{}{}",
                 crate::activity::slice(&plain, 80),
                 if plain.encode_utf16().count() > 80 { "…" } else { "" }
             ),
@@ -3216,7 +3216,7 @@ mod tests {
     fn ticket25_cancellation_errors_are_recognised_by_the_bridges_own_wording_only() {
         for real in [
             "回合已取消：会话映射已变化（重置或替换）",
-            "暂缓唤醒：conversation has a paused turn",
+            "暂缓唤醒：该对话存在尚未收尾的暂停回合",
             "模式已变化",
             "会话或白名单已变化",
             "会话令牌已变化（重置、取消或被替代）",

@@ -2106,7 +2106,7 @@ fn a_result_120_refusal_is_not_committed() {
     assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
     let refused: Vec<String> = read_outbox(&root).iter().filter(|r| r["k"] == "not_committed")
         .filter_map(|r| r["error"].as_str().map(str::to_string)).collect();
-    assert_eq!(refused, vec!["OneBot 发送失败：retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
+    assert_eq!(refused, vec!["OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
     drop(onebot);
 }
 
@@ -2133,7 +2133,7 @@ fn a_muted_group_is_refused_locally_without_a_onebot_call() {
     let refused = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
     assert_eq!(refused.status, 403, "{}", refused.body);
     let error = refused.body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("禁言") && error.contains("muted in this group until"), "{}", refused.body);
+    assert!(error.contains("禁言") && error.contains("muted until"), "{}", refused.body);
     assert!(refused.body.get("unknown").is_none(), "a local refusal is never unknown delivery: {}", refused.body);
     assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0);
     assert!(read_outbox(&root).iter().all(|r| r["k"] != "intent"), "no intent for a refused send");

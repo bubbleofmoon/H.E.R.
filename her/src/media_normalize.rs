@@ -13,7 +13,7 @@ pub fn looks_like_image(bytes: &[u8]) -> bool {
         || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
 }
 
-/// Read image dimensions from container headers (PNG, GIF, JPEG SOF, WebP VP8X/VP8L/VP8).
+/// Read image dimensions from container headers (PNG, GIF, JPEG SOF, WebP chunks).
 /// Used as a preflight pixel-bomb check before allocating pixel buffers.
 pub fn image_dimensions(b: &[u8]) -> Option<(u64, u64)> {
     if b.len() < 24 {

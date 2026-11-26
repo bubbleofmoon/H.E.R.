@@ -1,7 +1,5 @@
-//! The two auxiliary MCP servers the DSH profile launches next to the QQ tool server (`--mcp-serve`):
-//! `web-search-safe` (`web_search`, `web_fetch`) and `snowluma-host` (`snowluma_status`). Tool definitions are the
-//! real `tools/list` of the frozen JS servers (`spec/aux-baseline.json`); behaviour ports `mcp-web-search-safe.js`
-//! and `mcp-host-server.js`.
+//! Auxiliary MCP servers launched beside the QQ tool server (`--mcp-serve`): search/fetch (`web_search`,
+//! `web_fetch`) and host probe (`snowluma_status`), matching the definitions in `spec/aux-baseline.json`.
 //!
 //! External boundaries (not rewritten here): DeepSeek's Anthropic-compatible search endpoint, Bing, any public
 //! web page, DSH's credential file and the SnowLuma OneBot HTTP gateway. Their failures become the documented
@@ -181,7 +179,7 @@ fn gateway_info(context: &RuntimeContext, cfg: &Value) -> Map<String, Value> {
         info.insert("reachable".into(), json!(false));
         info.insert("httpStatus".into(), json!(reply.status));
         if reply.status == 426 {
-            info.insert("hint".into(), json!("（HTTP 426：snowluma.httpUrl 疑似设成了 WebSocket 地址，请调整为 OneBot HTTP 接口）"));
+            info.insert("hint".into(), json!("（收到 HTTP 426：配置的网关地址似乎写成了长连接入口，请改成 OneBot HTTP 入口）"));
         }
         return info;
     }
@@ -224,9 +222,9 @@ fn snowluma_status(context: &RuntimeContext) -> Value {
             Some(Value::Null) | None => cfg.pointer("/snowluma/launcherPath").is_some_and(js_truthy),
             Some(v) => js_truthy(v),
         };
-        let mut hint = "无法连接 SnowLuma 网关，请手动确认 SnowLuma 已启动（遵守合规约定，本工具不代装或代启网关）。".to_string();
+        let mut hint = "目前连不上 SnowLuma 网关，请手动检查网关程序是否已跑起（依使用约定本工具不代为下载或拉起进程）。".to_string();
         if !home_configured {
-            hint.push_str(" 同时请核对 config.json 的 snowluma.httpUrl 与网关监听端口是否匹配。");
+            hint.push_str(" 并且核实一下配置文件里的网关 HTTP 入口与实际监听端口是不是一致。");
         }
         payload.insert("hint".into(), json!(hint));
     }

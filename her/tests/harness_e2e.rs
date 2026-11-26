@@ -4818,7 +4818,7 @@ fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
             assert_eq!(requests.len(), 4);
             (reserved2_current_prompt(&requests[0]).to_owned(), reserved2_current_prompt(&requests[2]).to_owned())
         };
-        let prefix = format!("{GROUP_KEY} [reserved2] AI 内部输出：");
+        let prefix = format!("{GROUP_KEY} [reserved2] 对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：");
         let read_internal = || {
             let activity = fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default();
             activity.lines().filter_map(|line| line.split_once(&prefix).map(|(_, text)| text.to_owned()))

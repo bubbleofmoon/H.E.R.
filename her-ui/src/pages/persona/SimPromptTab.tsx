@@ -440,7 +440,7 @@ export const SimPromptTab: React.FC = () => {
               )}
             </span>
           }
-          subtitle="编辑并同步 agent.cordis.yml 中的仿真预设正文；保存前自动校验长度与安全不变量。"
+          subtitle="在此修改并回写仿真配置档案内的核心提示正文；落盘前将自动核验文本篇幅与安全边界。"
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <select

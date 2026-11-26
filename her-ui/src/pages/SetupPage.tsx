@@ -107,8 +107,8 @@ export const SetupPage: React.FC = () => {
               onChange={(e) => setToken(e.target.value)}
               placeholder={
                 fromConfig
-                  ? '粘贴 config/config.json 中的 consoleToken…'
-                  : `粘贴 ${tokenFile} 或 config.json 中的 consoleToken…`
+                  ? '请把主配置目录里存放的管理台访问口令文本（consoleToken）粘贴并填入此处…'
+                  : `请粘贴并填入 ${tokenFile} 或配置文件里记录的管理台登录令牌…`
               }
               className="h-9 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 text-[13px] text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
             />

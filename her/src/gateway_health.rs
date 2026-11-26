@@ -73,7 +73,7 @@ impl GatewayHealth {
         let silent = self.last_packet_at > 0 && ago.is_some_and(|a| a > self.silence_warn_ms);
         let confirmed = self.good == Some(false);
         let hint = if confirmed {
-            Some("SnowLuma 网关回报接收通道异常（good=false），其 Hook 未能收到 QQ 客户端推送导致消息断流，非桥接侧故障。请排查 SnowLuma 日志 logs/snowluma-*.log 中的 Hook 报错（如队列滞留或进程枚举超时），必要时升级网关版本。".to_string())
+            Some("网关回报收消息链路异常（good=false），其内部挂钩未能收到客户端推送造成消息断流，并非桥接层自身故障。请打开网关运行目录查看报错细节（常见如队列滞留或进程扫描超时），如有必要请更新网关组件版本。".to_string())
         } else if silent {
             Some(format!(
                 "连接虽在但已有 {} 分钟未收到任何事件（包括每 30 秒的心跳包），SnowLuma 服务进程可能已卡死或退出，请直接检查 logs/snowluma-*.log。",

@@ -1221,7 +1221,7 @@ pub(super) fn host_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
     let shown = if host.is_empty() { "缺失" } else { host };
     Some((
         403,
-        json!({"ok": false, "error": format!("Host 头不被允许（{shown}）：控制台仅开放本机回环地址连接")}),
+        json!({"ok": false, "error": format!("拒绝来自非本机 Host 头的请求（{shown}）：管理台接口只受理本机回环地址连接")}),
     ))
 }
 
@@ -1935,7 +1935,7 @@ fn auth_sessions_revoke_route(
         }
         (None, true, false) => RevokeTarget::Others,
         (None, false, true) => RevokeTarget::All,
-        _ => return err(400, "请明确指定 id、others: true 或 all: true"),
+        _ => return err(400, "执行清理前请至少选定一个清理范围，必须显式传入 id、others: true 或是 all: true"),
     };
 
     let outcome =

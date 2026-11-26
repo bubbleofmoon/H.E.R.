@@ -196,7 +196,7 @@ export const UpcomingScheduleTab: React.FC<UpcomingScheduleTabProps> = ({
     const text = remText.trim();
     const localAt = remLocalAt.trim();
     if (!/^(group|private):\d+$/.test(conv)) {
-      pushToast('请选择或填写有效的会话 key（group:群号 或 private:QQ号）', 'warn');
+      pushToast('请先选中或填入格式合规的会话标识（群聊 group:<群ID> 或单聊 private:<账号>）', 'warn');
       return;
     }
     const scalarCount = unicodeScalarLength(text);

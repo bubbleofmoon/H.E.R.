@@ -485,7 +485,7 @@ pub(crate) fn update_memory(
             let impressions = conv.impressions_mut();
             // Only existing impressions may be updated here.
             let Some(mut im) = impressions.get(target).cloned() else {
-                return Err((404, "未找到对应的成员印象，新增条目请调用 qq_memory_append".to_string()));
+                return Err((404, "找不到对应的群友印象记录，若要新记一条请改调写入备忘工具".to_string()));
             };
             let new_target = extra
                 .target

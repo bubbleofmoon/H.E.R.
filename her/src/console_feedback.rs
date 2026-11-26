@@ -96,9 +96,9 @@ fn post_inner(
     )?;
     let head = crate::activity::slice(&safe_message, 80);
     crate::safe_println!("[reserved2] AI 反馈 ({key}) [{level}]: {}", crate::activity::redact(context, &head));
-    crate::activity::append(context, &format!("{key} [reserved2] AI 反馈 [{level}]：{head}"));
+    crate::activity::append(context, &format!("{key} [reserved2] 对话端发来运行情况反馈记录，记录级别为 [{level}]，简要说明如下：{head}"));
     if level == "error" && cfg.pointer("/socialV2/feedback/notifyOwnerOnError").is_some_and(truthy) {
-        crate::admin_alert::notify_owner(context, cfg, &format!("[{key}] AI 报错反馈：{safe_message}"), "agent-feedback");
+        crate::admin_alert::notify_owner(context, cfg, &format!("[{key}] 对话端上报异常：{safe_message}"), "agent-feedback");
     }
     Ok(json!({ "ok": true, "key": key, "level": level, "message": message }))
 }

@@ -423,12 +423,12 @@ pub(super) use crate::social_state::{
 fn assert_group_member(ob: &crate::onebot::OneBot, group_id: i64, user_id: &str) -> Option<String> {
     let reply = match ob.request("get_group_member_list", json!({ "group_id": group_id })) {
         Some(r) => r,
-        None => return Some(format!("无法获取群 {group_id} 的成员列表：OneBot get_group_member_list 请求失败")),
+        None => return Some(format!("拉取群 {group_id} 成员清单出错：OneBot 成员接口通讯异常")),
     };
     if reply.get("status").and_then(Value::as_str) != Some("ok") || reply.get("retcode").and_then(Value::as_i64) != Some(0) {
         let retcode = reply.get("retcode").map(social_policy_js_string).unwrap_or_else(|| "undefined".to_string());
         let wording = reply.get("wording").and_then(Value::as_str).unwrap_or("");
-        return Some(format!("无法获取群 {group_id} 的成员列表：OneBot get_group_member_list 失败: retcode={retcode} {wording}"));
+        return Some(format!("拉取群 {group_id} 成员清单出错：网关动作被拒（retcode={retcode} {wording}）"));
     }
     let data = reply.get("data").cloned().unwrap_or(Value::Null);
     let members: Vec<Value> = match &data {
@@ -484,7 +484,7 @@ fn send_poke_inner(
     }
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if token.is_empty() {
-        return Err((403, "在 reserved2 模式下执行拍一拍须附带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
@@ -508,7 +508,7 @@ fn send_poke_inner(
         return Err((403, "当前处于静默状态，暂停拍一拍动作".to_string()));
     }
     if kind == "group" && target.is_empty() {
-        return Err((400, "在群内拍一拍时必须传入 targetUserId（目标 QQ 号）".to_string()));
+        return Err((400, "群聊场景发起拍一拍动作时必须写明目标群友编号（targetUserId）".to_string()));
     }
     let target_ok = target.as_bytes().first().map(|b| (b'1'..=b'9').contains(b)).unwrap_or(false) && target.bytes().all(|b| b.is_ascii_digit());
     if !target.is_empty() && !target_ok {
@@ -792,7 +792,7 @@ pub(super) fn resolve_quote_js(
     None
 }
 
-pub(super) const UNRESOLVED_QUOTE: &str = "未找到该待引用消息，请核对编号无误且属于本对话（可调 qq_get_message_detail 查明）";
+pub(super) const UNRESOLVED_QUOTE: &str = "查不到待引用的原消息，请核对编号是否正确且归属当前对话（可先查详情确认）";
 
 /// The process-wide send order (JS `sendChain`), owned by the recorded send.
 pub(super) use crate::recorded_send::send_chain;
@@ -1017,8 +1017,8 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     crate::activity::append(
         context,
         &match flavor {
-            SendFlavor::Message => format!("{key} [reserved2] 工具合并发送成功： {sent}/{count} 条"),
-            SendFlavor::Burst => format!("{key} [reserved2] 工具分段发送成功： {sent}/{count} 条"),
+            SendFlavor::Message => format!("{key} [reserved2] 工具通道已把本批消息合为一条并投递完毕，总计成功发出 {sent} 条（计划共 {count} 条）"),
+            SendFlavor::Burst => format!("{key} [reserved2] 工具通道已把本批消息拆为逐条气泡投递完毕，总计成功发出 {sent} 条（计划共 {count} 条）"),
             SendFlavor::Direct => format!("{key} [send] 成功 {sent}/1 条：{}", crate::activity::slice(&messages[0], 80)),
         },
     );
@@ -1089,7 +1089,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
         .map(|v| !v.is_null() && !social_policy_js_string(v).trim_matches(social_policy_js_trim_char).is_empty())
         .unwrap_or(false);
     if reply_given {
-        return Err((400, "qq_send_burst 不支持引用回复，引用请改调 qq_reply".to_string()));
+        return Err((400, "连续多条发送接口不支持直接引用，要引用请换用专用回复工具".to_string()));
     }
     if key.is_empty() || messages.is_empty() {
         return Err((400, "key 和 messages 不能为空".to_string()));
@@ -1110,7 +1110,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
         return Err((403, "当前接口仅限 reserved2 模式调用".to_string()));
     }
     if token.is_empty() {
-        return Err((403, "在 reserved2 模式下执行发送须附带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     let Some((kind, id_s, _)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
@@ -1184,7 +1184,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     let key = format!("{}:{}", if is_private { "private" } else { "group" }, target_id);
     let mode = current_mode_for(context)?;
     if mode == "chat" || mode == "reserved" {
-        return Err((403, "发送接口只在 closed-agent 或 reserved2 模式下开放".to_string()));
+        return Err((403, "该发件接口只在受控直连或二代仿真模式下开放使用".to_string()));
     }
     let doc = ConversationState::for_runtime(context).read_document()?;
     if doc.paused() && !token.is_empty() {
@@ -1200,7 +1200,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
         return Err((400, "replyToMessageId 不能为空".to_string()));
     }
     if mode == "reserved2" && token.is_empty() {
-        return Err((403, "在 reserved2 模式下执行发送须附带 agent token".to_string()));
+        return Err((403, "处于二代仿真态调用该动作时，必须附带对应会话口令".to_string()));
     }
     if !token.is_empty() && !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
@@ -1221,7 +1221,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     if reply_present {
         let digits = reply_ref.strip_prefix('-').unwrap_or(&reply_ref);
         if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Err((400, "replyToMessageId 须为非零的整数值（支持负数消息编号）".to_string()));
+            return Err((400, "用于引用的消息编号须设为非零整数（平台部分编号允许为负）".to_string()));
         }
     }
     let storage_key = canonical_v2_key(&key).ok_or((400, "key 格式无效".to_string()))?;
@@ -1296,9 +1296,9 @@ fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Conv
     if used >= wait_policy(cfg).max_per_turn { return None; }
     let remain_min = (remaining as f64 / 60_000.0).ceil() as i64;
     let error = if what == "mark_read" {
-        format!("当前尚不能调 qq_mark_read 结束本轮：还需静默约 {remain_min} 分钟，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 走完睡前观察。若等待期间收到 newMessages，请先阅读再决定是否接话；无需插话即可收尾进入潜水。成功发言后按【互动窗口】重新计算。")
+        format!("尚不能提交已读收尾：静默等待还差约 {remain_min} 分钟，可传 timeoutMs={pre_sleep_ms} 走完睡前守候。守候期间一旦收到新消息先读再定，不用插话即可落盘休眠；每次成功发话后会按【互动窗口】重算余时。")
     } else {
-        format!("当前尚不能配置下一次唤醒：还需静默约 {remain_min} 分钟，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 走完睡前观察。若等待期间收到 newMessages，请先阅读再决定是否接话；无需插话即可写入配置并潜水。成功发言后按【互动窗口】重新计算。")
+        format!("尚不能写入下次唤醒方案：静默等待还差约 {remain_min} 分钟，可传 timeoutMs={pre_sleep_ms} 走完睡前守候。守候期间收到新消息先读再定，确认无需接茬即可保存设定退入休眠；每次成功发话后会按【互动窗口】重算余时。")
     };
     Some((
         400,
@@ -1394,7 +1394,7 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
             return Err((400, "clearAll=true 仅限管理端单独使用".to_string()));
         }
         if requested.is_none() && (is_agent || b["clearAll"] != true) {
-            return Err((400, "throughSeq 请填入上次读取返回结果里的 readThroughSeq".to_string()));
+            return Err((400, "提交的本地序号上限请直接填上一轮读取结果给出的已读水位数值".to_string()));
         }
         let through = requested_through(requested, &conv, through_of_conv(context, &storage_key, &conv), is_agent)
             .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;

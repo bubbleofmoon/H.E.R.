@@ -36,7 +36,7 @@ fn edge_report(context: &RuntimeContext, cfg: &Value) {
     match gateway_health::with(|h| h.report(now)) {
         Report::Steady => {}
         Report::Degraded(hint) => {
-            crate::safe_println!("[health] ⚠️ SnowLuma 上游不健康：{hint}");
+            crate::safe_println!("[health] ⚠️ 网关依赖汇报异常状态：{hint}");
             recovery_log::record(context, Trigger::Timer, Component::Snowluma, "degraded", Outcome::Failed, &hint);
             crate::admin_alert::notify_notice(context, cfg, &format!("SnowLuma 上游不健康：{hint}"), "snowluma-degraded");
         }
@@ -139,7 +139,7 @@ pub async fn adopt_heal(
     let healed = match healed {
         Ok(Ok(healed)) => healed,
         Ok(Err(error)) => {
-            println!("[her] ⚠️ token 自愈失败（{reason}）：{error}");
+            println!("[her] ⚠️ 自动修复网关凭证受阻（{reason}）：{error}");
             recovery_log::record(context, Trigger::Recovery, Component::Snowluma, "token-heal", Outcome::Failed, &format!("{reason}: {error}"));
             return false;
         }
@@ -156,7 +156,7 @@ pub async fn adopt_heal(
         *cfg_raw = fresh;
     }
     // Field names only: a token (even a prefix) is a credential and must not reach logs or the record.
-    println!("[her] 🔄 SnowLuma 自愈完成（{reason}）：已更新 {}", if healed.persisted.is_empty() { "无需改写 config.json".to_string() } else { healed.persisted.join(" / ") });
+    println!("[her] 🔄 已自动修好网关配置凭证（{reason}）：刷新了 {}", if healed.persisted.is_empty() { "无需改写 config.json".to_string() } else { healed.persisted.join(" / ") });
     recovery_log::record(
         context,
         Trigger::Recovery,

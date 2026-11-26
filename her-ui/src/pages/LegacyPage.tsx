@@ -87,15 +87,15 @@ const DSH_MCP_TOOL_REFERENCE: { name: string; purpose: string }[] = [
   { name: 'qq_get_group_history', purpose: '按可选 messageSeq 读取指定 QQ 群的最近历史消息（只读）' },
   {
     name: 'qq_send_group_message',
-    purpose: '向允许列表中的 QQ 群发送纯文本消息，支持传 replyToMessageId 引用回复',
+    purpose: '向允许名单里的指定群聊投递纯文本发言，也可附带引用消息编号进行回应',
   },
   {
     name: 'qq_reply',
-    purpose: '在允许列表中的 QQ 群里按 replyToMessageId 明确引用某条消息并回复文本',
+    purpose: '针对允许名单群聊里的某条特定消息发出引用回应，并附带纯文本正文内容',
   },
   {
     name: 'qq_send_private_message',
-    purpose: '向允许列表中的 QQ 好友发送私聊纯文本消息，支持传 replyToMessageId 引用回复',
+    purpose: '向私聊允许名单里的指定好友递出纯文本私信，也可附带引用编号回应对方',
   },
   { name: 'qq_slang_query', purpose: '只读查询当前已确认的群黑话、梗与常用表达' },
   { name: 'qq_slang_submit', purpose: '将群内遇到的陌生词或黑话提交至候选库供管理员审核' },
@@ -827,7 +827,7 @@ export const LegacyPage: React.FC = () => {
     const trimmedKey = notifyKey.trim();
     const trimmedMsg = notifyText.trim();
     if (!/^(group|private):\d+$/.test(trimmedKey)) {
-      pushToast('请填写有效会话 key（group:群号 或 private:QQ号）', 'warn');
+      pushToast('请输入格式合规的会话标识（群聊 group:<群ID> 或单聊 private:<账号>）', 'warn');
       return;
     }
     if (!trimmedMsg) {
@@ -1271,7 +1271,7 @@ export const LegacyPage: React.FC = () => {
                 DSH 侧 MCP 工具
               </span>
             }
-            subtitle="由 bridge 的 MCP server 提供给 DSH agent（修改后需重启 DSH 刷新 schema）；二代工具见主导航页。"
+            subtitle="经本地工具协议挂接给第一代引擎使用（改动后须重启外部宿主以重新拉取清单）；二代接口请看主导航页面。"
           />
           <div className="max-h-80 overflow-y-auto">
             <table className="w-full border-collapse text-left text-xs">

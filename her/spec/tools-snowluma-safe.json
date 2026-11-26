@@ -53,7 +53,7 @@
   },
   {
    "name": "qq_get_group_history",
-   "description": "只读拉取目标群聊的近期历史记录。若传入 messageSeq，则从该序号向前追溯；该能力依赖 SnowLuma 网关是否提供 get_group_msg_history 接口。",
+   "description": "按只读方式读取指定 QQ 群的过往聊天记录；若填写起始序号，则从该条记录之前继续向前翻查。能否使用此能力取决于当前网关接口支持情况。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -84,7 +84,7 @@
   },
   {
    "name": "qq_send_group_message",
-   "description": "往允许列表内的目标群投递单条纯文本发言；如需指明回复对象，可附带非零整数 replyToMessageId（可为负，可借助 qq_get_recent_messages 或 qq_get_message_detail 查得）。在 reserved2 仿真中通常优先用 qq_send_message，且必须附带 token 口令；若目标群不在 allow.groups 白名单内将被拦截。发完后不必再额外汇报发送状态。",
+   "description": "向已授权白名单内的群聊投递一条纯文本发言；如需指明回应某条消息，可填写非零整数 replyToMessageId（允许负数，可经历史或详情工具查到）。在二代仿真下一般优先使用统一发送接口，每次调用均需携带口令；未获准放行的群聊会被拦截。成功后不必再重复说明已发出。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -179,7 +179,7 @@
   },
   {
    "name": "qq_send_private_message",
-   "description": "给 allow.private 白名单内的指定好友发送私聊纯文本。附带非零整数 replyToMessageId（允许负数，可先经 qq_get_message_detail 核对）时将携带引用气泡发出。在 reserved2 仿真中一般优先使用 qq_send_message，且每次调用须附带 token；不在允许列表的好友将被拒发。发送完成后无需另行输出“已发送”回执。",
+   "description": "向私聊允许名单里的指定好友发送纯文本发言；填写非零整数 replyToMessageId（可为负数，可先核对消息详情）即可携带引用气泡发出。在二代仿真下通常优先调用统一发送工具，每次都须随带口令；未放行的好友会被拒绝。发出后无需另行汇报结果。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -192,7 +192,7 @@
         "type": "string"
        }
       ],
-      "description": "目标好友 QQ 号，须命中 allow.private 白名单"
+      "description": "接收消息的好友账号，须属于私聊允许名单"
      },
      "message": {
       "type": "string",
@@ -232,7 +232,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -257,7 +257,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -292,7 +292,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -325,7 +325,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -350,14 +350,14 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
       "description": "本场对话的鉴权口令，源自唤醒简报中的【会话令牌】字段"
      },
      "throughSeq": {
-      "description": "确认读完的本地序列号上限，请填读取结果中的 readThroughSeq，以免吞掉新消息",
+      "description": "待确认的本地读取进度序号，请填返回里的已读上限编号，避免跳过后续新发言",
       "type": "integer",
       "minimum": 0,
       "maximum": 9007199254740991
@@ -376,20 +376,20 @@
   },
   {
    "name": "qq_set_wake_config",
-   "description": "更新该会话的二代唤醒策略，可设置 mode、限时/永久休眠状态以及触发恢复的条件（如 @、昵称、触发词、直问、戳一戳、概率、anyMessage 或指定成员发言）。triggers.speakerIds 可选填入若干成员 QQ 号，任一成员发言即唤醒（不填则关闭，常用于等候特定对象回复）；打开 triggers.poke 后群内任何拍一拍动作都会唤醒。若群聊需观察，依会话提示操作。",
+   "description": "配置本会话的二代唤醒行为，可调整运行模式、限时或长期休眠策略以及恢复对话的触发规则（包括艾特、称呼、触发词、直问、拍一拍、随机概率、任意新话或指定成员发言）。配置触发器里的成员号列表后，名单内成员一旦发言即刻醒来（留空则关闭，常用于等某人回话）；开启拍一拍触发则群内任何拍一拍均会唤醒。如需守候观察，照会话提示执行即可。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
       "description": "本场对话的鉴权口令，源自唤醒简报中的【会话令牌】字段"
      },
      "throughSeq": {
-      "description": "顺带提交已读水位：传入刚读到的 readThroughSeq 即可免去单独调用 qq_mark_read；未开启 markRead 时只更新唤醒配置",
+      "description": "顺带更新已读进度：传入刚读到的已读上限序号即可免调已读工具；若未启用已读回执则只刷新唤醒配置",
       "type": "integer",
       "minimum": 0,
       "maximum": 9007199254740991
@@ -551,7 +551,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -634,7 +634,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -670,7 +670,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -715,7 +715,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -754,7 +754,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -783,7 +783,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -820,7 +820,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -843,13 +843,13 @@
   },
   {
    "name": "qq_memory_append",
-   "description": "写入一条会话级短时备忘：activeTopic 记录仍在聊的话题，pendingThought 记录想说而未说的念头，memberImpression 记录对特定群友的印象。这些记录会保存下来并在后续唤醒简报及 qq_get_prompt 里自动带出。",
+   "description": "记下一条本会话的临时短时备忘：进行中话题用 activeTopic，想讲还没讲的念头用 pendingThought，对特定群友的观感用 memberImpression。条目会保留下来，并在随后的唤醒简报与提示词查询接口中自动附上。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -873,7 +873,7 @@
       "type": "object",
       "properties": {
        "target": {
-        "description": "当 category 为 memberImpression 时填写对应群友的称呼或昵称",
+        "description": "仅在记入人物观感类别时填写，写明对应群友的昵称或常见称呼",
         "type": "string"
        },
        "participants": {
@@ -888,11 +888,11 @@
         "type": "string"
        },
        "motivation": {
-        "description": "pendingThought 产生的原因，例如 curiosity 或 sociability",
+        "description": "写下产生该念头的缘由，例如好奇追问或凑热闹等常见动机",
         "type": "string"
        },
        "expiresAtMs": {
-        "description": "pendingThought 有效的毫秒时长，缺省 2 小时",
+        "description": "这条待说念头保留的有效时长（毫秒，缺省两小时失效）",
         "type": "number"
        }
       }
@@ -918,7 +918,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -946,13 +946,13 @@
   },
   {
    "name": "qq_memory_remove",
-   "description": "移除一条指定的短时备忘：删除 activeTopic 或 pendingThought 时按 content 原文匹配，删除 memberImpression 时按 target 群友名称匹配。",
+   "description": "从本会话临时短时备忘中删去一条记录：清理进行中话题或待说念头时按原文匹配，清理人物观感时按对方称呼匹配。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -968,7 +968,7 @@
       "description": "短时备忘类别"
      },
      "content": {
-      "description": "待删话题或想法的精确内容（memberImpression 可不填）",
+      "description": "需要删掉的话题或念头原句（清理人物观感时可以留空）",
       "type": "string"
      },
      "target": {
@@ -995,7 +995,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1029,7 +1029,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1059,7 +1059,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1093,7 +1093,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "messageId": {
       "anyOf": [
@@ -1123,13 +1123,13 @@
   },
   {
    "name": "qq_list_stickers",
-   "description": "检索当前账号已收藏的自定义表情列表，返回各表情的 emoji_id、desc 备注、本地笔记 localNote、tags 标签及使用计数；可用 query 做筛选。遇到没有说明的表情时，可先通过 qq_get_sticker_image 看图，再用 qq_sticker_note 记下含义。需要立即同步新变动时传 refresh=true。",
+   "description": "查询当前账号收藏的自定义图库清单，返回每项的编号、官方备注、个人笔记、标签以及使用次数，可用 query 关键词筛选。遇到缺乏注释的图时，可先调看图接口查看画面，再写下个人笔记留档。想立刻拉取最新变更时可将 refresh 设为 true。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1140,7 +1140,7 @@
       "type": "string"
      },
      "count": {
-      "description": "单次返回的条数上限，缺省 48，且不超过 socialV2.sticker.maxListCount 配置上限（通常 100）",
+      "description": "单次最多拉回的条目数量，缺省四十八条，不得高于系统设定的单页上限（常为一百）",
       "type": "number"
      },
      "refresh": {
@@ -1160,13 +1160,13 @@
   },
   {
    "name": "qq_get_sticker_image",
-   "description": "按标识读取已藏表情图并直接作为视觉附件呈现在上下文里。当清单里该表情缺少说明或需要核实画面细节时调用；stickerId 可取 qq_list_stickers 给出的 id、md5 或地址。",
+   "description": "按标识读取已藏表情的原图并直接附入对话视野供查看。清单缺少说明或需核对图案细节时调用；标识可填图库清单返回的编号、散列值或图片地址。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1174,7 +1174,7 @@
      },
      "stickerId": {
       "type": "string",
-      "description": "表情条目的唯一标识（可取自 qq_list_stickers 返回的 id、md5 或图片地址）"
+      "description": "图库条目的唯一代号，支持填入清单给出的编号、散列校验码或图链"
      }
     },
     "required": [
@@ -1190,13 +1190,13 @@
   },
   {
    "name": "qq_send_sticker",
-   "description": "向会话发出一张账号收藏表情。stickerId 取自 qq_list_stickers 的 id、md5 或图片地址。表情消息须单独成条，不能与文字混发在同一条气泡里；需要先说话时请先用 qq_send_message 或 qq_reply 发出文字再单独发表情，群聊支持附带 replyToMessageId 或 atUserId。注意控制使用频次。",
+   "description": "往当前会话发送一张已藏表情图，标识可填清单给出的编号、散列码或地址。表情图必须独立成条发送，不可和文字塞在同一气泡里；需要先开口时请先调发消息或引用工具写出文字，再另发图，群里可附带引用或艾特对象。请勿高频连续发图。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1204,7 +1204,7 @@
      },
      "stickerId": {
       "type": "string",
-      "description": "表情条目的唯一标识（可取自 qq_list_stickers 返回的 id、md5 或图片地址）"
+      "description": "图库条目的唯一代号，支持填入清单给出的编号、散列校验码或图链"
      },
      "replyToMessageId": {
       "description": "需要引用的目标消息编号（非零整数，QQ 编号可能为负；不填则不引用）",
@@ -1242,13 +1242,13 @@
   },
   {
    "name": "qq_collect_sticker",
-   "description": "把本会话里他人发出的图片或表情加入你自己的 QQ 收藏表情库，并可附上不超过 20 字的简短备注。messageId 须填写由 qq_get_unread_messages 或 qq_get_recent_messages 取到的 messageId 或 seq。仅在确实觉得好玩或实用时偶尔收藏，避免刷屏式偷图；入库后即可经 qq_list_stickers 检索复用。",
+   "description": "把当前对话里别人发出的图片或表情收进账号自己的图库，可选附上至多二十字的简短备注。来源消息编号请填未读或近期列表返回的消息标识或序号。只在真正有趣或实用时偶尔收图，别刷屏式狂存；入库后就能经图库清单搜出来复用了。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1256,7 +1256,7 @@
      },
      "messageId": {
       "type": "string",
-      "description": "目标消息的 messageId 或 seq（取自未读或近期消息接口）"
+      "description": "被收藏图片所在消息的编号或序号，取自未读或近期记录"
      },
      "remark": {
       "description": "可选短备注，至多 20 字，例如“收藏一张好图”",
@@ -1276,13 +1276,13 @@
   },
   {
    "name": "qq_send_voice",
-   "description": "从语音库挑选预先备好的音频作为 QQ 语音条发往当前会话；voice 可填 qq_list_voices 返回的 name（允许带子目录或省略后缀）。使用限制如下：1) 仅限本地语音库内文件，拒绝任意磁盘路径、网址或 base64；2) 须满足 qq_list_voices 返回的 limits 时长与频次约束；3) 语音分量较重，日常闲聊偶尔使用即可；4) 当返回 verified=true 时代表已通过 get_msg 确认语音段成功落盘，仅此情形可认定发送完成；5) readback 仅对别人发来的语音有转写作用，本人发出的语音通常无转写，缺省关闭。",
+   "description": "从本地语音曲库里选一段预先准备好的录音，以语音条形式发入当前会话；文件名填曲库清单给出的名称（可带子目录，也能略去后缀）。使用时须遵守以下约束：1) 只读本地曲库内的文件，拒绝磁盘绝对路径、网址或编码数据；2) 必须符合曲库返回的时长和频次配额；3) 语音存在感强，平时闲聊偶尔发一条即可；4) 当回执显示已核验为真时，说明经回查确认语音确实落到会话里，只有这时才算发成；5) 语音转字仅对他人语音生效，自己发出的录音通常无文字转写，缺省关闭。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1290,7 +1290,7 @@
      },
      "voice": {
       "type": "string",
-      "description": "语音库中的音频文件名（对应 qq_list_voices 返回的 name，可含子目录或省略后缀）"
+      "description": "当地曲库里的音频名称，需与曲库清单给出的条目名字对应（支持子路径与省后缀）"
      },
      "label": {
       "description": "可选，记入历史记录的简短文字说明，例如「道了声晚安」",
@@ -1324,7 +1324,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1353,7 +1353,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1378,7 +1378,7 @@
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1386,7 +1386,7 @@
      },
      "stickerId": {
       "type": "string",
-      "description": "表情条目的唯一标识（可取自 qq_list_stickers 返回的 id、md5 或图片地址）"
+      "description": "图库条目的唯一代号，支持填入清单给出的编号、散列校验码或图链"
      },
      "note": {
       "description": "你对该表情含义或适用情景的归纳，至多 200 字",
@@ -1417,13 +1417,13 @@
   },
   {
    "name": "qq_set_sticker_remark",
-   "description": "直接更改 QQ 账号内对应图库条目的官方备注（desc）。属于会改变账号数据的写操作，只有当管理员显式放开 socialV2.tools.setStickerRemark=true 时才可使用；平常优先用 qq_sticker_note 做本地记录即可。",
+   "description": "直接修改账号图库中该表情的官方描述文字。该操作会改动账号自身资料，唯有管理员在配置里显式放行改备注开关后方可调用；日常只需记在个人本地笔记即可。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1431,7 +1431,7 @@
      },
      "stickerId": {
       "type": "string",
-      "description": "表情条目的唯一标识（可取自 qq_list_stickers 返回的 id、md5 或图片地址）"
+      "description": "图库条目的唯一代号，支持填入清单给出的编号、散列校验码或图链"
      },
      "remark": {
       "type": "string",
@@ -1452,13 +1452,13 @@
   },
   {
    "name": "qq_get_forward_msg",
-   "description": "只读展开本会话中收到过的合并转发聊天记录。当消息正文含 `[转发消息 id=...]` 或消息列表返回 `forwardIds` / `hasForward: true` 时使用，仅限读取本会话真实收到的转发编号。结果包含各条消息的 text、media 元数据及 nestedForwardIds；若内含图片会附带返回最多 5 张图像供你直接查看，若存在嵌套转发也会给出对应编号与前几条摘要。",
+   "description": "以只读方式展开当前对话中收到过的聊天转发包。只有当聊天记录中出现了转发标记，或消息携带了转发序号数组时才能调用，并且仅允许查询本会话实际收到的编号。返回内容含子条目的文本、媒体附件以及深层转发编号；内有图片时附带传回至多五张图片以便查阅，若有套娃转发也会列出序号和前几条预览。",
    "inputSchema": {
     "type": "object",
     "properties": {
      "key": {
       "type": "string",
-      "description": "对话标识，格式为 group:群号 或 private:QQ号"
+      "description": "会话归属标识，群聊写 group:<群ID>，单聊写 private:<账号>"
      },
      "token": {
       "type": "string",
@@ -1466,7 +1466,7 @@
      },
      "id": {
       "type": "string",
-      "description": "目标合并转发编号，取自对话正文里的 [转发消息 id=...] 标记或 forwardIds 字段"
+      "description": "待拆看的合并转发编号，来自消息正文占位符或转发列表字段"
      }
     },
     "required": [

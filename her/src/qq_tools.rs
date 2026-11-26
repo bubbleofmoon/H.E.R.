@@ -151,7 +151,7 @@ fn describe_text_batch(tool: &mut Value, cfg: &Value) {
         TextBatch::Single => format!("一次只允许一条消息，最多 {max_chars} 个 UTF-16 单元。"),
     };
     let properties = &mut tool["inputSchema"]["properties"];
-    properties["messages"]["description"] = json!(format!("纯文本字符串或数组，也兼容 JSON 数组字符串。{messages}"));
+    properties["messages"]["description"] = json!(format!("接收单条文本字符串或文本数组，同时兼容传入数组的序列化文字。{messages}"));
     if unified && policy != TextBatch::Split {
         for field in ["gapMode", "gapMs", "gaps"] {
             properties[field]["description"] = json!("当前每次只发一个气泡，忽略此参数。");
@@ -210,7 +210,7 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
         "wake snapshot",
     )?;
     if packet.is_null() { return Ok(String::new()); }
-    let guidance = "消息已在下方给出，无需重复查询；partial=true 时调 qq_get_unread_messages(afterSeq=readThroughSeq) 拉取剩余条数。请先消化手头消息；要回话直接调用发送端工具（静默与节奏由桥接掌控），若收到 reviseRequired=true 则先查 newMessages 再调整或重发。收尾仅把你已读妥的 readThroughSeq（本地序号，勿填 QQ messageId）传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq，未处理的新消息留待下轮。";
+    let guidance = "下方已附带当前最新对话记录，不必再重复拉取列表；只有返回未完标记时再按已读上限接续抓取余下内容。先看懂这批对话再决定动作：要回话就调用对应发件工具（发件停顿由底层统一调度）；若返回需修订标志则先看新消息后再改发。收尾时切记只把真正看过处理好的本地已读上限 readThroughSeq（勿填平台全局消息编号）提交给已读接口或唤醒设置接口的 throughSeq 参数，剩下未处理的留给下一轮。";
     // DSH sends this text immediately. The harness keeps the original packet for replay.
     let (packet, guidance) = if redact {
         let delivery_cfg = crate::model_view::with_blacklist(context, cfg);
@@ -480,7 +480,7 @@ impl Api<'_> {
             .map_err(|err| err.to_qq_tools_message())?;
         if !(200..300).contains(&reply.status) {
             let hint = if reply.status == 426 {
-                "；收到 HTTP 426 表示 httpUrl 指向的可能是 WebSocket 地址，请检查 config.json 内 snowluma.httpUrl 是否填对 HTTP 入口"
+                "；收到 HTTP 426 说明配置中的接口地址可能填成了长连接入口，请到配置里核对网关 HTTP 入口是否写对"
             } else {
                 ""
             };
@@ -1115,7 +1115,7 @@ fn images_message_outcome(message_id: &str, data: &Value) -> ToolOutcome {
         }
     }
     if !parts.is_empty() {
-        content.insert(0, json!({"type": "text", "text": format!("消息 {message_id} 的媒体内容（{} 项）：\n{}", images.len(), parts.join("\n"))}));
+        content.insert(0, json!({"type": "text", "text": format!("编号 {message_id} 对应的媒体清单（共 {} 项）：\n{}", images.len(), parts.join("\n"))}));
     }
     ToolOutcome { content, is_error: false, delivery_unknown: false }
 }

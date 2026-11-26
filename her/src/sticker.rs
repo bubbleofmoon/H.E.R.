@@ -274,8 +274,7 @@ pub fn format_list(entries: &[Value], query: &str, limit: i64) -> Value {
 }
 
 /// 合并 QQ 拉回来的列表与本地库（对应 JS 的 mergeStickerLibrary）。///
-/// **本地认知优先**：localNote / tags / usage / useCount / lastUsedAt / lastContext
-/// 一律保留旧值，只更新 QQ 侧会变的字段（url / md5 / desc）。
+/// 保留既有的本地笔记、分类标签、场景说明与使用计数等认知字段，仅更新远端可变元信息（url / md5 / desc）。
 /// `complete=true` 时才清理「QQ 那边已删除」的 qq 来源条目；
 /// 拉取被 count 截断时必须传 false，否则会把没返回的表情误判成已删除。
 pub fn merge(existing: &[Value], fetched: &[Value], complete: bool) -> Vec<Value> {
@@ -584,7 +583,7 @@ pub fn sync_for_runtime(
     let fetched = resp
         .get("data")
         .and_then(|d| d.as_array())
-        .ok_or("fetch_custom_face_detail 响应中的 data 字段非数组类型，已中止同步")?
+        .ok_or("网关同步接口响应的列表主体字段不是数组结构，本次同步已取消")?
         .clone();
 
     let complete = fetched.len() < count;
@@ -1170,7 +1169,7 @@ mod tests {
         let result = sync_with_runtime(&context, &context.load_config().unwrap());
         let request = fake.finish();
         assert_onebot_request(&request, "selected-gateway-token-fixture");
-        assert!(result.unwrap_err().contains("非数组类型"));
+        assert!(result.unwrap_err().contains("不是数组结构"));
         assert_eq!(std::fs::read(&store).unwrap(), original);
     }
 

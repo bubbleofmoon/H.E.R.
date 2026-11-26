@@ -1218,7 +1218,7 @@ mod tests {
     #[test]
     fn recall_one_shared_common_token_is_not_enough() {
         let conn = recall_fixture();
-        add_row(&conn, "group:101", "group", "链接", "参考 https://example.test/a 里的说明，2026 年计划，haha 好玩", 1.0, 1);
+        add_row(&conn, "group:101", "group", "链接", "这是一条专门用于验证检索分词规则的测试句子：参考 https://example.test/a 里的说明，2026 年计划，haha 好玩", 1.0, 1);
         for message in ["https", "2026", "haha", "你看这个 https 呀", "2026 怎么样", "haha 笑死我了"] {
             let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));

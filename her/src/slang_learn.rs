@@ -1771,25 +1771,24 @@ pub(crate) fn research_prompt(candidates: &[Value], cfg: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        r#"请根据下列群内语境与通行网络释义，逐一考证以下候选词条的实际含义：
-
-待考证词条：
-{list}
-
-仅返回 JSON 数组，数组成员结构如下：
+        r#"请结合下列群聊上下文以及常见网络用语习惯，逐项核查候选词的真实含义。
+请严格回复一个以方括号包裹的数组文本，每一条对象包含以下键名：
 {{
-  "content": "词条",
-  "meaning": "简洁准确的真实释义，方便群成员看懂",
-  "usage": "适用语气或典型场景（选填）",
-  "example": "自然口语短句用例（选填）",
-  "risk": "若存在敏感或冒犯风险请说明，无则留空（选填）",
-  "confirmed": true 或 false
+  "content": "对应词条",
+  "meaning": "简洁明了的真实意思，能让普通群友一眼读懂",
+  "usage": "常见语气或适用语境（可略）",
+  "example": "自然口语短造句示例（可略）",
+  "risk": "如带有冒犯或敏感争议请简述，没有则留空",
+  "confirmed": <boolean>（释义明确且把握高填 true；含糊或存疑填 false）
 }}
 
-要求：
-- 仅属常见字词、算不上特定黑话或热梗的，请将 confirmed 置为 false。
-- 严禁杜撰释义；把握不准时写明「不确定」并将 confirmed 设为 false。
-- 除 JSON 数组外勿输出多余文字。"#
+以下是待考证词条清单：
+{list}
+
+核查规范：
+- 如仅属普通日常用语、算不上特定热梗或黑话，请将该条的审核布尔字段设为假。
+- 绝不可凭空编造意思；实在拿不准时把含义写为「不确定」并将审核布尔字段置为假。
+- 只返回合法数组结构本身，切勿夹杂多余寒暄或代码块围栏。"#
     )
 }
 
@@ -2068,7 +2067,7 @@ fn extract_once_with_runtime(
         cfg
     };
     if !enabled(cfg) {
-        return summary_error(key, 0, "群聊词汇收集功能未启用（slang.enabled=false）".to_string());
+        return summary_error(key, 0, "群聊黑话搜集功能现处于关闭态（配置开关为 false）".to_string());
     }
     if let Err(error) = reconcile_pending_commit(context, window_state) {
         return summary_error(key, 0, error);
@@ -2363,7 +2362,7 @@ fn extract_now_with_runtime(
     force: bool,
 ) -> Value {
     if !enabled(cfg) {
-        return summary_error(key, 0, "群聊词汇收集功能未启用（slang.enabled=false）".to_string());
+        return summary_error(key, 0, "群聊黑话搜集功能现处于关闭态（配置开关为 false）".to_string());
     }
     if let Err(error) = reconcile_pending_commit(context, window_state) {
         return summary_error(key, 0, error);

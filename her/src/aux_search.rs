@@ -308,7 +308,7 @@ pub(crate) fn settings_endpoint(document: &Value) -> Option<String> {
 fn validate_search_endpoint(base_url: &str, net: &Network) -> Result<(Url, Vec<IpAddr>), String> {
     let url = Url::parse(js_trim(base_url)).map_err(|_| "webSearch.baseURL 无效".to_string())?;
     if url.scheme() != "https" {
-        return Err("webSearch.baseURL 须为 https 地址（凭据不可明文传输）".to_string());
+        return Err("搜索接口地址必须使用加密 HTTPS 协议，防止凭证在网络明文裸奔".to_string());
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("webSearch.baseURL 不能包含凭据".to_string());
@@ -358,9 +358,9 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
             .unwrap_or_default();
         // The provider's own error text stays in the log; the model reads the HTTP status only.
         if !detail.is_empty() {
-            crate::safe_eprintln!("[web_search] 主搜索接口 HTTP {status}：{detail}");
+            crate::safe_eprintln!("[web_search] 主检索服务状态码 {status}：{detail}");
         }
-        return Err(SearchError::new("HTTP_ERROR", format!("主搜索接口 HTTP {status}")));
+        return Err(SearchError::new("HTTP_ERROR", format!("主检索服务状态码 {status}")));
     }
     let mut parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主检索返回内容不是合法 JSON"))?;
     crate::harness::redact(&mut parsed, std::slice::from_ref(&key));

@@ -594,7 +594,7 @@ impl Hub {
                 .map(|r| format!("\n理由：{r}"))
                 .unwrap_or_default();
             format!(
-                "🔐 agent 请求审批：{}{reason}\n回复「通过」或「拒绝」",
+                "🔐 当前挂起待批操作：{}{reason}\n请回复「通过」或者「拒绝」",
                 p.tool.as_str().unwrap_or("")
             )
         };

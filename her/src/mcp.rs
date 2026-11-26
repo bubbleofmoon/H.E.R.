@@ -298,7 +298,7 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                     .collect::<Vec<_>>()
                     .join("、");
                 format!(
-                    "共 {} 条，话题：{terms}（要细节用 memory_search）",
+                    "共 {} 条，覆盖主题：{terms}（查阅正文请调用检索工具）",
                     result["total"]
                 )
             }

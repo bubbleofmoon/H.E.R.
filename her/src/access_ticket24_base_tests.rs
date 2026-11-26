@@ -30,10 +30,10 @@ fn ticket24_console_front_refuses_foreign_hosts_non_json_writes_and_cross_site_o
     // DNS rebinding: a foreign Host is refused before credentials are looked at.
     let (status, body) = raw_request(port, &format!("GET /api/status HTTP/1.1\r\nHost: evil.example:{port}\r\nx-console-token: {token}\r\n"), "");
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["error"], format!("Host 头不被允许（evil.example:{port}）：控制台仅开放本机回环地址连接"));
+    assert_eq!(body["error"], format!("拒绝来自非本机 Host 头的请求（evil.example:{port}）：管理台接口只受理本机回环地址连接"));
     let (status, body) = raw_request(port, &format!("GET /api/status HTTP/1.1\r\nx-console-token: {token}\r\n"), "");
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["error"], "Host 头不被允许（缺失）：控制台仅开放本机回环地址连接");
+    assert_eq!(body["error"], "拒绝来自非本机 Host 头的请求（缺失）：管理台接口只受理本机回环地址连接");
 
     // A credentialed write must be declared JSON.
     let (status, body) = raw_request(port, &format!("POST /api/security HTTP/1.1\r\nHost: {ok_host}\r\nx-console-token: {token}\r\n"), r#"{"interceptNotify":false}"#);

@@ -1605,12 +1605,12 @@ pub(crate) const SETTINGS_WRITABLE: [&str; 3] = [
 ];
 
 const SETTINGS_READONLY_HINT: &str =
-    "白名单 allow.*、ownerQQ、后端及网关配置、consoleToken 与所有本机路径项仅允许本地修改";
+    "名单白名单、主人账号、引擎与网关地址、控制台令牌及各类本地路径仅允许在本地界面改动";
 
 const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 
 pub(crate) const SETTINGS_READ_REFUSED: &str =
-    "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
+    "当前工具只准查阅允许借对话修改的配置项；若要查看清单请不传项名调用读取接口";
 
 const SETTINGS_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
 

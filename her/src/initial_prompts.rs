@@ -153,12 +153,12 @@ pub struct SaveOutcome {
 /// Saves (or, with an empty text, deletes) one entry. `Err((status, message))` carries the exact
 /// JS status and error text.
 pub fn set(context: &RuntimeContext, cfg: &Value, key: &str, raw_text: &str, now_ms: i64) -> Result<SaveOutcome, (u16, String)> {
-    let canonical = canonical_key(key).ok_or((400, "key 格式须为 group:群号 或 private:QQ号".to_string()))?;
+    let canonical = canonical_key(key).ok_or((400, "会话标识格式有误，群聊需写 group:<群ID>，单聊需写 private:<账号>".to_string()))?;
     let max = max_chars(cfg);
     let text = normalize_text(raw_text);
     let len = utf16_len(&text);
     if len > max {
-        return Err((400, format!("初始提示词过长（{len} 字符，上限 {max}）；请精简后重试")));
+        return Err((400, format!("开场背景设定超出字数上限（现有 {len} 字符，至多 {max}）；请删减精简后再存")));
     }
     let _gate = SAVE_GATE.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load(context);

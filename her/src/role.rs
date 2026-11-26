@@ -44,7 +44,7 @@ pub fn utf16_take(s: &str, max: usize) -> String {
     out
 }
 
-/// 人格名清洗：与 JS 的 `/[^\w\u4e00-\u9fff-]/g` **同义**。
+/// Strip characters other than ASCII word chars, hyphens, and Han characters.
 pub(crate) fn sanitize_name(raw: &str) -> String {
     raw.chars()
         .filter(|c| {
@@ -57,7 +57,7 @@ pub(crate) fn sanitize_name(raw: &str) -> String {
 }
 
 // ── 模式标记 ────────────────────────────────────────────────────────────────
-// JS: /[\[〔（(]\s*(?:二代|2\s*代|v2|reserved2)\s*[\]〕）)]/gi
+// Mode tag matcher (v2 / reserved2 / Chinese equivalents).
 
 fn is_open_bracket(c: char) -> bool {
     matches!(c, '[' | '〔' | '（' | '(')
@@ -426,7 +426,7 @@ fn is_cjk(c: char) -> bool {
     (0x4e00..=0x9fff).contains(&(c as u32))
 }
 
-/// `/[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/`：中文之间夹空白。
+/// Match whitespace placed between adjacent Han characters.
 fn has_cjk_space_cjk(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     for i in 0..chars.len() {
@@ -461,7 +461,7 @@ pub fn role_warnings(content: &str, mode: &str, inject_max: usize) -> Vec<String
     let injected = if mode == MODE_V1 { stats.v1 } else { stats.v2 };
     if injected > inject_max {
         warnings.push(format!(
-            "超过注入字数上限：当前模式将注入 {injected} 字，超出前 {inject_max} 字的尾部不会进入提示（可通过 role.maxInjectChars 调整）"
+            "内容超出最大注入字数：当前正文计 {injected} 字，排在 {inject_max} 字之后的部分将截断不注入（可在角色上限配置里调大）"
         ));
     }
     let untagged = parse_role_sections(content)

@@ -127,7 +127,7 @@ pub(super) fn harden_selected_state_dir(context: &RuntimeContext) {
     };
     let (ok, detail) = harden_state_dir(&dir);
     if !ok {
-        crate::safe_println!("[console] ⚠️ 收紧 state/ 权限失败：{detail}");
+        crate::safe_println!("[console] ⚠️ 目录访问权限收紧未成：{detail}");
     }
 }
 
@@ -170,7 +170,7 @@ pub(super) fn security_post_tx(
         let dir = state_dir(context).map_err(|error| CommitError::plain(503, error))?;
         let (ok, detail) = harden_state_dir(&dir);
         if !ok {
-            crate::safe_println!("[console] ⚠️ 收紧 state/ 权限失败：{detail}");
+            crate::safe_println!("[console] ⚠️ 目录访问权限收紧未成：{detail}");
         }
         return Ok(CommitOutcome {
             value: json!({ "ok": ok, "hardened": ok, "path": dir }),
@@ -220,7 +220,7 @@ pub(super) fn security_post_tx(
             wake_error_prefix: "",
             finish: Box::new(move |_, _| {
                 crate::safe_println!(
-                    "[console] 控制台：拦截提醒配置已刷新（interceptNotify={}）",
+                    "[console] 管理台已将本次调整的安全拦截提示通知策略写入硬盘并生效，当前开关取值（interceptNotify={}）",
                     view.get("interceptNotify")
                         .map(js_string)
                         .unwrap_or_default()

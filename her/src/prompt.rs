@@ -102,7 +102,7 @@ pub fn role_line(key: &str) -> String {
 
 pub fn role_line_with_runtime(context: &RuntimeContext, key: &str) -> String {
     match role_for_session_with_runtime(context, key) {
-        Some(name) => format!("【当前角色】{name}（详情可调 qq_get_prompt 查看）\n\n"),
+        Some(name) => format!("【当前角色】{name}（如需查阅当前启用的完整角色卡正文内容，请调用提示词查询接口 qq_get_prompt 读取）\n\n"),
         None => String::new(),
     }
 }
@@ -206,13 +206,16 @@ fn v2_card_lines(raw: &str) -> String {
     for line in raw.split('\n') {
         if line.starts_with("##") && line[2..].contains("回复示例") {
             in_example = true;
-            let rewritten = match (line.find("（空格代表"), line.rfind('）')) {
-                (Some(start), Some(end)) if end > start => format!(
+            let rewritten = match line
+                .find("（空格代表")
+                .and_then(|start| line[start..].find('）').map(|rel| (start, start + rel)))
+            {
+                Some((start, end)) => format!(
                     "{}（示例中逗号仅表停顿；若拆成多条气泡请传数组）{}",
                     &line[..start],
                     &line[end + '）'.len_utf8()..]
                 ),
-                _ => line.to_string(),
+                None => line.to_string(),
             };
             kept.push(rewritten);
             continue;
@@ -441,7 +444,7 @@ fn pre_sleep_line(cfg: &Value, key: &str) -> String {
     if ms > 0 {
         let duration = duration_text(ms);
         line.push_str(&format!(
-            "【沉睡前强制等待】准备离场潜水前，若 preSleepWaitRemainingMs 大于 0 且仍余等待次数，请调 qq_wait_for_messages(timeoutMs={ms}) 保持观察。若 {duration} 内静默无新话即可直接收尾；期间若有新消息先查 newMessages，确定无需搭话即可结束。自己发言后请依【互动窗口】重算时长（见【互动窗口】）。\n\n"
+            "【沉睡前强制等待】准备退场潜水之前，只要剩余等待毫秒尚高于零且还有次数余额，就调 qq_wait_for_messages(timeoutMs={ms}) 保持守候。若 {duration} 内一直安静无新话即可收工结束；其间如果来了新话先逐条浏览，确认不用接茬再离场。自己发过话之后按新规则重算守候时长（见【互动窗口】）。\n\n"
         ));
     }
     if let Some(window) = crate::wake::engagement_window_ms(cfg) {
@@ -464,7 +467,7 @@ fn duration_text(ms: i64) -> String {
 /// The engagement window is the pre-sleep observation measured from her last send.
 fn engagement_line(window_ms: i64) -> String {
     let duration = duration_text(window_ms);
-    format!("【互动窗口】你每次成功发送后保持互动 {duration}；只有你自己的成功发送会重新计时，别人的消息（闲聊，或给你但你选择跳过的消息）都不会延长它。互动期间 qq_wait_for_messages(purpose=messages) 只在有给你的消息（forYou=true）、@你或管理员来信时立即返回，期间的闲聊一并带上；只有闲聊时会一直等到互动窗口结束再一起返回。每条消息带桥接提示 forYou（true/false）和简短原因 forYouReason（私聊你、拍了拍你、引用回复你、@你、提到你的昵称或群名片、或正在和你来回交流）。forYou 只是提示，不强制回复：逐条判断，回复或跳过，再继续等待。互动窗口结束时等待返回 engagementEnded=true 和退出指令，桥接会让你干净地沉睡并保留当前唤醒配置；互动中用完本轮等待次数时同样干净地沉睡。\n\n")
+    format!("【互动窗口】你每次成功发送后保持互动 {duration}；唯有本人发出的消息才重设这段倒数，他人发言（无论是普通闲聊还是找你而你未回）都不顺延计时。互动期间调用消息等待工具（将 purpose 参数设为 messages）会在收到针对你的来信（forYou=true）、被艾特或管理员发言时即刻返回，同时捎带期间的普通群聊；若一直只有旁人闲谈，则会守至本段结束才合并交付。每条来信都会附带字段 forYou（true 或 false）和简短原因 forYouReason（私聊、拍拍、引用、艾特、提到称呼或来回对话）。forYou 仅供参考而不强制回复，逐条斟酌决定搭话或略过后再继续等候。互动时段结束时等待返回 engagementEnded=true 并给出退出指令，系统随之带你退入休眠并沿用当前唤醒设定；期间耗尽等待次数也会平稳收尾。\n\n")
 }
 
 fn wait_limit_line(cfg: &Value) -> String {
@@ -1063,31 +1066,31 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: i64) -> String {
     match reason {
         // 首次唤醒：引导它先看角色/工具，再决定怎么被唤醒。
         "bootstrap" => format!(
-            "【引导唤醒】已接入 QQ 对话：{key}\n当前采用工具直驱模式，直接输出的文字不会发往 QQ，发言须通过工具完成。\n先调 qq_get_prompt 了解设定、状态与可用工具；如需说话调用发送工具，临结束再调 qq_set_wake_config 设定后续唤醒条件。"
+            "【引导唤醒】已接入 QQ 对话：{key}\n当前采用工具直驱模式，直接输出的文字不会发往 QQ，发言须通过工具完成。\n开口之前可先浏览设定、状态及工具说明；需要讲话就调发送接口，离场前务必配置好下轮唤醒方案。"
         ),
         "replyCheck" => {
             let mut out = format!(
                 "【回复检查】{key}\n原因：刚才你发出过消息，现回来确认群内是否接话。\n看到回应请先读内容，有话想讲可直接调发送工具，无人回应时平静收尾即可。"
             );
             if pre_sleep_ms > 0 {
-                out.push_str(&format!("仍需观察可调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms})，有消息先阅览 newMessages。"));
+                out.push_str(&format!("如果眼下还须继续守候一小段时间以观察群里动向，请调用等待工具 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 保持监听；其间倘若收到新的群内发言，请先逐条阅览内容再斟酌要不要开口接话或保持静默。"));
             }
             out
         }
         "poke" => format!(
-            "【唤醒】{key}\n原因：检测到拍一拍事件（对象可能是你或他人）。\n查看未读或近期记录中的 [拍一拍] 提示确认目标，想回拍可用 qq_send_poke，否则调 qq_mark_read 或 qq_set_wake_config 结束。"
+            "【唤醒】{key}\n原因：刚才有人发起了拍一拍（被拍对象可能是你，也可能是群里其他人）。\n请先翻看未读或近期列表中的拍一拍记录核实对象；打算回拍可调用 qq_send_poke，否则推进已读进度或更新唤醒设定收尾。"
         ),
         "timeout" => format!(
             "【唤醒】{key}\n原因：预设的定时潜水时长届满，期间未命中所设触发规则。\n可按需翻阅近期消息，或重新配置后续唤醒条件。"
         ),
         "proactiveCheck" => format!(
-            "【主动机会】{key}\n原因：对话空闲度已满足条件。请按场内氛围酌情决定是否开口，也可直接调 qq_mark_read 或 qq_set_wake_config 收尾。"
+            "【主动机会】{key}\n原因：当前对话安静了一段时间，已满足主动冒泡的条件。请先结合眼下气氛斟酌是否适合插话；没有合适话头的话，直接推进已读或配置下次唤醒即可离场。"
         ),
         r if r.starts_with("reminder:") => format!(
             "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按当前唤醒规则收尾。"
         ),
         other => format!(
-            "【唤醒】{key}\n原因：{other}\n【行动前】请先判断场内气氛（话题方向、冷热程度、是否明确针对你、对方是否讲完、自己是否真有话讲）。\n【引用规则】仅当你要回应的对象并非最新一条他人发言，或连发多句且各自指向不同对象时，才通过 qq_reply 或 qq_send_message 的 replyToMessageId 明确引用；其余情况无需引用。\n你可调用工具查阅未读、设定与状态并自行决定发言与否；若决定潜水，按当前唤醒规范收尾。"
+            "【唤醒】{key}\n原因：{other}\n【行动前】请先判断场内气氛（话题方向、冷热程度、是否明确针对你、对方是否讲完、自己是否真有话讲）。\n【引用规则】仅当你要回应的对象并非最新一条他人发言，或连发多句且各自指向不同对象时，才经由发消息或回复接口的引用字段明确标出目标编号；其余情况无需引用。\n你可调用工具查阅未读、设定与状态并自行决定发言与否；若决定潜水，按当前唤醒规范收尾。"
         ),
     }
 }
@@ -1120,9 +1123,9 @@ pub fn build_reminder_with_runtime(
     out.push_str(&role_line_with_runtime(context, key));
     out.push_str(&identity_line(&crate::model_view::strip_from_model_text(self_name, &cfg), self_qq));
     out.push_str(&token_line(token));
-    out.push_str("【提醒】本次对话尚未完成收尾。请调用 qq_set_wake_config 设定下次唤醒规则（定时休眠时长、@、昵称、关键词、提问、概率或特定成员等），或调 qq_mark_read 并填妥已查看的 readThroughSeq 作为 throughSeq，以免遗漏收尾导致会话陷入「永眠」。");
+    out.push_str("【提醒】本轮对话还没执行收尾动作。离开前务必借助 qq_set_wake_config 设妥下一次唤醒方案（定时休眠、被艾特、称呼、触发词、直问、随机概率或特定成员等），或者提交本轮已阅览妥当的本地进度序号标记已读，避免会话陷入无法再被唤起的「永眠」状态。");
     if pre_sleep_ms > 0 {
-        out.push_str(&format!("仍需沉睡前观察时用 qq_wait_for_messages(timeoutMs={pre_sleep_ms})；有人说话时先查看 newMessages。"));
+        out.push_str(&format!("如果目前还没满足睡前静默观察的时长要求，请继续调用等待工具 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 守候余下时段；守候期间一旦有人开口说话，先浏览新来发言再决定要不要开口插话或安静结束。"));
     }
     out
 }
@@ -1475,7 +1478,7 @@ mod tests {
         // 主动冒泡是独立的一段，**不能落进 other 分支** —— 这里钉住它是【主动机会】
         let d = tail("proactiveCheck", "group:1", 300_000);
         assert!(d.starts_with("【主动机会】"), "proactiveCheck 必须走专属分支，实际：{d}");
-        assert!(d.contains("空闲度已满足条件"));
+        assert!(d.contains("主动冒泡"));
         assert!(!d.contains("【行动前】"));
         assert!(tail("reminder:rem-1", "group:1", 300_000).starts_with("【提醒】"));
     }
@@ -1485,7 +1488,7 @@ mod tests {
         let (root, context) = runtime_fixture("reminder");
         let p = build_reminder_with_runtime(&context, "private:1", "Fixture Bot", "7004");
         assert!(p.contains("【你的身份】"));
-        assert!(p.contains("【提醒】本次对话尚未完成收尾"));
+        assert!(p.contains("【提醒】本轮对话还没执行收尾动作"));
         assert!(p.contains("永眠"), "必须点明后果，否则模型不当回事");
         assert!(!p.contains("qq_wait_for_messages(timeoutMs="), "private closeout has no mandatory wait");
         assert!(!p.contains("【此刻状态】"), "提醒 prompt 不该带状态块");
@@ -1853,6 +1856,16 @@ mod tests {
     }
 
     #[test]
+    fn role_hint_v2_preserves_trailing_parenthetical_after_example_heading() {
+        let input = "# 卡\n\n## 回复示例（空格代表分两条）（保留附注）\n甲 乙\n";
+        let out = v2_card_lines(input);
+        assert_eq!(
+            out,
+            "# 卡\n\n## 回复示例（示例中逗号仅表停顿；若拆成多条气泡请传数组）（保留附注）\n甲，乙\n"
+        );
+    }
+
+    #[test]
     fn role_map_default_empty_string_means_no_role_even_with_a_global_role() {
         let (root, context) = runtime_fixture("role-default");
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
@@ -1910,7 +1923,7 @@ mod tests {
     fn engage_briefing_and_wait_tool_explain_the_engagement_window() {
         let cfg = serde_json::json!({"socialV2":{"wake":{"preSleepWaitMs":180000}}});
         let line = pre_sleep_line(&cfg, "group:1");
-        for needle in ["3 分钟", "只有你自己的成功发送会重新计时", "forYou", "forYouReason", "不强制回复", "engagementEnded", "保留当前唤醒配置", "不占次数"] {
+        for needle in ["3 分钟", "唯有本人发出的消息才重设这段倒数", "forYou", "forYouReason", "不强制回复", "engagementEnded", "沿用当前唤醒设定", "不占次数"] {
             assert!(line.contains(needle), "briefing lacks {needle}: {line}");
         }
         let tools = crate::mcp::tool_list(&cfg);
@@ -1939,7 +1952,7 @@ mod tests {
         let line = pre_sleep_line(&serde_json::json!({}), "group:1");
         assert!(line.contains("【互动窗口】你每次成功发送后保持互动 5 分钟"), "{line}");
         let paragraph = line.split("【互动窗口】你每次").next().unwrap();
-        assert!(paragraph.contains("【沉睡前强制等待】准备离场潜水前") && paragraph.contains("见【互动窗口】"), "{paragraph}");
+        assert!(paragraph.contains("【沉睡前强制等待】准备退场潜水之前") && paragraph.contains("见【互动窗口】"), "{paragraph}");
         assert!(!paragraph.contains("若你选择参与"), "the window rule is stated once: {paragraph}");
     }
 
@@ -2146,8 +2159,8 @@ pub(crate) fn render_wake(
     let wake_config = crate::wake::without_wake_bookkeeping(st["wakeConfig"].clone());
     let wake_config = crate::model_view::strip_model_chat_data(&wake_config, cfg);
     delta.push_str(&format!("【当前唤醒配置】{wake_config}\n\n"));
-    delta.push_str("【回复节奏】需要说话时调用发送工具即可，桥接层会自动安排停顿；返回 reviseRequired=true 时先看 newMessages 再改发，睡前观察另计。\n\n");
-    delta.push_str(&format!("【观察状态】preSleepWaitRemainingMs={}\n\n",
+    delta.push_str("【回复节奏】要回话时经发送接口递出消息即可，发件停顿与时机由桥接层统一调度；如返回修订标志，先查看新来消息再决定改发或放弃，睡前守候另行计算。\n\n");
+    delta.push_str(&format!("【观察状态】当前距离本轮睡前静默观察达标尚余如下毫秒数值，供后续安排等待调用时核对并决定时长参考：preSleepWaitRemainingMs={}\n\n",
         crate::wake::pre_sleep_remaining(st,cfg,key,now_ms()).unwrap_or(0)));
     if !full { delta.push_str(&wait_limit_line(cfg)); }
     // Automatic recall for the message being answered. The briefing's retrieval section remains

@@ -228,7 +228,7 @@ impl Pipeline {
             Ok(v) => v,
             Err(_) if access_changed(self) => return Err(refused()),
             Err(e) if e.contains("401") => {
-                println!("[dsh] session/create 401，重读密钥后重试");
+                println!("[dsh] 建联接口遇 401，重载本地凭证后再重投一次");
                 self.rpc.relogin().map_err(|re| format!("{e}；重新登录也失败：{re}"))?;
                 if access_changed(self) {
                     return Err(refused());
@@ -857,7 +857,7 @@ impl Pipeline {
     /// Retain the local activity/recovery diagnostics; the shared failure reporter owns the private alert.
     fn report_turn_error(&mut self, cfg: &serde_json::Value, key: &str, message: &str) {
         let safe = self.hide_if_sensitive(cfg, key, &crate::activity::slice(message, 500));
-        println!("[turn] ⚠️ agent 处理出错 ({key})：{}", crate::activity::redact(&self.context, &safe));
+        println!("[turn] ⚠️ 处理回合发生故障 ({key})：{}", crate::activity::redact(&self.context, &safe));
         crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&safe, 80)));
         recovery_log::record(
             &self.context,
@@ -1444,7 +1444,7 @@ impl Pipeline {
             let outcome = match action {
                 failover::FailoverAction::Retry { idx: next } => {
                     println!(
-                        "[failover] {key} 失败（{} {}），换 {} 重投",
+                        "[failover] {key} 线路遇挫（{} {}），换接 {} 重试",
                         kind.as_str(),
                         crate::activity::redacted_preview(&self.context, &why, 80),
                         chain[next].label()

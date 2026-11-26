@@ -1243,10 +1243,10 @@ fn get_prompt_sticker_strategy_follows_include_in_prompt_even_when_disabled() {
     const JS_STRATEGY: &str = "【表情包策略：自然使用，别刷屏】
 - 使用时机：遇到搞笑、吐槽、接梗、附和、调侃、安抚、无言、道别、互怼或对方发图回应时，都可以顺手配一张。
 - 使用频率：日常对话不必每句都配图，隔三五轮挑准时机发一张即可；气氛热络玩梗时可略加密，但切忌连续刷屏。
-- 选图方法：优先挑选描述（desc）或个人备注（localNote/tags）契合当前语境的图；若缺乏说明或拿不准图意，先调 qq_get_sticker_image 看图再决定。
-- 发送规范：调 qq_send_sticker 单独成条发出，表情气泡内不能混带文字；需要说话时先调 qq_send_message / qq_reply 发文字气泡，再另发一条表情。若需引用或点名，请附带 replyToMessageId / atUserId（群内）。
+- 选图方法：优先从图库清单中挑出备注与情景合拍的图；若图库里缺乏文字描述或拿不准图意，先查看原图确认后再决定。
+- 发送规范：每次调用发表情工具都应单独发成一条气泡，切勿把图和字拼在一条里；想说话请先发文字气泡再另外配图，群内支持附带引用或点名对象。
 - 避坑事项：正经、敏感或严肃讨论时别硬插图；不要反复连发同一张；不要单条连塞多张或文字混排；不要长期只靠发表情敷衍回复。
-- 备注积累：碰到不熟悉的图意时，先用 qq_get_sticker_image 查验画面，再通过 qq_sticker_note 补录含义便于日后挑图。";
+- 备注积累：碰到不熟悉的图意时，先看图核验画面内容，再写一条本地笔记把含义记下来方便以后挑图。";
     for (label, sticker, expected) in [
         ("disabled-included", json!({"enabled": false}), JS_STRATEGY),
         ("disabled-excluded", json!({"enabled": false, "includeInPrompt": false}), ""),

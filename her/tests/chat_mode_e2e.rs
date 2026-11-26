@@ -78,7 +78,7 @@ fn closed_agent_approval_accept_and_reject_have_one_receipt_each() {
         assert!(wait_for(Duration::from_secs(12), || rig.texts_to(OWNER_KEY).iter().any(|s| s == "synthetic reply")), "turn did not continue");
         let messages = rig.texts_to(OWNER_KEY);
         let interaction: Vec<_> = messages.iter().filter(|s| s.as_str() != ACK).map(String::as_str).collect();
-        assert_eq!(interaction, vec!["🔐 agent 请求审批：file_write\n理由：save report\n回复「通过」或「拒绝」", "synthetic reply"], "the frozen JS sends no approval confirmation");
+        assert_eq!(interaction, vec!["🔐 当前挂起待批操作：file_write\n理由：save report\n请回复「通过」或者「拒绝」", "synthetic reply"], "the frozen JS sends no approval confirmation");
         assert_eq!(rig.dsh.prompts().len(), 1);
         wait_pending(&rig, pending); // The frozen JS retains answered approvals until timeout or reset.
     }
@@ -3659,11 +3659,11 @@ fn check_hotfix128_final_text(marker: &str, token: Option<&str>, guard: bool) {
         assert!(!summary.contains("private plan") && !summary.contains("thought"));
     } else {
         assert!(summary.ends_with("synthetic reply"), "ordinary text is unchanged: {summary}");
-        assert!(activity.contains("AI 内部输出：synthetic reply"));
+        assert!(activity.contains("对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：synthetic reply"));
     }
     if marker == "#REPEAT128#" {
         assert_eq!(summary.matches("***").count(), 2, "one fixed mask per repeated token");
-        let internal = activity.lines().find(|line| line.contains("AI 内部输出：")).unwrap();
+        let internal = activity.lines().find(|line| line.contains("对话端本回合直接输出的这段文本并未外发（仅作内部草稿归档备查）：")).unwrap();
         assert_eq!(internal.matches("***").count(), 2, "Markdown must preserve both masks: {internal}");
     }
     assert!(rig.texts_to(OWNER_KEY).is_empty(), "local masking must not alert the owner: {:?}", rig.sends());

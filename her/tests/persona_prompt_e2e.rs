@@ -145,7 +145,7 @@ impl Dsh {
             inner.prompts.push(PromptRec {
                 session: sid.clone(),
                 text: text.clone(),
-                is_reminder: text.contains("【提醒】本次对话尚未完成收尾"),
+                is_reminder: text.contains("【提醒】本轮对话还没执行收尾动作"),
                 get_prompt: Value::Null,
             });
         }
@@ -1264,7 +1264,7 @@ fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
     // no prompt carries the command, and every prompt is one of those timed wakes.
     let delivered = rig.dsh.prompts();
     assert!(delivered.iter().all(|p| !p.text.contains("/persona")), "the command reached the model: {delivered:?}");
-    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】已接入 QQ 对话") || p.text.contains("【提醒】本次对话尚未完成收尾")), "a turn other than a timed wake ran: {delivered:?}");
+    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】已接入 QQ 对话") || p.text.contains("【提醒】本轮对话还没执行收尾动作")), "a turn other than a timed wake ran: {delivered:?}");
     assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
     assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
 }

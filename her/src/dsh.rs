@@ -688,8 +688,7 @@ pub struct TurnUsage {
 
 /// 从一条会话事件里取 provider usage，语义照抄 JS `usageOfEvent`：
 ///   · `assistant/message` 优先用 `data.usage`；
-///   · 否则从 `assistant/message` / `assistant/attempt` 的 `data.stream` 尾部
-///     找最后一个带 `usage` 的 chunk。
+///   · 若缺少顶层 usage，则回溯读取事件中流式字段末端的最后一条用量记录。
 ///
 /// 与 JS 一样用「字段存在」判断（`!== undefined`）：`data.usage: null` 也算存在，不回落到 stream，
 /// 归一化后得到 0 桶，于是不产生采样。
@@ -1438,7 +1437,7 @@ impl FollowStream {
 /// 诊断用：订阅会话并把收到的帧类型打印出来（不做解析）。
 // ── 回合核对：某条 prompt 在 DSH 里到底发生了什么（ticket 10）──────────────────────
 
-/// `projections.values.inbox` 里待处理的用户消息（`next-turn` + `next-step`）。
+/// `projections.values.inbox` 待处理的入站请求条目。
 fn inbox_of_values(values: Option<&serde_json::Value>) -> Option<Vec<serde_json::Value>> {
     let inbox = values?.get("inbox")?;
     let mut items = Vec::new();
@@ -1918,12 +1917,12 @@ mod tests {
     fn only_the_exact_session_not_found_code_proves_a_session_is_gone() {
         assert!(is_session_gone("session/projections 被拒：session-not-found: session s1 not found"));
         assert!(is_session_gone("订阅被拒：session-not-found"));
-        assert!(is_session_gone("所有候选模型都设置失败：x：session/selectModel 被拒：session/not-found: gone"));
+        assert!(is_session_gone("全部备选线路切换均遇到阻碍（测试样例）：x；选线调用被拒：session/not-found: gone"));
         for text in [
             "连 /api/remote.mux 失败：HTTP error: 404 Not Found",
             "session/projections 被拒：internal: Method not found",
             "session/projections 被拒：internal: session not found in cache",
-            "响应不是 JSON（session/projections）：expected value；原文 Not Found",
+            "响应不是 JSON（session/projections）：解析时未收到有效实体对象，网关只吐出短文 Not Found",
             "订阅被拒：resource not found",
             "session/projections 被拒：workspace-not-found: x",
             "session-not-found",

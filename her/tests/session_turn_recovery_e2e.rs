@@ -1655,7 +1655,7 @@ fn scheduling_unclosed_wake_gets_one_reminder_then_resets_its_counter() {
         let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
         state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"] == 0
     }), "scheduler did not reset the completed unclosed wake");
-    assert!(rig.dsh.applied()[1].text.contains("【提醒】本次对话尚未完成收尾"));
+    assert!(rig.dsh.applied()[1].text.contains("【提醒】本轮对话还没执行收尾动作"));
     assert!(!rig.dsh.applied()[1].text.contains("【本次消息快照】"), "JS reminders do not offer a wake snapshot");
     let state: Value = serde_json::from_slice(&fs::read(rig.root.join("data/social-v2.json")).unwrap()).unwrap();
     assert_eq!(state["conversations"][GROUP_KEY]["wakeConfig"]["wakeCount"], 0);
