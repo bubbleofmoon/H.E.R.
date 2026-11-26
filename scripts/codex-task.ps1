@@ -15,7 +15,6 @@ param(
 # "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report).
 # The sandbox is read-only, workspace-write or bypass. workspace-write writes only -WorkDir and -AddDir
 # (neither the temp folder nor $env:TEMP: the caller points TEMP at a writable -AddDir) and gets loopback/network access.
-# Only codex-work implement uses bypass to disable sandboxing and approvals.
 # Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
 # After a writable run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
 $ErrorActionPreference = 'Stop'

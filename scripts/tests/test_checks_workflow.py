@@ -82,7 +82,7 @@ class PathClassification(unittest.TestCase):
             "docs\\guide.md",
             "her/AGENTS.md",
             "her/THIRD_PARTY_NOTICES.md",
-            ".claude/agents/planner.md",
+            "docs/agents/coordinator.md",
             "docs/agents/issue-tracker.MD",
         ):
             with self.subTest(path=path):

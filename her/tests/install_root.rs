@@ -34,7 +34,7 @@ fn command(image: &Path) -> Command {
         .env_remove("HER_INSTALL_ROOT");
     cmd
 }
-/// Interpreter for the Python helpers: `python` when it runs, else `python3` (same rule as agent-guard.sh).
+/// Interpreter for the Python helpers: `python` when it runs, else `python3`.
 fn python_program() -> &'static str {
     static PYTHON: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     PYTHON.get_or_init(|| {

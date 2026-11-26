@@ -1,6 +1,6 @@
 name: quick
 run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}${{ inputs.sha && format(' sha={0}', inputs.sha) || '' }}
-# Batch test targets per step and OS. Dispatch check and lint separately. The coordinator dispatches and waits for Codex runs. A quota-fallback Claude implementer may dispatch unpinned batches and hand back the IDs once.
+# Batch test targets per step and OS. Dispatch check and lint separately. The coordinator dispatches and waits for runs.
 # A second run with the same ref, target, os, filter and sha cancels the first. `-f sha=<commit>` runs an older commit instead of the ref head (a red receipt); the step fails unless it is an ancestor of the head.
 # Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
 # `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
