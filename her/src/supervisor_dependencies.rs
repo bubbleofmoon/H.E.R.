@@ -1196,23 +1196,23 @@ fn run_npm(
             install.version
         )
     };
-    let mut tree = os::NpmTree::spawn(command)?;
+    let mut tree = crate::process_tree::ProcessTree::spawn(command, Duration::from_secs(30))?;
     let deadline = Instant::now() + NPM_INSTALL_LIMIT;
     loop {
         if !wanted(context) {
-            tree.stop();
+            let _ = tree.stop();
             return Ok(false);
         }
-        match tree.child().try_wait() {
+        match tree.child_mut().try_wait() {
             Ok(Some(status)) if status.success() => return Ok(true),
             Ok(Some(_)) => return Err(failed("npm could not install")),
             Ok(None) if Instant::now() >= deadline => {
-                tree.stop();
+                let _ = tree.stop();
                 return Err(failed("npm timed out after 10 minutes installing"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => {
-                tree.stop();
+                let _ = tree.stop();
                 return Err(failed("npm could not be observed installing"));
             }
         }
@@ -2378,23 +2378,6 @@ mod os {
         fn ReleaseMutex(handle: HANDLE) -> i32;
         fn WaitForSingleObject(handle: HANDLE, timeout: u32) -> u32;
     }
-    /// npm and its descendants run in a kill-on-close job.
-    pub struct NpmTree(crate::backend::windows_cli_lifecycle::CliProcessTree);
-    impl NpmTree {
-        pub fn spawn(command: std::process::Command) -> Result<Self, String> {
-            crate::backend::windows_cli_lifecycle::CliProcessTree::spawn_task(
-                command,
-                Duration::from_secs(30),
-            )
-            .map(Self)
-        }
-        pub fn child(&mut self) -> &mut std::process::Child {
-            self.0.child_mut()
-        }
-        pub fn stop(&mut self) {
-            let _ = self.0.stop_task();
-        }
-    }
     pub struct Gate(HANDLE);
     impl Drop for Gate {
         fn drop(&mut self) {
@@ -2486,31 +2469,6 @@ mod os {
 #[cfg(unix)]
 mod os {
     use super::*;
-    /// npm runs as its own process group so a stop reaches its descendants.
-    pub struct NpmTree(std::process::Child);
-    impl NpmTree {
-        pub fn spawn(mut command: std::process::Command) -> Result<Self, String> {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-            command
-                .spawn()
-                .map(Self)
-                .map_err(|e| format!("npm could not start: {}", e.kind()))
-        }
-        pub fn child(&mut self) -> &mut std::process::Child {
-            &mut self.0
-        }
-        pub fn stop(&mut self) {
-            // The unreaped leader keeps its PID, so the group id cannot have been reused.
-            if let Ok(pid) = i32::try_from(self.0.id()) {
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            }
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     pub fn processes() -> Result<Vec<Entry>, String> {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir("/proc")
