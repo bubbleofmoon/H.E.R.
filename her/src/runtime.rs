@@ -1448,6 +1448,24 @@ fn validated_components(relative: &str) -> Result<Vec<&std::ffi::OsStr>, &'stati
         .collect()
 }
 
+fn is_ntfs_deleted_path(path: &Path) -> bool {
+    let mut saw_extend = false;
+    for component in path.components() {
+        let Some(name) = (match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        }) else {
+            saw_extend = false;
+            continue;
+        };
+        if saw_extend && name.eq_ignore_ascii_case("$Deleted") {
+            return true;
+        }
+        saw_extend = name.eq_ignore_ascii_case("$Extend");
+    }
+    false
+}
+
 pub(crate) fn resolve_contained_path(
     pinned_root: &Path,
     area_relative: &str,
@@ -1525,6 +1543,12 @@ pub(crate) fn resolve_contained_path(
         fs::canonicalize(&candidate).map_err(|e| runtime_io_error("path/canonicalize", &e))?
     };
     if !canonical.starts_with(pinned_root) {
+        if cfg!(windows) && is_ntfs_deleted_path(&canonical) {
+            return Err(runtime_io_error(
+                "path/canonicalize",
+                &std::io::Error::from_raw_os_error(303),
+            ));
+        }
         return Err("runtime path policy rejected class=path".into());
     }
     let root_meta = fs::symlink_metadata(pinned_root).map_err(|e| runtime_io_error("root/metadata", &e))?;
@@ -3183,11 +3207,14 @@ pub(crate) mod tests {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         let sharing = std::io::Error::from_raw_os_error(32);
+        let delete_pending = std::io::Error::from_raw_os_error(303);
         assert!(transient_read_io(true, &denied));
         assert!(transient_read_io(true, &sharing));
+        assert!(transient_read_io(true, &delete_pending));
         assert!(!transient_read_io(true, &missing));
         assert!(!transient_read_io(false, &denied));
         assert!(!transient_read_io(false, &sharing));
+        assert!(!transient_read_io(false, &delete_pending));
 
         assert!(transient_read_resolve(
             true,
@@ -3196,6 +3223,10 @@ pub(crate) mod tests {
         assert!(transient_read_resolve(
             true,
             "class=path/canonicalize kind=Uncategorized os=Some(32)"
+        ));
+        assert!(transient_read_resolve(
+            true,
+            "class=path/canonicalize kind=Uncategorized os=Some(303)"
         ));
         assert!(!transient_read_resolve(
             true,
@@ -3210,6 +3241,21 @@ pub(crate) mod tests {
             false,
             "class=leaf/metadata kind=PermissionDenied os=Some(5)"
         ));
+        assert!(!transient_read_resolve(
+            false,
+            "class=path/canonicalize kind=Uncategorized os=Some(303)"
+        ));
+    }
+
+    #[test]
+    fn ntfs_deleted_path_matches_only_consecutive_extend_deleted_components() {
+        assert!(is_ntfs_deleted_path(Path::new("/$Extend/$Deleted/file-id")));
+        assert!(is_ntfs_deleted_path(Path::new("C:/$extend/$deleted/abc123")));
+        #[cfg(windows)]
+        assert!(is_ntfs_deleted_path(Path::new(r"\\?\C:\$Extend\$Deleted\abc123")));
+        assert!(!is_ntfs_deleted_path(Path::new("/$Extend/other/$Deleted/abc123")));
+        assert!(!is_ntfs_deleted_path(Path::new("/$Extend/$DeletedExtra/abc123")));
+        assert!(!is_ntfs_deleted_path(Path::new("/runtime/data/settings.db-wal")));
     }
 }
 
@@ -3223,7 +3269,7 @@ const READ_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_millis
 fn transient_read_io(windows: bool, error: &std::io::Error) -> bool {
     windows
         && (error.kind() == std::io::ErrorKind::PermissionDenied
-            || matches!(error.raw_os_error(), Some(5 | 32 | 33)))
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303)))
 }
 
 fn transient_read_resolve(windows: bool, error: &str) -> bool {
@@ -3233,7 +3279,8 @@ fn transient_read_resolve(windows: bool, error: &str) -> bool {
         && (error.contains("kind=PermissionDenied")
             || error.contains("os=Some(5)")
             || error.contains("os=Some(32)")
-            || error.contains("os=Some(33)"))
+            || error.contains("os=Some(33)")
+            || error.contains("os=Some(303)"))
 }
 
 fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {

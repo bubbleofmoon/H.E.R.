@@ -891,6 +891,10 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
     );
     drop(inspected);
 
+    let shm = root.0.join("data/settings.db-shm");
+    let _ = std::fs::remove_file(&shm);
+    assert!(!shm.exists(), "missing-shm test starts without settings.db-shm");
+
     let wal = root.0.join("data/settings.db-wal");
     std::fs::write(&wal, vec![0u8; 4096]).unwrap();
 
