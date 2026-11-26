@@ -211,10 +211,10 @@ pub(crate) fn resolve_safe_addresses_with(hostname: &str, resolver: &Resolver) -
     }
     let addresses = resolver(h).map_err(|e| format!("域名解析失败：{e}"))?;
     if addresses.is_empty() {
-        return Err("域名没有解析结果".to_string());
+        return Err("DNS 未返回任何地址".to_string());
     }
     if addresses.iter().any(|a| is_private_ip(&a.to_string())) {
-        return Err("域名解析到内网/本机地址，已阻止".to_string());
+        return Err("解析到内网或回环 IP，已拦截".to_string());
     }
     let ordered = order_addresses(&addresses);
     Ok(if ordered.is_empty() { vec![addresses[0]] } else { ordered })
@@ -607,7 +607,7 @@ pub(crate) fn fetch_text_with(raw_url: &str, max_chars: usize, resolver: &Resolv
             }
         }
     }
-    Err("重定向次数过多，已停止".to_string())
+    Err("跳转次数超出上限，已中止".to_string())
 }
 
 pub(crate) fn fetch_text(raw_url: &str, max_chars: usize) -> Result<Value, String> {
@@ -628,7 +628,7 @@ pub(crate) fn post_json_with(
     let deadline = Instant::now() + timeout;
     let attempts = addresses.len().min(2);
     if attempts == 0 {
-        return Err("没有任何可用地址".to_string());
+        return Err("无可用目标 IP".to_string());
     }
     let mut last_error: Option<String> = None;
     for pin in addresses.iter().take(attempts) {
@@ -641,7 +641,7 @@ pub(crate) fn post_json_with(
         let mut bytes: Vec<u8> = Vec::new();
         let mut on_head = |head: &Head| {
             if (300..400).contains(&head.status) {
-                Flow::Abort(format!("联网搜索端点返回重定向（HTTP {}），已拒绝跟随", head.status))
+                Flow::Abort(format!("搜索服务返回跳转状态（HTTP {}），拒绝跟随", head.status))
             } else {
                 Flow::Continue
             }
@@ -649,7 +649,7 @@ pub(crate) fn post_json_with(
         let mut on_body = |chunk: &[u8]| {
             bytes.extend_from_slice(chunk);
             if bytes.len() > max_bytes {
-                Flow::Abort("联网搜索响应体过大，已中止".to_string())
+                Flow::Abort("搜索返回数据体积超限，已切断".to_string())
             } else {
                 Flow::Continue
             }
@@ -657,13 +657,13 @@ pub(crate) fn post_json_with(
         match transfer_fn(&transfer, &mut on_head, &mut on_body) {
             Ok((head, _)) => return Ok((head.status, String::from_utf8_lossy(&bytes).into_owned())),
             Err(TransferError::Timeout) => {
-                last_error = Some(format!("联网搜索请求超时（{}s）", (budget.as_secs_f64()).round() as u64));
+                last_error = Some(format!("搜索接口超时（{} 秒）", (budget.as_secs_f64()).round() as u64));
             }
-            Err(TransferError::Interrupted) => last_error = Some("联网搜索响应中断".to_string()),
+            Err(TransferError::Interrupted) => last_error = Some("搜索接口传输中途断开".to_string()),
             Err(TransferError::Other(message)) => last_error = Some(message),
         }
     }
-    Err(last_error.unwrap_or_else(|| "联网搜索请求失败".to_string()))
+    Err(last_error.unwrap_or_else(|| "搜索接口调用异常".to_string()))
 }
 
 pub(crate) fn post_json(url: &Url, addresses: &[IpAddr], headers: Vec<(String, String)>, body: &str, timeout: Duration, max_bytes: usize) -> Result<(u16, String), String> {
@@ -784,12 +784,12 @@ mod tests {
         let (result, _) = run("http://public.test/dir/start", 100, relative);
         assert_eq!(result.unwrap()["url"], "http://public.test/next?x=1");
         let rebind: Script = Box::new(|_| Ok((307, Some("http://rebind.test/".into()), vec![])));
-        assert_eq!(run("http://public.test/", 100, rebind).0.unwrap_err(), "域名解析到内网/本机地址，已阻止");
+        assert_eq!(run("http://public.test/", 100, rebind).0.unwrap_err(), "解析到内网或回环 IP，已拦截");
         let missing: Script = Box::new(|_| Ok((302, None, vec![])));
         assert_eq!(run("http://public.test/", 100, missing).0.unwrap_err(), "重定向缺少 Location: 302");
         let endless: Script = Box::new(|_| Ok((302, Some("/again".into()), vec![])));
         let (result, log) = run("http://public.test/", 100, endless);
-        assert_eq!(result.unwrap_err(), "重定向次数过多，已停止");
+        assert_eq!(result.unwrap_err(), "跳转次数超出上限，已中止");
         assert_eq!(log.len(), 6, "the first request plus five redirects");
     }
 
@@ -807,8 +807,8 @@ mod tests {
             ("http://0x7f.1/", "禁止访问内网/本机地址"),
             ("http://[::1]/", "禁止访问内网/本机地址"),
             ("http://[::ffff:10.0.0.1]/", "禁止访问内网/本机地址"),
-            ("http://rebind.test/", "域名解析到内网/本机地址，已阻止"),
-            ("http://empty.test/", "域名没有解析结果"),
+            ("http://rebind.test/", "解析到内网或回环 IP，已拦截"),
+            ("http://empty.test/", "DNS 未返回任何地址"),
             ("http://nx.test/", "域名解析失败：getaddrinfo ENOTFOUND"),
         ] {
             assert_eq!(run(url, 100, Box::new(|_| panic!("no transfer may start"))).0.unwrap_err(), why, "{url}");

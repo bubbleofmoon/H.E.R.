@@ -1,26 +1,7 @@
-//! Token 账本（对应 JS 的 `token-ledger.js` 的载入与 recent 视图）。
+//! Token usage ledger: loads, merges, and aggregates `token-usage.jsonl` and `token-usage-rust.jsonl`.
 //!
-//! 数据源是**两份**文件（TD-1：双写无锁 → 各写各的，读时合并）：
-//!   · `qq-bridge/state/token-usage.jsonl`      —— JS 写，Rust 只读
-//!   · `state/token-usage-rust.jsonl`           —— Rust 写，JS 只读
-//!
-//! 分开写的原因：Windows 的 append 不保证原子，两个进程往同一个文件追加会交错出半行
-//! （决策日志已经实测坏过 24 行）。跨进程文件锁在 Windows 上更脆，所以照抄决策日志的
-//! 成功做法 —— 分文件，读取方合并。合并时**按 `t`（ts）排序**再重放，保证下面的
-//! seq 幂等规则跨文件也按时间生效。
-//!
-//! 每行一条记录，`k` 区分类型：
-//!   · `base`  —— 压缩后的基线（某会话截至某 seq 的累计桶）
-//!   · `turn`  —— 单轮采样（turn/step/retry 定位）
-//!   · `evict` —— 被淘汰的旧采样汇总（只保累计，不再拆到某一轮）
-//!
-//! 两个必须守住的幂等规则（照抄 JS 的注释，因为都是**会算错钱**的坑）：
-//!   1. `turn` 只有 seq **严格变大**才允许覆盖。相等 seq 只可能是重连时的快照重放，
-//!      放行「相等覆盖」会让旧快照把新数据改小，花费凭空缩水。
-//!   2. `base` 旧基线不得覆盖新基线（按 seq 比较）。
-//!
-//! 这一版只做 `load` + `recent` + `stats`；`summary` / `series` / `conversation`
-//! 是下一批（它们都建立在同一份载入结果上）。
+//! Separate files avoid non-atomic interleaved appends on Windows; records are sorted by timestamp `t` on load
+//! so turn `seq` monotonicity and baseline precedence apply consistently across files.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -325,7 +306,7 @@ impl Ledger {
             "base" => {
                 if let Some(prev) = self.baselines.get(&sid) {
                     if prev.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1) > seq {
-                        return false; // 旧基线不得覆盖新基线
+                        return false; // Do not let older baselines overwrite newer ones.
                     }
                 }
                 if !self.baselines.contains_key(&sid) {
@@ -630,9 +611,9 @@ impl Ledger {
         base.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1) >= max_seq
     }
 
-    /// 账本里出现过的全部 sessionId（基线 / 采样 / 淘汰 / 活动记录四处并集）。
+    /// Union of all `sessionId` values across baselines, samples, evictions, and activity records.
     pub fn all_session_ids(&self) -> Vec<String> {
-        // 顺序照抄 JS：baselines → sessionSeen → evicted → samples. Membership is a set, so the cost stays linear in the
+        // Order: baselines, session_seen, evicted, then samples; membership tracking keeps lookup linear.
         // number of sessions (harness usage adds one session per process and conversation).
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut ids: Vec<String> = Vec::new();
@@ -645,13 +626,8 @@ impl Ledger {
         ids
     }
 
-    /// 汇总：全局 + 每个会话（对应 `summary`）。
-    /// **按 provider 分列**（R3 要求：官方 DeepSeek 与 opencode go 分开看）。
-    ///
-    /// 只看**活数据**：基线之前的采样已经算进基线累计，再算一遍就是重复计费
-    /// —— 和 `build_index` 用的是同一条判据。
-    ///
-    /// 峰谷分开统计：同一份 token 在高峰/低峰的单价不同，混在一起看不出"贵在哪"。
+    /// Aggregate summary totals globally and per provider, separating peak and off-peak costs
+    /// and excluding pre-baseline samples already folded into baselines.
     pub fn by_provider(&self, table: &PriceTable) -> Value {
         struct Agg {
             samples: i64,
@@ -937,7 +913,7 @@ impl Ledger {
                 }
                 turns += e.turns.len() as i64;
             }
-            // 能拆到具体某一轮的花费 = 所有采样花费之和；差额是只剩累计值的历史
+            // Difference between total cost and attributed turn samples represents pre-turn baseline history.
             let attr = entry.map(|e| e.all_cost).unwrap_or(0.0);
             attributed += attr;
             unattributed += (c - attr).max(0.0);
@@ -984,7 +960,7 @@ pub const BUCKET_LADDER_MS: &[i64] = &[
     7 * 24 * 60 * 60 * 1000,
 ];
 
-/// 在不超过 maxBuckets 的前提下选最细的桶。
+/// Pick the finest bucket width from `BUCKET_LADDER_MS` that stays within `max_buckets`.
 pub fn pick_bucket_ms(window_ms: i64, max_buckets: i64) -> i64 {
     for c in BUCKET_LADDER_MS {
         if window_ms / c <= max_buckets {
@@ -995,13 +971,8 @@ pub fn pick_bucket_ms(window_ms: i64, max_buckets: i64) -> i64 {
 }
 
 impl Ledger {
-/// 按时间分桶的走势（对应 `series`）。控制台每 3 秒拉一次，所以刻意做成**单遍扫描**。
-///
-/// 三个不能省的细节（JS 注释里写死了，照抄）：
-///   1. 空桶必须补零出现 —— 否则「那段时间很安静」会被画成「那两小时之间什么都没有」，图会撒谎。
-///   2. 空桶也要有峰谷档位，按该时刻真实归属标 —— 否则看不出「这段时间本来就是 2 倍价」。
-///   3. `offChartCost` = 权威总额 − 窗口内合计。图上加起来不等于总花费时，
-///      前端要能解释差额（更早的回合 / 基线覆盖的历史），否则用户会以为丢钱了。
+/// Single-pass time-bucketed cost series (zero-padded empty intervals, labeled with peak/off-peak tier,
+/// plus `offChartCost`/`offChartTokens` for history outside the selected window).
 pub fn series(&self, table: &PriceTable, hours: i64, max_buckets: i64, at: Option<i64>) -> Value {
     let end_at = at.unwrap_or_else(now_ms);
     let window_hours = hours.clamp(1, 24 * 90);
@@ -1052,12 +1023,12 @@ pub fn series(&self, table: &PriceTable, hours: i64, max_buckets: i64, at: Optio
     let mut counted = 0i64;
     let mut turn_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 权威总额（含窗口外）：淘汰汇总 + 基线 + 未被基线覆盖的采样，与 summary 同口径
+    // Authoritative ledger totals across evictions, baselines, and uncovered samples.
     let mut ledger_cost = 0.0;
     let mut ledger_buckets = Buckets::default();
     for (sid, e) in &self.evicted {
         if self.eviction_covered(sid, e) {
-            continue; // 已被基线覆盖，再加一次就是重复计费
+            continue; // Already included in the baseline.
         }
         ledger_cost += e.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
         ledger_buckets =
@@ -1186,9 +1157,7 @@ pub fn series(&self, table: &PriceTable, hours: i64, max_buckets: i64, at: Optio
     })
 }
 
-/// 某个会话的逐轮明细（新的在前）。
-///
-/// 注意 `turns` 是**数组**（覆盖掉视图里的同名计数），与 JS 的 `...view, turns: rows` 一致。
+/// Detailed per-turn breakdown for a conversation key (newest first); `turns` is the row array.
 pub fn conversation(&self, table: &PriceTable, key: &str, turn_limit: i64) -> Option<Value> {
     let sids: Vec<String> = self.all_session_ids().into_iter().filter(|sid| self.key_of(sid).as_deref() == Some(key)).collect();
     if sids.is_empty() {
@@ -1867,7 +1836,7 @@ pub fn plan_appends(existing: &Ledger, candidates: &[Value]) -> Vec<Value> {
                 let seq = c.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1);
                 let buckets = buckets_json(&normalize_usage(c.get("b")));
                 if let Some((prev_seq, prev_buckets)) = base_state.get(sid) {
-                    // 旧基线不得覆盖新基线；同序号且内容未变的重复基线（重连重发）不再落盘。
+                    // Ignore older baselines and unchanged duplicate baseline replays.
                     if *prev_seq > seq || (*prev_seq == seq && *prev_buckets == buckets) {
                         continue;
                     }

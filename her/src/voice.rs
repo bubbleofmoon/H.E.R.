@@ -370,7 +370,7 @@ pub fn probe_audio(file: &Path, ffprobe: &str, tmp_dir: Option<&Path>) -> Result
     let dir = dirs
         .into_iter()
         .find(|d| std::fs::create_dir_all(d).is_ok() && std::fs::metadata(d).map(|m| !m.permissions().readonly()).unwrap_or(false))
-        .ok_or_else(|| "没有可写的临时目录用于 ffprobe 输出".to_string())?;
+        .ok_or_else(|| "找不到可写入 ffprobe 输出的临时目录".to_string())?;
     let out_file = dir.join(format!("p-{}.json", unique_suffix()));
     let args: Vec<String> = [
         "-v", "error", "-show_entries", "format=duration,format_name", "-show_entries",
@@ -390,7 +390,7 @@ pub fn probe_audio(file: &Path, ffprobe: &str, tmp_dir: Option<&Path>) -> Result
             return Err(format!("ffprobe 执行失败（退出码 {code}）"));
         }
         let raw = std::fs::read_to_string(&out_file)
-            .map_err(|error| format!("ffprobe 未产出结果（退出码 {code}，{error}）"))?;
+            .map_err(|error| format!("ffprobe 未生成输出文件（退出码 {code}，{error}）"))?;
         if raw.trim().is_empty() {
             return Err(format!("ffprobe 结果为空（退出码 {code}）"));
         }
@@ -478,7 +478,7 @@ pub fn inspect_audio(file: &Path, max_bytes: u64, max_seconds: f64, ffprobe: &st
     let meta = match std::fs::metadata(file) {
         Ok(meta) => meta,
         Err(error) => {
-            return Inspect { error: Some(format!("文件不存在或不可读：{error}")), ..Inspect::default() };
+            return Inspect { error: Some(format!("无法读取音频文件：{error}")), ..Inspect::default() };
         }
     };
     if !meta.is_file() {
@@ -498,7 +498,7 @@ pub fn inspect_audio(file: &Path, max_bytes: u64, max_seconds: f64, ffprobe: &st
     let name = file.to_string_lossy();
     if !is_audio_file(&name) {
         let ext = extname(&name);
-        warnings.push(format!("扩展名 {} 不在常见音频列表内，将交给网关自行识别", if ext.is_empty() { "(无)" } else { ext }));
+        warnings.push(format!("扩展名 {} 非常见音频后缀，将由网关尝试识别", if ext.is_empty() { "(无)" } else { ext }));
     }
     let lower_ext = extname(&name).to_lowercase();
     let is_silk = lower_ext == ".silk" || lower_ext == ".slk";
@@ -528,10 +528,10 @@ pub fn inspect_audio(file: &Path, max_bytes: u64, max_seconds: f64, ffprobe: &st
         };
     }
     if probe.duration > 60.0 {
-        warnings.push(format!("时长 {} 较长，QQ 会显示为长语音", format_duration(probe.duration)));
+        warnings.push(format!("音频时长 {} 较长，QQ 端将展示为长语音", format_duration(probe.duration)));
     }
     if probe.codec.is_empty() {
-        warnings.push("没找到音频流，网关转码可能失败".into());
+        warnings.push("未检测到音频流，网关可能无法完成转码".into());
     }
     Inspect {
         ok: true,
@@ -609,7 +609,7 @@ pub fn resolve_audio_processing(options: &AudioOptions) -> Result<Plan, String> 
         return match &options.loudness {
             Loudness::Number(n) => {
                 if !n.is_finite() || *n < -40.0 || *n > -5.0 {
-                    Err(format!("目标响度需在 -40 ~ -5 LUFS 之间，收到 {}", crate::qq_tools::js_number(*n)))
+                    Err(format!("目标响度须介于 -40 至 -5 LUFS，当前为 {}", crate::qq_tools::js_number(*n)))
                 } else {
                     Ok(Plan { volume: 1.0, loudness: Some(*n) })
                 }
@@ -621,7 +621,7 @@ pub fn resolve_audio_processing(options: &AudioOptions) -> Result<Plan, String> 
                     "loud" => -13.0,
                     _ => {
                         return Err(format!(
-                            "未知的响度档位「{name}」（可选：quiet / normal / loud，或直接给 -40~-5 的 LUFS 数字）"
+                            "不支持的响度预设「{name}」（可用 quiet / normal / loud，或直接传入 -40~-5 的 LUFS 数值）"
                         ))
                     }
                 };
@@ -631,11 +631,11 @@ pub fn resolve_audio_processing(options: &AudioOptions) -> Result<Plan, String> 
     }
     let v = options.volume;
     if !v.is_finite() {
-        return Err(format!("音量必须是数字，收到「{}」", options.volume_text));
+        return Err(format!("音量参数须为有效数字，当前收到「{}」", options.volume_text));
     }
     if !(VOLUME_MIN..=VOLUME_MAX).contains(&v) {
         return Err(format!(
-            "音量倍数需在 {}~{} 之间（1.0 = 原样），收到 {}",
+            "音量倍率限制为 {}~{}（1.0 表示原音量），当前收到 {}",
             crate::qq_tools::js_number(VOLUME_MIN),
             crate::qq_tools::js_number(VOLUME_MAX),
             crate::qq_tools::js_number(v)
@@ -703,7 +703,7 @@ pub fn process_audio_volume(file: &Path, plan: &Plan, ffmpeg_configured: Option<
             Run::Exit(code) => Outcome::Code(code),
             Run::TimedOut => Outcome::Error("ffmpeg 超时".into()),
             Run::SpawnFailed(error) if first && error.kind() == std::io::ErrorKind::NotFound => Outcome::Error(
-                "找不到 ffmpeg（请设置 FFMPEG_PATH 或在 config.json 里指定 socialV2.voice.ffmpegPath）".into(),
+                "未找到 ffmpeg 程序（可设置 FFMPEG_PATH 或在 config.json 配置 socialV2.voice.ffmpegPath）".into(),
             ),
             Run::SpawnFailed(error) => Outcome::Error(format!("ffmpeg 不可用：{}", io_reason(&ffmpeg, &error))),
         }
@@ -735,17 +735,17 @@ pub fn process_audio_volume(file: &Path, plan: &Plan, ffmpeg_configured: Option<
         }
         Outcome::Code(code) if !matches!(code, Some(0)) || !out_path.exists() => {
             cleanup(None);
-            return Err(format!("ffmpeg 音量处理失败（退出码 {}）", code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())));
+            return Err(format!("ffmpeg 音量转码异常（退出码 {}）", code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())));
         }
         Outcome::Code(_) => {}
     }
     if std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0) == 0 {
         cleanup(None);
-        return Err("ffmpeg 输出为空文件（源音频可能损坏）".into());
+        return Err("ffmpeg 生成的音频为空文件，请检查源音频是否损坏".into());
     }
     cleanup(Some(&out_path));
     let detail = match plan.loudness {
-        Some(target) => format!("智能音量（响度归一 {} LUFS）", crate::qq_tools::js_number(target)),
+        Some(target) => format!("响度均衡模式（目标 {} LUFS）", crate::qq_tools::js_number(target)),
         None if plan.volume > 1.0 => format!("音量提升至 {}%", (plan.volume * 100.0).round() as i64),
         None => format!("音量压低至 {}%", (plan.volume * 100.0).round() as i64),
     };
@@ -773,10 +773,10 @@ pub fn budget_check(scope: &str, now: i64, per_minute: f64, per_hour: f64) -> Re
     let in_minute = bucket.iter().filter(|t| now - **t < 60_000).count() as f64;
     let in_hour = bucket.iter().filter(|t| now - **t < 3_600_000).count() as f64;
     if per_minute > 0.0 && in_minute + 1.0 > per_minute {
-        return Err(format!("语音发送频率超限（每分钟最多 {} 条），请稍后再试", crate::qq_tools::js_number(per_minute)));
+        return Err(format!("已达每分钟语音配额上限（{} 条），请稍后重试", crate::qq_tools::js_number(per_minute)));
     }
     if per_hour > 0.0 && in_hour + 1.0 > per_hour {
-        return Err(format!("语音发送频率超限（每小时最多 {} 条），请稍后再试", crate::qq_tools::js_number(per_hour)));
+        return Err(format!("已达每小时语音配额上限（{} 条），请稍后重试", crate::qq_tools::js_number(per_hour)));
     }
     Ok(())
 }
@@ -851,14 +851,14 @@ mod tests {
             resolve_audio_processing(&options(2.0, "2", false, Loudness::Name("normal".into()))),
             Ok(Plan { volume: 2.0, loudness: None })
         );
-        assert_eq!(resolve_audio_processing(&options(9.0, "9", false, Loudness::Name("normal".into()))).unwrap_err(), "音量倍数需在 0.1~4 之间（1.0 = 原样），收到 9");
-        assert_eq!(resolve_audio_processing(&options(f64::NAN, "loud", false, Loudness::Name("normal".into()))).unwrap_err(), "音量必须是数字，收到「loud」");
+        assert_eq!(resolve_audio_processing(&options(9.0, "9", false, Loudness::Name("normal".into()))).unwrap_err(), "音量倍率限制为 0.1~4（1.0 表示原音量），当前收到 9");
+        assert_eq!(resolve_audio_processing(&options(f64::NAN, "loud", false, Loudness::Name("normal".into()))).unwrap_err(), "音量参数须为有效数字，当前收到「loud」");
         assert_eq!(
             resolve_audio_processing(&options(1.0, "1", true, Loudness::Name("loud".into()))),
             Ok(Plan { volume: 1.0, loudness: Some(-13.0) })
         );
         assert_eq!(resolve_audio_processing(&options(1.0, "1", true, Loudness::Number(-18.0))), Ok(Plan { volume: 1.0, loudness: Some(-18.0) }));
-        assert_eq!(resolve_audio_processing(&options(1.0, "1", true, Loudness::Number(-3.0))).unwrap_err(), "目标响度需在 -40 ~ -5 LUFS 之间，收到 -3");
+        assert_eq!(resolve_audio_processing(&options(1.0, "1", true, Loudness::Number(-3.0))).unwrap_err(), "目标响度须介于 -40 至 -5 LUFS，当前为 -3");
     }
 
     #[test]
@@ -868,9 +868,9 @@ mod tests {
         assert!(budget_check(&scope, now, 1.0, 10.0).is_ok());
         assert!(budget_check(&scope, now, 1.0, 10.0).is_ok(), "checking is free");
         budget_commit(&scope, now);
-        assert_eq!(budget_check(&scope, now + 1, 1.0, 10.0).unwrap_err(), "语音发送频率超限（每分钟最多 1 条），请稍后再试");
+        assert_eq!(budget_check(&scope, now + 1, 1.0, 10.0).unwrap_err(), "已达每分钟语音配额上限（1 条），请稍后重试");
         assert!(budget_check(&scope, now + 60_001, 1.0, 10.0).is_ok(), "a minute later the slot is free");
-        assert_eq!(budget_check(&scope, now + 60_001, 0.0, 1.0).unwrap_err(), "语音发送频率超限（每小时最多 1 条），请稍后再试");
+        assert_eq!(budget_check(&scope, now + 60_001, 0.0, 1.0).unwrap_err(), "已达每小时语音配额上限（1 条），请稍后重试");
         assert!(budget_check(&scope, now + 1, 0.0, 0.0).is_ok(), "zero means unlimited");
     }
 

@@ -233,7 +233,7 @@ pub enum GiveUp {
     AlreadySent,
     /// 已经重试过，不再重试。
     RetriesExhausted,
-    /// 已经是最后一个候选。
+    /// No remaining fallback candidates.
     LastCandidate,
 }
 
@@ -243,7 +243,7 @@ impl GiveUp {
             Self::NoFallbacks => "没有配置 fallbacks",
             Self::AlreadySent => "本轮已发过消息，避免重复发送",
             Self::RetriesExhausted => "已重试过，放弃",
-            Self::LastCandidate => "已是最后一个候选",
+            Self::LastCandidate => "无更多可用候选",
         }
     }
 }
@@ -381,7 +381,7 @@ mod tests {
         let chain = model_chain_for(&cfg, "group:1");
         assert_eq!(chain[0].model, "claude-haiku-5-5", "会话覆盖必须替换主候选");
         assert!(chain.len() >= 2, "fallbacks 不能被覆盖吃光");
-        // 没覆盖的会话走全局
+        // Sessions without an explicit override fall back to the global chain.
         let other = model_chain_for(&cfg, "group:2");
         assert_eq!(other[0].model, "deepseek-flash");
     }

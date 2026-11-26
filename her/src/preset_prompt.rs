@@ -87,7 +87,7 @@ pub fn locate_prefix_block(text: &str) -> Option<PrefixBlock> {
         .find(|c| **c == '-' || **c == '+')
         .copied()
         .unwrap_or(' ');
-    // 块尾：只有真正的内容行才推进（块内空行留给后面的内容行重新纳入）
+    // Advance block end only on non-empty content lines (trailing blank lines stay inside if followed by more content).
     let mut block_end = key_line + 1;
     for (i, line) in lines.iter().enumerate().take(entry_end).skip(key_line + 1) {
         if line.trim().is_empty() {
@@ -177,7 +177,7 @@ pub fn extract_prefix(text: &str) -> Option<String> {
     Some(expand_block(&block))
 }
 
-/// 硬性校验：返回阻止保存的原因（空 = 可保存）。
+/// Blocking validation: return error messages preventing save (empty means valid).
 pub fn preset_blockers(content: &str, preset_v1: bool) -> Vec<String> {
     let mut out = Vec::new();
     if content.trim().is_empty() {
@@ -229,7 +229,7 @@ pub fn render_preset_prompt_yaml(text: &str, content: &str, preset_v1: bool) -> 
     if !blockers.is_empty() {
         return Err(blockers.join("；"));
     }
-    // 沿用文件主导行尾
+    // Preserve the dominant line ending in the original file.
     let crlf = text.matches("\r\n").count();
     let lf_only = text.matches('\n').count().saturating_sub(crlf);
     let eol = if crlf >= lf_only { "\r\n" } else { "\n" };
@@ -251,9 +251,9 @@ pub fn render_preset_prompt_yaml(text: &str, content: &str, preset_v1: bool) -> 
     next_lines.extend_from_slice(&block.lines[block.block_end..]);
     let next = next_lines.join("\n");
     match extract_prefix(&next) {
-        None => Err("写入后 YAML 解析失败或找不到 persona.prefix".to_string()),
+        None => Err("回写后的 YAML 无法解析或缺失 persona.prefix 节点".to_string()),
         Some(back) if back != normalized => {
-            Err("写入校验失败：读回的提示词与新内容不一致，已放弃写入".to_string())
+            Err("回写后校验不一致：读出的正文与提交内容不同，已中止保存".to_string())
         }
         Some(_) => Ok(next),
     }

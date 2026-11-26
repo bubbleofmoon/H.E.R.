@@ -325,7 +325,7 @@ fn feedback_is_rate_limited_per_session_and_the_sixth_in_a_minute_is_refused() {
         assert_eq!(s, 200, "{b}");
     }
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "sixth"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (429, "反馈过于频繁，请稍后再试"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (429, "触发反馈频率上限，请稍后再试"));
     // Another session's quota is separate.
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "fresh"}));
     assert_eq!(s, 200);

@@ -77,7 +77,7 @@ fn post_inner(
         }
     }
     if !crate::feedback::allow(&scope_of(context), &key, now_ms()) {
-        return Err((429, "反馈过于频繁，请稍后再试".to_string()));
+        return Err((429, "触发反馈频率上限，请稍后再试".to_string()));
     }
     let max_length = agent::js_number_or(cfg.pointer("/socialV2/feedback/maxLength"), 500.0).max(1.0);
     let message = crate::social_mem::truncate_text(&raw, max_length as i64);

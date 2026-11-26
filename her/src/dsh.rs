@@ -691,7 +691,7 @@ pub async fn demo_create_and_prompt(base: &str, preset: &str) -> Result<(), Stri
         serde_json::json!({
             "sessionId": sid,
             "mode": "queue",
-            "content": [{ "type": "text", "text": "只回复两个字：收到" }]
+            "content": [{ "type": "text", "text": "仅回两字：好的" }]
         }),
     )?;
     println!("[dsh] prompt 已投递：{}", accepted);
@@ -822,7 +822,7 @@ pub struct UsageHarvest {
     pub base: Option<BaseFact>,
 }
 
-/// `projections.tokenUsage`：整条会话日志的权威累计，截至 `as_of_seq`。
+/// `projections.tokenUsage`: cumulative token counters across the session log up to `as_of_seq`.
 #[derive(Debug, Clone)]
 pub struct BaseFact {
     pub as_of_seq: i64,
@@ -1569,7 +1569,7 @@ async fn probe_prompt_with(rpc: &Rpc, session_id: &str, rpc_ids: &[String], harv
     let mut inbox: Option<Vec<serde_json::Value>> = None;
     match rpc.call("session/projections", serde_json::json!({ "sessionId": session_id })) {
         Ok(value) => {
-            // null = 会话不在宿主注册表里（没有活动 agent），没有待处理项。
+            // null means the session is absent from the host registry, with no queued items.
             inbox = Some(if value.is_null() {
                 Vec::new()
             } else {

@@ -87,10 +87,9 @@ pub fn ip_allowed(ip: IpAddr) -> bool {
     !crate::aux_fetch::is_private_ip(&ip.to_string())
 }
 
-/// 解析主机名并校验所有解析结果都必须是公网地址。
+/// 对目标主机做域名解析，要求返回的全部 IP 都处于公网段。
 ///
-/// **要求全部通过**而不是"有一个通过就行"：DNS 返回多个地址时，
-/// 只要有一个是内网，就可能被用在重试/轮询里。
+/// 哪怕只夹带一个内网 IP 也整体拒绝，防止后续重试轮询时落入内网。
 pub fn resolve_public(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
     // 主机名本身就是 IP 字面量时直接判
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -201,7 +200,7 @@ where
     R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
     F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
 {
-    fetch_checked(raw_url, max_bytes, redirects, budget, looks_like_image, "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）", resolve, transfer)
+    fetch_checked(raw_url, max_bytes, redirects, budget, looks_like_image, "目标文件不是受支持的图片格式（PNG/JPEG/GIF/WebP）", resolve, transfer)
 }
 
 /// `fetch_with_hops` with the body check `accept` in place of the image magic; a body it refuses fails with `refusal`.
@@ -254,7 +253,7 @@ where
             url: current,
         });
     }
-    Err("重定向次数过多，已停止".to_string())
+    Err("跳转次数超出上限，已中止".to_string())
 }
 
 fn redirect_target(base: &ParsedUrl, location: &str) -> Result<String, String> {

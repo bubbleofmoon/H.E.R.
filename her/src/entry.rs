@@ -1650,7 +1650,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         println!("[failover-probe] 候选链 {} 个：{:?}", chain.len(), chain.iter().map(|c| c.label()).collect::<Vec<_>>());
         let key = "private:7001";
         match pipe
-            .ask_with_failover(key, "只回复两个字：收到", 180, &cfg_raw)
+            .ask_with_failover(key, "仅回两字：好的", 180, &cfg_raw)
             .await
         {
             Ok(text) => println!("[failover-probe] ✅ 拿到回复（{} 字）：{}", text.chars().count(), activity::preview_chars(&text, 40)),
@@ -2169,13 +2169,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if !live_groups.is_empty() {
         println!("[her] 灰度接管：{live_groups:?}");
     }
-    // 交接一致性：JS 的闸门是 `rollout.rustGroups`（配置文件），Rust 实际服务的是
-    // 命令行 `--live-groups`。两者不一致的后果是**静默失联**：
-    // JS 看到 rustGroups 就把这些会话的唤醒让给 Rust，而 Rust 没打算服务它们 ——
-    // 两边都不回，群里就是"机器人突然哑了"，而且没有任何报错。
-    //
-    // 所以发现不一致就**直接退出**：Rust 退出后心跳停更，JS 在 TTL 内自动收回这些会话，
-    // 最坏是短暂停顿。比起"永久哑掉直到有人发现"，这个失败方式好得多。
+    // Handover invariant: `--live-groups` must match `rollout.rustGroups` in config.json.
+    // Otherwise one runtime yields the groups while the other ignores them, leaving them silent.
+    // Exit immediately on mismatch so the supervisor / peer runtime can reclaim the sessions cleanly.
     if let Some(missing) = if live_mode { rollout_mismatch(&cfg_raw, &live_groups) } else { None } {
         println!("[her] ❌ 灰度配置不一致，拒绝启动：");
         println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");

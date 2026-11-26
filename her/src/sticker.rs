@@ -1,11 +1,6 @@
-//! P7：QQ 收藏表情同步。
+//! Custom QQ sticker synchronization: fetch, merge with local notes/tags/use counts, and persist.
 //!
-//! JS 版在 `sticker-lib.js` 里做三件事：拉取（`fetch_custom_face_detail`）、
-//! 合并（保留本地认知：localNote / tags / useCount）、落盘。
-//! 这里逐条对齐，重点是把「合并」写成纯函数——它全是状态迁移，最该被测。
-//!
-//! 一条硬规则（JS 里踩过坑）：**「文件不存在」和「文件读坏了」必须分开**。
-//! 读坏了当成空库再合并写回，会把 AI 攒的备注/标签/使用次数永久清零。
+//! Distinguish missing files from corrupted JSON files so a parse failure never wipes local metadata.
 
 use serde_json::{Value, json};
 use crate::runtime::{RuntimeArea, RuntimeContext};
@@ -585,11 +580,11 @@ pub fn sync_for_runtime(
             resp.get("wording").and_then(|w| w.as_str()).unwrap_or("unknown")
         ));
     }
-    // 只有拿到合法数组才允许合并；data 异常时不能拿空数组清空本地库。
+    // Merge only when response.data is an array so malformed payloads cannot overwrite local state.
     let fetched = resp
         .get("data")
         .and_then(|d| d.as_array())
-        .ok_or("fetch_custom_face_detail 返回 data 不是数组，已放弃同步")?
+        .ok_or("fetch_custom_face_detail 响应中的 data 字段非数组类型，已中止同步")?
         .clone();
 
     let complete = fetched.len() < count;
@@ -1175,7 +1170,7 @@ mod tests {
         let result = sync_with_runtime(&context, &context.load_config().unwrap());
         let request = fake.finish();
         assert_onebot_request(&request, "selected-gateway-token-fixture");
-        assert!(result.unwrap_err().contains("data 不是数组"));
+        assert!(result.unwrap_err().contains("非数组类型"));
         assert_eq!(std::fs::read(&store).unwrap(), original);
     }
 

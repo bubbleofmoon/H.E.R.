@@ -182,7 +182,7 @@ fn revision(
             json!({"ok":true,"held":true,"reviseRequired":true,"newMessages":messages,
             "partial":packet["partial"],"nextAfterSeq":next,"readThroughSeq":packet["readThroughSeq"],
             "replyRevisionsUsed":used+1,"replyRevisionLimitReached":used+1>=MAX_REVISIONS,
-            "reason":"对方又说了… 本次待发内容已取消。先看 newMessages，再修改或重新发送；partial=true 时继续读取未读。最多退回修改三次，之后发送按本次请求的静默截止时间放行。"}),
+            "reason":"对方又说了几句，这条待发气泡已作废。请浏览 newMessages 后调整或重发；若 partial=true 需继续拉取未读。至多退回修订三回，超过后将按本轮静默截止时间发出。"}),
         ))
     })
 }

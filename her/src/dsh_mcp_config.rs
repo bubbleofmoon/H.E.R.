@@ -25,7 +25,7 @@ fn yaml_single_quote(text: &str) -> String {
 
 /// The managed block for `exe` (LF line endings, ends with a newline).
 pub fn render_block(exe: &str, runtime: Option<(&str, u16)>) -> String {
-    let mut out = format!("{BEGIN}\n# 由 her dsh-mcp-config 维护；这段区块会被整体替换，请勿手工编辑内部条目。\n");
+    let mut out = format!("{BEGIN}\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n");
     for (id, server_name, arg, timeout) in SERVERS {
         out.push_str("- insert:\n");
         out.push_str(&format!("    - id: {id}\n"));

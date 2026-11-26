@@ -1,11 +1,5 @@
-//! P3 记忆库移植：直接读写 JS 建的同一个 `data/memory.db`（schema 不动、数据不搬）。
-//!
-//! 与 `qq-bridge/src/memory-store.mjs` 逐条对齐：
-//!   resolveReaderScope  读者能读哪些 owner_id（ACL）
-//!   searchMemory        FTS5(bigram) + 过滤 + 打分排序 + hits 自增
-//!   **private 硬约束**  非 owner 且非本会话私聊时看不到 scope='private'
-//!
-//! 分词必须与 JS 的 `segment()` 完全一致，否则同一个库会出现不同的检索结果（且是静默的）。
+//! SQLite memory store (`data/memory.db`): ACL scope resolution, FTS5 bigram search,
+//! and strict `private` isolation (restricted to owners and the originating private chat).
 
 use rusqlite::{params, Connection, OpenFlags, ToSql};
 use std::path::PathBuf;

@@ -445,13 +445,7 @@ pub fn scheduler_from_state(
     s
 }
 
-/// 对应 JS 的 `ensureWakeableV2(st)`：**加载时**兜一次「配置里一个触发条件都没有」，
-/// 重置成默认配置，避免永眠。
-///
-/// JS 在四处调用它：加载状态、主动检查定时器、回合收尾（设过唤醒配置/读过消息时）、
-/// mark_read 端点。Rust 原来只有 mark_read 那一处 —— 也就是说「加载时兜底」这条没有。
-/// 现在的影子是从 JS 那边加载的、配置早就被 JS 兜过了，所以线上看不出差别；
-/// 但等 Rust 独立跑，这条不能少。
+/// Reset an un-wakeable session wake config at load time so the session cannot remain permanently unreachable.
 pub fn ensure_wakeable_at_load(sched: &mut WakeScheduler, cfg_json: &serde_json::Value, now: i64, rand01: f64) -> bool {
     let wc = &sched.wc;
     let timed = !wc.infinite
@@ -962,8 +956,7 @@ mod tests {
 
     #[test]
     fn ensure_wakeable_at_load_resets_dead_config() {
-        // 一个触发条件都没有的配置（全 false + 概率 0 + 无关键词）必须被兜底重置，
-        // 否则这条会话永远不会被唤醒（JS 在加载时就会兜）。
+        // A config with all triggers disabled, zero probability, and no keywords must fall back to defaults at load time.
         let cfg = serde_json::json!({"socialV2": {"wake": {"recommendedSleepMinMs": 300000}}});
         let dead = serde_json::json!({
             "infinite": true,

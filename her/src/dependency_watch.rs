@@ -41,9 +41,9 @@ fn edge_report(context: &RuntimeContext, cfg: &Value) {
             crate::admin_alert::notify_notice(context, cfg, &format!("SnowLuma 上游不健康：{hint}"), "snowluma-degraded");
         }
         Report::Recovered => {
-            crate::safe_println!("[health] ✅ SnowLuma 上游已恢复正常（good≠false 且事件包在流动）");
+            crate::safe_println!("[health] ✅ SnowLuma 网关事件流恢复正常（good 非 false 且心跳/事件可达）");
             recovery_log::record(context, Trigger::Recovery, Component::Snowluma, "recovered", Outcome::Ok, "receive chain healthy again");
-            crate::admin_alert::notify_notice(context, cfg, "SnowLuma 上游已恢复正常", "snowluma-recovered");
+            crate::admin_alert::notify_notice(context, cfg, "SnowLuma 网关接收链路已恢复", "snowluma-recovered");
         }
     }
 }

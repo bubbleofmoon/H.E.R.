@@ -23,10 +23,10 @@ pub fn truncate_text(value: &str, max: i64) -> String {
     let mut cut = limit;
     let code = units[cut - 1];
     if (0xd800..=0xdbff).contains(&code) {
-        cut -= 1; // 切在高代理上：前移一个码元
+        cut -= 1; // Back up one code unit when landing on a high surrogate.
     }
     if cut == 0 {
-        // limit=1 且开头就是代理对：至少保留一个完整码点
+        // With limit=1 and a leading surrogate pair, retain one complete scalar.
         let first = units[0];
         let second = *units.get(1).unwrap_or(&0);
         cut = if (0xd800..=0xdbff).contains(&first) && (0xdc00..=0xdfff).contains(&second) {
@@ -216,7 +216,7 @@ pub fn append_memory(
 ) {
     let text = js_trim(&redact_tokens(content, tokens)).to_string();
 
-    // 轻量清理：过期想法移除；超过 24h 未提起的话题移除（避免无限膨胀）
+    // Prune expired thoughts and topics inactive for over 24 hours.
     let thoughts = arr_mut(st, "pendingThoughts");
     thoughts.retain(|t| {
         let expires = num_of(t.get("expiresAt"));
@@ -460,9 +460,9 @@ pub fn update_memory(
         }
         "memberImpression" => {
             let impressions = obj_mut(st, "memberImpressions");
-            // 必须命中已有条目：否则任意 target 都能凭空建一条。
+            // Only existing impressions may be updated here.
             let Some(old) = impressions.get(target).cloned() else {
-                return Err((404, "找不到要编辑的群友印象（新印象请用 qq_memory_append 添加）".to_string()));
+                return Err((404, "未找到对应的成员印象，新增条目请调用 qq_memory_append".to_string()));
             };
             let new_target = extra
                 .target
@@ -511,9 +511,9 @@ mod tests {
         assert_eq!(truncate_text("abcdef", 3), "abc");
         assert_eq!(truncate_text("abc", 3), "abc");
         assert_eq!(truncate_text("abc", 0), "");
-        // 切点落在代理对中间：前移一个码元，不留孤立高代理
+        // Split mid-surrogate: step back one unit to avoid an unpaired high surrogate.
         assert_eq!(truncate_text("a🐟b", 2), "a");
-        // limit=1 且开头就是代理对：至少保留一个完整码点
+        // Keep one full scalar when limit=1 starts on a surrogate pair.
         assert_eq!(truncate_text("🐟b", 1), "🐟");
     }
 
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(truncate_text_tail("abcdef", 3), "def");
         assert_eq!(truncate_text_tail("abc", 3), "abc");
         assert_eq!(truncate_text_tail("abc", 0), "");
-        // 切点落在代理对中间：整对保留（宁可多一个码元）
+        // Mid-surrogate split: keep the full pair.
         assert_eq!(truncate_text_tail("a🐟b", 2), "🐟b");
     }
 

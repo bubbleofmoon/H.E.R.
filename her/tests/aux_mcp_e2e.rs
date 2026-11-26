@@ -159,7 +159,7 @@ fn expected_block() -> String {
         "- insert:\n    - id: {id}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server}\n        transport: stdio\n        command: {command}\n        args:\n          - '{arg}'\n{extra}"
     );
     format!(
-        "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 维护；这段区块会被整体替换，请勿手工编辑内部条目。\n{}{}{}# === qq-bridge MCP END ===\n",
+        "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n{}{}{}# === qq-bridge MCP END ===\n",
         entry("mcp-snowluma", "snowluma", "--mcp-serve", "        toolCallTimeoutMs: 725000\n"),
         entry("mcp-snowluma-host", "snowluma-host", "--mcp-host-serve", ""),
         entry("mcp-web-search-safe", "web-search-safe", "--mcp-web-search-serve", ""),
