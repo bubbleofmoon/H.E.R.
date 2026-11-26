@@ -17,7 +17,7 @@ import {
 } from '../api/her';
 import { useConsole } from '../stores/consoleStore';
 import { formatDateTimeMs, formatErrorMessage } from '../utils/format';
-import { INPUT_CLASS, utf16Length } from '../utils/herHelpers';
+import { INPUT_CLASS, isSingleLineWithin, utf16Length } from '../utils/herHelpers';
 import { Badge, Button, Card, Switch, Tabs } from './Primitives';
 
 const AUTO_PARTS: { id: PersonaAutoPart; label: string }[] = [
@@ -82,10 +82,6 @@ function normalizeDraftForCompare(d: PersonaDraft): string {
     monthlyDriftPause: d.monthlyDriftPause,
     notify: d.notify,
   });
-}
-
-function isSingleLineWithin(value: string, maxUnits: number): boolean {
-  return !/[\u0000-\u001F\u007F\u2028\u2029]/.test(value) && utf16Length(value) <= maxUnits;
 }
 
 export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId }) => {

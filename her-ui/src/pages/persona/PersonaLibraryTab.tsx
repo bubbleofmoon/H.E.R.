@@ -32,7 +32,7 @@ import { EmptyState, SearchInput } from '../../components/ConsoleWidgets';
 import { Badge, Button, Card, CardHeader } from '../../components/Primitives';
 import { useConsole } from '../../stores/consoleStore';
 import { formatDateTimeMs, formatErrorMessage } from '../../utils/format';
-import { INPUT_CLASS, utf16Length } from '../../utils/herHelpers';
+import { INPUT_CLASS, isSingleLineWithin, utf16Length } from '../../utils/herHelpers';
 
 export const PersonaLibraryTab: React.FC = () => {
   const { conversations, setInspector, openConfirm, pushToast } = useConsole();
@@ -231,10 +231,7 @@ export const PersonaLibraryTab: React.FC = () => {
       pushToast('唤醒别名最多 10 个', 'warn');
       return;
     }
-    if (
-      newFailureLine.trim() &&
-      (/[\u0000-\u001F\u007F\u2028\u2029]/.test(newFailureLine) || utf16Length(newFailureLine) > 160)
-    ) {
+    if (newFailureLine.trim() && !isSingleLineWithin(newFailureLine, 160)) {
       pushToast('终端失败提示语需为单行且不超过 160 个 UTF-16 字符', 'warn');
       return;
     }

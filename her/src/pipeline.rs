@@ -513,6 +513,10 @@ pub struct Pipeline {
     // Once the final unsubmitted failure is eligible for a line, the worker and hub
     // must use the same DSH parking decision even if health changes before collection.
     reserved2_failure_parks: Option<bool>,
+    // Set by the reserved hub (`work.attempt < 3`) and synced for DSH parking.
+    reserved_retries_remaining: Option<bool>,
+    reserved_failure_parks: Option<bool>,
+    chat_failure_defers: Option<bool>,
     /// Chat mode (ticket 12): the run state of the chat turn in flight.
     chat: Option<ChatRun>,
     /// Facts of the last finished turn, for the chat reply decision.
@@ -790,6 +794,9 @@ impl Pipeline {
             dispatch_unsubmitted: true,
             reserved2_retries_remaining: None,
             reserved2_failure_parks: None,
+            reserved_retries_remaining: None,
+            reserved_failure_parks: None,
+            chat_failure_defers: None,
             chat: None,
             last_report: None,
             failure_reported: false,
@@ -837,6 +844,14 @@ impl Pipeline {
 
     pub(crate) fn reserved2_failure_parks(&self) -> Option<bool> {
         self.reserved2_failure_parks
+    }
+
+    pub(crate) fn set_reserved_retry_budget(&mut self, retries_remaining: bool) {
+        self.reserved_retries_remaining = Some(retries_remaining);
+    }
+
+    pub(crate) fn reserved_failure_parks(&self) -> Option<bool> {
+        self.reserved_failure_parks
     }
 
     fn set_turn_token(&mut self, token: String) {
@@ -1448,17 +1463,39 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if self.turn_has_send_batch(key) {
             return;
         }
-        if mode == "reserved2" && self.dispatch_unsubmitted {
-            if let Some(retries_remaining) = self.reserved2_retries_remaining {
-                if retries_remaining {
-                    return;
+        if self.dispatch_unsubmitted {
+            match mode {
+                "reserved2" => {
+                    if let Some(retries_remaining) = self.reserved2_retries_remaining {
+                        if retries_remaining {
+                            return;
+                        }
+                        let Ok(cfg) = self.context.load_config() else { return };
+                        let parks = self.reserved2_wake_parks(&cfg, key);
+                        self.reserved2_failure_parks = Some(parks);
+                        if parks {
+                            return;
+                        }
+                    }
                 }
-                let Ok(cfg) = self.context.load_config() else { return };
-                let parks = self.reserved2_wake_parks(&cfg, key);
-                self.reserved2_failure_parks = Some(parks);
-                if parks {
-                    return;
+                "reserved" => {
+                    if self.reserved_retries_remaining == Some(true) {
+                        return;
+                    }
+                    let parks = self.unsubmitted_dsh_deferred();
+                    self.reserved_failure_parks = Some(parks);
+                    if parks {
+                        return;
+                    }
                 }
+                "chat" if dsh_session.is_some() => {
+                    let defers = self.unsubmitted_dsh_deferred();
+                    self.chat_failure_defers = Some(defers);
+                    if defers {
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
         let guard = || {
@@ -1524,6 +1561,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         owner_started: bool,
     ) -> Result<ChatTurnOutcome, String> {
         self.owner_interaction_closed = false;
+        self.chat_failure_defers = None;
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
@@ -1586,6 +1624,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         authority: crate::reserved::Authority,
     ) -> Result<(), String> {
         authority.check(&self.context, key)?;
+        self.reserved_failure_parks = None;
         self.expect_dispatch_token(authority.token.clone());
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.note_turn(
@@ -3694,5 +3733,343 @@ mod tests {
         assert_eq!(records[0]["step"], 0, "step=0 表示无明细，不冒充正常 step");
         // 连 turn/start 都没看到（prompt 未被接受）：不要凭空造一行
         assert!(turn_records("group:1", "sid-test-3", &[], 0, None, &None, &None, 0).is_empty());
+    }
+
+    struct FakeUnsubmittedDsh {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+        port: u16,
+    }
+
+    impl FakeUnsubmittedDsh {
+        fn start(unreachable_prompt: bool) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let server = std::thread::spawn(move || {
+                let mut clients = vec![];
+                while !stopping.load(Ordering::SeqCst) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    clients.push(std::thread::spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                            .unwrap();
+                        let mut head = [0; 4];
+                        if stream.peek(&mut head).is_err() {
+                            return;
+                        }
+                        if &head[..3] == b"GET" {
+                            use tokio_tungstenite::tungstenite::{accept, Message};
+                            let Ok(mut ws) = accept(stream) else { return };
+                            let Ok(msg) = ws.read() else { return };
+                            let Ok(text) = msg.to_text() else { return };
+                            let Ok(open) = serde_json::from_str::<Value>(text) else { return };
+                            let id = &open["streamId"];
+                            let _ = ws.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "item",
+                                    "streamId": id,
+                                    "value": {"type": "snapshot", "records": [], "hasMore": false}
+                                })
+                                .to_string(),
+                            ));
+                            let _ = ws.read();
+                        } else {
+                            let mut stream = stream;
+                            let mut bytes = vec![];
+                            let (path, body) = loop {
+                                let mut chunk = [0; 4096];
+                                let Ok(n) = stream.read(&mut chunk) else { return };
+                                if n == 0 {
+                                    return;
+                                }
+                                bytes.extend_from_slice(&chunk[..n]);
+                                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                    continue;
+                                };
+                                let head = String::from_utf8_lossy(&bytes[..end]);
+                                let len = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().unwrap_or(0))
+                                    })
+                                    .unwrap_or(0);
+                                if bytes.len() >= end + 4 + len {
+                                    break (
+                                        head.lines()
+                                            .next()
+                                            .unwrap()
+                                            .split_whitespace()
+                                            .nth(1)
+                                            .unwrap()
+                                            .to_string(),
+                                        String::from_utf8_lossy(&bytes[end + 4..end + 4 + len])
+                                            .to_string(),
+                                    );
+                                }
+                            };
+                            if path == "/api/session/prompt" && unreachable_prompt {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json"
+                                );
+                            } else {
+                                let value = match path.as_str() {
+                                    "/api/session/prompt" => serde_json::json!({"accepted": false}),
+                                    "/api/session/projections" => serde_json::json!({"values": []}),
+                                    _ => serde_json::json!({}),
+                                };
+                                fake_dsh_respond(
+                                    &mut stream,
+                                    &FakeDshRequest {
+                                        path,
+                                        cookie: None,
+                                        body,
+                                    },
+                                    200,
+                                    value,
+                                );
+                            }
+                        }
+                    }));
+                }
+                for client in clients {
+                    let _ = client.join();
+                }
+            });
+            Self {
+                stop,
+                server: Some(server),
+                port,
+            }
+        }
+    }
+
+    impl Drop for FakeUnsubmittedDsh {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    struct FailureLineFixture {
+        root: PathBuf,
+        context: RuntimeContext,
+        cfg: serde_json::Value,
+        ob_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ob_reqs: std::sync::Arc<std::sync::Mutex<Vec<FakeDshRequest>>>,
+        ob_server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FailureLineFixture {
+        fn finish(mut self) -> (Vec<Value>, Vec<FakeDshRequest>) {
+            self.ob_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(server) = self.ob_server.take() {
+                server.join().unwrap();
+            }
+            let outbox = crate::send_outbox::read_records(&self.context).unwrap();
+            let reqs = self.ob_reqs.lock().unwrap().drain(..).collect();
+            std::fs::remove_dir_all(&self.root).unwrap();
+            (outbox, reqs)
+        }
+    }
+
+    fn setup_failure_line_fixture(
+        tag: &str,
+        mode: &str,
+        dsh_port: u16,
+        line: &str,
+    ) -> FailureLineFixture {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let root = fake_runtime_root(tag);
+        write_selected_secret(&root, [0x48; 32]);
+        let onebot = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        onebot.set_nonblocking(true).unwrap();
+        let onebot_port = onebot.local_addr().unwrap().port();
+        let ob_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ob_reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ob_stopping = ob_stop.clone();
+        let ob_seen = ob_reqs.clone();
+        let ob_server = std::thread::spawn(move || {
+            while !ob_stopping.load(Ordering::SeqCst) {
+                if let Some((mut stream, req)) =
+                    fake_dsh_accept(&onebot, std::time::Duration::from_millis(20))
+                {
+                    ob_seen.lock().unwrap().push(req);
+                    let body = r#"{"status":"ok","retcode":0,"data":{"message_id":123}}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+        let cfg = serde_json::json!({
+            "consoleToken": "fixture-token",
+            "allow": {"groups": [42]},
+            "dsh": {"provider": "p1", "model": "m1"}
+        });
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            root.join("data/mode.json"),
+            serde_json::json!({"mode": mode}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            serde_json::json!({
+                "dsh": format!("http://127.0.0.1:{dsh_port}"),
+                "model": "http://127.0.0.1:43202",
+                "onebot": format!("http://127.0.0.1:{onebot_port}")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("data/personas.json"),
+            serde_json::json!({
+                "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+                "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+                    {"version": 1, "approved": true, "name": "Fixture", "core": "Speak plainly.", "failureLine": line}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        crate::session_map::bind(&context, "group:42", "sid-48", None).unwrap();
+        FailureLineFixture {
+            root,
+            context,
+            cfg,
+            ob_stop,
+            ob_reqs,
+            ob_server: Some(ob_server),
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_chat_unsubmitted_dsh_deferral_suppresses_failure_line_until_terminal() {
+        let line = "A moment, please.";
+        for (case, unreachable_prompt, expect_wait_for_dsh, expect_send) in [
+            ("deferred-wait-for-dsh", true, true, false),
+            ("terminal-prompt-refused", false, false, true),
+        ] {
+            let dsh = FakeUnsubmittedDsh::start(unreachable_prompt);
+            let fx = setup_failure_line_fixture(&format!("t48-chat-{case}"), "chat", dsh.port, line);
+            let mut pipe = Pipeline::new_with_runtime(&fx.context, &fx.cfg, true).unwrap();
+            let result = pipe
+                .run_chat_turn(
+                    "group:42",
+                    "hello chat",
+                    None,
+                    &fx.cfg,
+                    &["e1".into()],
+                    &[],
+                    "chat",
+                    false,
+                )
+                .await;
+            drop(pipe);
+            drop(dsh);
+            let (outbox, reqs) = fx.finish();
+
+            if expect_wait_for_dsh {
+                assert!(
+                    matches!(result, Ok(ChatTurnOutcome::WaitForDsh)),
+                    "{case}: expected WaitForDsh, got {result:?}"
+                );
+            } else {
+                assert!(result.is_err(), "{case}: expected terminal Err, got {result:?}");
+            }
+            let sent_count = reqs.len();
+            assert_eq!(
+                sent_count,
+                usize::from(expect_send),
+                "{case}: onebot failure-line send count"
+            );
+            assert_eq!(
+                outbox
+                    .iter()
+                    .filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure")
+                    .count(),
+                usize::from(expect_send),
+                "{case}: durable failure-line intent count"
+            );
+            if expect_send {
+                assert_eq!(reqs[0].path, "/send_group_msg");
+                let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+                assert_eq!(body["message"], serde_json::json!([{"type": "text", "data": {"text": line}}]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_reserved_unsubmitted_dsh_retries_and_parking_suppress_failure_line_until_terminal() {
+        let line = "A moment, please.";
+        for (case, retries_remaining, unreachable_prompt, expect_parks, expect_send) in [
+            ("retryable-attempt", true, false, None, false),
+            ("parked-on-dsh-down", false, true, Some(true), false),
+            ("terminal-retries-exhausted", false, false, Some(false), true),
+        ] {
+            let dsh = FakeUnsubmittedDsh::start(unreachable_prompt);
+            let fx =
+                setup_failure_line_fixture(&format!("t48-reserved-{case}"), "reserved", dsh.port, line);
+            let authority = crate::reserved::authority_for_test(&fx.context, "group:42").unwrap();
+            let mut pipe = Pipeline::new_with_runtime(&fx.context, &fx.cfg, true).unwrap();
+            pipe.set_reserved_retry_budget(retries_remaining);
+            let result = pipe
+                .run_reserved_turn(
+                    "group:42",
+                    "hello reserved",
+                    &fx.cfg,
+                    &["e1".into()],
+                    &[],
+                    false,
+                    authority,
+                )
+                .await;
+            let parks = pipe.reserved_failure_parks();
+            let unsubmitted = pipe.dispatch_definitely_unsubmitted();
+            drop(pipe);
+            drop(dsh);
+            let (outbox, reqs) = fx.finish();
+
+            assert!(result.is_err(), "{case}: turn failed");
+            assert!(unsubmitted, "{case}: prompt must stay unsubmitted");
+            assert_eq!(parks, expect_parks, "{case}: reserved_failure_parks");
+            assert_eq!(
+                reqs.len(),
+                usize::from(expect_send),
+                "{case}: onebot failure-line send count"
+            );
+            assert_eq!(
+                outbox
+                    .iter()
+                    .filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure")
+                    .count(),
+                usize::from(expect_send),
+                "{case}: durable failure-line intent count"
+            );
+            if expect_send {
+                assert_eq!(reqs[0].path, "/send_group_msg");
+                let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+                assert_eq!(body["message"], serde_json::json!([{"type": "text", "data": {"text": line}}]));
+            }
+        }
     }
 }

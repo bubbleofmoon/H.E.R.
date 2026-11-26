@@ -558,8 +558,15 @@ impl Pipeline {
         Ok(true)
     }
 
+    pub(super) fn unsubmitted_dsh_deferred(&self) -> bool {
+        self.dispatch_definitely_unsubmitted() && crate::dsh_health::is_down(&self.context)
+    }
+
     pub(super) fn defer_unsubmitted_dsh_chat(&self, key: &str, cfg: &serde_json::Value) -> bool {
-        if !self.dispatch_definitely_unsubmitted() || !crate::dsh_health::is_down(&self.context) {
+        let down = self
+            .chat_failure_defers
+            .unwrap_or_else(|| crate::dsh_health::is_down(&self.context));
+        if !self.dispatch_definitely_unsubmitted() || !down {
             return false;
         }
         crate::admin_alert::notify_notice(
