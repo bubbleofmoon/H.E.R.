@@ -2078,8 +2078,7 @@ fn handle_my_recent_from_doc(
 
 /// `/api/socialV2/active-members?key=&limit=`：最近参与过的人。
 ///
-/// 排序是 `count` 降序、再按 `lastTime` 降序（JS 用的是 `b.count - a.count ||
-/// b.lastTime - a.lastTime`）。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
+/// 排序是 `count` 降序、再按 `lastTime` 降序。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
 fn handle_active_members_from_doc(doc: &SocialDocument, key: &str, limit: i64) -> Value {
     let conv = doc.conversation(key).unwrap_or_default();
     let msgs = conv
@@ -3271,7 +3270,7 @@ fn handle_memory_append(
             return Err((400, "key/category/content 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         let parsed = crate::social_mem::append_extra_from(&extra);
         if category == "memberImpression" && parsed.target.is_empty() {
@@ -3311,7 +3310,7 @@ fn handle_memory_update(
             return Err((400, "key/category 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         if category == "memberImpression" && target.is_empty() {
             return Err((400, "更新人物观感条目时，须给出要改写的原成员称呼".to_string()));
@@ -3350,7 +3349,7 @@ fn handle_memory_remove(
             return Err((400, "key/category 不能为空".to_string()));
         }
         if !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         if category == "memberImpression" && target.is_empty() {
             return Err((400, "移除人物观感条目时，须指明待清理的成员称呼".to_string()));
@@ -3375,7 +3374,7 @@ fn handle_memory_clear(
             .unwrap_or_default();
         let category = req.get("category").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if !category.is_empty() && !MEMORY_CATEGORIES.contains(&category.as_str()) {
-            return Err((400, "category 必须是 activeTopic / pendingThought / memberImpression".to_string()));
+            return Err((400, "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交".to_string()));
         }
         crate::social_mem::clear_memory(conv, &category);
         Ok(json!({

@@ -1858,7 +1858,7 @@ fn token_rotation_during_a_batch_cancels_the_remaining_items() {
     assert_eq!(response.status, 500, "cancel body: {}", response.body);
     assert_eq!(response.body["sent"], 1);
     assert_eq!(response.body["cancelled"], json!([1, 2]));
-    assert!(response.body["error"].as_str().unwrap().contains("发送已取消"));
+    assert!(response.body["error"].as_str().unwrap().contains("发送中止"));
 
     let requests = onebot.finish();
     assert_eq!(send_paths(&requests).len(), 1, "cancelled items never reach OneBot");

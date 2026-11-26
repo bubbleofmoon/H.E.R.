@@ -258,7 +258,7 @@ fn simulation_alias_is_the_reserved2_gate() {
         .unwrap();
         assert_eq!(status, 403);
         assert!(
-            text.contains("须附带 agent token"),
+            text.contains("必须附带对应会话口令"),
             "simulation must pass the mode gate: {text}"
         );
     }

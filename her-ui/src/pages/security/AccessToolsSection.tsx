@@ -365,7 +365,7 @@ export const AccessToolsSection: React.FC<AccessToolsSectionProps> = ({
 
       <Card danger>
         <CardHeader
-          title="高危管理动作：作废旧凭证并立即生成全新管理台访问口令"
+          title="高危管理动作：作废旧凭证并立即生成全新控制台令牌"
           subtitle="立即吊销所有历史浏览器会话并要求重新登录，且不可通过审计撤销"
         />
         <div className="space-y-3 p-4">

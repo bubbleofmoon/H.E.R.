@@ -639,7 +639,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     );
     assert_eq!(
         invalid_append["error"],
-        "category 必须是 activeTopic / pendingThought / memberImpression"
+        "所填类别参数取值无效，目前只支持如下三种短时备忘条目类别：正在聊的话题（对应 activeTopic）、尚未开口讲的念头（对应 pendingThought）或有关群友个人的观感随笔（对应 memberImpression），请按规范核实后重新提交"
     );
     assert_eq!(fs::read(&state_a_path).unwrap(), state_a_initial);
     assert_eq!(fs::read(&state_b_path).unwrap(), state_b_initial);

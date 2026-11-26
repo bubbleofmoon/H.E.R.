@@ -594,7 +594,7 @@ fn activity_text_is_redacted_and_the_log_rotates_at_five_hundred_lines() {
     let backup = root.text("data/qq-activity.log.1");
     assert_eq!(backup.lines().count(), 501);
     let last = backup.lines().last().unwrap();
-    assert_eq!(unclocked(last), "group:70001 [reserved2] AI 反馈 [info]：see *** and ***");
+    assert_eq!(unclocked(last), "group:70001 [reserved2] 对话端发来运行情况反馈记录，记录级别为 [info]，简要说明如下：see *** and ***");
     assert_eq!(status_activity(&console), Vec::<String>::new());
     drop(console);
 }
@@ -730,7 +730,7 @@ fn a_failed_write_is_reported_not_shown_as_success_and_nothing_is_lost_or_half_a
     assert_eq!(b["ok"], false);
     blocked_feedback.restore();
     assert_eq!(entries(&console), history().as_array().cloned().unwrap(), "history intact, the failed report is not listed");
-    assert!(!root.text("data/qq-activity.log").contains("AI 反馈"), "no activity line for a report that was not stored");
+    assert!(!root.text("data/qq-activity.log").contains("对话端发来运行情况反馈记录"), "no activity line for a report that was not stored");
     let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "stored after recovery"}));
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 3);

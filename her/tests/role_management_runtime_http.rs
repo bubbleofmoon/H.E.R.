@@ -883,7 +883,7 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     );
     assert_eq!(
         select_missing["error"],
-        "角色「Missing」不存在（roles/Missing.md）"
+        "找不到名为「Missing」的人格卡（roles 目录下查无对应文稿）"
     );
     assert!(
         !root_a.join("data/current-role.json").exists(),

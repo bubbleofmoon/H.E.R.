@@ -324,7 +324,7 @@ export const MemoryLibraryTab: React.FC = () => {
           if (err instanceof ApiRequestError && err.status === 403) {
             const msg = err.message || '';
             if (msg.includes('agent token') || msg.includes('会话自己的令牌')) {
-              pushToast('该会话口令尚未就绪：浏览器管理会话无权替身调取遗忘接口', 'warn');
+              pushToast('该会话口令尚未就绪：浏览器会话无权替身调取遗忘接口', 'warn');
             } else {
               pushToast(msg || '该条记录不在本对话开放视野内，无权移除', 'danger');
             }

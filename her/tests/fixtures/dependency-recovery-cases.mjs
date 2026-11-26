@@ -179,7 +179,7 @@ const CASES = {
     await until('the bridge noticed the outage', async () => (await api(side, '/api/status')).json?.dshReady === false, 30_000);
     const mark = side.world.log.length;
     push(side, groupMessage('@401 reserved-waits-for-dsh'));
-    await until('the message waits for DSH', () => /\[reserved\] group:420042 DSH 不可用，消息排队等待恢复/.test(side.stdout()), 20_000);
+    await until('the message waits for DSH', () => /\[reserved\] group:420042 引擎眼下离线，来信先存进待办列队/.test(side.stdout()), 20_000);
     await sleep(8_000);
     const calls = side.world.log.slice(mark).filter((e) => e.side === 'dsh' && e.kind === 'rpc' && e.endpoint !== 'settings/describe');
     assert.equal(calls.length, 0, `DSH was called for waiting work: ${calls.map((e) => e.endpoint).join(',')}`);

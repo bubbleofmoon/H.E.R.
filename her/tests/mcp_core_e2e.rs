@@ -787,7 +787,7 @@ fn media_budgets_count_original_bytes_before_compaction_and_clamp_settings() {
     ]),false);
     let answer=f.mcp.call("qq_get_message_images",group(json!({"messageId":"budget"})));
     assert_eq!(image_blocks(&answer).len(),2,"{answer}");
-    assert!(text_of(&answer).contains("图片总大小超限") && text_of(&answer).contains("超过单条上限 3"));
+    assert!(text_of(&answer).contains("（图片体积超过上限，已略过）") && text_of(&answer).contains("超过单条上限 3"));
     assert_eq!(f.onebot.actions("get_image").len(),3);
     f.onebot.image("pixels.gif",&media_fixtures::gif(1,2000,1000));
     set_media(&f,"pixels",json!([{"kind":"image","file":"pixels.gif"}]),false);
@@ -1589,7 +1589,7 @@ fn pending_send_stops(change: &str, poke: bool) {
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{change}, poke={poke}: {answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{answer}");
+    assert!(text_of(&answer).contains("发送中止"), "{answer}");
     assert!(f.onebot.actions("group_poke").is_empty());
     assert_eq!(f.onebot.actions("send_group_msg").len(), if poke { 0 } else { 1 });
     assert_eq!(f.root.state()["conversations"][GROUP_KEY]["sendTimes"].as_array().expect("quota").len(), if poke { 0 } else { 1 });
@@ -1620,7 +1620,7 @@ fn a_poke_is_cancelled_when_the_session_token_changes_during_the_member_check() 
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("group_poke").is_empty(), "the cancelled poke must never reach the gateway");
     let sends = f.root.state()["conversations"][GROUP_KEY]["sendTimes"].as_array().expect("sendTimes").len();
     assert_eq!(sends, 0, "the quota reserved for the cancelled poke is given back");
@@ -1636,7 +1636,7 @@ fn a_quoted_direct_send_is_cancelled_when_the_mode_changes_during_the_quote_look
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("send_group_msg").is_empty(), "no request after the validity check failed");
 }
 
@@ -1652,7 +1652,7 @@ fn a_quoted_direct_send_is_cancelled_when_the_allow_list_changes_during_the_quot
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     assert!(f.onebot.actions("send_group_msg").is_empty(), "revoked target must never reach the gateway");
     assert_eq!(f.root.state()["conversations"][GROUP_KEY]["sendTimes"], json!([]), "cancelled quota is released");
 }
@@ -1669,7 +1669,7 @@ fn revoking_a_target_keeps_the_confirmed_quoted_item_and_cancels_the_rest_of_the
     release.send(()).expect("release the held OneBot response");
     let answer = f.mcp.finish(pending);
     assert!(is_error(&answer), "{answer}");
-    assert!(text_of(&answer).contains("发送已取消"), "{}", text_of(&answer));
+    assert!(text_of(&answer).contains("发送中止"), "{}", text_of(&answer));
     let sent = f.onebot.actions("send_group_msg");
     assert_eq!(sent.len(), 1, "only the already submitted item reaches the gateway");
     assert_eq!(sent[0]["message"], json!([{"type": "reply", "data": {"id": "7003"}}, {"type": "text", "data": {"text": "已发送"}}]));
@@ -1788,7 +1788,7 @@ fn burst_merges_into_one_durable_message_and_the_duplicate_window_blocks_a_secon
     assert!(!is_error(&first), "burst does not open the window: {first}");
     let second = f.mcp.call("qq_send_message", group(json!({"messages": "第二次"})));
     assert!(is_error(&second));
-    assert!(text_of(&second).starts_with("发送失败：刚说过话了（"), "{}", text_of(&second));
+    assert!(text_of(&second).starts_with("发送失败：") && text_of(&second).contains("秒前刚发过消息"), "{}", text_of(&second));
     assert_eq!(f.onebot.actions("send_group_msg").len(), 2, "the blocked send never reached the gateway");
 }
 

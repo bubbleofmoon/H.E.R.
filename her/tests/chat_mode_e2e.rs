@@ -1450,7 +1450,7 @@ fn hotfix88_outbound_guard_absent_and_true_still_block_sensitive_reply() {
         let mut rig = Rig::new("guard88-on", Seed { config: json!({"security":security}), ..Seed::default() });
         rig.start();
         says(&rig, GROUP_KEY, 1001, "tester", "#GUARD88#");
-        assert!(rig.wait_texts(OWNER_KEY, 1)[0].contains("被安全策略拦截"));
+        assert!(rig.wait_texts(OWNER_KEY, 1)[0].contains("已拦截未发"));
         assert_eq!(rig.sentinel(GROUP_KEY, 1), vec![ACK.to_string(), ACK.to_string(), "synthetic reply".to_string()]);
     }
 }
@@ -1755,7 +1755,7 @@ fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
         200
     );
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里冷清了一阵"));
+    assert!(rig.wait_prompts(1)[0].text.contains("群里好一会儿没人接茬了"));
     says(&rig, GROUP_KEY, 1001, "tester", "new-after-probe15");
     wait_phase(&rig, "active");
     assert!(rig.wait_prompts(2)[1].text.contains("【新消息】"));
@@ -1791,7 +1791,7 @@ fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
     assert!(rig.texts_to(GROUP_KEY).is_empty());
     seed_group_mute(&rig, 0);
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里冷清了一阵"));
+    assert!(rig.wait_prompts(1)[0].text.contains("群里好一会儿没人接茬了"));
 }
 
 #[test]
@@ -2093,7 +2093,7 @@ fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncate
     assert!(
         prompts[1]
             .text
-            .split("【当前消息】")
+            .split("【此刻来信】")
             .nth(1)
             .unwrap()
             .contains("tail-marker15"),
@@ -2134,7 +2134,7 @@ fn reserved_selective_silence_is_seeded_and_carried_into_the_next_required_batch
     assert!(prompts[0].text.contains("ordinary-seen-but-unanswered15"));
     assert!(prompts[0].text.contains("在吗 #SPLIT15#"));
     assert!(
-        !prompts[0].text.contains("请只输出 [SILENT]"),
+        !prompts[0].text.contains("[SILENT]"),
         "required reply cannot opt out in its prompt"
     );
     assert_eq!(
@@ -3125,7 +3125,7 @@ fn queued_chat_waits_for_update_admission_without_losing_the_message() {
         .contains("obsolete-update-fence")));
     thread::sleep(Duration::from_millis(500));
     says(&rig, GROUP_KEY, OWNER, "owner", "/reset");
-    assert!(rig.wait_texts(GROUP_KEY, 5)[4].contains("已重置会话"));
+    assert!(rig.wait_texts(GROUP_KEY, 5)[4].contains("会话已清理"));
     drop(gate);
     says(&rig, GROUP_KEY, 1001, "tester", "after update reset");
     rig.wait_texts(GROUP_KEY, 7);
