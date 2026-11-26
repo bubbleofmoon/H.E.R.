@@ -897,7 +897,17 @@ fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
     let conn = std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(80));
-            std::fs::remove_file(&wal).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match std::fs::remove_file(&wal) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot remove synthetic wal: {error}"),
+                }
+            }
         });
         let conn = crate::settings::backup_source(&context).unwrap().unwrap();
         writer.join().unwrap();
