@@ -9,15 +9,18 @@
 
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
+mod dense;
 pub mod parity_clock;
 mod store;
 
+pub use dense::{DenseModel, EmbeddingFn, FileStamp, ModelResources, SemanticQuery};
 use parity_clock::now_ms;
 pub use store::{Admin, DigestCursor, ForgetError, MemoryStore, NewMemory, Reader, VerifiedMessage};
 
 /// Current memory schema version (`PRAGMA user_version`). Version 1 is the frozen
-/// `spec/memory-schema.sql`, version 2 adds `digest_cursor`, and version 3 adds `memory_provenance`.
-const SCHEMA_VERSION: i64 = 3;
+/// `spec/memory-schema.sql`, version 2 adds `digest_cursor`, version 3 adds `memory_provenance`,
+/// and version 4 adds the derived embedding cache.
+pub const SCHEMA_VERSION: i64 = 4;
 const PROVENANCE_V3: &str = "CREATE TABLE IF NOT EXISTS memory_provenance (
   memory_id INTEGER PRIMARY KEY, message_id TEXT, attributed_to TEXT, author_id TEXT, message_at INTEGER, message_seq INTEGER, superseded_by INTEGER
 );
@@ -70,6 +73,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
     if version == 2 {
         conn.execute_batch(PROVENANCE_V3)?;
         version = 3;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    if version == 3 {
+        conn.execute_batch(dense::CACHE_SCHEMA_V4)?;
+        version = 4;
         conn.pragma_update(None, "user_version", version)?;
     }
     Ok(version)
@@ -522,6 +530,8 @@ fn search_with(
 /// At most this many distinct terms of the message enter the match (the message is cut at 200
 /// characters upstream, so this never drops a term of a chat-length message).
 const RECALL_MAX_TERMS: usize = 200;
+const RECALL_MAX_ITEMS: usize = 5;
+const FUSION_DEPTH: usize = 20;
 /// Relevance bar: a memory qualifies when it shares two or more distinct terms totalling at least
 /// this many characters with the message (two Chinese words), or exactly one term that is an
 /// identifier or at least `RECALL_LONG_TERM_CHARS` characters long. One shared Chinese bigram or
@@ -570,7 +580,11 @@ fn recall_term(raw: &str) -> Option<String> {
         })
         .collect();
     let cleaned = cleaned.trim_matches('.');
-    cleaned.chars().any(char::is_alphanumeric).then(|| cleaned.to_string())
+    let stopword = matches!(
+        cleaned,
+        "你好" | "谢谢" | "请问" | "那个" | "这个" | "什么" | "一下"
+    );
+    (!stopword && cleaned.chars().any(char::is_alphanumeric)).then(|| cleaned.to_string())
 }
 
 /// The distinct terms of a message in message order, each with the indexes of the message
@@ -606,35 +620,83 @@ fn recall_match_expression(terms: &[String]) -> String {
         .join(" OR ")
 }
 
-/// Automatic recall for `text` (the message being answered): at most `limit` memories the reader
-/// may see that share enough words with it, best first, without the ids in `exclude` (what the session
-/// generation already holds). A message nothing matches recalls nothing: there is no pinned or
-/// recent padding. Relevance (bm25 and shared terms) leads the score; pin, importance, recency
-/// and past use only add small boosts. Hits are not counted here: the caller counts the items
-/// it actually delivered with `record_hits`.
+/// Automatic recall fuses applicable local semantic and sparse ranks. Both channels
+/// filter by reader scope and the ids already held by this session generation.
+/// Hits are not counted here: the caller counts the items it actually delivered with `record_hits`.
 pub fn recall(
     reader: &Reader<'_>,
     text: &str,
+    semantic: Option<SemanticQuery<'_>>,
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
-    let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
+    let limit = limit.min(RECALL_MAX_ITEMS);
     // A message under four letters, digits or Han characters is too short to say what it is about.
-    if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
+    if limit == 0 || text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
         return Ok(Vec::new());
     }
-    let spans = recall_term_spans(text);
-    let terms: Vec<String> = spans.iter().map(|(term, _)| term.clone()).collect();
-    if terms.is_empty() || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, &[])?;
     let excluded = if exclude.is_empty() {
         String::new()
     } else {
         let ids: Vec<String> = exclude.iter().map(i64::to_string).collect();
         format!(" AND m.id NOT IN ({})", ids.join(","))
     };
+
+    let dense = semantic
+        .and_then(|query| dense::rank(query, reader, &excluded, FUSION_DEPTH))
+        .unwrap_or_default();
+    let sparse_depth = if dense.is_empty() { limit } else { FUSION_DEPTH };
+    let sparse = match sparse_recall(reader, text, &excluded, sparse_depth) {
+        Ok(hits) => hits,
+        Err(error) if dense.is_empty() => return Err(error),
+        Err(error) => {
+            eprintln!(
+                "memory recall sparse search failed: {}",
+                search_error_message(&error)
+            );
+            Vec::new()
+        }
+    };
+    let mut hits = if dense.is_empty() {
+        sparse
+    } else {
+        fuse_recall(sparse, dense, limit)
+    };
+    reader.attach_provenance(&mut hits)?;
+    Ok(hits)
+}
+
+fn fuse_recall(sparse: Vec<Hit>, dense: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    const RANK_OFFSET: f64 = 60.0;
+    let mut fused = std::collections::HashMap::<i64, Hit>::new();
+    for ranking in [sparse, dense] {
+        for (position, mut hit) in ranking.into_iter().enumerate() {
+            hit.score = 1.0 / (RANK_OFFSET + 1.0 + position as f64);
+            fused
+                .entry(hit.id)
+                .and_modify(|existing| existing.score += hit.score)
+                .or_insert(hit);
+        }
+    }
+    let mut hits: Vec<_> = fused.into_values().collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    hits.truncate(limit);
+    hits
+}
+
+fn sparse_recall(
+    reader: &Reader<'_>,
+    text: &str,
+    excluded: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<Hit>> {
+    let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
+    let spans = recall_term_spans(text);
+    let terms: Vec<String> = spans.iter().map(|(term, _)| term.clone()).collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, &[])?;
     let sql = format!(
         "SELECT m.id, m.owner_id, m.scope, m.kind, m.subject, m.content,
                 bm25(memory_fts) AS rank, m.pinned, m.importance, m.hits, m.created_at,
@@ -699,7 +761,6 @@ pub fn recall(
             .then(a.id.cmp(&b.id))
     });
     scored.truncate(limit);
-    reader.attach_provenance(&mut scored)?;
     Ok(scored)
 }
 
@@ -1041,6 +1102,10 @@ mod tests {
 
     fn reader_for<'a>(conn: &'a Connection, key: &str, is_owner: bool) -> Reader<'a> {
         Reader { conn, key: key.to_string(), is_owner, has_provenance: false }
+    }
+
+    fn recall(reader: &Reader<'_>, text: &str, limit: usize, exclude: &[i64]) -> rusqlite::Result<Vec<Hit>> {
+        super::recall(reader, text, None, limit, exclude)
     }
 
     fn recall_fixture() -> Connection {
@@ -1385,5 +1450,73 @@ mod tests {
             restored,
             UpsertOutcome { id: created.id, deduped: true, archived: false }
         );
+    }
+
+    #[test]
+    fn recall_ignores_chinese_stopwords() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "礼貌", "你好 谢谢 请问 那个 这个 什么 一下", 1.0, 1);
+        let hits = recall(&reader_for(&conn, "group:101", false), "你好请问一下那个是什么谢谢", 3, &[]).unwrap();
+        assert!(hits.is_empty(), "stopwords alone must not trigger recall: {:?}", recalled_subjects(&hits));
+    }
+
+    #[test]
+    fn schema_v4_adds_embedding_cache_and_invalidates_on_update_or_delete() {
+        let conn = prepare_connection(Connection::open_in_memory().unwrap()).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let id1 = write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:101", scope: "group", kind: "fact",
+            subject: Some("s"), content: "first", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        let id2 = write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:101", scope: "group", kind: "fact",
+            subject: Some("s"), content: "second", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        for id in [id1, id2] {
+            conn.execute("INSERT INTO memory_embedding_cache(memory_id, model, embedding) VALUES(?1, X'01', X'02')", [id]).unwrap();
+        }
+        conn.execute("UPDATE memory SET content='updated' WHERE id=?1", [id1]).unwrap();
+        conn.execute("DELETE FROM memory WHERE id=?1", [id2]).unwrap();
+        let remaining: i64 = conn.query_row("SELECT count(*) FROM memory_embedding_cache", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn hybrid_recall_attaches_provenance_to_dense_hits() {
+        struct DummyResources(std::path::PathBuf);
+        impl ModelResources for DummyResources {
+            fn resources_dir(&self) -> &std::path::Path { &self.0 }
+            fn read_model_file(&self, _relative: &str) -> Option<Vec<u8>> { None }
+            fn model_file_stamp(&self, _relative: &str) -> Option<FileStamp> { None }
+        }
+        let store = MemoryStore::open_prepared(
+            Connection::open_in_memory().unwrap(),
+            Some("private:7001".to_string()),
+        ).unwrap();
+        let reader = store.for_reader("private:7001");
+        reader.write_message(
+            VerifiedMessage { id: "msg-1", text: "幼童遇到风暴时需要拥抱", author_id: "7001", position: (10, 0) },
+            None,
+        ).unwrap().unwrap();
+        let model = DenseModel::with_loader(|_| {
+            Some(Box::new(|texts: &[String]| {
+                Some(texts.iter().map(|t| {
+                    let mut v = vec![0.0f32; 512];
+                    v[if t.contains("小孩") || t.contains("幼童") { 0 } else { 1 }] = 1.0;
+                    v
+                }).collect())
+            }))
+        });
+        let resources = std::sync::Arc::new(DummyResources(std::path::PathBuf::from("dummy")));
+        let hits = super::recall(
+            &reader,
+            "小孩害怕打雷该如何安抚",
+            Some(SemanticQuery { query: "小孩害怕打雷该如何安抚", resources, model: Some(&model) }),
+            5,
+            &[],
+        ).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].provenance, Provenance::Fact));
+        assert_eq!(hits[0].message_id.as_deref(), Some("msg-1"));
     }
 }

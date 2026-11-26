@@ -6,13 +6,57 @@ use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 pub use her_memory::{
-    index_hint, recall, record_hits, search_error_message, DigestCursor, ForgetError, Hit,
-    MemoryStore, NewMemory, Provenance, VerifiedMessage,
+    index_hint, record_hits, search_error_message, DigestCursor, ForgetError, Hit, MemoryStore,
+    NewMemory, Provenance, VerifiedMessage,
 };
 #[cfg(test)]
 pub use her_memory::{list_acl_json, segment, write_memory, MemoryInput};
+#[cfg(test)]
+pub(crate) use fixture::{
+    install as install_fixture_embeddings, install_loader as install_fixture_embedding_loader,
+};
 
 pub const DB_PATH: &str = crate::legacy_path!("data/memory.db");
+
+struct RuntimeModelResources(RuntimeContext);
+
+impl her_memory::ModelResources for RuntimeModelResources {
+    fn resources_dir(&self) -> &std::path::Path {
+        self.0.resources_dir()
+    }
+
+    fn read_model_file(&self, relative: &str) -> Option<Vec<u8>> {
+        self.0.read_file(RuntimeArea::Resources, relative).ok()
+    }
+
+    fn model_file_stamp(&self, relative: &str) -> Option<her_memory::FileStamp> {
+        let path = self
+            .0
+            .resolve_path(RuntimeArea::Resources, relative, PathIntent::ReadFile)
+            .ok()?;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(her_memory::FileStamp::from_metadata(&metadata))
+    }
+}
+
+pub fn recall(
+    reader: &her_memory::Reader<'_>,
+    text: &str,
+    semantic: Option<(&RuntimeContext, &str)>,
+    limit: usize,
+    exclude: &[i64],
+) -> rusqlite::Result<Vec<Hit>> {
+    #[cfg(test)]
+    let fixture_model = semantic.and_then(|(context, _)| fixture::model(context));
+    #[cfg(not(test))]
+    let fixture_model: Option<her_memory::DenseModel> = None;
+    let semantic = semantic.map(|(context, query)| her_memory::SemanticQuery {
+        query,
+        resources: std::sync::Arc::new(RuntimeModelResources(context.clone())),
+        model: fixture_model.as_ref(),
+    });
+    her_memory::recall(reader, text, semantic, limit, exclude)
+}
 
 /// A selected root always owns its database. Legacy MCP/console calls honor an explicit
 /// Rust override, then the frozen JS override, before using the deployment default.
@@ -109,6 +153,66 @@ pub fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, 
         Some(guard) => store.with_guard(guard),
         None => store,
     })
+}
+
+#[cfg(test)]
+mod fixture {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    use her_memory::{DenseModel, EmbeddingFn};
+
+    use crate::runtime::RuntimeContext;
+
+    type Encoder = fn(&[String]) -> Option<Vec<Vec<f32>>>;
+    static RUNNERS: LazyLock<Mutex<HashMap<PathBuf, DenseModel>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct FixtureEncoder(PathBuf);
+
+    impl Drop for FixtureEncoder {
+        fn drop(&mut self) {
+            RUNNERS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(crate) fn install(
+        context: &RuntimeContext,
+        embed: impl FnMut(&[String]) -> Option<Vec<Vec<f32>>> + Send + 'static,
+    ) -> FixtureEncoder {
+        let embed = Mutex::new(Some(embed));
+        install_model(
+            context,
+            DenseModel::with_loader(move |_| {
+                let f = embed.lock().unwrap().take()?;
+                Some(Box::new(f) as EmbeddingFn)
+            }),
+        )
+    }
+
+    pub(crate) fn install_loader(
+        context: &RuntimeContext,
+        load: impl Fn() -> Option<Encoder> + Send + Sync + 'static,
+    ) -> FixtureEncoder {
+        install_model(
+            context,
+            DenseModel::with_loader(move |_| {
+                let f = load()?;
+                Some(Box::new(f) as EmbeddingFn)
+            }),
+        )
+    }
+
+    fn install_model(context: &RuntimeContext, model: DenseModel) -> FixtureEncoder {
+        let path = context.runtime_root().unwrap().to_owned();
+        assert!(RUNNERS.lock().unwrap().insert(path.clone(), model).is_none());
+        FixtureEncoder(path)
+    }
+
+    pub(super) fn model(context: &RuntimeContext) -> Option<DenseModel> {
+        RUNNERS.lock().unwrap().get(context.runtime_root()?).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -314,7 +418,7 @@ mod tests {
         let before = rows(&conn);
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), her_memory::SCHEMA_VERSION);
         assert_eq!(rows(&conn), before, "migration to version 1 must not change rows");
     }
 
@@ -328,11 +432,12 @@ mod tests {
         let conn = open_ready_for_runtime(&context).unwrap();
         assert!(conn.prepare("SELECT * FROM role_group_session").is_err(),
                 "a version 1 open must not rerun the unversioned completion");
-        conn.execute_batch("PRAGMA user_version=4;").unwrap();
+        let newer = her_memory::SCHEMA_VERSION + 1;
+        conn.execute_batch(&format!("PRAGMA user_version={newer};")).unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), newer);
     }
 
     #[test]
@@ -340,12 +445,13 @@ mod tests {
         let (root, context) = isolated_fixture();
         drop(open_ready_for_runtime(&context).unwrap());
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        conn.execute_batch("DROP TABLE memory_provenance; DROP TRIGGER remove_memory_provenance; DROP TABLE digest_cursor; PRAGMA user_version=1;").unwrap();
+        conn.execute_batch("DROP TABLE memory_embedding_cache; DROP TRIGGER memory_embedding_delete; DROP TRIGGER memory_embedding_update; DROP TABLE memory_provenance; DROP TRIGGER remove_memory_provenance; DROP TABLE digest_cursor; PRAGMA user_version=1;").unwrap();
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), her_memory::SCHEMA_VERSION);
         conn.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
         conn.prepare("SELECT memory_id, message_id, attributed_to, author_id, message_at, message_seq, superseded_by FROM memory_provenance").unwrap();
+        conn.prepare("SELECT memory_id, model, embedding FROM memory_embedding_cache").unwrap();
     }
 
     #[test]
@@ -353,7 +459,7 @@ mod tests {
         let (root, context) = isolated_fixture();
         drop(open_ready_for_runtime(&context).unwrap());
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        conn.execute_batch("DROP TABLE memory_provenance; DROP TRIGGER remove_memory_provenance; DROP TABLE digest_cursor; PRAGMA user_version=1; PRAGMA wal_autocheckpoint=0;").unwrap();
+        conn.execute_batch("DROP TABLE memory_embedding_cache; DROP TRIGGER memory_embedding_delete; DROP TRIGGER memory_embedding_update; DROP TABLE memory_provenance; DROP TRIGGER remove_memory_provenance; DROP TABLE digest_cursor; PRAGMA user_version=1; PRAGMA wal_autocheckpoint=0;").unwrap();
         write_memory(&conn, &MemoryInput {
             owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
             subject: Some("topic"), content: "version one marker", tags: None, source: "fixture", importance: 0.5,
@@ -364,7 +470,7 @@ mod tests {
         let before = rows(&conn);
         // The version 1 writer stays open with its rows still in the WAL, as a crashed older bridge leaves them.
         let migrated = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), her_memory::SCHEMA_VERSION);
         assert_eq!(rows(&migrated), before, "migration to version 2 must not change rows");
         migrated.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
         drop((migrated, conn));
@@ -374,7 +480,8 @@ mod tests {
     fn schema_version_newer_database_is_refused_before_journal_mode_changes() {
         let (root, context) = isolated_fixture();
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=4;").unwrap();
+        let newer = her_memory::SCHEMA_VERSION + 1;
+        conn.execute_batch(&format!("PRAGMA journal_mode=DELETE; PRAGMA user_version={newer};")).unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
@@ -398,7 +505,7 @@ mod tests {
         conn.execute_batch("DROP TABLE memory_fts;").unwrap();
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), her_memory::SCHEMA_VERSION);
         let after: Vec<String> = rows(&conn).into_iter().filter(|r| !r.starts_with("SELECT rowid, seg FROM memory_fts")).collect();
         assert_eq!(after, before, "migration must keep rows, grants and audit unchanged");
         assert_eq!(conn.query_row("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'marker'", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
@@ -492,5 +599,4 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), expected);
         drop((root, outside_root));
     }
-
 }

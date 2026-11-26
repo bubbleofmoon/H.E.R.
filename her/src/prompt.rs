@@ -680,7 +680,7 @@ pub(crate) fn record_recall_hits(context: &RuntimeContext, ids: &[i64]) {
     }
 }
 
-/// `memory.inject.relatedTopK` (default 3, 1..=20): how many recalled memories a wake carries.
+/// Requested automatic recall depth from `memory.inject.relatedTopK` (default 3, 1..=20).
 pub(crate) fn recall_top_k(cfg: &Value) -> usize {
     crate::settings::RELATED_TOP_K.integer(cfg) as usize
 }
@@ -693,6 +693,64 @@ pub(crate) const RECALL_HEADER: &str = "【记忆】你可能需要回顾（来�
 pub(crate) const RECALL_FOOTER: &str = "（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）";
 /// The most estimated tokens the 【记忆索引】 hint line of the recall block may take (`recall_block_with`).
 pub(crate) const RECALL_HINT_MAX: usize = 60;
+
+/// Recent context for the local semantic channel. The sparse query remains the answered message.
+fn semantic_recall_query(conv: &Conversation, query: &str) -> String {
+    let unread = conv.unread();
+    let recent = conv
+        .field("recentMessages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut speakers = Vec::new();
+    for (is_self, sender) in unread
+        .iter()
+        .rev()
+        .map(|message| (message.is_self(), message.sender()))
+        .chain(
+            recent
+                .iter()
+                .rev()
+                .take(4)
+                .map(|message| (message["isSelf"] == true, message["sender"].as_str())),
+        )
+    {
+        if is_self {
+            continue;
+        }
+        if let Some(sender) = sender.filter(|sender| !sender.is_empty()) {
+            let name: String = sender.chars().take(32).collect();
+            if !speakers.contains(&name) {
+                speakers.push(name);
+            }
+            if speakers.len() == 4 {
+                break;
+            }
+        }
+    }
+    let topic = conv
+        .field("activeTopics")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some((
+                item["lastMentionAt"].as_i64().unwrap_or(0),
+                item["text"].as_str()?,
+            ))
+        })
+        .filter(|(_, text)| !text.is_empty())
+        .max_by_key(|(last_mention, _)| *last_mention);
+    let mut contextual = query.to_string();
+    if let Some((_, text)) = topic {
+        let topic: String = text.chars().take(120).collect();
+        contextual.push_str(&format!("\n话题：{topic}"));
+    }
+    if !speakers.is_empty() {
+        contextual.push_str(&format!("\n说话者：{}", speakers.join("、")));
+    }
+    contextual
+}
 
 /// The recall block and the ids of the memories it carries. `memory::recall` decides what is
 /// recalled (matches only, never the ids in `held`, which the session generation already carries);
@@ -737,7 +795,8 @@ fn recall_block_with_conversation(
     let rows = if query.is_empty() {
         Vec::new()
     } else {
-        match crate::memory::recall(&reader, &query, top_k, held) {
+        let semantic = semantic_recall_query(conv, &query);
+        match crate::memory::recall(&reader, &query, Some((context, &semantic)), top_k, held) {
             Ok(rows) => rows,
             Err(error) => {
                 eprintln!("memory recall search failed: {}", crate::memory::search_error_message(&error));

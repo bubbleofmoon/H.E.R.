@@ -4372,6 +4372,83 @@ fn reserved2_current_prompt(request: &Value) -> &str {
 }
 
 #[test]
+fn hybrid_recall_wake_respects_relevance_cap_and_generation() {
+    let model = FakeModel::script(
+        (0..4)
+            .map(|_| ModelReply::Text("fixture deliberation".into()))
+            .collect(),
+    );
+    let mut rig = reserved2_fixture_with_config(
+        "reserved-hybrid-recall-wake",
+        &model,
+        json!({
+            "conversationEngines": {GROUP_KEY: "harness"},
+            "memory": {
+                "inject": {"relatedTopK": 8},
+                "layers": {"materialItems": 8, "materialTokens": 2000}
+            }
+        }),
+    );
+    rig.start();
+    let wake = |turn: usize, id, query| {
+        reserved2_push_mention(&rig, id, query);
+        assert!(
+            wait_for(LONG, || reserved2_group_ends(&rig) == turn),
+            "fixture wake {turn} must finish"
+        );
+        let requests = lock(&model.requests);
+        assert_eq!(requests.len(), turn, "one model request per wake");
+        reserved2_current_prompt(&requests[turn - 1]).to_owned()
+    };
+    wake(1, 2501, "prepare the fixture");
+    let state = rig.data_json("social-v2.json");
+    let token = state["conversations"][GROUP_KEY]["agentToken"]
+        .as_str()
+        .expect("fixture conversation token");
+    let markers: Vec<_> = (0..6).map(|index| format!("recallmarker-{index}")).collect();
+    for marker in &markers {
+        let (status, response) = http_call(
+            rig.console_port,
+            "POST",
+            "/api/memory/write",
+            &[("x-console-token", CONSOLE_TOKEN), ("x-agent-token", token)],
+            Some(&json!({"key": GROUP_KEY, "content": format!("recallfixture tag {marker}")})),
+        )
+        .expect("write a synthetic memory through the console");
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["deduped"], false);
+    }
+    let recalled = |prompt: &str| {
+        markers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, marker)| prompt.contains(marker.as_str()).then_some(index))
+            .collect::<Vec<_>>()
+    };
+    let unrelated = wake(2, 2502, "can I use a tag?");
+    assert!(
+        recalled(&unrelated).is_empty(),
+        "an irrelevant wake must recall no items"
+    );
+
+    let first = recalled(&wake(3, 2503, "what was recallfixture about?"));
+    assert_eq!(
+        first.len(),
+        5,
+        "a wake with six matches must carry exactly five"
+    );
+
+    let next = recalled(&wake(4, 2504, "tell me about recallfixture again"));
+    let remaining: Vec<_> = (0..markers.len())
+        .filter(|index| !first.contains(index))
+        .collect();
+    assert_eq!(
+        next, remaining,
+        "the same generation must recall only the remaining item"
+    );
+}
+
+#[test]
 fn her_reminders_use_the_schedule_and_live_settings() {
     let at = now_ms() + 3_600_000;
     let model = FakeModel::script(vec![
