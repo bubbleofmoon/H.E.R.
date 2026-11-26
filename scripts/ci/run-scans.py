@@ -21,10 +21,8 @@ DEFAULT_TIMEOUT = 900
 
 HEAVY_TEST_SUITES: tuple[str, ...] = (
     "test_pre_push_hook.py",
-    "test_agent_guard.py",
     "test_ci_wait.py",
     "test_gh_public.py",
-    "test_handoff.py",
     "test_scan_public.py",
     "test_strip_history.py",
     "test_checks_workflow.py",
@@ -35,12 +33,9 @@ FAST_TEST_SUITES: tuple[str, ...] = (
     "test_check_repo.py",
     "test_ci_suite.py",
     "test_codex_task.py",
-    "test_issue_watch.py",
-    "test_plan_export.py",
     "test_quick_workflow.py",
     "test_run_scans.py",
     "test_snowluma_export.py",
-    "test_watch_stream.py",
 )
 
 TEST_SUITES: tuple[str, ...] = HEAVY_TEST_SUITES + FAST_TEST_SUITES

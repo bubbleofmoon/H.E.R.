@@ -17,7 +17,7 @@ __pycache__/
 graphify-out/
 .test-fixtures/
 ci-evidence/
-# Private run data (agent usage ledger) stays untracked
+# Private run data stays untracked
 .scratch/
 
 # Local Claude Code overrides (machine-specific, may hold credentials)

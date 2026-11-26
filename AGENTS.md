@@ -15,7 +15,6 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 ## DOX
 
 - An AGENTS.md binds its subtree; read the ones on the path to what you edit. When a contract, workflow or preference changes, update the nearest doc in the same change and delete stale text. Document current contracts only, no history or decision dates (git has those).
-- Every AGENTS.md has a sibling CLAUDE.md containing only `@AGENTS.md`.
 
 ## User Preferences
 
