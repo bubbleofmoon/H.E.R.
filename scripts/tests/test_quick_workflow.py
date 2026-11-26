@@ -26,7 +26,7 @@ GIT_ENV = {
 
 
 def clean_env():
-    """This process's environment without any GIT_* variable (as test_agent_guard.py does), plus the fixed identity."""
+    """This process's environment without any GIT_* variable, plus the fixed identity."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env.update(GIT_ENV)
     return env

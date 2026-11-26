@@ -1,6 +1,6 @@
 # Baton and single-coordinator operation
 
-Development runs on a single Windows Antigravity coordinator against `bubbleofmoon/H.E.R.` (`docs/agents/issue-tracker.md`). Multi-host Linux↔Windows baton ping-pong and the background baton watcher daemon (`scripts/issue_watch.py`, `scripts/handoff.*`) are retired unless explicitly re-enabled.
+Development runs on a single Windows Antigravity coordinator against `bubbleofmoon/H.E.R.` (`docs/agents/issue-tracker.md`). Multi-host Linux↔Windows baton ping-pong is retired.
 
 ## Owner batons (`baton:owner`)
 

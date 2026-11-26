@@ -5,7 +5,7 @@
 # usage: scripts/codex-task.sh <name> <workdir> <prompt-file> [model] [effort] [sandbox] [timeout-minutes] [add-dir...]
 # Defaults: gpt-6.2-sol, high, read-only, 360. The sandbox is read-only, workspace-write or bypass.
 # workspace-write writes only <workdir> and the add-dirs (neither /tmp nor $TMPDIR: the caller points TMPDIR at a
-# writable add-dir) and gets loopback/network access. Only codex-work implement uses bypass to disable sandboxing and approvals.
+# writable add-dir) and gets loopback/network access.
 set -uo pipefail
 name=$1 workdir=$2 prompt=$(realpath -- "$3") model=${4:-gpt-6.2-sol} effort=${5:-high} sandbox=${6:-read-only} minutes=${7:-360}
 case "$sandbox" in read-only|workspace-write|bypass) ;; *) echo "codex-task: sandbox must be read-only, workspace-write or bypass: $sandbox" >&2; exit 64 ;; esac

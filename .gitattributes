@@ -1,6 +1,6 @@
 # Markdown is stored and checked out with LF, so agent-written files do not trigger CRLF warnings.
 *.md text eol=lf
-# Shell scripts, git hooks and the agent guard run under bash and must keep LF.
+# Shell scripts and git hooks run under bash and must keep LF.
 *.sh text eol=lf
 .githooks/* text eol=lf
 *.py text eol=lf

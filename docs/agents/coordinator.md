@@ -12,8 +12,11 @@ Binding for the single Windows Antigravity coordinator (`C:/her`, 32 GB, 4 cores
 
 ## Model and review routing
 
-- **Default coordinator:** `Orchestrator (Neon)` (plans on Gemini 4 Neon, fast execution).
-- **Spec/contract second opinion:** `scripts/codex-task.ps1 -Model gpt-6.2-astra -Effort high -Sandbox read-only` for cross-file state/backend contract audits alongside Antigravity Standards review.
+- **Default coordinator and primary planner:** `Orchestrator (Neon)` (`Gemini 4 Neon` for planning and blueprint slicing; fast execution model for routine steps).
+- **Tiered planning and adversarial checks:**
+  - **Tier 1 — Standard / scoped tickets:** Neon plans alone; pair Antigravity Standards review (`research` subagent) with `scripts/codex-task.ps1 -Model gpt-6.2-sol -Effort high -Sandbox read-only` for Spec/contract second opinion during code review.
+  - **Tier 2 — Large / cross-cutting refactors and migrations (clear target shape, multi-module cutovers):** Neon gathers a read-only grep inventory and writes the primary plan first; then run a targeted **adversarial red-team pass** on Neon's plan using `claude-opus-5-5-high` (via `swarm`, hunting edge-case/test-assertion traps and dead-code or wire-compatibility gaps) and `scripts/codex-task.ps1 -Model gpt-6.2-sol -Effort high -Sandbox read-only` (auditing CI/UI/rollback risk and scope boundaries). Critics inspect the codebase directly and return only concrete delta findings with `file:line` proof rather than full plan rewrites.
+  - **Tier 3 — Big projects and greenfield architecture forks (multi-ticket initiatives, major new subsystems, or open-ended design choices where one draft could anchor the framing):** Run three independent blind planners (`gemini-4-neon-high`, `claude-opus-5-5-high`, and `scripts/codex-task.ps1 -Model gpt-6.2-sol -Effort high -Sandbox read-only`) in parallel on the identical prompt and pre-gathered read-only inventory, writing to separate files (`@coordinator DONE: <path>` on blind swarm briefs so peers never cross-read each other), then synthesize the merged plan on Neon.
 - **Deep single-model work:** use `Gemini 4 Neon (High/XHigh)` for deep backend bug audits, UI/navigation architecture, or subtle Rust concurrency/lifecycle fixes.
 - **Review cap:** verify each finding in code before requiring fixes, and file non-blocking medium/low polish as follow-up issues (`#362` or dedicated follow-up tickets).
 

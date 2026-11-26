@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
-EXECUTABLE_PATTERNS = ('*.sh', '.githooks/*', '.claude/hooks/*')
+EXECUTABLE_PATTERNS = ('*.sh', '.githooks/*')
 EXECUTABLE_MODE = '100755'
 root = Path(__file__).resolve().parent.parent
 staged = '--staged' in sys.argv
