@@ -84,15 +84,6 @@ impl Counts {
             Layer::Material => self.material += n,
         }
     }
-    /// Takes `n` items back from `layer` (a section the model-view strip emptied delivers nothing).
-    pub fn remove(&mut self, layer: Layer, n: usize) {
-        match layer {
-            Layer::Identity => self.identity = self.identity.saturating_sub(n),
-            Layer::Relationship => self.relationship = self.relationship.saturating_sub(n),
-            Layer::Conversation => self.conversation = self.conversation.saturating_sub(n),
-            Layer::Material => self.material = self.material.saturating_sub(n),
-        }
-    }
     pub fn to_json(&self) -> Value {
         Value::Object(Layer::ALL.iter().map(|l| (l.name().to_string(), json!(self.get(*l)))).collect())
     }
@@ -163,8 +154,6 @@ pub struct Assembly {
     /// What Identity and Relationship left of Material's budget.
     pub material_tokens: usize,
     pub material_items: usize,
-    /// Each section's layer and item count before any strip; the caller takes back what a strip emptied (`Counts::remove`).
-    pub section_items: Vec<(&'static str, Option<Layer>, usize)>,
 }
 
 impl Assembly {
@@ -205,7 +194,6 @@ pub fn assemble(mut sections: Vec<Section>, budgets: &Budgets) -> Assembly {
         cut,
         material_tokens: budgets.material - from_material,
         material_items: budgets.material_items,
-        section_items: sections.iter().map(|s| (s.name, s.layer, s.items())).collect(),
     }
 }
 
@@ -220,7 +208,9 @@ pub fn persona_core(context: &RuntimeContext, cfg: &Value, key: &str) -> String 
 fn empty_protected(counts: &Counts, key: &str, cfg: &Value) -> Vec<Layer> {
     let mut empty = Vec::new();
     if counts.identity == 0 { empty.push(Layer::Identity); }
-    if counts.relationship == 0 && crate::conversation_authority::owner_conversation(cfg).as_deref() == Some(key) {
+    if counts.relationship == 0
+        && crate::social_state::owner_conversation(cfg).as_deref() == Some(key)
+    {
         empty.push(Layer::Relationship);
     }
     empty

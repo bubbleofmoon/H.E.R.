@@ -12,6 +12,7 @@ const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const TEXT_MAX: usize = 20_000;
 const NAME_MAX: usize = 40;
 const NAMES_MAX: usize = 10;
+const FAILURE_LINE_MAX: usize = 160;
 /// Versions kept per persona.
 const VERSIONS_MAX: usize = 50;
 /// Estimated tokens (`briefing::estimate_tokens`) a newly approved core and compact form may use.
@@ -19,7 +20,7 @@ pub const CORE_TOKENS_MAX: usize = 1500;
 pub const COMPACT_TOKENS_MAX: usize = 300;
 /// The fields a save compares with the latest version.
 const CONTENT: [&str; 8] = ["name", "core", "notes", "compact", "names", "traits", "editMode", "autoRules"];
-/// Parts auto edits may change; the name and the rule set are never auto-editable.
+/// Parts auto edits may change. Name, failure line and rule set are owner-edited.
 const PARTS: [&str; 5] = ["core", "notes", "compact", "names", "traits"];
 static GATE: Mutex<()> = Mutex::new(());
 
@@ -27,10 +28,10 @@ type Failure = (u16, String);
 
 /// Checked by every write before the library lock is taken; the returned guard is held until the
 /// write commits (the console: configuration gate + fresh credential; `/persona`: gate + fresh owner).
-pub type Authority<'a> = &'a dyn Fn() -> Result<Option<std::fs::File>, (u16, String)>;
+pub type Authority<'a> = &'a dyn Fn() -> Result<Option<crate::conversation_state::Gate>, (u16, String)>;
 
 #[cfg(test)]
-pub(crate) fn open_authority() -> Result<Option<std::fs::File>, (u16, String)> {
+pub(crate) fn open_authority() -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
     Ok(None)
 }
 
@@ -205,6 +206,23 @@ fn rules(value: &Value) -> Result<Value, Failure> {
     Ok(out)
 }
 
+fn literal_failure_line(value: &Value) -> Result<Option<&str>, Failure> {
+    let line = match value {
+        Value::Null => return Ok(None),
+        Value::String(text) => text,
+        _ => return Err(fail(400, "failureLine must be text or null")),
+    };
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    if line.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        || crate::role::utf16_len(line) > FAILURE_LINE_MAX
+    {
+        return Err(fail(400, "failureLine must be one line of at most 160 UTF-16 units"));
+    }
+    Ok(Some(line))
+}
+
 fn pick<'a>(body: &'a Value, base: &'a Value, field: &str) -> &'a Value {
     if body.get(field).is_some() { &body[field] } else { &base[field] }
 }
@@ -237,10 +255,11 @@ fn build(base: &Value, body: &Value, number: u64, source: &str) -> Result<Value,
         _ => return Err(fail(400, "editMode must be auto or manual")),
     };
     let auto_rules = rules(pick(body, base, "autoRules"))?;
+    let failure_line = literal_failure_line(pick(body, base, "failureLine"))?;
     Ok(json!({
         "version": number, "createdAt": now(), "source": source, "approved": false, "approvedAt": null,
         "name": name, "core": core, "notes": notes, "compact": compact, "names": names,
-        "traits": traits, "editMode": edit_mode, "autoRules": auto_rules
+        "traits": traits, "editMode": edit_mode, "autoRules": auto_rules, "failureLine": failure_line
     }))
 }
 
@@ -335,7 +354,9 @@ pub fn update(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
         let base = latest(found).cloned().unwrap_or(Value::Null);
         let next = build(&base, body, base["version"].as_u64().unwrap_or(0) + 1, "console")?;
         // Saving what the latest version already says adds no version.
-        if !base.is_null() && CONTENT.iter().all(|field| next[*field] == base[*field]) {
+        if !base.is_null() && CONTENT.iter().all(|field| next[*field] == base[*field])
+            && literal_failure_line(&base["failureLine"])? == next["failureLine"].as_str()
+        {
             return Ok(json!({"ok": true, "id": id, "version": base["version"], "activeVersion": found["activeVersion"], "unchanged": true}));
         }
         if name_taken(doc, next["name"].as_str().unwrap_or(""), Some(&id)) {
@@ -488,8 +509,7 @@ pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
 /// memory and history stay. Without a mapped session the next wake starts a fresh one anyway.
 pub(crate) fn rebrief(context: &RuntimeContext, key: &str) -> Result<bool, String> {
     let Some(sid) = crate::session_map::lookup(context, key)? else { return Ok(false) };
-    let state = context.read_social_state()?;
-    let Some(epoch) = state["conversations"][key]["agentToken"].as_str().map(str::to_string) else { return Ok(false) };
+    let Some(epoch) = crate::conversation_state::read_agent_token(context, key)? else { return Ok(false) };
     crate::session_map::update_context(context, key, &sid, &epoch, crate::briefing_delivery::next_generation)
 }
 
@@ -576,7 +596,7 @@ fn role_cards(context: &RuntimeContext) -> Result<Vec<(String, String)>, Failure
             continue;
         }
         let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
-        if name.is_empty() || name == "README" || crate::console::sanitize_role_name(&name) != name {
+        if name.is_empty() || name == "README" || crate::role::sanitize_name(&name) != name {
             continue;
         }
         let content = context.read_text(RuntimeArea::Resources, &format!("roles/{name}.md")).map_err(|_| unavailable())?;
@@ -601,9 +621,17 @@ pub(crate) fn briefing_identity(context: &RuntimeContext, key: &str) -> Option<S
     Some(format!("{:x}", Sha256::digest(identity.to_string())))
 }
 
+/// Literal owner-authored text from the conversation's current approved persona version.
+pub(crate) fn failure_line(context: &RuntimeContext, key: &str) -> Option<String> {
+    let doc = load(context).ok()?;
+    let id = effective_id(&doc, key)?;
+    let version = active(doc["personas"].get(&id)?)?;
+    literal_failure_line(&version["failureLine"]).ok().flatten().map(str::to_owned)
+}
+
 /// Companion modes (chat, reserved, reserved2) use personas; closed-agent keeps role cards.
 pub(crate) fn applies(context: &RuntimeContext) -> bool {
-    context.is_isolated() && crate::console::runtime_mode(context) != "closed-agent"
+    context.is_isolated() && crate::social_state::mode(context) != "closed-agent"
 }
 
 /// `【人设】<name>\n<core>\n\n` for the conversation's persona (override, else default), or empty.
@@ -668,10 +696,16 @@ mod tests {
     #[test]
     fn persona_writes_commit_only_while_the_authority_holds() {
         let (root, context) = fixture("authority");
-        let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+        let revoked = || Err((401, "console credential was revoked".to_string()));
         assert_eq!(super::create(&context, &json!({"name": "甲", "core": "核心。"}), &revoked).unwrap_err().0, 401);
-        let (status, _, body) = crate::console_persona::route(&context, "POST", "/api/personas/create",
-            &std::collections::HashMap::new(), r#"{"name":"甲","core":"核心。"}"#, false, &revoked);
+        let revoked_context = crate::console_front::revoked_admin_context(&context);
+        let (status, _, body) = crate::console_persona::route(
+            crate::console_front::AdminCaller::new(&revoked_context),
+            "POST",
+            "/api/personas/create",
+            &std::collections::HashMap::new(),
+            r#"{"name":"甲","core":"核心。"}"#,
+        );
         assert_eq!(status, 401, "{body}");
         assert!(!root.join("data/personas.json").exists(), "nothing was written");
         let _ = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
@@ -744,7 +778,7 @@ mod tests {
         super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap();
         crate::session_map::bind(&context, "group:1", "sid-1", None).unwrap();
         // The social gate stays busy longer than a re-brief waits: the assignment is saved, its re-brief fails.
-        let held = crate::console::acquire_social_state_gate(&context).unwrap();
+        let held = crate::social_state::acquire_gate(&context).unwrap();
         let first = super::assign(&context, &json!({"default": id}), open()).unwrap();
         drop(held);
         assert_eq!(first["rebriefFailed"][0]["conversation"], "group:1", "{first}");

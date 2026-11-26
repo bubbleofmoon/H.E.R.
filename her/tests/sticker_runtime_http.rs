@@ -138,19 +138,17 @@ fn legacy_snapshot(root: &Root) -> Vec<(PathBuf, Vec<u8>)> {
 fn install_fake_curl(root: &Root) {
     let script = format!(
         r#"#!/bin/sh
-out=""; hdr=""; url=""
-while [ $# -gt 0 ]; do
-  case "$1" in -o) out="$2"; shift;; -D) hdr="$2"; shift;; esac
-  url="$1"; shift
-done
+cfg=$(cat)
+url=$(printf '%s\n' "$cfg" | sed -n 's/^url = "\(.*\)"$/\1/p' | head -n 1 | sed 's/\\"/"/g; s/\\\\/\\/g')
 echo "$url" >> "{dir}/curl.log"
 name=$(basename "$url")
 if [ -f "{dir}/images/.fail" ]; then exit 7; fi
 if [ -f "{dir}/images/$name.delay" ]; then sleep 1; fi
 if [ -f "{dir}/images/$name" ]; then
-  cp "{dir}/images/$name" "$out"; printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"; printf 200
+  printf 'HTTP/1.1 200 OK\r\n\r\n'
+  cat "{dir}/images/$name"
 else
-  : > "$out"; printf 'HTTP/1.1 404 Not Found\r\n\r\n' > "$hdr"; printf 404
+  printf 'HTTP/1.1 404 Not Found\r\n\r\n'
 fi
 "#,
         dir = root.0.display()
@@ -165,11 +163,11 @@ fn install_fake_curl(root: &Root) {
     let source = root.p("fake-bin/curl.cs");
     fs::write(&source, r#"using System; using System.IO;
 class Curl { static int Main(string[] args) {
-  string output=null, headers=null, url=null;
-  for(int i=0;i<args.Length;i++) {
-    if(args[i]=="-o" && i+1<args.Length) output=args[++i];
-    else if(args[i]=="-D" && i+1<args.Length) headers=args[++i];
-    else url=args[i];
+  string cfg=Console.In.ReadToEnd();
+  string url="";
+  foreach(string line in cfg.Split('\n')) {
+    string t=line.Trim();
+    if(t.StartsWith("url = \"") && t.EndsWith("\"")) url=t.Substring(7,t.Length-8).Replace("\\\"","\"").Replace("\\\\","\\");
   }
   string root=Environment.GetEnvironmentVariable("TICKET20_FAKE_ROOT");
   for(int attempt=0;;attempt++) {
@@ -181,9 +179,12 @@ class Curl { static int Main(string[] args) {
   if(File.Exists(Path.Combine(root,"images",".fail")))return 7;
   if(File.Exists(image+".delay"))System.Threading.Thread.Sleep(1000);
   bool found=File.Exists(image);
-  File.WriteAllBytes(output,found ? File.ReadAllBytes(image) : new byte[0]);
-  File.WriteAllText(headers,found ? "HTTP/1.1 200 OK\r\n\r\n" : "HTTP/1.1 404 Not Found\r\n\r\n");
-  Console.Write(found ? "200" : "404"); return 0;
+  using(var stdout=Console.OpenStandardOutput()) {
+    byte[] head=System.Text.Encoding.ASCII.GetBytes(found ? "HTTP/1.1 200 OK\r\n\r\n" : "HTTP/1.1 404 Not Found\r\n\r\n");
+    stdout.Write(head,0,head.Length);
+    if(found) { byte[] body=File.ReadAllBytes(image); stdout.Write(body,0,body.Length); }
+  }
+  return 0;
 } }"#).unwrap();
     let compiler = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows root"))
         .join("Microsoft.NET/Framework64/v4.0.30319/csc.exe");

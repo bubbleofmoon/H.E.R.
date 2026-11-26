@@ -709,7 +709,7 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
         response_a.body["quoted"],
         json!({ "sender": "fixture-card", "text": "引用文本", "userId": "711" })
     );
-    assert!(response_a.body["hint"].as_str().is_some());
+    assert!(response_a.body.get("hint").is_none(), "split sends follow the selected policy");
     assert!(response_a.body["warn"]
         .as_str()
         .unwrap()

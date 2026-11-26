@@ -14,7 +14,7 @@
 //! Record format and folding stay in `send_outbox.rs`; reply classification stays in
 //! `onebot::classify_send_reply`.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use serde_json::{json, Map, Value};
 
@@ -34,6 +34,15 @@ pub fn send_chain() -> MutexGuard<'static, ()> {
     SEND_CHAIN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Try to enter the send chain without waiting under another gate.
+pub(crate) fn try_send_chain() -> Option<MutexGuard<'static, ()>> {
+    match SEND_CHAIN.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Run a send that may wait for the chain (and then on the gateway) without holding a tokio
@@ -65,6 +74,7 @@ pub fn message_id(value: Option<&Value>) -> Option<i64> {
 #[derive(Clone, Copy, Debug)]
 pub enum Proof<'a> {
     Text(&'a str),
+    LiteralText(&'a str),
     Segment(&'static str),
 }
 
@@ -398,6 +408,15 @@ pub fn history_evidence(
 fn proof_matches(message: &Value, proof: Proof<'_>) -> bool {
     match proof {
         Proof::Text(text) => history_text_matches(message, text),
+        Proof::LiteralText(text) => {
+            let expected = crate::onebot::escape_cq(text);
+            match message.get("message").and_then(Value::as_array) {
+                Some(segments) => segments.len() == 1
+                    && segments[0]["type"] == "text"
+                    && segments[0]["data"]["text"].as_str() == Some(expected.as_str()),
+                None => plain_text_of_message(message) == expected,
+            }
+        }
         Proof::Segment(kind) => message
             .get("message")
             .and_then(Value::as_array)
@@ -424,7 +443,7 @@ fn plain_text_of_message(message: &Value) -> String {
                 Some("text") => s["data"]["text"].as_str().map(str::to_owned),
                 Some("face") => Some(format!(
                     "[表情{}]",
-                    crate::console::social_policy_js_string(&s["data"]["id"])
+                    crate::social_state::js_string(&s["data"]["id"])
                 )),
                 _ => None,
             })

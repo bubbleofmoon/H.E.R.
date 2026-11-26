@@ -25,6 +25,7 @@ pub(crate) const GAP_PER_CHAR: Setting = setting!("send.gapPerCharMs", "/socialV
 pub(crate) const GAP_MAX: Setting = setting!("send.maxGapMs", "/socialV2/send/maxGapMs", &Integer { min: 0, max: 120_000, default: Some(10_000), file: FileRule::Default }, "Inter-bubble gap cap", "Maximum requested inter-bubble delay in milliseconds.", false, "reply rhythm");
 pub(crate) const STICKER_MIN: Setting = setting!("reply.stickerPauseMinMs", "/socialV2/reply/stickerPauseMinMs", &Integer { min: 0, max: 30_000, default: Some(800), file: FileRule::Default }, "Sticker pause minimum", "Shortest pause before submitting a sticker.", false, "reply rhythm");
 pub(crate) const STICKER_MAX: Setting = setting!("reply.stickerPauseMaxMs", "/socialV2/reply/stickerPauseMaxMs", &Integer { min: 0, max: 30_000, default: Some(2_000), file: FileRule::Default }, "Sticker pause maximum", "Longest pause before submitting a sticker.", false, "reply rhythm");
+pub(crate) const MERGE_MULTI: Setting = setting!("send.mergeMultiIntoOne", "/socialV2/send/mergeMultiIntoOne", &Switch::new(true), "Merge text parts", "Joins text parts with line breaks in one QQ bubble.", false, "send limits");
 pub(crate) const BURST: Setting = setting!("send.burstEnabled", "/socialV2/send/burstEnabled", &Switch::new(true), "Burst enabled", "Allows an unmerged multi-bubble send.", true, "send limits");
 pub(crate) const BURST_MAX: Setting = setting!("send.burstMaxMessages", "/socialV2/send/burstMaxMessages", &Integer { min: 1, max: 1_000, default: Some(8), file: FileRule::Default }, "Burst size", "Maximum messages in one burst.", false, "send limits");
 pub(crate) const BURST_MIN_MS: Setting = setting!("send.burstIntervalMinMs", "/socialV2/send/burstIntervalMinMs", &Integer { min: 0, max: 120_000, default: Some(1_000), file: FileRule::Default }, "Burst gap minimum", "Shortest regular automatic gap in milliseconds.", true, "send limits");
@@ -41,7 +42,7 @@ pub(crate) const REPEAT_WINDOW: Setting = setting!("send.repeatWindowSends", "/s
 pub(crate) const DUPLICATE_WINDOW: Setting = setting!("send.duplicateWindowMs", "/socialV2/send/duplicateWindowMs", &Integer { min: 0, max: 86_400_000, default: Some(0), file: FileRule::LegacyDecimal }, "Duplicate tool-send window", "Milliseconds before another tool send in the conversation. Zero disables the window.", false, "send limits");
 
 pub(crate) const SETTINGS: &[Setting] = &[
-    SEND_DELAY, FIRST_ENABLED, FILL_TYPING, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_PER_CHAR, GAP_MAX, STICKER_MIN, STICKER_MAX, BURST, BURST_MAX, BURST_MIN_MS, BURST_MAX_MS, LONG_MIN, LONG_MAX, LONG_CHANCE, RATE_MIN, RATE_HOUR, TURN_MAX, MAX_CHARS, REPEAT, REPEAT_WINDOW, DUPLICATE_WINDOW,
+    SEND_DELAY, FIRST_ENABLED, FILL_TYPING, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_PER_CHAR, GAP_MAX, STICKER_MIN, STICKER_MAX, MERGE_MULTI, BURST, BURST_MAX, BURST_MIN_MS, BURST_MAX_MS, LONG_MIN, LONG_MAX, LONG_CHANCE, RATE_MIN, RATE_HOUR, TURN_MAX, MAX_CHARS, REPEAT, REPEAT_WINDOW, DUPLICATE_WINDOW,
 ];
 
 pub(crate) const ORDERED: [[Setting; 2]; 3] = [
@@ -56,4 +57,24 @@ pub(crate) fn first_gap_setting(document: &Value, first: &Setting, fallback: &Se
     }
     fallback.found_in(document).and_then(|value| fallback.kind.read(value)).and_then(|value| value.as_i64())
         .filter(|value| *value != 0).unwrap_or_else(|| first.integer(&Value::Null))
+}
+
+/// How fresh text batches become QQ bubbles under the effective send settings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextBatch {
+    Merge,
+    Split,
+    Single,
+}
+
+impl TextBatch {
+    pub(crate) fn configured(cfg: &Value) -> Self {
+        if MERGE_MULTI.switch(cfg) {
+            Self::Merge
+        } else if BURST.switch(cfg) {
+            Self::Split
+        } else {
+            Self::Single
+        }
+    }
 }

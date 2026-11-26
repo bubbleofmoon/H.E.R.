@@ -344,7 +344,7 @@
   },
   {
    "name": "qq_mark_read",
-   "description": "推进该会话的已读水位。建议传入刚读过消息里的 readThroughSeq 作为 throughSeq，这样不会把读取期间新进来的消息误标为已读；省略 throughSeq 则会按旧逻辑一次性清零当前未读。注意：若准备结束本轮并切入休眠，除对方已明确告别外，桥接要求先通过 qq_wait_for_messages(timeoutMs=300000) 完成一轮睡前观察；观察期内无人发言即可用本工具收尾；若有人发言则先审阅 newMessages，确认无需回应再收尾，而若参与了发言则下次入睡前须重新观察。",
+   "description": "将指定会话已查看的未读消息标记为已读。必须把已查看结果中的 readThroughSeq 作为 throughSeq；更晚到达的消息保持未读。群聊需要观察时，按会话指引处理。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -365,7 +365,8 @@
     },
     "required": [
      "key",
-     "token"
+     "token",
+     "throughSeq"
     ],
     "$schema": "http://json-schema.org/draft-07/schema#"
    },
@@ -375,7 +376,7 @@
   },
   {
    "name": "qq_set_wake_config",
-   "description": "更新会话的休眠与唤醒策略，涵盖模式切换、定时或永久休眠以及各类唤醒触发条件（提及、称呼、触发词、直问、戳一戳、随机概率、anyMessage、特定成员发言）。其中 triggers.speakerIds 可填入若干群成员 QQ 号，当其中任一人发言时即唤醒（适合等某人回话）；启用 triggers.poke 则群内任意拍一拍事件都会唤醒。入睡前若非对方已明确结束对话，须先用 qq_wait_for_messages(timeoutMs=300000) 完成完整睡前观察；无新发言或审阅 newMessages 后无需插话即可写入配置并结束本轮，若途中又发了言则下次入睡前需重新完成观察。",
+   "description": "更新指定会话的二代唤醒策略，包含 mode、有限/无限休眠开关与提前唤醒条件（提及、称呼、关键词、提问、拍一拍、随机概率、anyMessage、指定发言人）。其中 triggers.speakerIds 可选填入若干成员 QQ 号，任意一位开口即触发唤醒（留空则不启用，适合在等特定对象回复时开启）；开启 triggers.poke 则群内任意拍一拍动作都会唤醒。群聊需要观察时，按会话指引处理。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -663,7 +664,7 @@
   },
   {
    "name": "qq_wait_for_messages",
-   "description": "按用途等待新消息或完成睡前观察。回复节奏已由发送端控制，首条回复不必先等待。仅在确需等待对方续言或准备入睡观察时调用：purpose=\"reply\" 仅补齐距上条来信的 quietMs 静默窗，不可替代睡前观察；默认 purpose=\"messages\" 先等待新发言到达再进入静默窗，无新发言则一直等到 timeoutMs 耗尽。准备潜水时使用默认用途并传入 timeoutMs=300000；若全程静默则返回 preSleepWaitSatisfied=true，若期间收到了消息则返回 preSleepWaitObserved=true（读过 newMessages 若决定不插话可直接收尾，决定发言则下次入睡需重等）。",
+   "description": "messages 用途等待后续消息或按需观察群聊；reply 用途按最后来信补齐可选静默间隔。首条回复的节奏已由发送端接管。返回后读取 newMessages 与 readThroughSeq，若仍有未展示的未读消息则继续拉取；观察时长请遵循会话指引。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -684,7 +685,7 @@
       ]
      },
      "timeoutMs": {
-      "description": "最长等待毫秒数，缺省 30000，封顶 600000；睡前观察请使用 messages 用途并设为 300000",
+      "description": "等待预算毫秒数，受当前等待配置限制；reply 用途在静默条件满足后立即返回；需要观察群聊时请用 messages 并按会话指引设置时长",
       "type": "number"
      },
      "minNewMessages": {

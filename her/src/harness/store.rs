@@ -22,6 +22,8 @@ pub(crate) struct Round {
 #[derive(Clone, Debug)]
 pub(crate) struct History {
     pub session: String,
+    /// The initial `model_attempts.id` opened for this turn admission.
+    pub attempt: String,
     /// The summary the session's newest checkpoint carries (`None`: no checkpoint, or one without a summary).
     pub summary: Option<String>,
     /// The completed turns after that checkpoint, oldest first.
@@ -208,12 +210,12 @@ impl Store {
 
     #[cfg(test)]
     pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
-        self.admit_with_briefing(request, None)
+        self.admit_with_briefing(request, &request.user_message(), None)
     }
 
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
-    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, briefing: Option<Value>) -> Result<History, String> {
+    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, user: &ChatMessage, briefing: Option<Value>) -> Result<History, String> {
         let known = record_credentials(&self.context)?;
         let initial = crate::engine_switch::summary(
             &self.context,
@@ -249,6 +251,7 @@ impl Store {
         let idle_from: Option<i64> = tx
             .query_row("SELECT MAX(ended_ms) FROM turns WHERE session_id=?1", [&session], |r| r.get(0))
             .map_err(|_| STORAGE_ERROR)?;
+        let attempt = crate::turn_ledger::mint_id("model-attempt-");
         let history = {
             let mut stmt = tx.prepare("SELECT e.seq,e.turn_id,e.kind,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
                 WHERE e.session_id=?1 AND e.seq>?2 AND t.state='completed' AND e.kind IN ('user','assistant','tool_result') ORDER BY e.seq").map_err(|_| STORAGE_ERROR)?;
@@ -294,6 +297,7 @@ impl Store {
             }
             History {
                 session: session.clone(),
+                attempt: attempt.clone(),
                 summary,
                 rounds: rounds.into_iter().map(|(_, round)| round).collect(),
                 idle_from,
@@ -304,7 +308,6 @@ impl Store {
             params![request.id, session, request.conversation, request.profile, now]).map_err(|_| STORAGE_ERROR)?;
         // The first attempt goes to the turn's start route (`ModelRoute::start`).
         let route = request.route.routes.get(request.route.start).ok_or(STORAGE_ERROR)?;
-        let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
             params![attempt, request.id, safe_text(&known, &route.model), safe_text(&known, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
         append(
@@ -323,7 +326,7 @@ impl Store {
             &request.id,
             None,
             "user",
-            json!({"text":request.prompt,"message":request.user_message()}),
+            json!({"text":request.prompt,"message":user}),
         )?;
         if let Some(mut record) = briefing {
             // The preceding insert is the canonical user fact. The receipt and fact commit together.
@@ -376,7 +379,7 @@ impl Store {
     }
 
     /// A new attempt of the running turn on route `route` of its chain (a step, a retry or a failover).
-    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<(), String> {
+    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<String, String> {
         let route = request.route.routes.get(route).ok_or(STORAGE_ERROR)?;
         let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
@@ -397,7 +400,7 @@ impl Store {
             json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
-        Ok(())
+        Ok(attempt)
     }
 
     /// Intent commits before the blocking handler may be scheduled, including refused calls.
@@ -769,6 +772,112 @@ fn switch_reader(context: &RuntimeContext) -> Result<Option<Connection>, String>
     Ok(Some(conn))
 }
 
+const INSPECTOR_EVENT_LIMIT: usize = 50;
+const INSPECTOR_EVENT_BYTES: usize = 512 * 1024;
+
+/// Read one page of a turn's committed events through the contained read-only connection.
+/// The returned flag indicates that another event remains after this page.
+pub(crate) fn inspect_events(
+    context: &RuntimeContext,
+    turn: &str,
+    conversation: &str,
+    after: i64,
+    prices: &crate::pricing::PriceTable,
+) -> Result<(Vec<Value>, bool), String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok((Vec::new(), false));
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.seq, e.created_ms, e.kind, e.attempt_id, a.model,
+                    CASE WHEN length(CAST(e.payload AS BLOB)) <= 65536 THEN e.payload END
+             FROM turns t JOIN events e ON e.session_id = t.session_id AND e.turn_id = t.id
+             LEFT JOIN model_attempts a ON a.id = e.attempt_id
+             WHERE t.id = ?1 AND t.conversation = ?2 AND e.seq > ?3
+             ORDER BY e.seq LIMIT ?4",
+        )
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut rows = stmt
+        .query(params![turn, conversation, after, INSPECTOR_EVENT_LIMIT + 1])
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut events = Vec::new();
+    let mut bytes = 2; // JSON array brackets.
+    while let Some(row) = rows.next().map_err(|_| STORAGE_ERROR)? {
+        if events.len() == INSPECTOR_EVENT_LIMIT {
+            return Ok((events, true));
+        }
+        let seq: i64 = row.get(0).map_err(|_| STORAGE_ERROR)?;
+        let at: i64 = row.get(1).map_err(|_| STORAGE_ERROR)?;
+        let kind: String = row.get(2).map_err(|_| STORAGE_ERROR)?;
+        let attempt: Option<String> = row.get(3).map_err(|_| STORAGE_ERROR)?;
+        let model: Option<String> = row.get(4).map_err(|_| STORAGE_ERROR)?;
+        let stored: Option<String> = row.get(5).map_err(|_| STORAGE_ERROR)?;
+        let payload = match stored {
+            Some(stored) => {
+                let mut payload: Value = serde_json::from_str(&stored).map_err(|_| STORAGE_ERROR)?;
+                // Canonical replay messages can contain opaque data. The view uses the recorded
+                // text, results and attempt metadata rather than a duplicate replay message.
+                if let Some(fields) = payload.as_object_mut() {
+                    fields.remove("message");
+                    if let Some(raw) = fields.remove("raw") {
+                        if let Some(reasoning) = raw.get("captured_reasoning_content") {
+                            fields.insert("reasoning".into(), reasoning.clone());
+                        }
+                        if let Some(usage) = inspector_usage(&raw, model.as_deref(), at, prices) {
+                            fields.insert("usage".into(), usage);
+                        }
+                    }
+                }
+                payload
+            }
+            None => json!({"omitted": "event payload exceeds the inspector's size limit"}),
+        };
+        let mut event = json!({
+            "seq": seq,
+            "at": at,
+            "kind": kind,
+            "attemptId": attempt,
+            "payload": payload,
+        });
+        let mut event_bytes = event.to_string().len();
+        if event_bytes > INSPECTOR_EVENT_BYTES - 2 {
+            event["payload"] = json!({"omitted": "event payload exceeds the inspector's size limit"});
+            event_bytes = event.to_string().len();
+        }
+        let next_bytes = bytes + event_bytes + usize::from(!events.is_empty());
+        if next_bytes > INSPECTOR_EVENT_BYTES {
+            if events.is_empty() {
+                return Err(STORAGE_ERROR.into());
+            }
+            return Ok((events, true));
+        }
+        events.push(event);
+        bytes = next_bytes;
+    }
+    Ok((events, false))
+}
+
+fn inspector_usage(
+    raw: &Value,
+    model: Option<&str>,
+    at: i64,
+    prices: &crate::pricing::PriceTable,
+) -> Option<Value> {
+    let model = model?;
+    let usage =
+        serde_json::from_value::<genai::chat::Usage>(raw.get("captured_usage")?.clone()).ok()?;
+    let buckets = super::usage::buckets(&usage)?;
+    let normalized = crate::pricing::normalize_usage(Some(&buckets));
+    let (rates, cost) = crate::pricing::price_usage(&normalized, model, at, prices);
+    Some(json!({
+        "tokens": normalized.total(),
+        "buckets": buckets,
+        "cost": cost.total,
+        "currency": rates.currency,
+        "estimated": rates.estimated,
+    }))
+}
+
 pub(crate) fn has_generation(context: &RuntimeContext, key: &str, generation: &str) -> Result<bool, String> {
     let Some(conn) = switch_reader(context)? else { return Ok(false) };
     conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1 AND generation=?2)",
@@ -840,6 +949,118 @@ fn attempt_route(model: String, started: &str) -> String {
         .unwrap_or(model)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedAttemptRecord {
+    pub seq: i64,
+    pub attempt_id: String,
+    pub conversation: String,
+    pub model: String,
+    pub route: String,
+    pub ended_ms: i64,
+    pub usage: Option<genai::chat::Usage>,
+}
+
+/// Completed model attempts committed after `after_seq` (`events.seq` of `model_attempt_ended`)
+/// that carry a saved response, for startup usage-ledger crash reconciliation. Never creates or
+/// migrates `conversations.db`.
+pub(crate) fn completed_attempts_after(
+    context: &RuntimeContext,
+    after_seq: i64,
+) -> Result<Vec<CompletedAttemptRecord>, String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.seq, a.id, s.conversation, a.model, a.ended_ms, a.begun_ms, a.response,
+                (SELECT es.payload FROM events es
+                 WHERE es.attempt_id = a.id AND es.kind = 'model_attempt_started'
+                 ORDER BY es.seq DESC LIMIT 1) AS started_payload
+             FROM events e
+             JOIN model_attempts a ON a.id = e.attempt_id
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.kind = 'model_attempt_ended'
+               AND a.state = 'completed'
+               AND a.response IS NOT NULL
+               AND e.seq > ?1
+             ORDER BY e.seq ASC",
+        )
+        .map_err(|_| STORAGE_ERROR)?;
+    let rows = stmt
+        .query_map(params![after_seq], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(|_| STORAGE_ERROR)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (seq, attempt_id, conversation, model, ended_ms, begun_ms, response_raw, started) in rows {
+        let Ok(response) = serde_json::from_str::<Value>(&response_raw) else {
+            continue;
+        };
+        let usage = response
+            .get("captured_usage")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value::<genai::chat::Usage>(v.clone()).ok());
+        let route = attempt_route(model.clone(), started.as_deref().unwrap_or(""));
+        out.push(CompletedAttemptRecord {
+            seq,
+            attempt_id,
+            conversation,
+            model,
+            route,
+            ended_ms: ended_ms.unwrap_or(begun_ms),
+            usage,
+        });
+    }
+    Ok(out)
+}
+
+/// Highest `events.seq` among `model_attempt_ended` events (all events when `attempt_ids` is
+/// `None`, or those matching `attempt_ids` when `Some`). Returns `0` when no database exists.
+pub(crate) fn max_attempt_event_seq(
+    context: &RuntimeContext,
+    attempt_ids: Option<&[String]>,
+) -> Result<i64, String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok(0);
+    };
+    match attempt_ids {
+        None => conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE kind = 'model_attempt_ended'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| STORAGE_ERROR.to_string()),
+        Some(ids) if ids.is_empty() => Ok(0),
+        Some(ids) => {
+            let mut max_seq = 0i64;
+            for chunk in ids.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT COALESCE(MAX(seq), 0) FROM events
+                     WHERE kind = 'model_attempt_ended' AND attempt_id IN ({placeholders})"
+                );
+                let seq: i64 = conn
+                    .query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |r| r.get(0))
+                    .map_err(|_| STORAGE_ERROR.to_string())?;
+                max_seq = max_seq.max(seq);
+            }
+            Ok(max_seq)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,7 +1126,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-128").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
             id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),
@@ -958,7 +1179,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-165").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), None, "no database: no request");
         assert!(!root.join("data").join(DB).exists(), "reading never creates the database");
@@ -1006,7 +1227,7 @@ mod tests {
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-7").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let request = TurnRequest {
             id:"last-route".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),

@@ -77,7 +77,7 @@ pub fn serve_web_search(context: &RuntimeContext) -> std::io::Result<()> {
             _ => web_fetch_tool(args["url"].as_str().unwrap_or("")),
         }
     });
-    serve_stdio("web-search-safe", tools, dispatch)
+    serve_stdio("web-search-safe", Arc::new(move || tools.as_ref().clone()), dispatch)
 }
 
 fn web_search_tool(query: &str, context: &RuntimeContext) -> Value {
@@ -111,7 +111,7 @@ pub fn serve_host(context: &RuntimeContext) -> std::io::Result<()> {
         }
         outcome(pretty(&snowluma_status(&context)), false)
     });
-    serve_stdio("snowluma-host", tools, dispatch)
+    serve_stdio("snowluma-host", Arc::new(move || tools.as_ref().clone()), dispatch)
 }
 
 /// Where the gateway answers: an isolated runtime uses only its selected OneBot dependency, a legacy one
@@ -160,8 +160,14 @@ fn gateway_info(context: &RuntimeContext, cfg: &Value) -> Map<String, Value> {
     let mut info = Map::new();
     let token = cfg.pointer("/snowluma/accessToken").filter(|v| js_truthy(v)).map(crate::aux_text::js_string).unwrap_or_default();
     let reply = gateway_target(context, cfg).and_then(|(host_port, prefix)| {
-        let headers = if token.is_empty() { Vec::new() } else { vec![("Authorization".to_string(), format!("Bearer {token}"))] };
-        crate::qq_tools::http_request(&host_port, "GET", &format!("{prefix}/get_login_info"), &headers, None, GATEWAY_TIMEOUT)
+        let ob = crate::onebot::OneBot::try_new_authority(&host_port, token.clone())
+            .map_err(|_| "fetch failed".to_string())?;
+        ob.get_raw_path(
+            &format!("{prefix}/get_login_info"),
+            GATEWAY_TIMEOUT,
+            crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+        )
+        .map_err(|err| err.to_qq_tools_message())
     });
     let reply = match reply {
         Ok(reply) => reply,
@@ -180,7 +186,7 @@ fn gateway_info(context: &RuntimeContext, cfg: &Value) -> Map<String, Value> {
         return info;
     }
     // `res.json()` decodes UTF-8 (lossily) first; a lone surrogate escape becomes U+FFFD (accepted deviation 18).
-    let body: Value = match crate::aux_text::parse_json_replacing_lone_surrogates::<Value>(&String::from_utf8_lossy(&reply.body)) {
+    let body: Value = match reply.parse_json_lossy::<Value>(crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd) {
         Ok((body, _)) => body,
         Err(error) => {
             info.insert("reachable".into(), json!(false));

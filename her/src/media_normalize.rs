@@ -3,6 +3,77 @@ use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat};
 use std::io::Cursor;
 
 pub const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Image magic sniff: PNG / JPEG / GIF / WebP.
+pub fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+/// Read image dimensions from container headers (PNG, GIF, JPEG SOF, WebP VP8X/VP8L/VP8).
+/// Used as a preflight pixel-bomb check before allocating pixel buffers.
+pub fn image_dimensions(b: &[u8]) -> Option<(u64, u64)> {
+    if b.len() < 24 {
+        return None;
+    }
+    if b[0] == 0x89 && &b[1..4] == b"PNG" {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]) as u64;
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]) as u64;
+        return Some((w, h));
+    }
+    if &b[0..6] == b"GIF87a" || &b[0..6] == b"GIF89a" {
+        let w = u16::from_le_bytes([b[6], b[7]]) as u64;
+        let h = u16::from_le_bytes([b[8], b[9]]) as u64;
+        return Some((w, h));
+    }
+    if b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
+        let mut off = 2usize;
+        while off + 9 < b.len() {
+            if b[off] != 0xFF {
+                off += 1;
+                continue;
+            }
+            let marker = b[off + 1];
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                off += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([b[off + 2], b[off + 3]]) as usize;
+            if len < 2 {
+                return None;
+            }
+            if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+                let h = u16::from_be_bytes([b[off + 5], b[off + 6]]) as u64;
+                let w = u16::from_be_bytes([b[off + 7], b[off + 8]]) as u64;
+                return Some((w, h));
+            }
+            off += 2 + len;
+        }
+    }
+    if &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" && b.len() >= 30 {
+        let fourcc = &b[12..16];
+        if fourcc == b"VP8X" {
+            let w = 1 + b[24] as u64 + ((b[25] as u64) << 8) + ((b[26] as u64) << 16);
+            let h = 1 + b[27] as u64 + ((b[28] as u64) << 8) + ((b[29] as u64) << 16);
+            return Some((w, h));
+        }
+        if fourcc == b"VP8L" && b.len() >= 25 {
+            let bits = u32::from_le_bytes([b[21], b[22], b[23], b[24]]);
+            let w = (bits & 0x3FFF) as u64 + 1;
+            let h = ((bits >> 14) & 0x3FFF) as u64 + 1;
+            return Some((w, h));
+        }
+        if fourcc == b"VP8 " && b.len() >= 30 {
+            let w = u16::from_le_bytes([b[26], b[27]]) as u64 & 0x3FFF;
+            let h = u16::from_le_bytes([b[28], b[29]]) as u64 & 0x3FFF;
+            return Some((w, h));
+        }
+    }
+    None
+}
 pub const MAX_OUTPUT_BYTES: usize = 96 * 1024;
 const PASS_BYTES: usize = 64 * 1024;
 const MAX_FRAMES: usize = 256;
@@ -43,7 +114,7 @@ fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
         _ => return Err(()),
     };
     // Header-only checks precede construction of pixel decoders and all frame buffers.
-    let (w, h) = crate::safe_fetch::image_dimensions(bytes).ok_or(())?;
+    let (w, h) = image_dimensions(bytes).ok_or(())?;
     let pixels = w.checked_mul(h).ok_or(())?;
     if w == 0 || h == 0 || w > 16_384 || h > 16_384 || pixels > max_pixels.min(64_000_000) {
         return Err(());
@@ -500,7 +571,7 @@ mod tests {
         if payload.len() % 2 != 0 {
             input.push(0);
         }
-        assert_eq!(crate::safe_fetch::image_dimensions(&input), Some((1, 1)));
+        assert_eq!(image_dimensions(&input), Some((1, 1)));
         // This preflight has no pixel/Huffman allocations. Never run an OOM probe.
         assert!(webp_frame_count(&input, 1, 1).is_err());
         assert!(normalize(&input, 64_000_000).is_err());
@@ -740,5 +811,34 @@ mod tests {
         // Small safe mismatch fixture; the same preflight check rejects bomb-sized dimensions.
         webp[header..header + 4].copy_from_slice(&4u32.to_le_bytes());
         assert!(normalize(&webp, 64_000_000).is_err());
+    }
+
+    #[test]
+    fn image_dimensions_reads_headers() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&7u32.to_be_bytes());
+        png.extend_from_slice(&9u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert_eq!(image_dimensions(&png), Some((7, 9)));
+
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&3u16.to_le_bytes());
+        gif.extend_from_slice(&5u16.to_le_bytes());
+        gif.extend_from_slice(&[0u8; 20]);
+        assert_eq!(image_dimensions(&gif), Some((3, 5)));
+
+        assert_eq!(image_dimensions(b"not an image at all............"), None);
+    }
+
+    #[test]
+    fn image_magic_detection() {
+        assert!(looks_like_image(&[0x89, b'P', b'N', b'G', 0x0d]));
+        assert!(looks_like_image(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(looks_like_image(b"GIF89a...."));
+        assert!(looks_like_image(b"RIFF____WEBP"));
+        assert!(!looks_like_image(b"<html>not an image"));
+        assert!(!looks_like_image(b""));
     }
 }

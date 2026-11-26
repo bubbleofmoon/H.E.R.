@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>会话检查器 · HER</title>
+<style>
+  :root { color-scheme: light dark; font: 16px/1.55 system-ui, sans-serif; }
+  body { max-width: 62rem; padding: 1rem 1.25rem; margin: auto; }
+  nav, form, .heading { display: flex; gap: .8rem; align-items: baseline; flex-wrap: wrap; }
+  [hidden] { display: none; }
+  a { color: LinkText; }
+  select, button { font: inherit; }
+  ol { padding-inline-start: 1.75rem; }
+  li { padding: .6rem 0; border-block-end: 1px solid GrayText; }
+  time, .elapsed { font-variant-numeric: tabular-nums; color: GrayText; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .4rem 0; }
+  details { margin: .35rem 0; }
+</style>
+<nav><a id="home" href="/">管理台</a><a id="browse" href="/inspector" hidden>返回会话列表</a></nav>
+<h1 id="title">会话检查器</h1>
+<form id="picker" hidden>
+  <label for="conversation">会话</label>
+  <select id="conversation"></select>
+</form>
+<p role="status" id="status">正在读取…</p>
+<section id="ledger" hidden aria-label="DSH 记录"></section>
+<ol id="rows"></ol>
+<button id="older" type="button" hidden>加载更早的回合</button>
+<script>
+(() => {
+  const byId = id => document.getElementById(id);
+  const query = new URLSearchParams(location.search);
+  const token = query.get('token') || sessionStorage.getItem('consoleToken') || localStorage.getItem('consoleToken') || '';
+  const status = byId('status');
+  const rows = byId('rows');
+  const started = new Map();
+  let renderedLedger;
+  const labels = {
+    turn_admitted: '开始回合', user: '输入', assistant: '模型响应',
+    model_attempt_started: '模型请求', model_attempt_ended: '模型请求结束',
+    tool_started: '调用工具', tool_result: '工具结果', turn_ended: '回合结束',
+    turn_paused: '回合暂停', checkpoint: '历史检查点', checkpoint_failed: '历史检查点失败',
+    wake_briefing: '背景提示'
+  };
+
+  function link(path, values = {}) {
+    const params = new URLSearchParams(values);
+    if (token) params.set('token', token);
+    return params.size ? path + '?' + params : path;
+  }
+
+  async function read(path, values) {
+    const headers = token ? {'x-console-token': token} : {};
+    const response = await fetch(path + '?' + new URLSearchParams(values), {
+      headers,
+      cache: 'no-store'
+    });
+    const body = await response.json();
+    if (!response.ok) throw Object.assign(new Error(body.error), {status: response.status});
+    return body;
+  }
+
+  function element(tag, text) {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    return node;
+  }
+
+  function time(at) {
+    const date = new Date(at);
+    const node = element('time', date.toLocaleString());
+    node.dateTime = date.toISOString();
+    return node;
+  }
+
+  function details(label, content) {
+    const node = document.createElement('details');
+    node.append(element('summary', label), element('pre', JSON.stringify(content, null, 2)));
+    return node;
+  }
+
+  async function list() {
+    const selected = query.get('conversation') || '';
+    const result = await read('/api/inspector/conversations', {conversation: selected});
+    const picker = byId('conversation');
+    picker.append(new Option('选择会话', ''));
+    for (const conversation of result.conversations) picker.append(new Option(conversation, conversation));
+    if (selected && !result.conversations.includes(selected)) picker.append(new Option(selected, selected));
+    picker.value = selected;
+    picker.onchange = () => { location.href = link('/inspector', {conversation: picker.value}); };
+    byId('picker').hidden = result.conversations.length === 0;
+    status.textContent = !result.conversations.length ? '暂无回合记录' :
+      (selected ? (result.turns.length ? '' : '此会话暂无回合记录') : '选择会话以查看回合');
+
+    const older = byId('older');
+    let before;
+    function appendPage(page) {
+      for (const turn of page.turns) {
+        const row = document.createElement('li');
+        const a = element('a', turn.code);
+        a.href = link('/inspector', {turnId: turn.turnId});
+        row.append(a, ' · ', time(turn.beganAt), ' · ' + turn.engine + ' · ' + turn.state);
+        rows.append(row);
+      }
+      before = page.nextBefore;
+      older.hidden = !before;
+    }
+    appendPage(result);
+    older.onclick = async () => {
+      older.disabled = true;
+      try {
+        appendPage(await read('/api/inspector/conversations', {conversation: selected, before}));
+        status.textContent = '';
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        older.disabled = false;
+      }
+    };
+  }
+
+  function appendEvent(event) {
+    const row = document.createElement('li');
+    const heading = document.createElement('div');
+    heading.className = 'heading';
+    const {kind, at, attemptId, payload} = event;
+    heading.append(time(at), element('strong', labels[kind] || kind));
+    const name = payload.route || payload.call?.fn_name || payload.state || payload.purpose;
+    if (name) heading.append(element('span', name));
+    const key = kind.startsWith('tool_') ? payload.id : attemptId;
+    if (key && (kind === 'tool_started' || kind === 'model_attempt_started')) started.set(key, at);
+    if (key && started.has(key) && (kind === 'tool_result' || kind === 'model_attempt_ended')) {
+      const elapsed = element('span', Math.max(0, at - started.get(key)) + ' ms');
+      elapsed.className = 'elapsed';
+      heading.append(elapsed);
+    }
+    if (payload.usage) {
+      const {tokens, cost, currency, estimated} = payload.usage;
+      heading.append(element('span', tokens + ' tokens · ' + (estimated ? '≈ ' : '') + cost.toPrecision(4) + ' ' + currency));
+    }
+    row.append(heading, details('详细记录', payload));
+    rows.append(row);
+  }
+
+  async function poll(id, after = 0) {
+    try {
+      const {turn, ledger, events, more, live, nextAfter} = await read('/api/inspector/turn', {turnId: id, after});
+      byId('title').textContent = turn.conversation + ' · ' + turn.code;
+      byId('browse').href = link('/inspector', {conversation: turn.conversation});
+      const outcome = turn.pauseReason || turn.outcomeReason;
+      const elapsed = turn.endedAt === null ? '' : Math.max(0, turn.endedAt - turn.beganAt) + ' ms';
+      status.textContent = [turn.engine, turn.state, outcome, elapsed, live && '实时更新'].filter(Boolean).join(' · ');
+      if (ledger && JSON.stringify(ledger) !== renderedLedger) {
+        const container = byId('ledger');
+        container.hidden = false;
+        container.replaceChildren(details('模型请求', ledger.attempts), details('工具记录', ledger.tools));
+        renderedLedger = JSON.stringify(ledger);
+      }
+      for (const event of events) appendEvent(event);
+      if (more || live) setTimeout(() => poll(id, nextAfter), more ? 0 : 2000);
+    } catch (error) {
+      status.textContent = error.message;
+      if (!error.status || error.status === 503) setTimeout(() => poll(id, after), 2000);
+    }
+  }
+
+  byId('home').href = link('/');
+  byId('browse').href = link('/inspector');
+  const turnId = query.get('turnId');
+  if (turnId) {
+    byId('browse').hidden = false;
+    poll(turnId);
+  } else {
+    list().catch(error => { status.textContent = error.message; });
+  }
+})();
+</script>
+</html>

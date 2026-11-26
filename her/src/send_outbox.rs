@@ -21,7 +21,10 @@
 //! Writers go through `recorded_send.rs`; this module owns the record format and folding.
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
+pub(crate) use crate::conversation_state::token_epoch;
+#[cfg(test)]
+pub(crate) use crate::conversation_state::token_epoch_matches;
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
@@ -29,12 +32,6 @@ use crate::runtime::{RuntimeArea, RuntimeContext};
 pub const LEGACY_OUTBOX_FILE: &str = crate::legacy_path!("state/send-outbox-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_OUTBOX_FILE: &str = "send-outbox.jsonl";
-
-/// Non-reversible identity of the agent token a batch was created under.
-pub fn token_epoch(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Read every outbox record in append order. A truncated record (crash mid-append) is skipped with a
 /// warning; any other damaged line is an error (see `runtime::parse_evidence_jsonl`).
@@ -188,17 +185,43 @@ impl Batch {
     }
 }
 
+pub(crate) const PERSONA_FAILURE_SEND: &str = "persona-failure";
+
+/// A terminal line must not collide with an earlier reply or an unresolved delivery.
+pub(crate) fn blocks_persona_failure(records: &[Value], key: &str, epochs: &[String], began: i64) -> bool {
+    let mut batches = std::collections::HashMap::<&str, Vec<&Value>>::new();
+    for record in records {
+        if record["k"] == "intent" && record["key"] == key {
+            if !matches!(record["purpose"].as_str(), Some("ack" | PERSONA_FAILURE_SEND))
+                && record["epoch"].as_str().is_some_and(|epoch| epochs.iter().any(|e| e == epoch))
+                && record["t"].as_i64().is_some_and(|at| at >= began)
+            {
+                return true;
+            }
+            let Some(id) = record["batch"].as_str() else { return true };
+            batches.entry(id).or_default().push(record);
+        } else if let Some(events) = record["batch"].as_str().and_then(|id| batches.get_mut(id)) {
+            events.push(record);
+        }
+    }
+    batches.into_iter().any(|(id, events)| {
+        fold_matching_batch(events, id).is_none_or(|batch| batch.items.iter().any(ItemState::needs_verification))
+    })
+}
+
 fn record_idx(record: &Value) -> Option<usize> {
     record.get("idx").and_then(Value::as_u64).map(|v| v as usize)
 }
 
 /// Fold one batch. Later records override earlier ones, except terminal superseded items.
 pub fn fold_batch(records: &[Value], batch_id: &str) -> Option<Batch> {
+    let matching = records.iter().filter(|r| r["batch"].as_str() == Some(batch_id));
+    fold_matching_batch(matching, batch_id)
+}
+
+fn fold_matching_batch<'a>(records: impl IntoIterator<Item = &'a Value>, batch_id: &str) -> Option<Batch> {
     let mut batch: Option<Batch> = None;
     for record in records {
-        if record.get("batch").and_then(Value::as_str) != Some(batch_id) {
-            continue;
-        }
         match record.get("k").and_then(Value::as_str) {
             Some("intent") => {
                 let messages: Vec<String> = record
@@ -483,6 +506,9 @@ mod tests {
         assert_eq!(epoch.len(), 16);
         assert_eq!(epoch, token_epoch("secret-token-value"));
         assert!(!epoch.contains("secret"));
+        assert!(token_epoch_matches("secret-token-value", &epoch));
+        assert!(!token_epoch_matches("fixture-replaced-agent-token", &epoch));
+        assert!(!token_epoch_matches("", &token_epoch("")));
     }
 
     fn history_files(root: &std::path::Path) -> Vec<Value> {

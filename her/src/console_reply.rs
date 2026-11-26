@@ -147,31 +147,39 @@ fn revision(
     epoch: &str,
     after: i64,
 ) -> Result<Option<Value>, (u16, String)> {
-    mutate_social_state_for(context, |state| {
-        let conv = &mut state["conversations"][key];
+    use crate::conversation_state::{ConversationState, UnreadMessage};
+    ConversationState::for_runtime(context).update(key, |conv| {
         if !conversation_matches_epoch(conv, epoch) {
             return Err((409, SEND_CANCELLED_MESSAGE.into()));
         }
         let (scope, _) = wait_usage(context, key, conv)?;
-        let used = if conv["replyRevisionBudget"]["scope"] == scope {
-            conv["replyRevisionBudget"]["used"].as_u64().unwrap_or(0)
+        let used = if conv
+            .field("replyRevisionBudget")
+            .and_then(|b| b.get("scope"))
+            .and_then(Value::as_str)
+            == Some(scope.as_str())
+        {
+            conv.field("replyRevisionBudget")
+                .and_then(|b| b.get("used"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
         } else {
             0
         };
         if used >= MAX_REVISIONS {
             return Ok(None);
         }
-        conv["replyRevisionBudget"] = json!({"scope":scope,"used":used+1});
+        conv.set_field("replyRevisionBudget", json!({"scope": scope, "used": used + 1}));
         let mut fresh = conv.clone();
-        fresh["unread"] = json!(conv["unread"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|m| m["seq"].as_i64().is_some_and(|s| s > after))
+        let filtered: Vec<UnreadMessage> = conv
+            .unread()
+            .iter()
+            .filter(|m| m.raw_i64_seq().is_some_and(|s| s > after))
             .cloned()
-            .collect::<Vec<_>>());
-        fresh["recentMessages"] = json!([]);
-        let packet = agent::build_wake_snapshot(context, cfg, key, &fresh)
+            .collect();
+        *fresh.unread_mut() = filtered;
+        fresh.set_field("recentMessages", json!([]));
+        let packet = agent::build_wake_snapshot_conv(context, cfg, key, &fresh)
             .unwrap_or_else(|| json!({"messages":[],"partial":true}));
         let messages = packet["messages"].as_array().cloned().unwrap_or_default();
         let next = messages
@@ -195,16 +203,18 @@ pub(super) fn publish_revision(
     epoch: &str,
     packet: &mut Value,
 ) -> Result<(), (u16, String)> {
-    let _gate = context.is_isolated().then(|| acquire_social_state_gate(context)).transpose()?;
-    let state = load_social_state_for(context)?;
-    let conv = &state["conversations"][key];
-    if !conversation_matches_epoch(conv, epoch) {
+    let _gate = crate::conversation_state::acquire_config_gate(context)?;
+    let conv = crate::conversation_state::ConversationState::for_runtime(context)
+        .read(key)?
+        .unwrap_or_default();
+    if !conversation_matches_epoch(&conv, epoch) {
         return Err((409, SEND_CANCELLED_MESSAGE.into()));
     }
-    let unread = conv["unread"].as_array().cloned().unwrap_or_default();
+    let unread = conv.unread_values();
     let messages = packet["newMessages"].as_array().cloned().unwrap_or_default();
-    agent::note_receipts(context, key, conv, &unread, &messages);
-    packet["readThroughSeq"] = json!(agent::through_of(context, key, conv));
+    let conv_val = conv.to_value();
+    agent::note_receipts(context, key, &conv_val, &unread, &messages);
+    packet["readThroughSeq"] = json!(agent::through_of_conv(context, key, &conv));
     Ok(())
 }
 
@@ -273,10 +283,12 @@ pub(super) fn hold(
     let mut revisions_exhausted = false;
     loop {
         send_guard_for(context, cfg, key, epoch, policy, tool)?;
-        let state = load_social_state_for(context)?;
+        let conv = crate::conversation_state::ConversationState::for_runtime(context).read(key)?;
         if !revisions_exhausted
-            && state["conversations"][key]["lastUnreadSeq"]
-                .as_i64()
+            && conv
+                .as_ref()
+                .and_then(|c| c.field("lastUnreadSeq"))
+                .and_then(Value::as_i64)
                 .unwrap_or(0)
                 > after
         {
@@ -296,9 +308,11 @@ pub(super) fn hold(
     drop(typing);
     send_guard_for(context, cfg, key, epoch, policy, tool)?;
     if !revisions_exhausted {
-        let state = load_social_state_for(context)?;
-        if state["conversations"][key]["lastUnreadSeq"]
-            .as_i64()
+        let conv = crate::conversation_state::ConversationState::for_runtime(context).read(key)?;
+        if conv
+            .as_ref()
+            .and_then(|c| c.field("lastUnreadSeq"))
+            .and_then(Value::as_i64)
             .unwrap_or(0)
             > after
         {

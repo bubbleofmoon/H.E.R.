@@ -23,8 +23,8 @@ pub(crate) const RATE_MIN: Setting = setting!("wake", "maxWakePerMinute", &Integ
 pub(crate) const RATE_HOUR: Setting = setting!("wake", "maxWakePerHour", &Integer { min: 0, max: 10_000, default: Some(12), file: FileRule::SignedClamp }, "Wakes per hour", "Zero disables this quota.", false);
 pub(crate) const NO_ACTION: Setting = setting!("wake", "noActionLimit", &Integer { min: 1, max: 10_000, default: Some(3), file: FileRule::Default }, "No-action limit", "Consecutive no-action turns before resetting the wake plan.", false);
 pub(crate) const REMINDERS: Setting = setting!("wake", "maxWakeConfigReminders", &Integer { min: 1, max: 10_000, default: Some(2), file: FileRule::Default }, "Closure reminder limit", "Maximum closure attempts including the original turn.", false);
-pub(crate) const PRE_SLEEP: Setting = setting!("wake", "preSleepWaitMs", &Integer { min: 0, max: TURN_LIMIT, default: Some(PRE_SLEEP_DEFAULT), file: FileRule::TruncateAndClamp }, "Pre-sleep observation", "Milliseconds to watch before sleeping.", false);
-pub(crate) const PRE_SLEEP_ENABLED: Setting = setting!("wake", "preSleepWaitEnabled", &Switch::new(true), "Pre-sleep observation enabled", "Enables the pre-sleep gate after a send.", false);
+pub(crate) const PRE_SLEEP: Setting = setting!("wake", "preSleepWaitMs", &Integer { min: 0, max: TURN_LIMIT, default: Some(PRE_SLEEP_DEFAULT), file: FileRule::TruncateAndClamp }, "Pre-sleep observation", "Milliseconds for the engagement window and group pre-sleep observation. Zero disables both.", false);
+pub(crate) const PRE_SLEEP_ENABLED: Setting = setting!("wake", "preSleepWaitEnabled", &Switch::new(true), "Pre-sleep observation enabled", "Enables the engagement window and group pre-sleep observation.", false);
 pub(crate) const PREEMPT: Setting = setting!("wake", "preemptAfterMs", &Integer { min: 0, max: TURN_LIMIT, default: Some(0), file: FileRule::Clamp }, "Preemption age", "Milliseconds before an urgent wake can interrupt a turn. Zero disables preemption.", false);
 pub(crate) const HARD_CAP: Setting = setting!("wake", "turnHardCapMs", &Integer { min: 1, max: TURN_LIMIT, default: None, file: FileRule::Automatic }, "Turn hard cap", "Milliseconds. Reset to derive the cap from observation and closing time.", false);
 pub(crate) const CEILING: Setting = setting!("wake", "turnCeilingMs", &Integer { min: 1, max: TURN_LIMIT, default: Some(CEILING_DEFAULT), file: FileRule::Default }, "Turn ceiling", "Absolute milliseconds from dispatch.", false);
@@ -41,7 +41,7 @@ pub(crate) const WAIT_MAX: Setting = setting!("wait", "maxMs", &Integer { min: 1
 pub(crate) const WAIT_QUIET: Setting = setting!("wait", "minQuietAfterNewMs", &Integer { min: 0, max: TURN_LIMIT, default: Some(10_000), file: FileRule::Clamp }, "Quiet after new messages", "Milliseconds of additional silence after messages arrive.", false);
 pub(crate) const WAIT_BATCH_MAX: Setting = setting!("wait", "batchMaxMs", &Integer { min: 1, max: 120_000, default: Some(30_000), file: FileRule::Default }, "Wait batch maximum", "Maximum milliseconds from the first arrival in a messages wait.", false);
 
-pub(crate) const TURN_FIELDS: &[Setting] = &[CEILING, HARD_CAP, PRE_SLEEP, WAIT_MIN, WAIT_MAX, WAIT_QUIET, WAIT_BATCH_MAX];
+pub(crate) const TURN_FIELDS: &[Setting] = &[CEILING, HARD_CAP, PRE_SLEEP, PRE_SLEEP_ENABLED, WAIT_MIN, WAIT_MAX, WAIT_QUIET, WAIT_BATCH_MAX];
 
 pub(crate) const ORDERED: [[Setting; 2]; 2] = [[PROACTIVE_MIN, PROACTIVE_MAX], [WAIT_MIN, WAIT_MAX]];
 

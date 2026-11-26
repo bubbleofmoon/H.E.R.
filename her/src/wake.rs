@@ -872,18 +872,15 @@ const MIN_TURN_HARD_CAP_MS: i64 = 120_000;
 pub const DEFAULT_TURN_HARD_CAP_MS: i64 =
     PRE_SLEEP_WAIT_DEFAULT_MS + DEFAULT_WAIT_MAX_QUIET_MS + WAIT_QUIET_SLACK_MS + TURN_HEADROOM_MS;
 
-/// The pre-sleep gate's reading (`pre_sleep_remaining`, wait results).
+/// Effective pre-sleep and engagement duration. Zero disables both.
 pub fn pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    timing::PRE_SLEEP.integer(cfg)
+    let duration = timing::PRE_SLEEP.integer(cfg);
+    if timing::PRE_SLEEP_ENABLED.switch(cfg) { duration } else { 0 }
 }
 
-/// The observation the agent is told to wait for (prompt, closing reminder, closing refusals).
-/// JS `Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000)`: 0 and non-numbers mean 300000.
-pub fn prompt_pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    match timing::PRE_SLEEP.integer(cfg) {
-        0 => timing::PRE_SLEEP.integer(&Value::Null),
-        ms => ms,
-    }
+/// Private conversations may use the engagement window without a mandatory observation.
+pub fn required_pre_sleep_ms(cfg: &Value, key: &str) -> i64 {
+    if key.starts_with("private:") { 0 } else { pre_sleep_wait_ms(cfg) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,11 +890,9 @@ pub struct TurnBudget {
 }
 
 /// The longest observation a turn may be asked for, plus the messages wait's quiet extension.
-/// The prompt does not read `preSleepWaitEnabled`, so neither does the budget.
 fn observation_with_quiet_ms(cfg: &Value) -> i64 {
-    prompt_pre_sleep_wait_ms(cfg)
-        .max(pre_sleep_wait_ms(cfg))
-        .saturating_add(crate::console::wait_max_quiet_ms(cfg))
+    pre_sleep_wait_ms(cfg)
+        .saturating_add(crate::social_state::wait_max_quiet_ms(cfg))
         .saturating_add(WAIT_QUIET_SLACK_MS)
 }
 
@@ -986,9 +981,6 @@ pub fn reserved2_collector_ms(cfg: &Value) -> u64 {
 /// Length of her engagement window (`preSleepWaitMs`), or `None` when the window does not
 /// exist (`preSleepWaitEnabled=false` or a non-positive gate reading).
 pub fn engagement_window_ms(cfg: &Value) -> Option<i64> {
-    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
-        return None;
-    }
     Some(pre_sleep_wait_ms(cfg)).filter(|ms| *ms > 0)
 }
 
@@ -1002,8 +994,9 @@ pub fn engagement_end(st: &Value, cfg: &Value) -> Option<i64> {
 
 /// JS 的 `preSleepWaitBlockedV2`：返回还要等多久（None = 不拦）。
 /// While she is engaged the requirement never outlasts her engagement window.
-pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
-    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
+pub fn pre_sleep_remaining(st: &Value, cfg: &Value, key: &str, now: i64) -> Option<i64> {
+    let wait_ms = required_pre_sleep_ms(cfg, key);
+    if wait_ms == 0 {
         return None;
     }
     if has_explicit_end(st) {
@@ -1013,7 +1006,6 @@ pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
     if window_end.is_some_and(|end| now >= end) {
         return None;
     }
-    let wait_ms = pre_sleep_wait_ms(cfg);
     let last_incoming = st.get("lastIncomingAt").and_then(|v| v.as_i64()).unwrap_or(0);
     if last_incoming > 0 && now - last_incoming >= wait_ms {
         return None;
@@ -1182,11 +1174,8 @@ pub fn normalize_wake_config(
         .and_then(|s| s.get("wake"))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let num = |k: &str, d: i64| -> i64 {
-        wake_cfg.get(k).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(d)
-    };
-    let min_ms = num("sleepMinMs", 0).max(0);
-    let max_ms = num("sleepMaxMs", 0).max(0);
+    let sleep = SleepSettings::read(&wake_cfg);
+    let (min_ms, max_ms) = (sleep.minimum, sleep.maximum);
 
     if is_infinite(&Value::Object(next.clone())) {
         next.insert("sleepUntil".into(), Value::Null);
@@ -1204,8 +1193,8 @@ pub fn normalize_wake_config(
         }
         next.insert("sleepUntil".into(), Value::String(crate::sticker::iso_at(now + ms)));
     } else if next.get("sleepUntil").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_none() {
-        let rec_min = num("recommendedSleepMinMs", 300_000);
-        let rec_max = num("recommendedSleepMaxMs", 7_200_000);
+        let rec_min = sleep.recommended_minimum;
+        let rec_max = sleep.recommended_maximum;
         let span = (rec_max - rec_min).max(0) as f64;
         let ms = rec_min + (rand01.clamp(0.0, 0.999_999) * span).round() as i64;
         next.insert("sleepUntil".into(), Value::String(crate::sticker::iso_at(now + ms)));
@@ -1265,15 +1254,32 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
     plan
 }
 
-// Keep the legacy draw (sample the recommendation, then apply the hard bounds).
+struct SleepSettings {
+    minimum: i64,
+    maximum: i64,
+    recommended_minimum: i64,
+    recommended_maximum: i64,
+}
+
+impl SleepSettings {
+    fn read(wake: &Value) -> Self {
+        let number = |key: &str, fallback| wake[key].as_i64().filter(|n| *n >= 0).unwrap_or(fallback);
+        Self {
+            minimum: number("sleepMinMs", 0),
+            maximum: number("sleepMaxMs", 0),
+            recommended_minimum: number("recommendedSleepMinMs", 300_000),
+            recommended_maximum: number("recommendedSleepMaxMs", 7_200_000),
+        }
+    }
+}
+
+// Sample the recommendation, then apply the hard bounds.
 fn sleep_duration(cfg: &Value, fraction: f64) -> i64 {
-    let w = &cfg["socialV2"]["wake"];
-    let num = |key: &str, fallback| w[key].as_i64().filter(|n| *n != 0).unwrap_or(fallback);
-    let low = num("recommendedSleepMinMs", 300_000);
-    let high = num("recommendedSleepMaxMs", 7_200_000).max(low);
+    let sleep = SleepSettings::read(&cfg["socialV2"]["wake"]);
+    let low = sleep.recommended_minimum;
+    let high = sleep.recommended_maximum.max(low);
     let drawn = low as f64 + fraction * (high as f64 - low as f64);
-    let minimum = num("sleepMinMs", 0);
-    let maximum = num("sleepMaxMs", 0);
+    let (minimum, maximum) = (sleep.minimum, sleep.maximum);
     let drawn = if minimum > 0 { drawn.max(minimum as f64) } else { drawn };
     let drawn = if maximum > 0 { drawn.min(maximum as f64) } else { drawn };
     drawn.round() as i64
@@ -1321,6 +1327,28 @@ pub(crate) fn default_wake_plan(cfg: &Value) -> Value {
         plan["inheritsKeywords"] = json!(true);
     }
     plan
+}
+
+/// Project the effective inherited plan back onto the configuration field names.
+pub(crate) fn effective_wake_defaults(cfg: &Value) -> Value {
+    let plan = default_wake_plan(cfg);
+    let triggers = &plan["triggers"];
+    let sleep = SleepSettings::read(&cfg["socialV2"]["wake"]);
+    json!({
+        "defaultMode": plan["mode"],
+        "recommendedDefaultInfinite": plan["infinite"],
+        "recommendedAtMention": triggers["atMention"],
+        "recommendedNameMention": triggers["nameMention"],
+        "recommendedQuestion": triggers["question"],
+        "recommendedPoke": triggers["poke"],
+        "recommendedKeywords": triggers["keywords"],
+        "recommendedProbability": triggers["probability"],
+        "batchWindowMs": plan["batchWindowMs"],
+        "sleepMinMs": sleep.minimum,
+        "sleepMaxMs": sleep.maximum,
+        "recommendedSleepMinMs": sleep.recommended_minimum,
+        "recommendedSleepMaxMs": sleep.recommended_maximum,
+    })
 }
 
 /// JS 的 `ensureWakeableV2`：配置里一个触发条件都没有时重置为默认，避免永眠。

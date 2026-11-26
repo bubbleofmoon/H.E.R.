@@ -485,14 +485,7 @@ impl Failure {
 }
 
 fn known_tokens(context: &RuntimeContext) -> Vec<String> {
-    load_social_state_for(context)
-        .ok()
-        .and_then(|state| {
-            state.get("conversations").and_then(Value::as_object).map(|all| {
-                all.values().filter_map(|c| c.get("agentToken").and_then(Value::as_str)).filter(|t| !t.is_empty()).map(str::to_string).collect()
-            })
-        })
-        .unwrap_or_default()
+    crate::conversation_state::read_active_tokens(context).unwrap_or_default()
 }
 
 /// `shouldAuditKey`: closed-agent skips the audit only for the owner's private chat.
@@ -651,14 +644,13 @@ fn record_voice_sent(context: &RuntimeContext, key: &str, sent: &Sent, label: &s
     let text = crate::social_mem::truncate_text(&display, 200);
     let at = now_ms();
     let message_id = sent.message_id.filter(|id| *id != 0).map(|id| json!(id.to_string())).unwrap_or(Value::Null);
-    mutate_social_state_for(context, |state| {
-        let conv = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-            .ok_or((404, format!("会话不存在：{key}")))?;
-        let recent = conv.entry("recentMessages".to_string()).or_insert_with(|| json!([]));
-        if let Some(list) = recent.as_array_mut() {
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .update_existing(key, |conv| {
+            let mut list = conv
+                .field("recentMessages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             list.push(json!({
                 "messageId": message_id, "sender": "我", "text": text, "plain": text, "quoteTargetIsSelf": false,
                 "isOwner": true, "ownerLabel": "我", "isSelf": true, "at": at
@@ -667,20 +659,22 @@ fn record_voice_sent(context: &RuntimeContext, key: &str, sent: &Sent, label: &s
                 let excess = list.len() - 200;
                 list.drain(0..excess);
             }
-        }
-        conv.insert("lastAiReplyAt".to_string(), json!(at));
-        conv.insert("lastActionAt".to_string(), json!(at));
-        // A delivered voice message is her send: it (re)starts her engagement window and, like a
-        // text, sticker or poke send, a new pre-sleep observation.
-        for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] {
-            conv.insert(field.to_string(), json!(0));
-        }
-        conv.insert("engagedAt".to_string(), json!(at));
-        if let Some(wake) = conv.get_mut("wakeConfig").and_then(Value::as_object_mut) {
-            wake.insert("noActionCount".to_string(), json!(0));
-        }
-        Ok(())
-    })
+            conv.set_field("recentMessages", Value::Array(list));
+            conv.set_field("lastAiReplyAt", json!(at));
+            conv.set_field("lastActionAt", json!(at));
+            // A delivered voice message is her send: it (re)starts her engagement window and, like a
+            // text, sticker or poke send, a new pre-sleep observation.
+            for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] {
+                conv.set_field(field, json!(0));
+            }
+            conv.set_field("engagedAt", json!(at));
+            if let Some(mut wake) = conv.field("wakeConfig").filter(|w| w.is_object()).cloned() {
+                wake["noActionCount"] = json!(0);
+                conv.set_field("wakeConfig", wake);
+            }
+            Ok(())
+        })?
+        .ok_or((404, format!("会话不存在：{key}")))
 }
 
 fn budget_scope(context: &RuntimeContext, key: &str) -> String {

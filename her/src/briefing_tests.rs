@@ -40,9 +40,10 @@ fn serve_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, std::th
     let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..n {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     (context, server)
@@ -55,6 +56,23 @@ fn wake(context: &RuntimeContext, cfg: &Value, rpc: &str) -> crate::prompt::DshW
 fn section(text: &str, name: &str) -> String {
     text.split(&format!("【简报节 {name}】\n")).nth(1)
         .map(|rest| rest.split("\n\n【").next().unwrap().to_string()).unwrap_or_default()
+}
+
+#[test]
+fn dsh_wake_snapshot_applies_model_view_strip() {
+    let (_root, context, mut cfg) = layered_wake_fixture("wake snapshot strip", true);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["v0.2.1", "无需重复查询"]);
+    let (context, server) = serve_packets(&context, 1);
+    let rendered = wake(&context, &cfg, "rpc-snapshot-strip");
+    server.join().unwrap();
+
+    let (_, snapshot) = rendered.text.rsplit_once("【本次消息快照】\n").unwrap();
+    let (packet, guidance) = snapshot.split_once('\n').unwrap();
+    let packet: Value = serde_json::from_str(packet).unwrap();
+    assert_eq!(packet["messages"][0]["text"], "deepseek-v4.1-flash 【已隐藏】");
+    assert_eq!(packet["readThroughSeq"], 1);
+    assert!(guidance.contains("以上消息已提供"));
+    assert!(!guidance.contains("无需重复查询"), "snapshot guidance retained the configured strip literal");
 }
 
 #[test]
@@ -74,7 +92,7 @@ fn wake_bookkeeping_stays_out_of_model_output_and_tool_input() {
     }
     context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
 
-    let (context, server) = serve_packets(&context, 6);
+    let (context, server) = serve_packets(&context, 7);
     let _ = wake(&context, &cfg, "rpc-bookkeeping-full");
     crate::session_context::observe(&context, KEY, "sid-18", "epoch-18", &json!({
         "type": "user/message",
@@ -91,7 +109,12 @@ fn wake_bookkeeping_stays_out_of_model_output_and_tool_input() {
     let args = json!({"key": KEY, "token": "epoch-18"});
     let prompt = crate::mcp::call_prepared("qq_get_prompt", &args, &context);
     let social = crate::mcp::call_prepared_recorded("qq_social_state", &args, &context);
-    let marked = crate::mcp::call_prepared("qq_mark_read", &args, &context);
+    let unread = crate::mcp::call_prepared("qq_get_unread_messages", &args, &context);
+    assert_ne!(unread["isError"], true, "{unread}");
+    let unread: Value = serde_json::from_str(unread["content"][0]["text"].as_str().unwrap()).unwrap();
+    let through = unread["readThroughSeq"].as_i64().unwrap();
+    let mark_args = json!({"key": KEY, "token": "epoch-18", "throughSeq": through});
+    let marked = crate::mcp::call_prepared("qq_mark_read", &mark_args, &context);
     let mut set_args = args;
     set_args["config"] = json!({
         "mode": "active",
@@ -185,16 +208,16 @@ fn a_wake_with_an_empty_identity_raises_the_owner_alert_once_per_generation() {
 }
 
 #[test]
-fn a_strip_that_empties_the_identity_section_is_not_counted_as_delivered_and_alerts() {
+fn redaction_marks_the_nickname_and_preserves_the_identity_and_id() {
     let (_root, context, mut cfg) = layered_wake_fixture("layers stripped identity", true);
     cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
-    cfg["socialV2"]["context"]["stripFromModelText"] = json!([crate::prompt::identity_line("小鲸鱼", "9001")]);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["小鲸鱼", "9001"]);
     let (context, server) = serve_packets(&context, 1);
     let w = wake(&context, &cfg, "rpc-18e");
     server.join().unwrap();
-    assert!(!w.text.contains("你在 QQ 上的昵称是"), "the strip removed the identity text:\n{}", w.text);
-    assert_eq!(w.layers.identity, 0, "a section the strip emptied delivers nothing");
-    assert_eq!(w.alerted, vec![crate::briefing::Layer::Identity]);
+    assert!(w.text.contains("【已隐藏】") && w.text.contains("QQ 9001"), "{}", w.text);
+    assert_eq!(w.layers.identity, 1);
+    assert!(w.alerted.is_empty());
 }
 
 #[test]
@@ -219,50 +242,53 @@ fn the_index_hint_line_stays_within_its_allowance() {
 }
 
 #[test]
-fn a_stripped_operator_section_delivers_nothing_and_relationship_counts_only_what_is_left() {
+fn a_redacted_operator_field_retains_the_relationship_item() {
     let (_root, context, mut cfg) = layered_wake_fixture("layers stripped operator", true);
     cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
     let operator = crate::initial_prompts::format_injection(&context, &cfg, KEY);
     assert!(operator.contains("层级背景丁"), "{operator}");
-    cfg["socialV2"]["context"]["stripFromModelText"] = json!([operator]);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["层级背景丁"]);
     let (context, server) = serve_packets(&context, 1);
     let w = wake(&context, &cfg, "rpc-18f");
     server.join().unwrap();
-    assert!(!w.text.contains("层级背景丁"), "the strip removed the operator text:\n{}", w.text);
+    assert!(!w.text.contains("层级背景丁"), "the redaction must cover the operator text:\n{}", w.text);
     assert!(w.text.contains("层级印象丙"), "{}", w.text);
-    assert_eq!(w.layers.relationship, 1, "the operator section delivers nothing; only the impression is left: {:?}", w.layers);
+    assert!(w.text.contains("【已隐藏】") && w.text.contains("操作者预设"));
+    assert_eq!(w.layers.relationship, 2);
 }
 
 #[test]
-fn a_stripped_slang_section_drops_its_conversation_items() {
+fn a_redacted_slang_field_retains_the_conversation_item() {
     let (_root, context, mut cfg) = layered_wake_fixture("layers stripped slang", true);
     cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
     context.write_atomic(RuntimeArea::Data, "slang.json",
         json!([{"status":"confirmed","content":"层级黑话戊","meaning":"层级含义己","count":3}]).to_string().as_bytes()).unwrap();
     let slang = crate::slang::build_context(&crate::slang::load_entries_for_runtime(&context), None);
     assert!(slang.contains("层级黑话戊"), "{slang}");
-    cfg["socialV2"]["context"]["stripFromModelText"] = json!([slang]);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["层级黑话戊"]);
     let (context, server) = serve_packets(&context, 1);
     let w = wake(&context, &cfg, "rpc-18g");
     server.join().unwrap();
-    assert!(!w.text.contains("层级黑话戊"), "the strip removed the slang text:\n{}", w.text);
-    assert_eq!(w.layers.conversation, 3, "topic, thought and participation; the stripped slang delivers nothing: {:?}", w.layers);
+    assert!(!w.text.contains("层级黑话戊"), "the redaction must cover the slang text:\n{}", w.text);
+    assert!(w.text.contains("【已隐藏】：层级含义己"));
+    assert_eq!(w.layers.conversation, 4);
 }
 
 #[test]
-fn a_strip_that_empties_the_recall_block_delivers_no_memory_and_holds_none() {
+fn a_redacted_recall_retains_the_material_item_and_its_id() {
     let (_root, context, mut cfg) = layered_wake_fixture("layers stripped recall", true);
     cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
     let state = context.read_social_state().unwrap();
     let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &state["conversations"][KEY], KEY);
     assert!(block.contains("层级材料戊"), "{block}");
-    cfg["socialV2"]["context"]["stripFromModelText"] = json!([block]);
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!(["层级材料戊"]);
     let (context, server) = serve_packets(&context, 1);
     let w = wake(&context, &cfg, "rpc-18h");
     server.join().unwrap();
-    assert!(!w.text.contains("层级材料戊"), "the strip removed the recall block:\n{}", w.text);
-    assert_eq!(w.layers.material, 0, "a recall block the strip empties delivers no memory: {:?}", w.layers);
-    assert!(w.recalled.is_empty(), "no recalled id is carried: {:?}", w.recalled);
+    assert!(!w.text.contains("层级材料戊"), "the redaction must cover the recall block:\n{}", w.text);
+    assert!(w.text.contains("【已隐藏】"));
+    assert_eq!(w.layers.material, 1);
+    assert_eq!(w.recalled.len(), 1);
     let record = crate::session_map::context_record(&context, KEY, "sid-18", "epoch-18").unwrap();
-    assert_eq!(record["pending"]["recalled"], json!([]), "a stripped recall holds no memory for the generation");
+    assert_eq!(record["pending"]["recalled"], json!(w.recalled));
 }

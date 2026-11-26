@@ -157,7 +157,7 @@ pub struct Credential {
     base: String,
     context: RuntimeContext,
     cookie: Mutex<String>,
-    /// One refresh after a rejection (the frozen JS `_doFetchWithAuth`). The 401 drill (`--selftest-401`) turns it
+    /// One refresh after a rejection (pinned by transport tests). Test fixtures turn it
     /// off to observe the raw refusal.
     refresh: AtomicBool,
     /// False for a pipeline whose turns run without DSH: no secret was read and no cookie minted.
@@ -245,7 +245,8 @@ impl Credential {
         *self.cookie.lock().unwrap_or_else(|p| p.into_inner()) = cookie;
     }
 
-    /// Turn the refresh after a rejection off (only the `--selftest-401` drill does).
+    /// Turn the refresh after a rejection off (test fixtures only).
+    #[cfg(test)]
     pub fn disable_refresh(&self) {
         self.refresh.store(false, Ordering::SeqCst);
     }
@@ -453,6 +454,10 @@ impl LoginWatch {
         self.alert_owed = false;
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "dsh_credential/contract.rs"]
+mod contract;
 
 #[cfg(test)]
 mod tests {

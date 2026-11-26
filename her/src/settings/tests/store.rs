@@ -151,7 +151,7 @@ fn settings_source_list_names_every_product_file() {
 fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
     // A newer release's WAL store, closed cleanly: everything is in the file and no sidecar is left.
     let (root, context) = settings_fixture("settings newer schema");
-    StoreProbe::at(&root.0).build_wal("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;", false);
+    StoreProbe::at(&root.0).build_wal("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;", false);
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the fixture left settings.db{suffix}");
     }
@@ -171,7 +171,7 @@ fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
         assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the refusal created settings.db{suffix}");
     }
     let store = StoreProbe::at(&root.0);
-    assert_eq!(store.user_version(), 3, "a newer store is never migrated down");
+    assert_eq!(store.user_version(), 4, "a newer store is never migrated down");
     assert_eq!(store.objects_named("settings"), 0, "a newer store is never written");
 }
 
@@ -316,16 +316,25 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     // The set route's authority re-checks the credential under the configuration gate (`console.rs`).
     let (root, context) = settings_fixture("settings revoked");
     let body = json!({"setting": QUIET_KEY, "value": 4500}).to_string();
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
-    let (status, _, reply) =
-        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &revoked);
+    let revoked = crate::console_front::revoked_admin_context(&context);
+    let (status, _, reply, _) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&revoked),
+        "POST",
+        "/api/settings/set",
+        &HashMap::new(),
+        &body,
+    );
     assert_eq!(status, 401, "{reply}");
     assert!(!settings_db(&root).exists(), "a revoked credential never writes");
     assert!(!pre_settings_copy(&root).exists(), "nor copies config.json");
     assert_eq!(next_use_quiet(&context), Some(3000));
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, _, reply) =
-        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &granted);
+    let (status, _, reply, _) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&context),
+        "POST",
+        "/api/settings/set",
+        &HashMap::new(),
+        &body,
+    );
     assert_eq!(status, 200, "{reply}");
     assert_eq!(next_use_quiet(&context), Some(4500));
 }
@@ -479,7 +488,7 @@ fn settings_store_refusal_leaves_uncheckpointed_frames_alone() {
     let wal = root.0.join("data/settings.db-wal");
     let shm = root.0.join("data/settings.db-shm");
     StoreProbe::at(&root.0)
-        .build_wal("CREATE TABLE later (x INTEGER); INSERT INTO later VALUES (1); PRAGMA user_version=3;", true);
+        .build_wal("CREATE TABLE later (x INTEGER); INSERT INTO later VALUES (1); PRAGMA user_version=4;", true);
     let db_before = std::fs::read(settings_db(&root)).unwrap();
     let wal_before = std::fs::read(&wal).unwrap();
     assert!(!wal_before.is_empty() && shm.is_file(), "the fixture leaves frames in the WAL");
@@ -500,7 +509,7 @@ fn settings_store_refusal_leaves_uncheckpointed_frames_alone() {
 fn settings_store_refuses_a_newer_store_with_a_journal_and_leaves_both() {
     let (root, context) = settings_fixture("settings newer journal");
     let journal = root.0.join("data/settings.db-journal");
-    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;");
+    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;");
     std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
     let db_before = std::fs::read(settings_db(&root)).unwrap();
     let (status, body) = set_quiet(&context, json!(4500));
@@ -697,4 +706,241 @@ fn settings_writes_wait_for_the_store_gate_and_give_up_after_five_seconds() {
     assert!(waited >= std::time::Duration::from_secs(5), "{waited:?}");
     assert_eq!(next_use_quiet(&context), Some(5000), "a write that gave up changed nothing");
     assert_eq!(audit_rows(&root).len(), 2);
+}
+
+#[test]
+fn settings_readers_retry_across_concurrent_wal_writes() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let (_root, context) = settings_fixture("settings concurrent reader retry");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let barrier = std::sync::Barrier::new(5);
+    let stop = AtomicBool::new(false);
+    let (overlays, views, histories, previews) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            for value in 1001..=1040 {
+                let applied = crate::settings::apply(
+                    &context,
+                    QUIET_KEY,
+                    &json!(value),
+                    "administrator",
+                    "console",
+                )
+                .unwrap();
+                assert!(applied.changed);
+            }
+            stop.store(true, SeqCst);
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            while !stop.load(SeqCst) || overlays.load(SeqCst) == 0 {
+                let mut document = json!({});
+                crate::settings::overlay_checked(&context, &mut document).unwrap();
+                let value = document
+                    .pointer("/socialV2/reply/wakeQuietMs")
+                    .and_then(Value::as_i64);
+                assert!(
+                    matches!(value, Some(v) if (1000..=1040).contains(&v)),
+                    "overlay dropped or read unexpected value: {value:?}"
+                );
+                overlays.fetch_add(1, SeqCst);
+            }
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            while !stop.load(SeqCst) || views.load(SeqCst) == 0 {
+                let body = crate::settings::view(&context).unwrap();
+                assert!(body.get("storeError").is_none(), "spurious storeError: {body}");
+                let stored = body["settings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["key"] == QUIET_KEY)
+                    .unwrap()["stored"]
+                    .as_i64();
+                assert!(
+                    matches!(stored, Some(v) if (1000..=1040).contains(&v)),
+                    "view dropped or read unexpected value: {stored:?}"
+                );
+                views.fetch_add(1, SeqCst);
+            }
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            while !stop.load(SeqCst) || histories.load(SeqCst) == 0 {
+                let body = crate::settings::history(&context, Some(QUIET_KEY), None, None).unwrap();
+                let entries = body["entries"].as_array().unwrap();
+                assert!(!entries.is_empty(), "history unexpectedly empty: {body}");
+                histories.fetch_add(1, SeqCst);
+            }
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            while !stop.load(SeqCst) || previews.load(SeqCst) == 0 {
+                let preview = crate::settings::preview(
+                    &context,
+                    &crate::settings::Change::Undo { entry: 1 },
+                )
+                .unwrap();
+                assert_eq!(preview.len(), 1);
+                assert_eq!(preview[0].0.key, QUIET_KEY);
+                previews.fetch_add(1, SeqCst);
+            }
+        });
+    });
+    assert!(overlays.load(SeqCst) > 0);
+    assert!(views.load(SeqCst) > 0);
+    assert!(histories.load(SeqCst) > 0);
+    assert!(previews.load(SeqCst) > 0);
+    assert_eq!(next_use_quiet(&context), Some(1040));
+}
+
+#[test]
+fn settings_store_retries_empty_db_with_live_wal_until_initialized() {
+    let (root, context) = settings_fixture("settings fresh wal init");
+    std::fs::write(settings_db(&root), b"").unwrap();
+    let wal = root.0.join("data/settings.db-wal");
+    std::fs::write(&wal, vec![0u8; 4096]).unwrap();
+
+    let view = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let _ = std::fs::remove_file(&wal);
+            crate::settings::apply(&context, QUIET_KEY, &json!(4500), "administrator", "console")
+                .unwrap();
+        });
+        let view = crate::settings::view(&context).unwrap();
+        writer.join().unwrap();
+        view
+    });
+    assert!(view.get("storeError").is_none(), "{view}");
+    let stored = view["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == QUIET_KEY)
+        .unwrap()["stored"]
+        .as_i64();
+    assert!(matches!(stored, None | Some(4500)), "{view}");
+    assert_eq!(next_use_quiet(&context), Some(4500));
+}
+
+#[test]
+fn settings_store_refusals_do_not_stall() {
+    for case in ["garbage", "newer", "journal", "hardlink_db", "hardlink_sidecar"] {
+        let (root, context) = settings_fixture(&format!("settings fast fail {case}"));
+        match case {
+            "garbage" => std::fs::write(settings_db(&root), b"not sqlite").unwrap(),
+            "newer" => StoreProbe::at(&root.0).build("PRAGMA user_version=4;"),
+            "journal" => {
+                StoreProbe::at(&root.0).build("CREATE TABLE scratch (x INTEGER);");
+                std::fs::write(
+                    root.0.join("data/settings.db-journal"),
+                    vec![0xff_u8; 512],
+                )
+                .unwrap();
+            }
+            "hardlink_db" => {
+                let other = root.0.join("data/memory.db");
+                other_database(&other);
+                std::fs::hard_link(&other, settings_db(&root)).unwrap();
+            }
+            _ => {
+                let other = root.0.join("data/memory.db");
+                other_database(&other);
+                std::fs::write(settings_db(&root), b"").unwrap();
+                std::fs::hard_link(&other, root.0.join("data/settings.db-wal")).unwrap();
+            }
+        }
+        let started = std::time::Instant::now();
+        let err = crate::settings::overlay_checked(&context, &mut json!({})).unwrap_err();
+        assert!(!err.is_empty(), "{case}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{case} stalled for {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
+    let (root, context) = settings_fixture("settings backup source wal retry");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let crate::settings::StoreInspection::Ready(inspected) =
+        crate::settings::inspect_store(&context).unwrap()
+    else {
+        panic!("expected ready settings store");
+    };
+    let timeout: i64 = inspected
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        timeout > 0 && timeout < 1000,
+        "read inspection busy_timeout must stay well below WAL_SWITCH_WAIT: {timeout}"
+    );
+    drop(inspected);
+
+    let shm = root.0.join("data/settings.db-shm");
+    let _ = std::fs::remove_file(&shm);
+    assert!(!shm.exists(), "missing-shm test starts without settings.db-shm");
+
+    let wal = root.0.join("data/settings.db-wal");
+    std::fs::write(&wal, vec![0u8; 4096]).unwrap();
+
+    let started = std::time::Instant::now();
+    let (conn, waited) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match std::fs::remove_file(&wal) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot remove synthetic wal: {error}"),
+                }
+            }
+        });
+        let conn = crate::settings::backup_source(&context).unwrap().unwrap();
+        let waited = started.elapsed();
+        writer.join().unwrap();
+        (conn, waited)
+    });
+    assert!(
+        waited >= std::time::Duration::from_millis(60),
+        "backup_source returned before synthetic WAL transition cleared: {waited:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        0,
+        "synthetic non-empty WAL must be cleared before backup_source returns"
+    );
+    let backup_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        backup_timeout > 0 && backup_timeout < 1000,
+        "backup_source busy_timeout must stay well below WAL_SWITCH_WAIT: {backup_timeout}"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [QUIET_KEY],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "1000");
 }

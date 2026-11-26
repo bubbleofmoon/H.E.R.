@@ -147,9 +147,10 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..2 {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     let (briefing, _) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-142", "epoch-142", "atMention", "rpc-142-1", "").unwrap();

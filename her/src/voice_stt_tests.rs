@@ -336,7 +336,7 @@ fn the_label_names_no_denied_term_and_the_transcript_passes_the_model_view_strip
     );
     assert_eq!(LABEL, "[语音转文字]");
     let cfg = json!({"socialV2": {"context": {"stripFromModelText": ["秘密"]}}});
-    assert_eq!(crate::model_view::strip_from_model_text(&label("说了秘密"), &cfg), label("说了"));
+    assert_eq!(crate::model_view::strip_from_model_text(&label("说了秘密"), &cfg), label("说了【已隐藏】"));
 }
 
 #[test]

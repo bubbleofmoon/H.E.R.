@@ -48,12 +48,15 @@ so the UI opens. Flag contracts: `docs/agents/windows-lifecycle.md`.
   only one administrator notice per episode across supervisor restarts, then
   confirmed login followed by login-needed produces one new notice. No QQ QR
   image, account ID or dependency credential appears in HER.
-- Under notify, serve a fake release feed with a newer release. Confirm the app
-  banner and enabled **Update available** tray item show the same current/new
-  versions. Confirm the Schedule page selects the current update policy and retains
-  policy edits after reload. Before approval, no candidate is staged or switched.
-- On fresh disposable installations, approve through the console button, app
-  banner button and tray item. Each action must use the displayed version and
+- Under notify, serve a fake release feed with a newer release. Confirm the Overview
+  update banner displays the offered version and the enabled **Update available**
+  tray item shows the same current/new versions. Click **查看更新** on the Overview
+  banner to open the System Updates page (`/system`, Updates tab), confirm the
+  current/new versions and current update policy match, and verify policy edits are
+  retained after reload. Before approval, no candidate is staged or switched.
+- On fresh disposable installations, approve through the System Updates page button
+  (**批准更新** on `/system`, Updates tab, reachable via Overview banner's
+  **查看更新** action) and the tray item. Each action must use the displayed version and
   reach the existing fixed-helper trial/handover path with no foreground console.
   Observe current/last-good and dependency PID/start/image before and after.
   Change the offered version between display and click: require a visible

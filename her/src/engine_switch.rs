@@ -1,5 +1,9 @@
 //! The selected runtime's per-conversation turn fence and durable engine handover.
-use crate::{runtime::{RuntimeArea, RuntimeContext}, turn_engine::Engine};
+use crate::{
+    conversation_state::{Conversation, ConversationState},
+    runtime::{RuntimeArea, RuntimeContext},
+    turn_engine::Engine,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs::File, path::PathBuf, sync::{Mutex, OnceLock}, time::Duration};
@@ -173,8 +177,8 @@ struct Handover {
     pending: Option<Pending>,
 }
 
-fn read_handover(conv: &Value) -> Result<Handover, String> {
-    match conv.get(FIELD) {
+fn read_handover(conv: Option<&Conversation>) -> Result<Handover, String> {
+    match conv.and_then(|c| c.field(FIELD)) {
         None | Some(Value::Null) => Ok(Handover::default()),
         Some(value) => serde_json::from_value(value.clone()).map_err(|_| "invalid conversation handover".into()),
     }
@@ -191,69 +195,67 @@ fn handover_uses_dsh(
 
 /// Whether admitting a reserved2 wake may need DSH history or a captured archive.
 pub(crate) fn handover_needs_dsh(context: &RuntimeContext, key: &str, wanted: Engine) -> Result<bool, String> {
-    let state = crate::console::load_social_state_for(context).map_err(|(_, error)| error)?;
-    let conversation = &state["conversations"][key];
-    let record = read_handover(conversation)?;
+    let conversation = ConversationState::for_runtime(context)
+        .read(key)
+        .map_err(|(_, error)| error)?;
+    let record = read_handover(conversation.as_ref())?;
     let session = crate::session_map::lookup(context, key)?;
     let stamp = crate::reserved::mode_stamp(context)?;
-    Ok(handover_uses_dsh(&record, wanted, session.as_deref(), &epoch(conversation), &stamp))
+    Ok(handover_uses_dsh(&record, wanted, session.as_deref(), &epoch(conversation.as_ref()), &stamp))
 }
 
-fn validate_conversation(state: &Value, key: &str) -> Result<(), (u16, String)> {
-    let conversations = &state["conversations"];
-    let record = &conversations[key];
-    if !(conversations.is_null() || conversations.is_object()) || !(record.is_null() || record.is_object()) {
-        return Err((503, "invalid conversation state".into()));
-    }
-    Ok(())
-}
-
-fn epoch(conv: &Value) -> String {
-    conv["agentToken"].as_str().map(crate::send_outbox::token_epoch).unwrap_or_default()
+fn epoch(conv: Option<&Conversation>) -> String {
+    conv.and_then(|c| c.generation()).unwrap_or_default()
 }
 
 fn refused(error: String) -> (u16, String) { (503, error) }
 
 fn admission_changed() -> (u16, String) { (409, crate::turn_engine::ADMISSION_CHANGED.into()) }
 
-fn pending_conversation<'a>(
-    state: &'a mut Value, key: &str, generation: &str, pending: &Pending,
-) -> Result<&'a mut Value, (u16, String)> {
-    validate_conversation(state, key)?;
-    let conv = &mut state["conversations"][key];
-    if epoch(conv) != generation || read_handover(conv).map_err(refused)?.pending.as_ref() != Some(pending) {
+fn check_pending_conversation(
+    conv: &Conversation, generation: &str, pending: &Pending,
+) -> Result<(), (u16, String)> {
+    if epoch(Some(conv)) != generation
+        || read_handover(Some(conv)).map_err(refused)?.pending.as_ref() != Some(pending)
+    {
         return Err(admission_changed());
     }
-    Ok(conv)
+    Ok(())
 }
 
 fn clear_pending(
-    context: &RuntimeContext, key: &str, conv: &mut Value, pending: &Pending, continuing: Engine,
+    context: &RuntimeContext, key: &str, conv: &mut Conversation, pending: &Pending, continuing: Engine,
 ) -> Result<(), (u16, String)> {
     // An interrupted archive may already have succeeded. Never submit to its captured session.
     if let Some(sid) = pending.session.as_ref().filter(|_| pending.archive_started) {
         crate::session_map::retire_if(context, key, sid).map_err(refused)?;
     }
     if pending.archive_started {
-        if conv["agentToken"].as_str().is_none_or(str::is_empty) {
-            conv["agentToken"] = json!(crate::console::fresh_agent_token());
+        if conv.token().is_none() {
+            conv.rotate_token();
         }
-        conv[FIELD] = json!(Handover {
-            engine: Some(continuing), epoch: Some(epoch(conv)), summary: Some(pending.summary.clone()), pending: None,
-        });
+        conv.set_field(FIELD, json!(Handover {
+            engine: Some(continuing),
+            epoch: Some(epoch(Some(conv))),
+            summary: Some(pending.summary.clone()),
+            pending: None,
+        }));
         return Ok(());
     }
-    let same_epoch = pending.epoch == epoch(conv);
-    if let Some(fields) = conv[FIELD].as_object_mut() {
-        fields.remove("pending");
-        if same_epoch {
-            if fields.get("epoch").and_then(Value::as_str) != Some(pending.epoch.as_str())
-                || fields.get("engine") != Some(&json!(pending.from)) {
-                fields.remove("summary");
+    let same_epoch = pending.epoch == epoch(Some(conv));
+    if let Some(mut handover) = conv.field(FIELD).cloned() {
+        if let Some(fields) = handover.as_object_mut() {
+            fields.remove("pending");
+            if same_epoch {
+                if fields.get("epoch").and_then(Value::as_str) != Some(pending.epoch.as_str())
+                    || fields.get("engine") != Some(&json!(pending.from)) {
+                    fields.remove("summary");
+                }
+                fields.insert("engine".into(), json!(pending.from));
+                fields.insert("epoch".into(), json!(&pending.epoch));
             }
-            fields.insert("engine".into(), json!(pending.from));
-            fields.insert("epoch".into(), json!(&pending.epoch));
         }
+        conv.set_field(FIELD, handover);
     }
     Ok(())
 }
@@ -291,17 +293,15 @@ fn prepare_admission(
     if !wanted.supports(mode) {
         return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
     }
-    if mode == "reserved2" && !crate::console::inbound_admitted(cfg, key) {
+    if mode == "reserved2" && !crate::social_state::inbound_admitted(cfg, key) {
         return Err((409, NOT_ADMITTED.into()));
     }
-    let state = crate::console::load_social_state_for(context)?;
-    validate_conversation(&state, key)?;
-    let conversation = &state["conversations"][key];
-    if expected_token.is_some_and(|token| conversation["agentToken"].as_str() != Some(token)) {
+    let conversation = ConversationState::for_runtime(context).read(key)?;
+    if expected_token.is_some_and(|token| conversation.as_ref().and_then(Conversation::token) != Some(token)) {
         return Err(admission_changed());
     }
-    let generation = epoch(conversation);
-    let mut record = read_handover(conversation).map_err(refused)?;
+    let generation = epoch(conversation.as_ref());
+    let mut record = read_handover(conversation.as_ref()).map_err(refused)?;
     let session = crate::session_map::lookup(context, key).map_err(refused);
     let automatic_reserved2 = requested.is_none() && mode == "reserved2";
     if automatic_reserved2 && crate::dsh_health::is_down(context) {
@@ -348,12 +348,12 @@ fn prepare_admission(
 
     let permitted = |current_cfg: &Value| -> Result<(), (u16, String)> {
         if !crate::settings::conversation_admitted(current_cfg, key)
-            || !crate::console::access_allowed(current_cfg, mode, key)
-            || (mode == "reserved2" && !crate::console::inbound_admitted(current_cfg, key))
+            || !crate::social_state::access_allowed(current_cfg, mode, key)
+            || (mode == "reserved2" && !crate::social_state::inbound_admitted(current_cfg, key))
         {
             return Err((409, NOT_ADMITTED.into()));
         }
-        if crate::console::runtime_mode(context) != mode
+        if crate::social_state::mode(context) != mode
             || crate::reserved::mode_stamp(context).map_err(refused)? != *stamp.as_ref().map_err(Clone::clone)? {
             return Err((409, CHANGED.into()));
         }
@@ -415,10 +415,10 @@ fn prepare_admission(
             || session.as_ref().is_some_and(|current| pending.session.as_ref() != Some(current));
         if stale || pending.to != wanted {
             let continuing = if stale { source } else { pending.from };
-            let cleared = crate::console::mutate_social_state_for(context, |fresh| {
+            let cleared = ConversationState::for_runtime(context).update(key, |conv| {
                 let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
                 recheck_choice(&current_cfg)?;
-                let conv = pending_conversation(fresh, key, &generation, pending)?;
+                check_pending_conversation(conv, &generation, pending)?;
                 clear_pending(context, key, conv, pending, continuing)
             });
             if let Err(error) = cleared {
@@ -436,22 +436,28 @@ fn prepare_admission(
             let previous = record.summary.as_deref().filter(|_| record.epoch.as_deref() == Some(generation.as_str()));
             let rows = match source {
                 Engine::Dsh => match &session {
-                    Some(sid) => crate::dsh::switch_history(&crate::console::dsh_rpc_for(context, cfg).map_err(refused)?, sid, HISTORY_ROWS).map_err(refused)?,
+                    Some(sid) => crate::dsh::switch_history(
+                        &crate::dsh::rpc_for(context, cfg).map_err(refused)?,
+                        sid,
+                        HISTORY_ROWS,
+                    )
+                    .map_err(refused)?,
                     None => Vec::new(),
                 },
                 Engine::Harness => crate::harness::store::switch_history(context, key, &generation, HISTORY_ROWS).map_err(refused)?,
             };
             let summary = summarize(context, cfg, previous, rows, source).map_err(refused)?;
             let pending = Pending { from: source, to: wanted, epoch: generation.clone(), mode_stamp: mode_stamp.clone(), session: session.clone(), summary, archive_started: false };
-            crate::console::mutate_social_state_for(context, |fresh| {
-                validate_conversation(fresh, key)?;
+            ConversationState::for_runtime(context).update(key, |conv| {
                 let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
                 recheck_choice(&current_cfg)?; // Access may have changed while summarizing.
-                if epoch(&fresh["conversations"][key]) != generation
+                if epoch(Some(conv)) != generation
                     || crate::session_map::lookup(context, key).map_err(refused)? != pending.session {
                     return Err(admission_changed());
                 }
-                fresh["conversations"][key][FIELD]["pending"] = json!(&pending);
+                let mut handover = conv.field(FIELD).cloned().unwrap_or_else(|| json!({}));
+                handover["pending"] = json!(&pending);
+                conv.set_field(FIELD, handover);
                 Ok(())
             })?;
             Ok(pending)
@@ -466,14 +472,12 @@ fn prepare_admission(
                 let can_serve = match (|| {
                     let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
                     recheck_choice(&current_cfg)?;
-                    let fresh = crate::console::load_social_state_for(context)?;
-                    validate_conversation(&fresh, key)?;
-                    let conv = &fresh["conversations"][key];
-                    if epoch(conv) != generation
+                    let conv = ConversationState::for_runtime(context).read(key)?;
+                    if epoch(conv.as_ref()) != generation
                         || crate::session_map::lookup(context, key).map_err(refused)? != session {
                         return Err(admission_changed());
                     }
-                    Ok(read_handover(conv).map_err(refused)?.pending.is_none())
+                    Ok(read_handover(conv.as_ref()).map_err(refused)?.pending.is_none())
                 })() {
                     Ok(can_serve) => can_serve,
                     Err(error) if error.0 < 500 => return Err(error),
@@ -501,16 +505,18 @@ fn finish_pending(
     minted: Option<&crate::pipeline::MintedEpoch>,
 ) -> Result<String, (u16, String)> {
     if let Some(sid) = pending.session.clone() {
-        let rpc = crate::console::dsh_rpc_for(context, cfg).map_err(refused)?;
-        crate::console::mutate_social_state_for(context, |fresh| {
+        let rpc = crate::dsh::rpc_for(context, cfg).map_err(refused)?;
+        ConversationState::for_runtime(context).update(key, |conv| {
             let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
             recheck_choice(&current_cfg)?;
-            let conv = pending_conversation(fresh, key, generation, pending)?;
+            check_pending_conversation(conv, generation, pending)?;
             if crate::session_map::lookup(context, key).map_err(refused)?.is_some_and(|current| current != sid) {
                 return Err(admission_changed());
             }
             pending.archive_started = true;
-            conv[FIELD]["pending"] = json!(&*pending);
+            let mut handover = conv.field(FIELD).cloned().unwrap_or_else(|| json!({}));
+            handover["pending"] = json!(&*pending);
+            conv.set_field(FIELD, handover);
             Ok(())
         })?;
         crate::dsh::archive_for_switch(&rpc, &sid).map_err(refused)?;
@@ -519,26 +525,25 @@ fn finish_pending(
     // Same order as the hub's observation and the pipeline's epoch publication: publication
     // mutex, then social state gate, then the session map. No remote work under these locks.
     let mut publication = minted.map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
-    let token = crate::console::mutate_social_state_for(context, |fresh| {
+    let token = ConversationState::for_runtime(context).update(key, |conv| {
         let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
         recheck_choice(&current_cfg)?;
-        let conv = pending_conversation(fresh, key, generation, pending)?;
+        check_pending_conversation(conv, generation, pending)?;
         if let Some(current) = crate::session_map::lookup(context, key).map_err(refused)? {
             if pending.session.as_deref() != Some(current.as_str())
                 || !crate::session_map::retire_if(context, key, &current).map_err(refused)? {
                 return Err(admission_changed());
             }
         }
-        let token = crate::console::fresh_agent_token();
-        if conv["agentToken"].is_null() {
-            *conv = crate::console::new_conversation(context);
+        if conv.token_is_null() {
+            *conv = Conversation::new_default(context);
         }
-        conv[FIELD] = json!(Handover {
-            engine: Some(pending.to), epoch: Some(crate::send_outbox::token_epoch(&token)),
+        let token = conv.rotate_token();
+        conv.set_field(FIELD, json!(Handover {
+            engine: Some(pending.to), epoch: Some(crate::conversation_state::token_epoch(&token)),
             summary: Some(pending.summary.clone()), pending: None,
-        });
-        conv["agentToken"] = json!(&token);
-        conv["bootstrapSent"] = json!(false);
+        }));
+        conv.set_field("bootstrapSent", json!(false));
         Ok(token)
     })?;
     if let Some(slot) = publication.as_mut() {
@@ -549,8 +554,10 @@ fn finish_pending(
 
 /// Read only a published handover of this exact destination generation.
 pub(crate) fn summary(context: &RuntimeContext, key: &str, generation: &str, engine: Engine) -> Result<Option<String>, String> {
-    let state = crate::console::load_social_state_for(context).map_err(|(_, error)| error)?;
-    let record = read_handover(&state["conversations"][key])?;
+    let conversation = ConversationState::for_runtime(context)
+        .read(key)
+        .map_err(|(_, error)| error)?;
+    let record = read_handover(conversation.as_ref())?;
     Ok(record.summary.filter(|_| record.engine == Some(engine) && record.epoch.as_deref() == Some(generation)))
 }
 
@@ -619,7 +626,8 @@ fn summarize(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows
     let failure = |class| format!("conversation handover summary failed ({class})");
     // The joined delivery copy gets the last filter, including token and denied-term checks.
     let data = filtered_text(context, cfg, &data, HISTORY_CHARS, &known).ok_or_else(|| failure("wording"))?;
-    let model = crate::digest::model_for(context, cfg).map_err(|error| failure(error.0))?;
+    let model =
+        crate::harness::one_shot::digest_model(context, cfg).map_err(|error| failure(error.0))?;
     let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).map_err(|error| failure(error.0))?;
     let accepted = crate::harness::handover::accept(&data, &answer).map_err(failure)?;
     filtered_text(context, cfg, &accepted, ROW_CHARS, &known).ok_or_else(|| failure("wording"))

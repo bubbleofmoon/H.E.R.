@@ -11,7 +11,7 @@
 //! 所以 `stream_events` 在 trait 里**故意不存在**：现在没有实现需要它，
 //! 摆一个空抽象比没有更糟 —— 会让人以为已经支持了。
 
-// 抽象层的接口现在只被 --backends 和单测用到，接进主链路之前整体允许 dead_code。
+// 抽象层接口允许保留未接进主链路的辅助方法（见 `#![allow(dead_code)]`）。
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
@@ -253,27 +253,13 @@ pub(crate) fn decode_cli_exit(
     id: &str,
     code: Option<i32>,
 ) -> Result<String, BackendError> {
-    if code != Some(0) {
-        // Exit status is authoritative for failure, but a structured error still carries
-        // the provider's class/code (including safety refusals that also exit nonzero).
-        let failure = decode_cli_output(stdout_text, structured)
-            .err()
-            .map(|error| crate::model_failure::Failure::classify("", error.message()))
-            .filter(|failure| !matches!(failure.code.as_str(), "INVALID_RESULT" | "EMPTY_ANSWER"))
-            .unwrap_or_else(|| {
-                crate::model_failure::Failure::classify(
-                    "",
-                    &format!("{stdout_text}\n{stderr_text}"),
-                )
-            });
-        return Err(BackendError::Failed(format!(
-            "{} command={} exit_code={:?}",
-            failure.summary(),
-            id,
-            code
-        )));
-    }
-    decode_cli_output(stdout_text, structured)
+    let result = decode_cli_output(stdout_text, structured, code == Some(0), stderr_text);
+    result.map_err(|failure| {
+        BackendError::Failed(format!(
+            "{} command={id} exit_code={code:?}",
+            failure.summary()
+        ))
+    })
 }
 
 fn is_agy(id: &str, cmd: &str) -> bool {
@@ -282,73 +268,191 @@ fn is_agy(id: &str, cmd: &str) -> bool {
         || id == "agy" || id.starts_with("agy-")
 }
 
-/// Only recognized result envelopes are answers. Plain-text clients may return prose,
-/// but process diagnostics and event streams never become conversation text.
-pub(crate) fn decode_cli_output(stdout: &str, structured: bool) -> Result<String, BackendError> {
+/// Decode the process envelope before extracting text. Only failed exits may
+/// carry legacy diagnostics on stderr.
+fn decode_cli_output(
+    stdout: &str,
+    structured: bool,
+    success: bool,
+    stderr: &str,
+) -> Result<String, crate::model_failure::Failure> {
     use crate::model_failure::Failure;
-    let fail = |failure: Failure| BackendError::Failed(failure.summary());
-    let text = stdout.trim();
-    if text.is_empty() { return Err(fail(Failure::new("empty-response", "EMPTY_ANSWER"))); }
-    let parsed = serde_json::from_str::<Value>(text).ok();
-    if let Some(failure) = parsed.as_ref().and_then(json_output_failure) {
-        return Err(fail(failure));
+
+    let parsed = serde_json::from_str::<Value>(stdout).ok();
+    let events = if parsed.is_none() {
+        cli_events(stdout)
+    } else {
+        None
+    };
+    if let Some(failure) = parsed.as_ref().and_then(json_output_failure).or_else(|| {
+        events
+            .as_ref()
+            .and_then(|events| events.iter().find_map(json_output_failure))
+    }) {
+        return Err(failure);
+    }
+    if !success {
+        return Err(Failure::classify("", stderr));
+    }
+    if stdout.trim().is_empty() {
+        return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
     }
     let answer = match parsed.as_ref() {
-        Some(value) if value.is_object() => {
-            // Agy's JSON result carries its answer in `response`; other CLI result
-            // envelopes use `result` (Claude) or `text`. Unknown objects fail closed.
-            let keys: &[&str] = if structured { &["response"] } else { &["response", "result", "text"] };
-            keys.iter().find_map(|key| value.get(key).and_then(Value::as_str))
-                .ok_or_else(|| fail(Failure::new("backend", "INVALID_RESULT")))?.to_string()
+        Some(value) if value.is_object() => cli_json_answer(value, structured)
+            .ok_or_else(|| Failure::new("backend", "INVALID_RESULT"))?,
+        _ if structured || events.is_some() => {
+            return Err(Failure::new("backend", "INVALID_RESULT"));
         }
-        _ if structured => return Err(fail(plain_output_failure(text)
-            .unwrap_or_else(|| Failure::new("backend", "INVALID_RESULT")))),
-        _ => {
-            // A JSON-lines stream is a protocol, never a plain-text answer. Scan all
-            // events before refusing it so a later error retains its class/code.
-            let mut events = false;
-            for line in text.lines() {
-                if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-                    if value.is_object() {
-                        events = true;
-                        if let Some(failure) = json_output_failure(&value) { return Err(fail(failure)); }
-                    }
-                }
-            }
-            if events { return Err(fail(Failure::new("backend", "INVALID_RESULT"))); }
-            text.to_string()
-        }
+        _ => stdout.to_owned(),
     };
-    if let Some(failure) = plain_output_failure(&answer) { return Err(fail(failure)); }
+    if answer.trim().is_empty() {
+        return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
+    }
     Ok(answer)
+}
+
+fn cli_json_answer(value: &Value, agy: bool) -> Option<String> {
+    if agy {
+        return value["response"].as_str().map(str::to_owned);
+    }
+    ["response", "result", "text"]
+        .into_iter()
+        .find_map(|key| value[key].as_str())
+        .or_else(|| {
+            value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .or_else(|| {
+            let parts = value.pointer("/candidates/0/content/parts")?.as_array()?;
+            Some(
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect(),
+            )
+        })
+}
+
+/// A JSON-lines stream must consist entirely of typed CLI events. A JSON
+/// example within a prose answer does not establish a protocol.
+fn cli_events(stdout: &str) -> Option<Vec<Value>> {
+    let events: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line).ok().filter(|value| {
+                matches!(
+                    value["type"].as_str(),
+                    Some(
+                        "start"
+                            | "result"
+                            | "error"
+                            | "refusal"
+                            | "system"
+                            | "assistant"
+                            | "user"
+                            | "stream_event"
+                            | "step_start"
+                            | "step_finish"
+                            | "text"
+                            | "tool_use"
+                            | "reasoning"
+                    )
+                )
+            })
+        })
+        .collect::<Option<_>>()?;
+    (events.len() > 1).then_some(events)
 }
 
 pub(crate) fn json_output_failure(value: &Value) -> Option<crate::model_failure::Failure> {
     use crate::model_failure::Failure;
-    let error = value.get("error").filter(|v| !v.is_null() && **v != Value::Bool(false));
-    let code = error.and_then(|e| e.get("code").or_else(|| e.get("type")))
-        .filter(|v| v.is_string() || v.is_number())
-        .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default();
-    let error_result = error.is_some() || value["is_error"] == true || value["isError"] == true
-        || value["type"] == "error" || value["status"] == "error"
-        || value["ok"] == false || value["success"] == false
-        || value.get("errorMessage").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
-        || value["subtype"].as_str().is_some_and(|s| s.starts_with("error"));
-    if error_result { return Some(Failure::classify(&code, &value.to_string())); }
-    if value.get("candidates").and_then(Value::as_array).is_some_and(Vec::is_empty)
-        || value.pointer("/promptFeedback/blockReason").is_some()
-        || value.get("refusal").is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
-        || value["type"] == "refusal"
-        || value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("content_filter")
-        || value["candidates"].as_array().is_some_and(|candidates| candidates.iter().any(|c|
-            c["finishReason"].as_str().is_some_and(|r| matches!(r, "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION")))) {
+
+    let error = value
+        .get("error")
+        .filter(|v| !v.is_null() && **v != Value::Bool(false));
+    let status = value["status"]
+        .as_u64()
+        .filter(|status| (400..600).contains(status));
+    if let Some(status @ (408 | 429 | 500..=599)) = status {
+        return Some(classify_cli_error(&status.to_string(), ""));
+    }
+    if value["type"] == "refusal" {
         return Some(Failure::new("refusal", "MODEL_REFUSAL"));
     }
-    // Nested error events (and errors wrapped in `result`) remain failures.
+    let error_result = status.is_some()
+        || error.is_some()
+        || value["is_error"] == true
+        || value["isError"] == true
+        || value["type"] == "error"
+        || value["status"] == "error"
+        || value["ok"] == false
+        || value["success"] == false
+        || value["errorMessage"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        || value["subtype"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("error"));
+    if error_result {
+        let code = error
+            .and_then(|error| {
+                ["code", "type", "status"]
+                    .into_iter()
+                    .find_map(|name| error_code(&error[name]))
+            })
+            .or_else(|| error_code(&value["code"]))
+            .or_else(|| status.map(|status| status.to_string()))
+            .unwrap_or_default();
+        let message = error
+            .and_then(|error| error["message"].as_str().or_else(|| error.as_str()))
+            .or_else(|| value["errorMessage"].as_str())
+            .or_else(|| value["message"].as_str())
+            .unwrap_or_default();
+        return Some(classify_cli_error(&code, message));
+    }
+    let choice = &value["choices"][0];
+    let candidates = value["candidates"].as_array();
+    if value["stop_reason"] == "refusal"
+        || is_refusal_field(&value["refusal"])
+        || is_refusal_field(&choice["message"]["refusal"])
+        || choice["finish_reason"] == "content_filter"
+        || value
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !matches!(reason, "" | "BLOCK_REASON_UNSPECIFIED"))
+        || candidates.is_some_and(Vec::is_empty)
+        || matches!(
+            value["candidates"][0]["finishReason"].as_str(),
+            Some("SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION")
+        )
+    {
+        return Some(Failure::new("refusal", "MODEL_REFUSAL"));
+    }
+    None
+}
+
+fn error_code(value: &Value) -> Option<String> {
     match value {
-        Value::Object(obj) => obj.values().filter(|v| v.is_object() || v.is_array()).find_map(json_output_failure),
-        Value::Array(items) => items.iter().find_map(json_output_failure),
+        Value::String(code) if !code.is_empty() => Some(code.clone()),
+        Value::Number(code) => Some(code.to_string()),
         _ => None,
+    }
+}
+
+fn is_refusal_field(value: &Value) -> bool {
+    *value == true || value.as_str().is_some_and(|text| !text.trim().is_empty())
+}
+
+fn classify_cli_error(code: &str, message: &str) -> crate::model_failure::Failure {
+    use crate::model_failure::Failure;
+
+    match code.parse::<u16>() {
+        Ok(408) => Failure::new("timeout", code),
+        Ok(500..=599) => Failure::new("backend", code),
+        _ => Failure::classify(code, message),
     }
 }
 
@@ -411,830 +515,172 @@ fn run_legacy_cli(
     }
 }
 
-#[cfg(windows)]
+const ISOLATED_CLI_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn join_cli_writer<'scope>(
+    writer: std::thread::ScopedJoinHandle<'scope, Result<(), String>>,
+) -> Result<(), String> {
+    writer
+        .join()
+        .map_err(|_| "stdin writer thread panicked".to_string())?
+}
+
+fn abort_and_join_cli<'scope>(
+    tree: &mut crate::process_tree::ProcessTree,
+    writer: Option<std::thread::ScopedJoinHandle<'scope, Result<(), String>>>,
+    reason: String,
+) -> BackendError {
+    let cleanup_error = tree.terminate_and_reap().err();
+    let force_close_error = cleanup_error
+        .as_ref()
+        .and_then(|_| tree.force_close().err());
+    let writer_error = writer.and_then(|writer| join_cli_writer(writer).err());
+    let details = cleanup_error
+        .into_iter()
+        .map(|error| format!("process-tree cleanup failed: {error}"))
+        .chain(force_close_error.map(|error| format!("force-close cleanup failed: {error}")))
+        .chain(writer_error.map(|error| format!("stdin writer cleanup failed: {error}")))
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        BackendError::Failed(reason)
+    } else {
+        BackendError::Failed(format!("{reason}; cleanup detail: {}", details.join("; ")))
+    }
+}
+
+fn finish_cli_root_exit(
+    tree: &mut crate::process_tree::ProcessTree,
+    status: ExitStatus,
+) -> Result<ExitStatus, BackendError> {
+    match tree.terminate_and_reap() {
+        Ok(()) => Ok(status),
+        Err(error) => {
+            let force_close = tree.force_close().err();
+            let details = force_close
+                .map(|detail| format!("; force-close cleanup was not confirmed: {detail}"))
+                .unwrap_or_default();
+            Err(BackendError::Failed(format!(
+                "CLI root exited but the contained process tree could not be confirmed stopped: {error}{details}"
+            )))
+        }
+    }
+}
+
 fn run_isolated_cli(
     command: Command,
     prompt: &str,
     timeout_s: u64,
     command_name: &str,
 ) -> Result<ExitStatus, BackendError> {
-    windows_cli_lifecycle::run(command, prompt, timeout_s, command_name)
-}
-
-#[cfg(not(windows))]
-fn run_isolated_cli(
-    _command: Command,
-    _prompt: &str,
-    _timeout_s: u64,
-    command_name: &str,
-) -> Result<ExitStatus, BackendError> {
-    Err(BackendError::Failed(format!(
-        "isolated CLI process-tree containment is unsupported on this platform: {command_name}"
-    )))
-}
-
-#[cfg(windows)]
-pub(crate) mod windows_cli_lifecycle {
-    use super::BackendError;
+    use crate::process_tree::{ProcessTree, SpawnError};
     use std::io::Write as _;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::{Child, ChildStdin, Command, ExitStatus};
-    use std::thread::ScopedJoinHandle;
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD,
-    };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-        JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, OpenThread, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
-        THREAD_SUSPEND_RESUME,
-    };
 
-    const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
-    const ERROR_NO_MORE_FILES: u32 = 18;
-    const CLEANUP_GRACE: Duration = Duration::from_millis(1_500);
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
-    const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
-
-    struct OwnedHandle(HANDLE);
-
-    impl OwnedHandle {
-        fn close(&mut self) {
-            if !self.0.is_null() && self.0 as isize != -1 {
-                let handle = self.0;
-                self.0 = std::ptr::null_mut();
-                unsafe {
-                    CloseHandle(handle);
-                }
+    let timeout = Duration::from_secs(timeout_s.clamp(5, 3600));
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| BackendError::Failed("isolated CLI timeout is out of range".into()))?;
+    std::thread::scope(|scope| {
+        let mut tree = ProcessTree::spawn_with_deadline(command, deadline).map_err(|failure| match failure {
+            SpawnError::Deadline(detail) => {
+                BackendError::Failed(format!("{command_name} 超时（{timeout_s}s）：{detail}"))
             }
-        }
-    }
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            self.close();
-        }
-    }
-
-    struct JobObject(OwnedHandle);
-
-    fn wait_stopped_until(
-        processes: &[OwnedHandle],
-        deadline: Instant,
-        empty: impl Fn() -> Result<bool, String>,
-    ) -> Result<bool, String> {
-        loop {
-            // Job accounting can reach zero before the last process object is signaled.
-            // Keep the exact process handles pinned and require both witnesses.
-            let mut signaled = true;
-            for process in processes {
-                match unsafe { WaitForSingleObject(process.0, 0) } {
-                    WAIT_OBJECT_0 => {}
-                    WAIT_TIMEOUT => signaled = false,
-                    _ => return Err(format!(
-                        "could not wait for CLI process: Win32 error {}",
-                        unsafe { GetLastError() }
-                    )),
-                }
+            SpawnError::Failed(error) => {
+                BackendError::Failed(format!("启动隔离 {command_name} 失败：{error}"))
             }
-            if signaled && empty()? {
-                return Ok(true);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(false);
-            }
-            std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
-        }
-    }
-
-    impl JobObject {
-        fn new() -> Result<Self, String> {
-            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle.is_null() {
-                return Err(format!(
-                    "CreateJobObjectW failed with Win32 error {}",
-                    unsafe { GetLastError() }
-                ));
-            }
-            let job = Self(OwnedHandle(handle));
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job.0.0,
-                    JobObjectExtendedLimitInformation,
-                    &limits as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of_val(&limits) as u32,
-                )
-            };
-            if configured == 0 {
-                return Err(format!(
-                    "SetInformationJobObject(KILL_ON_JOB_CLOSE) failed with Win32 error {}",
-                    unsafe { GetLastError() }
-                ));
-            }
-            Ok(job)
-        }
-
-        fn is_empty(&self) -> Result<bool, String> {
-            if self.0.0.is_null() {
-                return Err("job handle was already closed".into());
-            }
-            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-            let mut returned_length = 0u32;
-            let queried = unsafe {
-                QueryInformationJobObject(
-                    self.0.0,
-                    JobObjectBasicAccountingInformation,
-                    &mut accounting as *mut _ as *mut std::ffi::c_void,
-                    std::mem::size_of_val(&accounting) as u32,
-                    &mut returned_length,
-                )
-            };
-            if queried == 0 {
-                return Err(format!(
-                    "QueryInformationJobObject(BasicAccountingInformation) failed with Win32 error {}",
-                    unsafe { GetLastError() }
-                ));
-            }
-            if returned_length < std::mem::size_of_val(&accounting) as u32 {
-                return Err(format!(
-                    "QueryInformationJobObject returned a short accounting record ({returned_length} bytes)"
-                ));
-            }
-            Ok(accounting.ActiveProcesses == 0)
-        }
-
-        fn process_handles(&self) -> Result<Vec<OwnedHandle>, String> {
-            // The PID list has an aligned variable-length ULONG_PTR tail. Pin it before
-            // requesting termination, while the job still exposes its active members.
-            let mut buffer = vec![0usize; 65];
-            loop {
-                let queried = unsafe {
-                    QueryInformationJobObject(
-                        self.0.0,
-                        JobObjectBasicProcessIdList,
-                        buffer.as_mut_ptr().cast(),
-                        (buffer.len() * std::mem::size_of::<usize>()) as u32,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if queried == 0 {
-                    let error = unsafe { GetLastError() };
-                    if error == ERROR_MORE_DATA {
-                        buffer.resize(buffer.len() * 2, 0);
-                        continue;
-                    }
-                    return Err(format!("could not enumerate CLI job processes: Win32 error {error}"));
-                }
-                let info = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-                let ids = unsafe {
-                    std::slice::from_raw_parts(
-                        info.ProcessIdList.as_ptr(), info.NumberOfProcessIdsInList as usize,
-                    )
-                };
-                let mut handles = Vec::new();
-                for &pid in ids {
-                    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32) };
-                    if handle.is_null() {
-                        let error = unsafe { GetLastError() };
-                        // An already-exited process can disappear between query and open.
-                        if error == ERROR_INVALID_PARAMETER {
-                            continue;
-                        }
-                        return Err(format!("could not pin CLI job process: Win32 error {error}"));
-                    }
-                    handles.push(OwnedHandle(handle));
-                }
-                return Ok(handles);
-            }
-        }
-
-        fn wait_empty_until(&self, processes: &[OwnedHandle], deadline: Instant) -> Result<bool, String> {
-            wait_stopped_until(processes, deadline, || self.is_empty())
-        }
-
-        fn terminate(&self) -> Result<(), String> {
-            if self.0.0.is_null() {
-                return Err("job handle was already closed".into());
-            }
-            if unsafe { TerminateJobObject(self.0.0, 1) } != 0 {
-                return Ok(());
-            }
-            let error = unsafe { GetLastError() };
-            if self.is_empty()? {
-                Ok(())
-            } else {
-                Err(format!(
-                    "TerminateJobObject failed with Win32 error {error}"
-                ))
-            }
-        }
-    }
-
-    fn open_primary_thread(process_id: u32) -> Result<OwnedHandle, String> {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot.is_null() || snapshot as isize == -1 {
-            return Err(format!(
-                "CreateToolhelp32Snapshot failed with Win32 error {}",
-                unsafe { GetLastError() }
+        })?;
+        if Instant::now() >= deadline {
+            return Err(abort_and_join_cli(
+                &mut tree,
+                None,
+                format!("{command_name} 超时（{timeout_s}s）"),
             ));
         }
-        let snapshot = OwnedHandle(snapshot);
-        let mut entry = THREADENTRY32::default();
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        let mut matching_thread = None;
-        let mut found = unsafe { Thread32First(snapshot.0, &mut entry) };
-        if found == 0 {
-            let error = unsafe { GetLastError() };
-            if error != ERROR_NO_MORE_FILES {
-                return Err(format!(
-                    "Thread32First failed with Win32 error {error}"
-                ));
-            }
-        }
-        while found != 0 {
-            if entry.th32OwnerProcessID == process_id {
-                if matching_thread.replace(entry.th32ThreadID).is_some() {
-                    return Err(format!(
-                        "suspended process {process_id} exposed more than one initial thread"
-                    ));
-                }
-            }
-            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-            found = unsafe { Thread32Next(snapshot.0, &mut entry) };
-            if found == 0 {
-                let error = unsafe { GetLastError() };
-                if error != ERROR_NO_MORE_FILES {
-                    return Err(format!(
-                        "Thread32Next failed with Win32 error {error}"
-                    ));
-                }
-            }
-        }
-        let thread_id = matching_thread
-            .ok_or_else(|| format!("no initial thread found for suspended process {process_id}"))?;
-        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-        if thread.is_null() {
-            return Err(format!(
-                "OpenThread({thread_id}) failed with Win32 error {}",
-                unsafe { GetLastError() }
+        let Some(mut stdin) = tree.take_stdin() else {
+            return Err(abort_and_join_cli(
+                &mut tree,
+                None,
+                format!("{command_name} 没有可用的标准输入管道"),
             ));
-        }
-        Ok(OwnedHandle(thread))
-    }
-
-    pub(crate) struct CliProcessTree {
-        child: Child,
-        job: JobObject,
-        assigned: bool,
-        root_reaped: bool,
-        finished: bool,
-        #[cfg(test)]
-        fail_next_wait_observation: bool,
-    }
-
-    enum SpawnFailure {
-        Deadline(String),
-        Failed(String),
-    }
-
-    impl SpawnFailure {
-        fn operation(deadline: Instant, stage: &str, error: impl std::fmt::Display) -> Self {
-            let message = format!("{stage}: {error}");
-            if Instant::now() >= deadline {
-                Self::Deadline(format!("deadline expired during {message}"))
-            } else {
-                Self::Failed(message)
-            }
-        }
-    }
-
-    impl CliProcessTree {
-        /// Start a background task suspended, assign it to a kill-on-close job, then resume it.
-        pub(crate) fn spawn_task(command: Command, timeout: Duration) -> Result<Self, String> {
-            let deadline = Instant::now().checked_add(timeout).ok_or("task timeout is out of range")?;
-            Self::spawn(command, deadline).map_err(|failure| match failure {
-                SpawnFailure::Deadline(message) | SpawnFailure::Failed(message) => message,
-            })
-        }
-
-        pub(crate) fn child_mut(&mut self) -> &mut Child { &mut self.child }
-
-        pub(crate) fn stop_task(&mut self) -> Result<(), String> {
-            self.terminate_and_reap()
-        }
-
-        fn spawn(mut command: Command, deadline: Instant) -> Result<Self, SpawnFailure> {
-            if Instant::now() >= deadline {
-                return Err(SpawnFailure::Deadline(
-                    "deadline expired before creating the Windows job".into(),
-                ));
-            }
-            let job = JobObject::new().map_err(|error| {
-                SpawnFailure::operation(deadline, "creating Windows job", error)
-            })?;
-            use std::os::windows::process::CommandExt;
-            // command_without_console set CREATE_NO_WINDOW; include it again while adding
-            // CREATE_SUSPENDED so CommandExt's replacement semantics cannot clear that flag.
-            command.creation_flags(CREATE_NO_WINDOW_FLAG | CREATE_SUSPENDED);
-            let child = command
-                .spawn()
-                .map_err(|error| SpawnFailure::operation(deadline, "CreateProcess failed", error))?;
-            let mut tree = Self {
-                child,
-                job,
-                assigned: false,
-                root_reaped: false,
-                finished: false,
-                #[cfg(test)]
-                fail_next_wait_observation: false,
-            };
-            let setup = (|| {
-                if Instant::now() >= deadline {
-                    return Err(SpawnFailure::Deadline(
-                        "deadline expired during suspended process creation".to_string(),
-                    ));
-                }
-                let thread = open_primary_thread(tree.child.id()).map_err(|error| {
-                    SpawnFailure::operation(deadline, "opening suspended primary thread", error)
-                })?;
-                if unsafe { AssignProcessToJobObject(tree.job.0.0, tree.child.as_raw_handle() as HANDLE) }
-                    == 0
-                {
-                    let error = format!(
-                        "AssignProcessToJobObject failed with Win32 error {}",
-                        unsafe { GetLastError() }
-                    );
-                    return Err(SpawnFailure::operation(deadline, "assigning process to job", error));
-                }
-                tree.assigned = true;
-                let previous_suspend_count = unsafe { ResumeThread(thread.0) };
-                if previous_suspend_count == u32::MAX {
-                    let error = format!(
-                        "ResumeThread failed with Win32 error {}",
-                        unsafe { GetLastError() }
-                    );
-                    return Err(SpawnFailure::operation(deadline, "resuming contained process", error));
-                }
-                if previous_suspend_count != 1 {
-                    return Err(SpawnFailure::operation(
-                        deadline,
-                        "resuming contained process",
-                        format!("ResumeThread returned unexpected suspend count {previous_suspend_count}"),
-                    ));
-                }
-                if Instant::now() >= deadline {
-                    return Err(SpawnFailure::Deadline(
-                        "deadline expired immediately after resuming the contained process".into(),
-                    ));
-                }
-                Ok(())
-            })();
-            if let Err(mut failure) = setup {
-                let cleanup = tree.terminate_and_reap().err();
-                if let Some(cleanup) = cleanup {
-                    match &mut failure {
-                        SpawnFailure::Deadline(message) | SpawnFailure::Failed(message) => {
-                            message.push_str(&format!("; cleanup was not confirmed: {cleanup}"));
-                        }
-                    }
-                }
-                return Err(failure);
-            }
-            Ok(tree)
-        }
-
-        fn take_stdin(&mut self) -> Option<ChildStdin> {
-            self.child.stdin.take()
-        }
-
-        fn try_wait_root(&mut self) -> Result<Option<ExitStatus>, String> {
-            #[cfg(test)]
-            if self.fail_next_wait_observation {
-                self.fail_next_wait_observation = false;
-                return Err("injected one-shot root wait observation error".into());
-            }
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.root_reaped = true;
-                    Ok(Some(status))
-                }
-                Ok(None) => Ok(None),
-                Err(error) => Err(format!("could not observe CLI root process: {error}")),
-            }
-        }
-
-        #[cfg(test)]
-        fn spawn_unassigned_for_test(mut command: Command) -> Result<Self, String> {
-            let job = JobObject::new()?;
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(CREATE_NO_WINDOW_FLAG | CREATE_SUSPENDED);
-            let child = command
-                .spawn()
-                .map_err(|error| format!("could not spawn the test-owned suspended child: {error}"))?;
-            Ok(Self {
-                child,
-                job,
-                assigned: false,
-                root_reaped: false,
-                finished: false,
-                fail_next_wait_observation: false,
-            })
-        }
-
-        #[cfg(test)]
-        fn inject_wait_observation_error_for_test(&mut self) {
-            self.fail_next_wait_observation = true;
-        }
-
-        fn finish_root_exit(&mut self, status: ExitStatus) -> Result<ExitStatus, BackendError> {
-            let cleanup = self.terminate_and_reap();
-            match cleanup {
-                Ok(()) => Ok(status),
-                Err(error) => {
-                    let force_close = self.force_close_job().err();
-                    let details = force_close
-                        .map(|detail| format!("; force-close cleanup was not confirmed: {detail}"))
-                        .unwrap_or_default();
-                    Err(BackendError::Failed(format!(
-                        "CLI root exited but the contained process tree could not be confirmed stopped: {error}{details}"
-                    )))
-                }
-            }
-        }
-
-        fn terminate_and_reap(&mut self) -> Result<(), String> {
-            if self.finished {
-                return Ok(());
-            }
-            let cleanup_deadline = Instant::now()
-                .checked_add(CLEANUP_GRACE)
-                .ok_or_else(|| "cleanup deadline is out of range".to_string())?;
-            if self.assigned {
-                let processes = self.job.process_handles()?;
-                if !self.job.is_empty()? {
-                    self.job.terminate()?;
-                }
-                if !self.job.wait_empty_until(&processes, cleanup_deadline)? {
-                    return Err("Windows job still had live processes after the cleanup grace".into());
-                }
-            } else if !self.root_reaped {
-                let first_observation = self.try_wait_root();
-                self.terminate_unassigned_child(first_observation, cleanup_deadline)?;
-            }
-            if !self.root_reaped {
-                loop {
-                    match self.child.try_wait() {
-                        Ok(Some(_)) => {
-                            self.root_reaped = true;
-                            break;
-                        }
-                        Ok(None) if Instant::now() < cleanup_deadline => {
-                            let now = Instant::now();
-                            std::thread::sleep(
-                                cleanup_deadline.saturating_duration_since(now).min(POLL_INTERVAL),
-                            );
-                        }
-                        Ok(None) => return Err("CLI root process was not reaped before cleanup deadline".into()),
-                        Err(error) => return Err(format!("could not reap CLI child: {error}")),
-                    }
-                }
-            }
-            self.finished = true;
-            Ok(())
-        }
-
-        fn terminate_unassigned_child(
-            &mut self,
-            first_observation: Result<Option<ExitStatus>, String>,
-            cleanup_deadline: Instant,
-        ) -> Result<(), String> {
-            let mut issues = Vec::new();
-            match first_observation {
-                Ok(Some(_)) => {
-                    self.root_reaped = true;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(error) => issues.push(format!("root wait observation failed: {error}")),
-            }
-
-            if let Err(error) = self.child.kill() {
-                issues.push(format!("could not terminate unassigned suspended CLI child: {error}"));
-            }
-
-            let mut reap_observation_error = None;
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.root_reaped = true;
-                        break;
-                    }
-                    Ok(None) if Instant::now() < cleanup_deadline => {}
-                    Ok(None) => {
-                        issues.push("unassigned CLI child was not reaped before cleanup deadline".into());
-                        return Err(issues.join("; "));
-                    }
-                    Err(error) if Instant::now() < cleanup_deadline => {
-                        reap_observation_error.get_or_insert_with(|| error.to_string());
-                    }
-                    Err(error) => {
-                        issues.push(format!("could not reap unassigned CLI child: {error}"));
-                        return Err(issues.join("; "));
-                    }
-                }
-                let now = Instant::now();
-                if now >= cleanup_deadline {
-                    continue;
-                }
-                std::thread::sleep(cleanup_deadline.saturating_duration_since(now).min(POLL_INTERVAL));
-            }
-
-            if let Some(error) = reap_observation_error {
-                issues.push(format!("root wait observation failed while reaping: {error}"));
-            }
-            if issues.is_empty() {
-                Ok(())
-            } else {
-                issues.push("unassigned CLI child was terminated and reaped".into());
-                Err(issues.join("; "))
-            }
-        }
-
-        fn force_close_job(&mut self) -> Result<(), String> {
-            // KILL_ON_JOB_CLOSE is the final fallback when explicit termination/wait failed.
-            // Close the job before joining the stdin writer so every inherited pipe reader is
-            // asked to exit and the synchronous write can unblock.
-            self.job.0.close();
-            let mut issues = Vec::new();
-            match self.try_wait_root() {
-                Ok(Some(_)) => {
-                    self.root_reaped = true;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(error) => issues.push(format!("could not observe CLI root after closing job: {error}")),
-            }
-            if let Err(error) = self.child.kill() {
-                issues.push(format!("could not terminate CLI root after closing job: {error}"));
-            }
-            let deadline = Instant::now()
-                .checked_add(CLEANUP_GRACE)
-                .ok_or_else(|| "force-close deadline is out of range".to_string())?;
-            let mut reap_observation_error = None;
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.root_reaped = true;
-                        if let Some(error) = reap_observation_error {
-                            issues.push(format!("could not observe CLI root while reaping: {error}"));
-                        }
-                        if issues.is_empty() {
-                            return Ok(());
-                        }
-                        issues.push("CLI root was terminated and reaped".into());
-                        return Err(issues.join("; "));
-                    }
-                    Ok(None) if Instant::now() < deadline => {}
-                    Ok(None) => {
-                        issues.push("CLI root remained live after force-close cleanup grace".into());
-                        return Err(issues.join("; "));
-                    }
-                    Err(error) if Instant::now() < deadline => {
-                        reap_observation_error.get_or_insert_with(|| error.to_string());
-                    }
-                    Err(error) => {
-                        issues.push(format!("could not reap CLI root after force-close: {error}"));
-                        return Err(issues.join("; "));
-                    }
-                }
-                let now = Instant::now();
-                if now < deadline {
-                    std::thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
-                } else {
-                    issues.push("force-close cleanup deadline elapsed without observing CLI root exit".into());
-                    return Err(issues.join("; "));
-                }
-            }
-        }
-    }
-
-    impl Drop for CliProcessTree {
-        fn drop(&mut self) {
-            if self.finished {
-                return;
-            }
-            if self.terminate_and_reap().is_err() {
-                let _ = self.force_close_job();
-            }
-        }
-    }
-
-    #[test]
-    fn isolated_empty_job_accounting_requires_signaled_process_handles() {
-        use windows_sys::Win32::System::Threading::OpenProcess;
-        let command = crate::subprocess::command_without_console(std::env::current_exe().unwrap());
-        let mut tree = CliProcessTree::spawn_unassigned_for_test(command).unwrap();
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, tree.child.id()) };
-        assert!(!handle.is_null());
-        let handles = [OwnedHandle(handle)];
-        // Force the observed interleaving: accounting says zero while the pinned process
-        // handle is still unsignaled. A suspended child makes this deterministic.
-        let stopped = wait_stopped_until(&handles, Instant::now(), || Ok(true)).unwrap();
-        tree.terminate_and_reap().unwrap();
-        assert!(!stopped, "empty accounting alone must not report a live process stopped");
-        assert!(wait_stopped_until(&handles, Instant::now(), || Ok(true)).unwrap());
-    }
-
-    #[cfg(test)]
-    pub(super) fn cleanup_unassigned_after_wait_error_for_test(
-        force_close: bool,
-    ) -> Result<(String, bool), String> {
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("could not locate the test executable: {error}"))?;
-        let mut command = crate::subprocess::command_without_console(executable);
-        command
-            .args([
-                "--ignored",
-                "--exact",
-                "backend::tests::isolated_cli_lifecycle_probe",
-                "--nocapture",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let mut tree = CliProcessTree::spawn_unassigned_for_test(command)?;
-        if !matches!(tree.child.try_wait(), Ok(None)) {
-            return Err("test-owned suspended process was not alive before cleanup".into());
-        }
-        tree.inject_wait_observation_error_for_test();
-        let cleanup = if force_close {
-            tree.force_close_job()
-        } else {
-            tree.terminate_and_reap()
         };
-        let diagnostic = cleanup
-            .err()
-            .ok_or_else(|| "injected wait error was not preserved by cleanup".to_string())?;
-        let reaped = matches!(tree.child.try_wait(), Ok(Some(_)));
-        Ok((diagnostic, reaped))
-    }
-
-    fn join_writer<'scope>(
-        writer: ScopedJoinHandle<'scope, Result<(), String>>,
-    ) -> Result<(), String> {
-        writer
-            .join()
-            .map_err(|_| "stdin writer thread panicked".to_string())?
-    }
-
-    fn abort_and_join<'scope>(
-        tree: &mut CliProcessTree,
-        writer: Option<ScopedJoinHandle<'scope, Result<(), String>>>,
-        reason: String,
-    ) -> BackendError {
-        let cleanup_error = tree.terminate_and_reap().err();
-        let force_close_error = cleanup_error
-            .as_ref()
-            .and_then(|_| tree.force_close_job().err());
-        let writer_error = writer.and_then(|writer| join_writer(writer).err());
-        let details = cleanup_error
-            .into_iter()
-            .map(|error| format!("process-tree cleanup failed: {error}"))
-            .chain(force_close_error.map(|error| format!("force-close cleanup failed: {error}")))
-            .chain(writer_error.map(|error| format!("stdin writer cleanup failed: {error}")))
-            .collect::<Vec<_>>();
-        if details.is_empty() {
-            BackendError::Failed(reason)
-        } else {
-            BackendError::Failed(format!("{reason}; cleanup detail: {}", details.join("; ")))
-        }
-    }
-
-    pub(super) fn run(
-        command: Command,
-        prompt: &str,
-        timeout_s: u64,
-        command_name: &str,
-    ) -> Result<ExitStatus, BackendError> {
-        let timeout = Duration::from_secs(timeout_s.max(5).min(3600));
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| BackendError::Failed("isolated CLI timeout is out of range".into()))?;
-        std::thread::scope(|scope| {
-            let mut tree = CliProcessTree::spawn(command, deadline).map_err(|failure| match failure {
-                SpawnFailure::Deadline(detail) => {
-                    BackendError::Failed(format!("{command_name} 超时（{timeout_s}s）：{detail}"))
-                }
-                SpawnFailure::Failed(error) => BackendError::Failed(format!(
-                    "启动隔离 {command_name} 失败：{error}"
-                )),
-            })?;
-            if Instant::now() >= deadline {
-                return Err(abort_and_join(
+        let writer = std::thread::Builder::new()
+            .name("isolated-cli-stdin".into())
+            .spawn_scoped(scope, move || {
+                let result = stdin
+                    .write_all(prompt.as_bytes())
+                    .map_err(|error| error.to_string());
+                drop(stdin);
+                result
+            });
+        let mut writer = match writer {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                return Err(abort_and_join_cli(
                     &mut tree,
                     None,
+                    format!("启动 {command_name} 标准输入写入线程失败：{error}"),
+                ))
+            }
+        };
+
+        loop {
+            if Instant::now() >= deadline {
+                return Err(abort_and_join_cli(
+                    &mut tree,
+                    writer.take(),
                     format!("{command_name} 超时（{timeout_s}s）"),
                 ));
             }
-            let Some(mut stdin) = tree.take_stdin() else {
-                return Err(abort_and_join(
-                    &mut tree,
-                    None,
-                    format!("{command_name} 没有可用的标准输入管道"),
-                ));
-            };
-            let writer = std::thread::Builder::new()
-                .name("isolated-cli-stdin".into())
-                .spawn_scoped(scope, move || {
-                    let result = stdin
-                        .write_all(prompt.as_bytes())
-                        .map_err(|error| error.to_string());
-                    drop(stdin);
-                    result
-                });
-            let mut writer = match writer {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    return Err(abort_and_join(
+            if writer.as_ref().is_some_and(|writer| writer.is_finished()) {
+                let result = join_cli_writer(writer.take().expect("finished writer handle"));
+                if let Err(error) = result {
+                    return Err(abort_and_join_cli(
                         &mut tree,
                         None,
-                        format!("启动 {command_name} 标准输入写入线程失败：{error}"),
-                    ))
-                }
-            };
-
-            loop {
-                if Instant::now() >= deadline {
-                    return Err(abort_and_join(
-                        &mut tree,
-                        writer.take(),
-                        format!("{command_name} 超时（{timeout_s}s）"),
+                        format!("写入 {command_name} 标准输入失败：{error}"),
                     ));
                 }
-                if writer.as_ref().is_some_and(|writer| writer.is_finished()) {
-                    let result = join_writer(writer.take().expect("finished writer handle"));
-                    if let Err(error) = result {
-                        return Err(abort_and_join(
-                            &mut tree,
-                            None,
-                            format!("写入 {command_name} 标准输入失败：{error}"),
-                        ));
-                    }
-                }
-                match tree.try_wait_root() {
-                    Ok(Some(status)) => {
-                        if writer.is_some() {
-                            let cleanup_error = tree.terminate_and_reap().err();
-                            let force_close_error = cleanup_error
-                                .as_ref()
-                                .and_then(|_| tree.force_close_job().err());
-                            let writer_error = writer.take().and_then(|writer| join_writer(writer).err());
-                            let mut details = Vec::new();
-                            if let Some(error) = cleanup_error {
-                                details.push(format!("process-tree cleanup failed: {error}"));
-                            }
-                            if let Some(error) = force_close_error {
-                                details.push(format!("force-close cleanup failed: {error}"));
-                            }
-                            if let Some(error) = writer_error {
-                                details.push(format!("prompt input was incomplete: {error}"));
-                            }
-                            if !details.is_empty() {
-                                return Err(BackendError::Failed(format!(
-                                    "{command_name} exited before isolated stdin delivery completed; {}",
-                                    details.join("; ")
-                                )));
-                            }
-                        }
-                        return tree.finish_root_exit(status);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        return Err(abort_and_join(
-                            &mut tree,
-                            writer.take(),
-                            format!("等待 {command_name} 根进程失败：{error}"),
-                        ))
-                    }
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(remaining.min(POLL_INTERVAL));
             }
-        })
-    }
+            match tree.try_wait_root() {
+                Ok(Some(status)) => {
+                    if writer.is_some() {
+                        let cleanup_error = tree.terminate_and_reap().err();
+                        let force_close_error = cleanup_error
+                            .as_ref()
+                            .and_then(|_| tree.force_close().err());
+                        let writer_error = writer.take().and_then(|writer| join_cli_writer(writer).err());
+                        let mut details = Vec::new();
+                        if let Some(error) = cleanup_error {
+                            details.push(format!("process-tree cleanup failed: {error}"));
+                        }
+                        if let Some(error) = force_close_error {
+                            details.push(format!("force-close cleanup failed: {error}"));
+                        }
+                        if let Some(error) = writer_error {
+                            details.push(format!("prompt input was incomplete: {error}"));
+                        }
+                        if !details.is_empty() {
+                            return Err(BackendError::Failed(format!(
+                                "{command_name} exited before isolated stdin delivery completed; {}",
+                                details.join("; ")
+                            )));
+                        }
+                    }
+                    return finish_cli_root_exit(&mut tree, status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(abort_and_join_cli(
+                        &mut tree,
+                        writer.take(),
+                        format!("等待 {command_name} 根进程失败：{error}"),
+                    ))
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(ISOLATED_CLI_POLL_INTERVAL));
+        }
+    })
 }
 
 /// Output captures are unique candidate-root files and are removed on every exit path, including
@@ -1286,7 +732,7 @@ impl CliOutputFiles {
             if checked != path {
                 return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
             }
-            crate::guarded_credentials::create_credential(path)
+            crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
                 .map(Stdio::from)
                 .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
         } else {
@@ -1648,23 +1094,10 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     if key.trim().is_empty() {
         return Vec::new();
     }
-    let text = if context.is_isolated() {
-        context.read_text(RuntimeArea::Data, "social-v2.json").ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json")).ok()
+    let Ok(Some(conv)) = crate::conversation_state::ConversationState::for_runtime(context).read(key) else {
+        return Vec::new();
     };
-    let Some(text) = text else { return Vec::new() };
-    let v: Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let token = v
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|s| s.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .trim();
+    let token = conv.token().unwrap_or("").trim();
     if token.is_empty() {
         return Vec::new();
     }
@@ -1678,8 +1111,8 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
 ///
 /// 为什么必须自己解析：`std::process::Command::new("opencode")` 在 Windows 上
 /// **不会**按 PATHEXT 去找 .cmd/.ps1 —— 它只认 .exe，于是 npm 装的 CLI 一律
-/// 报 `program not found`。实测就是这么翻车的：`--backends` 说 ✅，`--backend-ask`
-/// 却说启动失败。**"在不在 PATH 里"和"能不能启动"是两回事。**
+/// 报 `program not found`。实测就是这么翻车的：配置检查通过，实际拉起子进程
+/// 却报启动失败。**"在不在 PATH 里"和"能不能启动"是两回事。**
 pub fn resolve_command(cmd: &str) -> Option<std::path::PathBuf> {
     if cmd.contains('/') || cmd.contains('\\') {
         let p = std::path::Path::new(cmd);
@@ -2009,34 +1442,54 @@ mod tests {
     }
 
     #[test]
-    fn cli_output_contract_keeps_answers_and_classifies_content_free_failures() {
-        for (text, structured, answer) in [
-            ("ordinary safety discussion", false, "ordinary safety discussion"),
-            (r#"{"response":"ordinary answer"}"#, true, "ordinary answer"),
-            (r#"{"result":"Claude answer"}"#, false, "Claude answer"),
+    fn cli_success_preserves_prose_and_ignores_nested_answer_metadata() {
+        for (stdout, structured, answer) in [
+            ("Error: quota exhausted\nThis is an example.", false, "Error: quota exhausted\nThis is an example."),
+            ("Fatal: a label\nI cannot assist with is the phrase to translate.", false, "Fatal: a label\nI cannot assist with is the phrase to translate."),
+            ("  HTTP 503 Service Unavailable\n<html>example</html>\n", false, "  HTTP 503 Service Unavailable\n<html>example</html>\n"),
+            ("A JSON example follows:\n{\"type\":\"error\"}", false, "A JSON example follows:\n{\"type\":\"error\"}"),
+            (r#"{"response":"<html>example</html>","data":{"error":{"code":"SAFETY"}}}"#, true, "<html>example</html>"),
+            (r#"{"result":"I can't assist with is the phrase to translate.","data":[{"refusal":"sample"}]}"#, false, "I can't assist with is the phrase to translate."),
             (r#"{"text":"plain client answer"}"#, false, "plain client answer"),
+            (r#"{"status":399,"text":"below the error range"}"#, false, "below the error range"),
+            (r#"{"status":600,"text":"above the error range"}"#, false, "above the error range"),
+            (r#"{"choices":[{"finish_reason":"stop","message":{"content":"Error: quoted","annotations":[{"error":"example"}]}}]}"#, false, "Error: quoted"),
+            (r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"a "},{"text":"b"}]}}]}"#, false, "a b"),
         ] {
-            assert_eq!(decode_cli_output(text, structured).unwrap(), answer);
+            let result = decode_cli_exit(stdout, "Error: quota warning on stderr", structured, "fixture-cli", Some(0));
+            assert_eq!(result.as_deref().map_err(BackendError::message), Ok(answer), "successful CLI answer must be preserved");
         }
-        for (text, structured, class) in [
-            ("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET", false, "refusal"),
-            (r#"{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}"#, true, "refusal"),
-            (r#"{"candidates":[]}"#, false, "refusal"),
-            (r#"{"candidates":[{"finishReason":"SAFETY"}]}"#, false, "refusal"),
-            ("Error: quota exhausted CHAT_SECRET", false, "quota"),
-            ("HTTP 503 Service Unavailable\n<html>CHAT_SECRET</html>", false, "backend"),
-            ("Error: timed out CHAT_SECRET", false, "timeout"),
-            ("   ", false, "empty-response"),
-            (r#"{"error":{"code":"ECONNRESET","message":"CHAT_SECRET"}}"#, false, "network"),
-            ("Traceback (most recent call last):\nRuntimeError: CHAT_SECRET", false, "backend"),
-            ("{\"type\":\"start\"}\n{\"type\":\"error\",\"error\":{\"code\":\"SAFETY\",\"message\":\"CHAT_SECRET\"}}", false, "refusal"),
-            (r#"{"ok":false,"message":"CHAT_SECRET"}"#, false, "backend"),
-            (r#"{"unknown":"CHAT_SECRET"}"#, false, "backend"),
-            ("unstructured agy prose CHAT_SECRET", true, "backend"),
+    }
+
+    #[test]
+    fn cli_output_contract_keeps_answers_and_classifies_content_free_failures() {
+        for (stdout, stderr, structured, exit, class, code) in [
+            ("", "The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET", false, 7, "refusal", "MODEL_REFUSAL"),
+            ("Error: quota exhausted in an answer example", "upstream disconnected CHAT_SECRET", false, 7, "backend", "BACKEND_ERROR"),
+            ("", "Error: timed out CHAT_SECRET", false, 7, "timeout", "TIMEOUT"),
+            ("", "Error: quota exhausted CHAT_SECRET", false, 7, "quota", "QUOTA_EXCEEDED"),
+            ("   ", "", false, 0, "empty-response", "EMPTY_ANSWER"),
+            (r#"{"response":" "}"#, "", true, 0, "empty-response", "EMPTY_ANSWER"),
+            (r#"{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}"#, "", true, 0, "refusal", "SAFETY"),
+            (r#"{"type":"error","code":"TIMEOUT","message":"CHAT_SECRET"}"#, "", false, 0, "timeout", "TIMEOUT"),
+            (r#"{"candidates":[]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"candidates":[{"finishReason":"SAFETY"}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"choices":[{"finish_reason":"content_filter","message":{"content":"discard"}}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"choices":[{"finish_reason":"stop","message":{"refusal":"CHAT_SECRET"}}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"status":400,"text":"discard"}"#, "", false, 0, "backend", "400"),
+            (r#"{"status":408,"text":"discard"}"#, "", false, 0, "timeout", "408"),
+            (r#"{"status":429,"response":"discard"}"#, "", false, 0, "quota", "429"),
+            (r#"{"status":599,"text":"discard"}"#, "", false, 0, "backend", "599"),
+            (r#"{"error":{"code":503,"message":"quota status could not be read CHAT_SECRET"}}"#, "", false, 0, "backend", "503"),
+            (r#"{"error":{"code":"ECONNRESET","message":"CHAT_SECRET"}}"#, "", false, 0, "network", "ECONNRESET"),
+            ("{\"type\":\"start\"}\n{\"type\":\"error\",\"error\":{\"code\":\"SAFETY\",\"message\":\"CHAT_SECRET\"}}", "", false, 0, "refusal", "SAFETY"),
+            (r#"{"ok":false,"message":"CHAT_SECRET","result":"Error: quota exhausted"}"#, "", false, 0, "backend", "BACKEND_ERROR"),
+            (r#"{"unknown":{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}}"#, "", false, 0, "backend", "INVALID_RESULT"),
+            ("unstructured agy prose CHAT_SECRET", "", true, 0, "backend", "INVALID_RESULT"),
         ] {
-            let error = decode_cli_output(text, structured).unwrap_err();
+            let error = decode_cli_exit(stdout, stderr, structured, "fixture-cli", Some(exit)).unwrap_err();
             let failure = crate::model_failure::Failure::classify("", error.message());
-            assert_eq!(failure.class, class, "{text}");
+            assert_eq!((failure.class, failure.code.as_str()), (class, code), "{stdout}");
             assert!(!error.message().contains("CHAT_SECRET"));
         }
     }
@@ -2909,6 +2362,38 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn cleanup_unassigned_after_wait_error_for_test(force_close: bool) -> Result<(String, bool), String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not locate the test executable: {error}"))?;
+        let mut command = crate::subprocess::command_without_console(executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "backend::tests::isolated_cli_lifecycle_probe",
+                "--nocapture",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut tree = crate::process_tree::ProcessTree::spawn_unassigned_for_test(command)?;
+        if !matches!(tree.child_mut().try_wait(), Ok(None)) {
+            return Err("test-owned suspended process was not alive before cleanup".into());
+        }
+        tree.inject_wait_observation_error_for_test();
+        let cleanup = if force_close {
+            tree.force_close()
+        } else {
+            tree.terminate_and_reap()
+        };
+        let diagnostic = cleanup
+            .err()
+            .ok_or_else(|| "injected wait error was not preserved by cleanup".to_string())?;
+        let reaped = matches!(tree.child_mut().try_wait(), Ok(Some(_)));
+        Ok((diagnostic, reaped))
+    }
+
+    #[cfg(windows)]
     #[test]
     fn isolated_cli_cleanup_kills_unassigned_child_after_wait_observation_error() {
         use std::time::{Duration, Instant};
@@ -2916,7 +2401,7 @@ mod tests {
         let started = Instant::now();
         for force_close in [false, true] {
             let (diagnostic, reaped) =
-                windows_cli_lifecycle::cleanup_unassigned_after_wait_error_for_test(force_close)
+                cleanup_unassigned_after_wait_error_for_test(force_close)
                     .expect("cleanup should confirm termination of its own suspended child");
             assert!(
                 diagnostic.contains("injected one-shot root wait observation error"),
@@ -2931,7 +2416,55 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
     }
 
-    #[cfg(windows)]
+    #[test]
+    fn isolated_cli_ask_executes_and_cleans_captures() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-ticket76-cli-cross-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        for sub in ["config", "data/logs", "resources", "user/dsh"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("config/config.json"), r#"{"consoleToken":"ticket76-synthetic"}"#).unwrap();
+        std::fs::write(dir.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(
+            dir.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#,
+        ).unwrap();
+        std::fs::write(
+            dir.join("user/dsh/.credentials.yaml"),
+            "OPENCODE_GO_API_KEY: fixture-aaaaaaaaaaaaaaaaaa\n",
+        ).unwrap();
+        let context = RuntimeContext::from_root(&dir).unwrap();
+        let backend = CliBackend {
+            id: "ticket76-cross-platform-cli".into(),
+            cmd: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            args: vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "backend::tests::isolated_cli_lifecycle_probe".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![
+                ("OPENAI_API_KEY".into(), "fixture-cli-process-key".into()),
+                ("QQBOT_TICKET04_TREE_MODE".into(), "echo-stdin-success".into()),
+            ],
+            context,
+        };
+        let reply = backend.ask(&BackendRequest {
+            key: "group:ticket76-synthetic".into(),
+            prompt: "hello-process-tree".into(),
+            timeout_s: 10,
+        }).unwrap();
+        assert!(reply.text.contains("isolated-cli-cross-platform-ok; stdin=hello-process-tree"), "{reply:?}");
+        assert!(std::fs::read_dir(dir.join("data/logs")).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     #[ignore = "spawned as a bounded synthetic CLI subprocess by its parent lifecycle test"]
     fn isolated_cli_lifecycle_probe() {
@@ -2946,6 +2479,12 @@ mod tests {
         const MONITOR_ACK_FILE_ENV: &str = "QQBOT_TICKET04_TREE_MONITOR_ACK_FILE";
 
         match std::env::var(MODE_ENV).as_deref() {
+            Ok("echo-stdin-success") => {
+                use std::io::Read as _;
+                let mut prompt = String::new();
+                std::io::stdin().read_to_string(&mut prompt).unwrap();
+                println!("isolated-cli-cross-platform-ok; stdin={prompt}");
+            }
             Ok("normal-exit") => {
                 use std::io::Read as _;
 
@@ -3101,7 +2640,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn write_cli_probe_marker(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
         use std::io::Write as _;
 

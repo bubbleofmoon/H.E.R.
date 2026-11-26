@@ -29,6 +29,8 @@ pub enum Schedule {
     /// Every `minutes` (a divisor of a day), at `offset` minutes past local midnight and every period after.
     Every { minutes: u32, offset: u32 },
     Daily { hour: u32, minute: u32 },
+    /// The first day of each month at the given local hour and minute.
+    Monthly { hour: u32, minute: u32 },
     /// Only by hand.
     Manual,
 }
@@ -41,6 +43,7 @@ impl Schedule {
             }
             Schedule::Every { minutes, offset } => format!("每 {minutes} 分钟（偏移 {offset} 分）"),
             Schedule::Daily { hour, minute } => format!("每天 {hour:02}:{minute:02}"),
+            Schedule::Monthly { hour, minute } => format!("每月 1 日 {hour:02}:{minute:02}"),
             Schedule::Manual => "仅手动".to_string(),
         }
     }
@@ -51,13 +54,16 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
     let after = Timestamp::from_millisecond(after_ms).ok()?;
     match schedule {
         Schedule::Manual => None,
-        Schedule::Daily { hour, minute } if hour < 24 && minute < 60 => {
+        Schedule::Daily { hour, minute } | Schedule::Monthly { hour, minute }
+            if hour < 24 && minute < 60 =>
+        {
             let mut date = after.to_zoned(zone.clone()).date();
             loop {
                 let civil = date.at(hour as i8, minute as i8, 0, 0);
                 let slot = zone.to_ambiguous_timestamp(civil);
                 // A missing wall time is skipped. A repeated wall time runs only on its first occurrence.
-                if !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
+                let is_scheduled_day = !matches!(schedule, Schedule::Monthly { .. }) || date.day() == 1;
+                if is_scheduled_day && !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
                     let stamp = slot.earlier().ok()?;
                     if stamp > after {
                         return Some(stamp.as_millisecond());
@@ -66,7 +72,7 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
                 date = date.tomorrow().ok()?;
             }
         }
-        Schedule::Daily { .. } => None,
+        Schedule::Daily { .. } | Schedule::Monthly { .. } => None,
         Schedule::Every { minutes, offset } => {
             let period = i64::from(minutes) * 60_000;
             if period == 0 || 86_400_000 % period != 0 {
@@ -99,6 +105,8 @@ pub enum TaskId {
     MemoryDigest,
     MemoryDigestCheck,
     Backup,
+    MemoryBackup,
+    MemoryRestoreTest,
     UpstreamCheck,
 }
 
@@ -110,6 +118,8 @@ impl TaskId {
             TaskId::MemoryDigest => "memory-digest",
             TaskId::MemoryDigestCheck => "memory-digest-check",
             TaskId::Backup => "backup",
+            TaskId::MemoryBackup => "memory-backup",
+            TaskId::MemoryRestoreTest => "memory-restore-test",
             TaskId::UpstreamCheck => "upstream-check",
         }
     }
@@ -217,6 +227,30 @@ pub const REGISTRY: &[TaskDef] = &[
         runs_when_held: false,
         chat_output: false,
         timeout: Duration::from_secs(60),
+        replaces: None,
+    },
+    TaskDef {
+        id: TaskId::MemoryBackup,
+        title: "记忆备份",
+        effect: "在本地创建记忆库快照，保留最近 14 份",
+        schedule: Schedule::Daily { hour: 4, minute: 0 },
+        action: TaskAction::Internal,
+        enabled_by_default: true,
+        runs_when_held: false,
+        chat_output: false,
+        timeout: Duration::from_secs(3600),
+        replaces: None,
+    },
+    TaskDef {
+        id: TaskId::MemoryRestoreTest,
+        title: "记忆恢复测试",
+        effect: "在临时运行目录中恢复并验证最近的记忆备份",
+        schedule: Schedule::Monthly { hour: 5, minute: 30 },
+        action: TaskAction::Internal,
+        enabled_by_default: true,
+        runs_when_held: false,
+        chat_output: false,
+        timeout: Duration::from_secs(3600),
         replaces: None,
     },
 ];
@@ -532,53 +566,24 @@ pub struct CommandExecutor {
     running_allowed: Option<Box<dyn Fn(&TaskDef) -> bool + Send + Sync>>,
 }
 
-pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<std::fs::File>, String> + Send + Sync>;
+pub struct AdmissionGuard(#[allow(dead_code)] AdmissionLock);
 
-struct TaskChild {
-    #[cfg(windows)]
-    tree: crate::backend::windows_cli_lifecycle::CliProcessTree,
-    #[cfg(not(windows))]
-    child: std::process::Child,
+enum AdmissionLock {
+    Scheduled(std::fs::File),
+    Manual(crate::conversation_state::Gate),
 }
 
-impl TaskChild {
-    fn spawn(mut command: std::process::Command, timeout: Duration) -> Result<Self, String> {
-        #[cfg(windows)]
-        {
-            let tree = crate::backend::windows_cli_lifecycle::CliProcessTree::spawn_task(command, timeout)?;
-            Ok(Self { tree })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = timeout;
-            command.spawn().map(|child| Self { child }).map_err(|e| e.kind().to_string())
-        }
+impl AdmissionGuard {
+    pub(crate) fn scheduled(lock: std::fs::File) -> Self {
+        Self(AdmissionLock::Scheduled(lock))
     }
 
-    fn child(&mut self) -> &mut std::process::Child {
-        #[cfg(windows)] { self.tree.child_mut() }
-        #[cfg(not(windows))] { &mut self.child }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        { self.tree.stop_task() }
-        #[cfg(not(windows))]
-        {
-            #[cfg(unix)]
-            {
-                let pid = i32::try_from(self.child.id()).map_err(|_| "invalid child pid".to_string())?;
-                if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) { return Err(format!("cannot stop process group: {}", error.kind())); }
-                }
-            }
-            self.child.kill().or_else(|error| {
-                if self.child.try_wait()?.is_some() { Ok(()) } else { Err(error) }
-            }).map_err(|e| format!("cannot stop task process: {}", e.kind()))
-        }
+    pub(crate) fn manual(gate: crate::conversation_state::Gate) -> Self {
+        Self(AdmissionLock::Manual(gate))
     }
 }
+
+pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<AdmissionGuard>, String> + Send + Sync>;
 
 impl CommandExecutor {
     pub fn new(resolve: Resolver, internal: InternalJob, clock: Arc<dyn Clock>) -> Self {
@@ -611,7 +616,13 @@ impl Executor for CommandExecutor {
             }
             // Long internal jobs recheck desired state themselves; release the configuration gate
             // before waiting for dependencies, queuing memory_write work or streaming a backup.
-            if matches!(def.id, TaskId::MemoryDigest | TaskId::MemoryDigestCheck | TaskId::Backup) { drop(admission); }
+            if matches!(
+                def.id,
+                TaskId::MemoryDigest | TaskId::MemoryDigestCheck | TaskId::Backup
+                    | TaskId::MemoryBackup | TaskId::MemoryRestoreTest
+            ) {
+                drop(admission);
+            }
             return (self.internal)(def, run, cancel);
         }
         let spec = match (self.resolve)(def) {
@@ -668,26 +679,25 @@ impl Executor for CommandExecutor {
                     Ok(())
                 });
             }
-            command.process_group(0);
         }
-        let mut tree = match TaskChild::spawn(command, def.timeout) {
+        let mut tree = match crate::process_tree::ProcessTree::spawn(command, def.timeout) {
             Ok(child) => child,
             Err(error) => return Finish::Failed { exit_code: None, reason: format!("task could not be started: {error}") },
         };
-        if let Err(error) = run.mark_running(Some(tree.child().id()), self.clock.now_ms()) {
-            if tree.stop().is_ok() { let _ = tree.child().wait(); }
+        if let Err(error) = run.mark_running(Some(tree.id()), self.clock.now_ms()) {
+            if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
             return Finish::Unknown { reason: error };
         }
         #[cfg(unix)]
         {
             if cancel.load(Ordering::SeqCst) || self.running_allowed.as_ref().is_some_and(|check| !check(def)) {
-                if tree.stop().is_ok() { let _ = tree.child().wait(); }
+                if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
                 return Finish::Cancelled { reason: "task was cancelled before execution".to_string() };
             }
-            let started = tree.child().stdin.take().ok_or_else(|| std::io::Error::other("task startup pipe is unavailable"))
+            let started = tree.take_stdin().ok_or_else(|| std::io::Error::other("task startup pipe is unavailable"))
                 .and_then(|mut pipe| std::io::Write::write_all(&mut pipe, b"her-start\n"));
             if let Err(error) = started {
-                if tree.stop().is_ok() { let _ = tree.child().wait(); }
+                if tree.stop().is_ok() { let _ = tree.child_mut().wait(); }
                 return Finish::Unknown { reason: format!("task startup could not be released: {}", error.kind()) };
             }
         }
@@ -697,8 +707,8 @@ impl Executor for CommandExecutor {
         let (tx, rx) = mpsc::sync_channel::<(LogStream, String)>(128);
         let mut readers = Vec::new();
         for (stream, pipe) in [
-            (LogStream::Out, tree.child().stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
-            (LogStream::Err, tree.child().stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+            (LogStream::Out, tree.child_mut().stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+            (LogStream::Err, tree.child_mut().stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
         ] {
             let Some(pipe) = pipe else { continue };
             let tx = tx.clone();
@@ -769,7 +779,7 @@ impl Executor for CommandExecutor {
                 }
             }
             if exited.is_none() {
-                match tree.child().try_wait() {
+                match tree.child_mut().try_wait() {
                     Ok(Some(status)) => exited = Some((Instant::now(), Ok(status))),
                     Ok(None) => {}
                     Err(error) => exited = Some((Instant::now(), Err(error))),
@@ -800,12 +810,13 @@ impl Executor for CommandExecutor {
             // SIGKILL and the leader's wait do not witness descendant exit.
             // Give a signalled tree a bounded interval to finish dying before
             // retaining an unresolved group; ordinary completion never kills it.
-            let pid = tree.child().id();
+            let pid = tree.id();
             let settled = Instant::now() + Duration::from_secs(1);
             while stopped.is_some() && crate::task_runs::task_group_alive(pid) && Instant::now() < settled {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if crate::task_runs::task_group_alive(pid) {
+                tree.disarm_drop();
                 return Finish::Unknown { reason: "task leader exited but its process group is still running; admission remains held".into() };
             }
         }
@@ -859,6 +870,31 @@ mod tests {
         assert_eq!(next_due(Schedule::Every { minutes: 7, offset: 0 }, MIDNIGHT, tz), None, "must divide a day");
         // UTC zone: 03:00 UTC is 11:00 at UTC+8
         assert_eq!(next_due(daily3, MIDNIGHT, &TimeZone::UTC), Some(MIDNIGHT + 11 * H));
+    }
+
+    #[test]
+    fn next_due_monthly_crosses_the_year_boundary() {
+        let schedule = Schedule::Monthly { hour: 5, minute: 30 };
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let before = ms("2026-12-31T23:59:59Z");
+        let january = ms("2027-01-01T05:30:00Z");
+        let february = ms("2027-02-01T05:30:00Z");
+
+        assert_eq!(next_due(schedule, before, &TimeZone::UTC), Some(january));
+        assert_eq!(next_due(schedule, january, &TimeZone::UTC), Some(february));
+    }
+
+    #[test]
+    fn next_due_monthly_follows_dst_and_uses_the_first_folded_time() {
+        let schedule = Schedule::Monthly { hour: 1, minute: 30 };
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let october = ms("2026-10-01T05:30:00Z");
+        let november = ms("2026-11-01T05:30:00Z");
+        let december = ms("2026-12-01T06:30:00Z");
+
+        assert_eq!(next_due(schedule, october, &zone), Some(november));
+        assert_eq!(next_due(schedule, november, &zone), Some(december));
     }
 
     #[test]

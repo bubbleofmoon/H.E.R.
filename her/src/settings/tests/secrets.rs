@@ -17,7 +17,7 @@ fn ticket219_core_registry_and_chat() {
         .filter(|setting| setting.secret)
         .map(|setting| setting.key)
         .collect();
-    assert_eq!(registered, [SEARCH, CLI], "only endpoint API keys are secret");
+    assert_eq!(registered, [SEARCH, CLI, "console.administratorPassword"]);
     assert!(
         crate::settings::registry().all(|setting| !setting.secret || !setting.chat),
         "a credential cannot be chat-visible",
@@ -164,7 +164,7 @@ fn ticket219_core_prompt_text_refuses_both_credentials() {
 }
 
 #[test]
-fn ticket219_core_prompt_delivery_rechecks_credentials_after_strip() {
+fn ticket219_core_model_view_preserves_credential_boundaries() {
     let (_root, context) = settings_fixture("prompt credential delivery");
     assert_eq!(put(&context, CLI, CLI_KEY).0, 200);
     let mut cfg = context.load_config().unwrap();
@@ -176,9 +176,10 @@ fn ticket219_core_prompt_delivery_rechecks_credentials_after_strip() {
     }
     *member = json!("fixture-cli-REMOVEcredential");
     let visible = crate::prompt_text::model_text(&context, &cfg, setting.key);
-    assert!(!visible.contains(CLI_KEY), "stripping exposed a credential in prompt text");
+    assert_eq!(visible, "fixture-cli-REMOVEcredential");
+    assert!(!visible.contains(CLI_KEY), "delivery exposed a credential in prompt text");
     let handover = crate::engine_switch::safe_text(&context, &cfg, "before fixture-cli-REMOVEcredential after", 100);
-    assert_eq!(handover.as_deref(), Some("before *** after"), "stripping exposed a credential in a handover");
+    assert_eq!(handover.as_deref(), Some("before fixture-cli-【已隐藏】credential after"));
 }
 
 #[test]

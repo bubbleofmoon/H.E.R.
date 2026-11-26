@@ -45,9 +45,9 @@ impl From<CheckError> for String {
 impl Tools {
     /// Match console authority, including its reserved2 default for an absent mode.
     pub(crate) fn current_mode(context: &RuntimeContext) -> &'static str {
-        crate::console::current_mode_for(context)
+        crate::social_state::mode_checked(context)
             .ok()
-            .and_then(|mode| crate::config::normalize_mode(&mode))
+            .and_then(|mode| crate::social_state::normalize_mode(&mode))
             .unwrap_or_default()
     }
 
@@ -66,7 +66,7 @@ impl Tools {
         }
         let profile = Profile::of_conversation(cfg, mode, conversation)
             .ok_or("harness has no tool menu for this conversation in this mode")?;
-        let token = crate::conversation_authority::token(context, conversation)?
+        let token = crate::social_state::token(context, conversation)?
             .ok_or("harness tool authority is unavailable")?;
         let authority = Authority {
             context: context.clone(),
@@ -78,7 +78,7 @@ impl Tools {
         };
         authority.check().map_err(String::from)?;
         // #140: read from the settings store with this turn's configuration, so an edit is in
-        // effect from the next turn; the model-view strip applies, and the stripped text is checked again.
+        // effect from the next turn under the prompt text and credential checks.
         let mode_prompt = profile
             .prompt_key()
             .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
@@ -124,7 +124,8 @@ impl Tools {
 
     pub(super) fn revoke(&self) -> Result<Option<String>, String> {
         match &self.authority {
-            Some(a) => crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token),
+            Some(a) => crate::social_state::revoke(&a.context, &a.conversation, &a.token)
+                .map_err(String::from),
             None => Ok(None),
         }
     }
@@ -177,10 +178,9 @@ impl Tools {
         Ok(self
             .definitions
             .iter()
-            .filter(|d| {
-                current
-                    .as_ref()
-                    .is_none_or(|current| current.iter().any(|c| c["name"] == d["name"]))
+            .filter_map(|captured| match &current {
+                Some(current) => current.iter().find(|tool| tool["name"] == captured["name"]),
+                None => Some(captured),
             })
             .map(|d| {
                 Tool::new(d["name"].as_str().unwrap_or_default())
@@ -263,6 +263,16 @@ impl Tools {
         let Some(authority) = &self.authority else {
             return error("tool authority is unavailable");
         };
+        // Use the same gate as mode, token and settings writers. Wait first, then recheck the turn.
+        let reminder = super::reminders::NAMES.contains(&call.fn_name.as_str());
+        let _gate = if reminder {
+            match crate::social_state::acquire_config_gate(&authority.context) {
+                Ok(gate) => gate,
+                Err(_) => return error("暂时无法处理提醒，请稍后再试"),
+            }
+        } else {
+            None
+        };
         if authority.check().is_err() {
             return error("tool authority changed");
         }
@@ -274,6 +284,15 @@ impl Tools {
             .any(|d| d["name"] == call.fn_name)
         {
             return error("tool is no longer enabled");
+        }
+        if reminder {
+            return super::reminders::dispatch(
+                &authority.context,
+                &cfg,
+                &authority.conversation,
+                &call.fn_name,
+                args,
+            );
         }
         match call.fn_name.as_str() {
             "web_search" | "web_fetch" | "snowluma_status" => {
@@ -294,7 +313,7 @@ impl Authority {
             .map_err(|reason| CheckError::Unavailable(reason.into()))?;
         let mode = Tools::current_mode(&self.context);
         let allowed = if mode == "reserved2" {
-            crate::console::inbound_admitted(&cfg, &self.conversation)
+            crate::social_state::inbound_admitted(&cfg, &self.conversation)
                 && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
                 && self.context.read_social_state().map_err(CheckError::Unavailable)?["paused"] != true
         } else {
@@ -308,10 +327,10 @@ impl Authority {
                 "harness conversation authority changed",
             ));
         }
-        let token = crate::conversation_authority::token(&self.context, &self.conversation)
-            .map_err(CheckError::Unavailable)?;
+        let token = crate::social_state::token(&self.context, &self.conversation)
+            .map_err(|e| CheckError::Unavailable(e.to_string()))?;
         if token.as_deref() != Some(&self.token)
-            || crate::conversation_authority::generation(&self.token) != self.generation
+            || crate::social_state::generation(&self.token) != self.generation
         {
             return Err(CheckError::Revoked(
                 "harness conversation generation changed",
@@ -324,21 +343,18 @@ impl Authority {
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
 /// configuration switches off (#153) drops out of every menu, the direct-send switches included.
 fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> {
-    let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     tools.extend(crate::aux_mcp::tool_list());
     tools.push(super::interactions::question_definition());
+    tools.extend(super::reminders::definitions());
     tools
         .into_iter()
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
-                menu.contains(&name)
-                    && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
-                        || crate::console::reserved2_menu_tool(cfg, conversation, name))
-                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
+                profile.allows_tool(cfg, Some(conversation), name)
             })
         })
         .map(|mut definition| {
@@ -355,19 +371,6 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
             }
         })
         .collect()
-}
-
-/// The `socialV2.tools` switch the console checks for a token-bound direct send
-/// (`console_agent::direct_inner`). The shared MCP registration (`qq_tools::registered`) does not
-/// gate these three tools, and the harness always binds the turn's token into them, so the menu
-/// applies the switch. As in the console, only an explicit `false` switches a send off.
-fn direct_send_switch(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "qq_send_private_message" => "sendPrivate",
-        "qq_send_group_message" => "sendGroup",
-        "qq_reply" => "reply",
-        _ => return None,
-    })
 }
 
 pub(super) fn error(reason: &str) -> Value {
@@ -446,9 +449,9 @@ mod tests {
         /// The conversation's generation, minting its agent token when it has none.
         fn generation(&self, conversation: &str) -> String {
             let token =
-                crate::conversation_authority::ensure_or_rotate(&self.context, conversation, false)
+                crate::social_state::ensure_or_rotate(&self.context, conversation, false)
                     .unwrap();
-            crate::conversation_authority::generation(&token)
+            crate::social_state::generation(&token)
         }
 
         fn capture(&self, mode: &str, conversation: &str) -> Result<Tools, String> {
@@ -479,22 +482,131 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row and its registered tools for a private chat with optional media enabled.
+    fn reminder_call(tools: &Tools, name: &str, args: Value) -> Value {
+        let call = call(name, args);
+        match tools.prepare(&call) {
+            Ok(prepared) => tools.dispatch(&call, &prepared),
+            Err(outcome) => outcome,
+        }
+    }
+
+    fn reminder_payload(outcome: Value) -> Value {
+        assert_eq!(outcome["isError"], false, "{outcome}");
+        serde_json::from_str(outcome["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reminder_tools_manage_the_admitted_private_conversation() {
+        let fixture = Fixture::new("reminder-tools", "reserved2");
+        fixture.edit_config(|cfg| cfg["time"] = json!({"zone": "Asia/Shanghai"}));
+        let tools = fixture.capture("reserved2", OWNER_KEY).unwrap();
+        let next_day = crate::parity_clock::now_ms() + 86_400_000;
+        let local =
+            crate::local_time::at(next_day, &jiff::tz::TimeZone::get("Asia/Shanghai").unwrap());
+        let wall = format!("{}", local.strftime("%Y-%m-%dT%H:%M"));
+        let created = reminder_payload(reminder_call(
+            &tools,
+            "reminder_create",
+            json!({
+                "text": " 喝水 ", "localAt": wall, "conversation": GROUP_KEY
+            }),
+        ));
+        let id = &created["item"]["id"];
+        assert_eq!(created["item"]["conversation"], OWNER_KEY);
+        assert_eq!(
+            created["item"]["nextAt"],
+            next_day.div_euclid(60_000) * 60_000
+        );
+        assert_eq!(created["item"]["text"], "喝水");
+
+        let changed = reminder_payload(reminder_call(
+            &tools,
+            "reminder_change",
+            json!({
+                "id": id, "text": "喝茶", "repeat": {"kind": "every", "minutes": 60}
+            }),
+        ));
+        let listed = reminder_payload(reminder_call(&tools, "reminder_list", json!({})));
+        assert_eq!(listed["items"], json!([changed["item"]]));
+        assert_eq!(listed["items"][0]["text"], "喝茶");
+
+        let cancelled =
+            reminder_payload(reminder_call(&tools, "reminder_cancel", json!({"id": id})));
+        assert_eq!(cancelled["item"]["status"], "cancelled");
+        let listed = reminder_payload(reminder_call(&tools, "reminder_list", json!({})));
+        assert_eq!(listed["items"], json!([]));
+    }
+
+    #[test]
+    fn group_reminder_writes_require_approval() {
+        use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
+
+        let fixture = Fixture::new("group-reminders", "reserved2");
+        let tools = fixture.capture("reserved2", GROUP_KEY).unwrap();
+        let now = crate::parity_clock::now_ms();
+        let at = now + 3_600_000;
+        let existing = ScheduleStore::new(&fixture.context)
+            .create(
+                NewItem {
+                    creator: Creator::Her,
+                    conversation: GROUP_KEY.into(),
+                    text: "喝茶".into(),
+                    at,
+                    repeat: Repeat::Once,
+                },
+                now,
+            )
+            .unwrap();
+        for (name, args) in [
+            ("reminder_create", json!({"text": "喝水", "at": at})),
+            (
+                "reminder_change",
+                json!({"id": existing.id, "text": "喝水"}),
+            ),
+        ] {
+            let outcome = reminder_call(&tools, name, args);
+            assert_eq!(
+                outcome["content"][0]["text"], "群聊提醒需要管理员批准，目前无法创建或修改",
+                "group reminder write must require approval"
+            );
+            assert_eq!(outcome["isError"], true);
+        }
+        let listed = reminder_payload(reminder_call(&tools, "reminder_list", json!({})));
+        assert_eq!(listed["items"], json!([existing]));
+    }
+
+    /// Check the profile table and the offered private-chat tools with and without an owner.
     fn assert_menu(profile: Profile, expected: &[&str]) {
-        let cfg = json!({
+        let mut cfg = json!({
             "socialV2": {
                 "voice": {"enabled": true},
                 "tools": {"sendVoice": true, "setStickerRemark": true}
             }
         });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
-        assert_eq!(
-            names(&definitions(&cfg, profile, OWNER_KEY)),
-            expected.iter().copied().filter(|name| {
+        let private_menu: Vec<_> = expected
+            .iter()
+            .copied()
+            .filter(|name| {
                 !matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
                     || !matches!(*name, "qq_send_group_message" | "qq_reply" | "qq_send_burst")
-            }).collect::<Vec<_>>(),
-            "{profile:?} offered"
+            })
+            .collect();
+        let without_owner: Vec<_> = private_menu
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "memory_acl" | "settings_get" | "settings_set"))
+            .collect();
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            without_owner,
+            "{profile:?} offered without an owner"
+        );
+        cfg["ownerQQ"] = json!(8808);
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            private_menu,
+            "{profile:?} offered to the configured owner"
         );
     }
 
@@ -609,6 +721,10 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "snowluma_status",
+                "reminder_create",
+                "reminder_list",
+                "reminder_change",
+                "reminder_cancel",
             ],
         );
     }
@@ -663,6 +779,10 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "snowluma_status",
+                "reminder_create",
+                "reminder_list",
+                "reminder_change",
+                "reminder_cancel",
             ],
         );
     }
@@ -719,6 +839,8 @@ mod tests {
                         || name.starts_with("memory_")
                         || name.starts_with("settings_")
                         || (profile == Profile::ClosedAgent && *name == "ask_owner")
+                        || (matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
+                            && super::super::reminders::NAMES.contains(name))
                         || ["web_search", "web_fetch", "snowluma_status"].contains(name),
                     "{profile:?} offers {name}"
                 );
@@ -1030,17 +1152,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_prompt_strip_that_makes_a_denied_term_falls_back_to_the_last_good_text() {
+    fn mode_prompt_keeps_its_validated_text_when_chat_redaction_changes() {
         let fixture = Fixture::new("mode-prompt-strip", "closed-agent");
         let save = |text: &str| {
             crate::settings::apply(&fixture.context, "prompt.mode.closedAgent", &json!(text), "administrator", "console")
         };
         save("封闭模式说明 140").unwrap();
-        // Accepted on save, when the strip has no term to remove; the strip below makes `DSH` of it.
         save("D鲸SH").unwrap();
         fixture.edit_config(|cfg| cfg["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
         let instruction = fixture.capture("closed-agent", OWNER_KEY).unwrap().instruction();
-        assert_eq!(instruction, format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY)));
+        assert_eq!(instruction, format!("D鲸SH\n\n{}", session_instruction(OWNER_KEY)));
         assert!(!instruction.contains("DSH"), "a denied term reached the model: {instruction}");
     }
 
@@ -1094,14 +1215,14 @@ mod tests {
             instruction("closed-agent", OWNER_KEY),
             format!("{}\n\n{}", "鲸".repeat(8000), session_instruction(OWNER_KEY))
         );
-        // The model-view strip applies to the mode prompt.
+        // Chat redaction leaves the saved mode prompt intact.
         save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
         fixture.edit_config(|cfg| {
             cfg["socialV2"] = json!({"context": {"stripFromModelText": ["封闭"]}})
         });
         assert_eq!(
             instruction("closed-agent", OWNER_KEY),
-            format!("模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+            format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY))
         );
         // An emptied prompt sends the session line alone again.
         save("prompt.mode.closedAgent", "").unwrap();

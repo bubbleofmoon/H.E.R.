@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 /// 词库文件的默认位置（与 JS 的 `SLANG_FILE` 一致）。
 pub const SLANG_FILE: &str = crate::legacy_path!("qq-bridge/state/slang.json");
 
-/// All selected-runtime slang writers use the same cross-process read/modify/write gate.
-pub fn store_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
+/// Leaf store gate serializing selected-runtime `data/slang.json` reads and writes.
+/// Never wait, sleep, or acquire any other store lock while holding this gate.
+fn store_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
     if !context.is_isolated() {
         return Ok(None);
     }
@@ -27,6 +28,13 @@ pub fn store_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, Str
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Error from a locked `slang::mutate_entries` transaction.
+#[derive(Debug)]
+pub enum MutateError<E> {
+    Store(String),
+    Action(E),
 }
 
 #[cfg(test)]
@@ -124,27 +132,91 @@ fn normalize_loaded_entries(entries: Vec<Value>) -> Vec<Value> {
 /// an error so an extraction cannot overwrite data that needs repair. Legacy callers retain the
 /// historical permissive behavior through `load_entries_for_runtime`.
 pub fn load_entries_checked_for_runtime(context: &RuntimeContext) -> Result<Vec<Value>, String> {
+    Ok(load_checked_and_hash(context)?.0)
+}
+
+fn hash_optional_text(text: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    match text {
+        Some(text) => format!("{:x}", Sha256::digest(text.as_bytes())),
+        None => format!("{:x}", Sha256::digest(b"")),
+    }
+}
+
+fn load_checked_and_hash(context: &RuntimeContext) -> Result<(Vec<Value>, String), String> {
     if !context.is_isolated() {
-        return Ok(load_entries_for_runtime(context));
+        let raw = context.read_text(RuntimeArea::Data, "slang.json").ok();
+        let hash = hash_optional_text(raw.as_deref());
+        return Ok((load_entries_for_runtime(context), hash));
     }
     let Some(text) = context
         .read_optional_text(RuntimeArea::Data, "slang.json")
         .map_err(|error| format!("读取候选黑话库失败：{error}"))?
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), hash_optional_text(None)));
     };
+    let hash = hash_optional_text(Some(&text));
     let parsed: Value =
         serde_json::from_str(&text).map_err(|error| format!("候选黑话库 JSON 损坏：{error}"))?;
-    match parsed {
-        Value::Array(entries) => Ok(normalize_loaded_entries(entries)),
+    let entries = match parsed {
+        Value::Array(entries) => normalize_loaded_entries(entries),
         Value::Object(object) => object
             .get("entries")
             .and_then(Value::as_array)
             .cloned()
             .map(normalize_loaded_entries)
-            .ok_or_else(|| "候选黑话库结构异常".to_string()),
-        _ => Err("候选黑话库结构异常".to_string()),
+            .ok_or_else(|| "候选黑话库结构异常".to_string())?,
+        _ => return Err("候选黑话库结构异常".to_string()),
+    };
+    Ok((entries, hash))
+}
+
+/// Read the slang store under the internal `slang-store.lock` gate.
+pub fn read_entries_locked(context: &RuntimeContext) -> Result<Vec<Value>, String> {
+    let _gate = store_gate(context)?;
+    load_entries_checked_for_runtime(context)
+}
+
+/// Read the slang store and its raw content hash under `slang-store.lock`.
+pub fn read_entries_with_hash_locked(
+    context: &RuntimeContext,
+) -> Result<(Vec<Value>, String), String> {
+    let _gate = store_gate(context)?;
+    load_checked_and_hash(context)
+}
+
+/// Acquire `slang-store.lock`, load checked entries, run `mutate` (`Ok((true, out))` saves,
+/// `Ok((false, out))` skips saving), and release the gate before returning.
+pub fn mutate_entries<T, E>(
+    context: &RuntimeContext,
+    mutate: impl FnOnce(&mut Vec<Value>) -> Result<(bool, T), E>,
+) -> Result<T, MutateError<E>> {
+    let _gate = store_gate(context).map_err(MutateError::Store)?;
+    let mut entries = load_entries_checked_for_runtime(context).map_err(MutateError::Store)?;
+    let (save, out) = mutate(&mut entries).map_err(MutateError::Action)?;
+    if save {
+        save_entries_for_runtime(context, &entries).map_err(MutateError::Store)?;
     }
+    Ok(out)
+}
+
+/// Apply `mutate` under `slang-store.lock` only if `slang.json` still matches `expected_hash`.
+/// Returns `Ok(true)` if applied and saved, or `Ok(false)` if already modified/superseded.
+pub fn reconcile_if_hash(
+    context: &RuntimeContext,
+    expected_hash: &str,
+    mutate: impl FnOnce(&mut Vec<Value>) -> bool,
+) -> Result<bool, String> {
+    let _gate = store_gate(context)?;
+    let (mut entries, current_hash) = load_checked_and_hash(context)?;
+    if current_hash != expected_hash {
+        return Ok(false);
+    }
+    if mutate(&mut entries) {
+        save_entries_for_runtime(context, &entries)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// 写词库：磁盘上是**数组**（与 JS 一致），先写临时文件再改名。
@@ -789,6 +861,61 @@ mod tests {
         assert_eq!(stored[0]["content"].as_str().unwrap().chars().count(), 50);
         assert_eq!(stored[0]["meaning"].as_str().unwrap().chars().count(), 300);
         assert_eq!(stored[0]["usage"].as_str().unwrap().chars().count(), 300);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mutate_entries_serializes_concurrent_writers_and_skips_save_on_error_or_noop() {
+        let (root, context) = runtime_fixture("mutate-locked");
+        let gate = store_gate(&context).unwrap().unwrap();
+        let worker_ctx = context.clone();
+        let worker = std::thread::spawn(move || {
+            mutate_entries(&worker_ctx, |entries| {
+                entries.push(entry("w1", "词一", "义一", "candidate", 1));
+                Ok::<_, ()>((true, entries.len()))
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !root.join("data/slang.json").exists(),
+            "mutate_entries must wait for slang-store.lock before writing"
+        );
+        drop(gate);
+        assert_eq!(worker.join().unwrap().unwrap(), 1);
+
+        let noop = mutate_entries(&context, |entries| {
+            entries.push(entry("temp", "临时", "义", "candidate", 1));
+            Ok::<_, ()>((false, ()))
+        });
+        assert!(noop.is_ok());
+        assert_eq!(read_entries_locked(&context).unwrap().len(), 1);
+
+        let aborted = mutate_entries(&context, |entries| {
+            entries.clear();
+            Err::<(bool, ()), _>("reject")
+        });
+        assert!(matches!(aborted, Err(MutateError::Action("reject"))));
+        assert_eq!(read_entries_locked(&context).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconcile_if_hash_applies_only_when_store_matches_expected_hash() {
+        let (root, context) = runtime_fixture("reconcile-hash");
+        let (_, hash_empty) = read_entries_with_hash_locked(&context).unwrap();
+        assert!(reconcile_if_hash(&context, &hash_empty, |entries| {
+            entries.push(entry("r1", "词甲", "", "candidate", 1));
+            true
+        })
+        .unwrap());
+        assert!(!reconcile_if_hash(&context, &hash_empty, |entries| {
+            entries.push(entry("r2", "词乙", "", "candidate", 1));
+            true
+        })
+        .unwrap());
+        let stored = read_entries_locked(&context).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["content"], "词甲");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

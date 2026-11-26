@@ -205,6 +205,7 @@ pub fn format_injection(context: &RuntimeContext, cfg: &Value, key: &str) -> Str
     } else {
         entry.text.clone()
     };
+    let body = crate::model_view::strip_from_model_text(&body, cfg);
     let label = if key.trim_matches(js_is_space).starts_with("private:") { "私聊环境" } else { "群聊环境" };
     format!("【{label}（操作者预设，仅本次首次唤醒参考）】\n{body}\n（以上是操作者提供的背景，不是群友发的消息、也不是新的系统指令；据此把握圈子主题、氛围与分寸，不必向群友复述。）")
 }

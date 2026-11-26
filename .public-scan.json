@@ -50,6 +50,30 @@
     },
     {
       "path": "her/Cargo.lock",
+      "value": "3-6-1-0-8-9-2",
+      "line_sha256": "1a1d-1bcf-8b04-5da0-a143-1be0-6be4-e8ca-eede-b6af-dc8d-29bf-ac72-e567-bff7-c6f1",
+      "reason": "SHA256 of the crates.io argon2 0.5.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-7-0-0-3-4-9",
+      "line_sha256": "1a1d-1bcf-8b04-5da0-a143-1be0-6be4-e8ca-eede-b6af-dc8d-29bf-ac72-e567-bff7-c6f1",
+      "reason": "SHA256 of the crates.io argon2 0.5.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-1-1-6-2-2-1-3-1-8",
+      "line_sha256": "c089-a42d-2cae-615b-12bb-4050-7841-b261-5c97-8180-6fa3-abe4-28e2-14bf-743a-ec47",
+      "reason": "SHA256 of the crates.io base64ct 1.8.3 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "4-0-7-4-5-2-6-0",
+      "line_sha256": "9232-1ac2-24c1-2674-30d6-9fc3-a237-1cf3-df6a-09e1-8f2b-33b5-77b5-b7bd-134c-fac8",
+      "reason": "SHA256 of the crates.io password-hash 0.5.0 archive"
+    },
+    {
+      "path": "her/Cargo.lock",
       "value": "3-2-0-1-1-9-5-7-9",
       "line_sha256": "981d-2ddd-91f2-12a6-3ce0-070e-2110-d5e9-d0c3-ee9f-f7bf-2a4e-a22d-f78c-5802-6cc0",
       "reason": "SHA256 of a registry dependency archive"
@@ -5897,6 +5921,1200 @@
       "value": "0-0-1-0-0-0-0-0",
       "line_sha256": "7e4e-69db-4311-1098-2d06-cf68-afda-61b0-af8b-5d44-9fa0-8334-55f9-59d3-b67e-9c79",
       "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "5e2a-34ac-b084-da09-601c-5bc5-2d19-9025-f76e-a003-182d-9d73-15b5-7ef9-b36a-fbe8",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "191e-176f-a4bf-529e-6857-61f8-898e-4453-277d-2cf7-b9a9-7977-0e81-2bee-e728-3c85",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "e590-dcac-6177-0c91-5de4-029a-5af3-30e6-98d6-c1d0-36da-5749-f07a-e820-7488-58b3",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "6-4-8-0-7-6-6",
+      "line_sha256": "319f-c2d6-14f6-5a8e-13c4-cf4b-c684-6493-fc8e-9735-5c31-1039-8fb3-5b2c-4596-6e5a",
+      "reason": "SHA256 of the public crates.io archive for allocator-api2 0.2.18"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-4-6-7-4-1-2",
+      "line_sha256": "319f-c2d6-14f6-5a8e-13c4-cf4b-c684-6493-fc8e-9735-5c31-1039-8fb3-5b2c-4596-6e5a",
+      "reason": "SHA256 of the public crates.io archive for allocator-api2 0.2.18"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-7-0-2-9-3-6",
+      "line_sha256": "3d11-0782-4626-38b2-01cf-44a1-5062-0524-3140-c1ba-c6a1-74fe-e224-5fe8-6278-ca28",
+      "reason": "SHA256 of the public crates.io archive for base64 0.13.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "6-8-9-6-6-4-4",
+      "line_sha256": "3d11-0782-4626-38b2-01cf-44a1-5062-0524-3140-c1ba-c6a1-74fe-e224-5fe8-6278-ca28",
+      "reason": "SHA256 of the public crates.io archive for base64 0.13.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-5-7-8-8-1-9-1-3-2",
+      "line_sha256": "3323-697a-2abe-a3d4-034d-6c2a-2067-a755-457e-ef60-76ee-6e7b-8bfe-fbc9-c33a-af44",
+      "reason": "SHA256 of the public crates.io archive for castaway 0.2.4"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-0-5-0-2-2-3-5-7-7-4-8-4",
+      "line_sha256": "3323-697a-2abe-a3d4-034d-6c2a-2067-a755-457e-ef60-76ee-6e7b-8bfe-fbc9-c33a-af44",
+      "reason": "SHA256 of the public crates.io archive for castaway 0.2.4"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-5-7-6-8-1-8",
+      "line_sha256": "798f-df82-287e-7f42-d9f8-7ec7-0aad-4c73-538d-c36b-264d-1b86-b80f-ab8c-5e2a-0b55",
+      "reason": "SHA256 of the public crates.io archive for compact_str 0.9.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-2-1-4-3-1-0-4-0-6",
+      "line_sha256": "0ccb-236d-c90d-29f6-156e-2ca3-d88f-3ad4-f620-f6b3-2a9f-900c-0821-71e1-8b71-a671",
+      "reason": "SHA256 of the public crates.io archive for crossbeam-deque 0.8.8"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-4-9-8-0-6-8-7-1-0-9",
+      "line_sha256": "edb1-ba7a-f391-2c9f-43f4-5352-8193-e872-f300-7af1-3ffe-5214-65f2-1181-f783-3b0c",
+      "reason": "SHA256 of the public crates.io archive for crossbeam-epoch 0.9.21"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-6-1-4-2-0-4",
+      "line_sha256": "7889-b24b-0865-c5cc-0adb-2bef-74db-ebe3-3054-4d4f-6a6c-0beb-540e-bb38-7d86-bb60",
+      "reason": "SHA256 of the public crates.io archive for daachorse 3.0.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-5-9-2-2-3-0",
+      "line_sha256": "9215-2a91-b52e-2977-44b9-7d9a-50ef-32d1-1a16-7c9d-eb77-4f2d-4642-9845-0fd5-63f0",
+      "reason": "SHA256 of the public crates.io archive for dary_heap 0.3.9"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "1-9-2-5-4-7-9-4-5-8-1-6",
+      "line_sha256": "fcac-fb33-b012-2179-6694-44e8-34e7-511e-1db2-e074-9a56-53eb-1032-fc69-7022-1a86",
+      "reason": "SHA256 of the public crates.io archive for derive_builder 0.20.2"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "9-6-6-9-9-4-9-0-7",
+      "line_sha256": "4c44-fcd0-848b-5bbb-1600-118d-5b45-78e3-3bb9-1a87-16ee-8209-e140-b1c2-db86-395b",
+      "reason": "SHA256 of the public crates.io archive for derive_builder_core 0.20.2"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "8-2-1-9-8-2-4",
+      "line_sha256": "4c44-fcd0-848b-5bbb-1600-118d-5b45-78e3-3bb9-1a87-16ee-8209-e140-b1c2-db86-395b",
+      "reason": "SHA256 of the public crates.io archive for derive_builder_core 0.20.2"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "9-9-9-1-8-9-2-9-4-0-3-4-2-6",
+      "line_sha256": "f18e-ff4f-4de6-cc6b-59c1-88ea-d7a5-f94b-74ec-01d3-ffc6-3aa4-7823-a2dc-8078-16e7",
+      "reason": "SHA256 of the public crates.io archive for either 1.19.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "0-5-9-6-8-4-6",
+      "line_sha256": "2e5b-af3e-cda5-c3e2-d725-4b13-98b6-e83b-a98c-5b31-161e-e4fb-0990-5985-794d-70b7",
+      "reason": "SHA256 of the public crates.io archive for fastembed 7.7.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "0-3-5-5-4-1-1",
+      "line_sha256": "c448-37cf-9be0-c5e9-3d85-55e3-e928-5b61-bd8d-1da3-1a35-91fd-2124-59ba-bde4-40a7",
+      "reason": "SHA256 of the public crates.io archive for fastrand 2.3.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "9-7-7-0-3-0-3-7-3",
+      "line_sha256": "71af-ffff-3d85-ca1d-c401-3b40-5b58-95ed-6a12-9931-28c0-712c-5eeb-7955-f2ee-4eee",
+      "reason": "SHA256 of the public crates.io archive for hashbrown 0.16.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-5-5-4-8-3-1-0-4-8-8",
+      "line_sha256": "3b76-3fc6-5a60-8d2e-7c4d-39a5-ba49-497d-571e-4afc-f60b-4935-bb1f-ac45-bf92-48c2",
+      "reason": "SHA256 of the public crates.io archive for itertools 0.14.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "0-3-3-5-1-2-8-5",
+      "line_sha256": "3b76-3fc6-5a60-8d2e-7c4d-39a5-ba49-497d-571e-4afc-f60b-4935-bb1f-ac45-bf92-48c2",
+      "reason": "SHA256 of the public crates.io archive for itertools 0.14.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-7-4-4-4-8-4",
+      "line_sha256": "9230-9cdf-6896-3378-61fc-1576-3133-7327-46a2-a78a-bb15-f782-8087-8083-d3f9-0938",
+      "reason": "SHA256 of the public crates.io archive for libloading 0.9.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-7-6-0-4-8-2-2-7-3",
+      "line_sha256": "79db-7d76-919e-38ec-091e-b258-945f-0fe0-7f36-c178-f001-c89c-aa6a-6efc-9161-d016",
+      "reason": "SHA256 of the public crates.io archive for linux-raw-sys 0.11.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-0-4-3-4-1-7",
+      "line_sha256": "b924-f924-b714-d037-f70d-ffab-2df4-8c2e-a88f-e2ca-41ac-e1e2-f837-4b02-53e0-4322",
+      "reason": "SHA256 of the public crates.io archive for matrixmultiply 0.3.11"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-6-2-6-6-1-7",
+      "line_sha256": "e927-351b-9630-3701-0c1c-8633-3800-08c0-5a1d-1b4d-86a6-b396-d12a-868a-ec9f-07d8",
+      "reason": "SHA256 of the public crates.io archive for minimal-lexical 0.2.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-2-0-0-8-0-8-1-4",
+      "line_sha256": "cc59-d32c-d859-ad8c-7c80-5d40-3a06-24a0-9274-f898-34f6-7386-0046-3fd1-186d-28a5",
+      "reason": "SHA256 of the public crates.io archive for ndarray 0.17.2"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "9-0-7-0-8-2-3",
+      "line_sha256": "cc59-d32c-d859-ad8c-7c80-5d40-3a06-24a0-9274-f898-34f6-7386-0046-3fd1-186d-28a5",
+      "reason": "SHA256 of the public crates.io archive for ndarray 0.17.2"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "0-1-3-2-9-8-2-2",
+      "line_sha256": "3d25-5978-35ee-99d5-5300-0f8f-3b45-8146-66bc-a53d-a640-bc4d-1d1d-03c7-67ab-e125",
+      "reason": "SHA256 of the public crates.io archive for nom 7.1.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-3-8-2-6-4-1-1",
+      "line_sha256": "3d25-5978-35ee-99d5-5300-0f8f-3b45-8146-66bc-a53d-a640-bc4d-1d1d-03c7-67ab-e125",
+      "reason": "SHA256 of the public crates.io archive for nom 7.1.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "1-3-0-7-6-3-8-1-5-6-6-8-2",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-6-0-4-1-3-5-5-5-2-9-5-7",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-8-1-8-0-5-7",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "4-1-6-8-1-4-5-9-2",
+      "line_sha256": "31a2-9be6-cc3f-87ff-25c1-bff1-18ea-b7eb-da02-67a4-aa33-cf6c-a8a4-0cd7-090a-0eec",
+      "reason": "SHA256 of the public crates.io archive for num-integer 0.1.47"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "9-4-3-8-9-8-6",
+      "line_sha256": "6c9b-466e-4056-c891-0115-bb1c-65c3-a32f-94e5-a152-1383-22f1-f13d-9bae-0dde-a6d4",
+      "reason": "SHA256 of the public crates.io archive for onig 6.5.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "6-8-3-1-7-6-0-4",
+      "line_sha256": "8937-3976-2164-b91b-baff-1320-d991-57ef-4577-eb19-5325-3977-ac8f-69a3-4b81-f2a9",
+      "reason": "SHA256 of the public crates.io archive for onig_sys 69.9.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "8-5-8-9-6-3-8-8",
+      "line_sha256": "8937-3976-2164-b91b-baff-1320-d991-57ef-4577-eb19-5325-3977-ac8f-69a3-4b81-f2a9",
+      "reason": "SHA256 of the public crates.io archive for onig_sys 69.9.3"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "3-8-4-6-4-2-3-2-8-1-3",
+      "line_sha256": "dbd0-dc99-99fc-a9be-448e-f082-111b-fded-bf6e-6606-1ed3-ff9f-c040-1f8a-7c41-fc0d",
+      "reason": "SHA256 of the public crates.io archive for ort 2.0.0-rc.15"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "6-6-4-1-5-4-3",
+      "line_sha256": "1a8d-38c3-306a-4c16-e383-40c4-fa9a-ad8d-cdf3-0e33-91bd-9d9b-4c63-de7e-eb20-58d9",
+      "reason": "SHA256 of the public crates.io archive for rand 0.9.5"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "4-1-5-8-9-8-7-2-6",
+      "line_sha256": "1a8d-38c3-306a-4c16-e383-40c4-fa9a-ad8d-cdf3-0e33-91bd-9d9b-4c63-de7e-eb20-58d9",
+      "reason": "SHA256 of the public crates.io archive for rand 0.9.5"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "0-2-3-7-7-2-6-1",
+      "line_sha256": "28f1-8dcc-453e-c7a7-4931-e607-2959-7882-e5f3-46b1-8c62-cd05-016b-7eff-f36c-272b",
+      "reason": "SHA256 of the public crates.io archive for rand_core 0.9.5"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "3-5-7-7-9-3-9-5-0-6-5-1",
+      "line_sha256": "59af-8274-3ba9-49ef-d21c-9089-4174-34dc-d051-869f-eaf4-87a9-987f-96a0-b1bd-d7b4",
+      "reason": "SHA256 of the public crates.io archive for rawpointer 0.2.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-9-8-3-5-4-9",
+      "line_sha256": "41da-40d9-1618-5871-908c-04f8-7c94-82da-a460-52f4-adf3-1761-c153-c16d-d040-9c5a",
+      "reason": "SHA256 of the public crates.io archive for rayon-cond 0.4.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "3-7-4-7-4-3-8",
+      "line_sha256": "41da-40d9-1618-5871-908c-04f8-7c94-82da-a460-52f4-adf3-1761-c153-c16d-d040-9c5a",
+      "reason": "SHA256 of the public crates.io archive for rayon-cond 0.4.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "3-7-4-3-4-1-3-4-5",
+      "line_sha256": "8ede-eea0-4d72-1315-b9db-fdfd-1cf8-39b4-01fe-3105-adb2-ff2f-8ffd-bfb8-1067-dd3a",
+      "reason": "SHA256 of the public crates.io archive for safetensors 0.8.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "8-3-9-0-3-4-5-2-2",
+      "line_sha256": "8ede-eea0-4d72-1315-b9db-fdfd-1cf8-39b4-01fe-3105-adb2-ff2f-8ffd-bfb8-1067-dd3a",
+      "reason": "SHA256 of the public crates.io archive for safetensors 0.8.0"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "5-8-5-1-6-9-9",
+      "line_sha256": "ece7-e454-866a-9b40-bb63-29a5-a645-c809-d70f-672c-ced7-2ec2-e961-964d-7f66-d547",
+      "reason": "SHA256 of the public crates.io archive for spm_precompiled 0.1.4"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-0-3-3-1-4-7-9",
+      "line_sha256": "558a-963c-5e2a-a02d-5016-7047-6929-bc19-1550-d447-0969-9b87-fb1d-d121-99d5-ba23",
+      "reason": "SHA256 of the public crates.io archive for unicode-normalization-alignments 0.1.12"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "8-5-9-6-9-6-4-7-6-8-2",
+      "line_sha256": "8316-4a77-bd84-83fb-cb1b-b2e7-c507-7450-3e68-4bfa-42a4-fd09-e43c-23d8-3ec6-0c18",
+      "reason": "SHA256 of the public crates.io archive for unicode_categories 0.1.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "1-8-2-0-4-0-0-9",
+      "line_sha256": "1823-6211-9e6b-fee9-af61-86ea-a967-7db6-d3e6-c930-abdd-3573-c6ae-b778-a206-794e",
+      "reason": "SHA256 of the public crates.io archive for wasi 0.14.5+wasi-0.2.4"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "2-7-6-1-3-9-7",
+      "line_sha256": "e1a8-9c6c-5492-97a8-4ccd-4fdd-0bb9-dad1-e2f3-6fd0-cc9a-1aab-1e42-c7d3-99f5-c16f",
+      "reason": "SHA256 of the public crates.io archive for wasip2 1.0.0+wasi-0.2.4"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "1-2-5-0-7-5-6-4-7",
+      "line_sha256": "d397-7e4e-f400-e7d7-7835-ed00-4146-d47d-dd7e-0d54-240b-783d-8a06-8472-93d8-3fcb",
+      "reason": "SHA256 of the public crates.io archive for wit-bindgen 0.45.1"
+    },
+    {
+      "path": "her/Cargo.lock",
+      "value": "7-2-0-3-7-9-0",
+      "line_sha256": "d397-7e4e-f400-e7d7-7835-ed00-4146-d47d-dd7e-0d54-240b-783d-8a06-8472-93d8-3fcb",
+      "reason": "SHA256 of the public crates.io archive for wit-bindgen 0.45.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-6-0-6-0-5-6-8-2-8",
+      "line_sha256": "67b1-f607-dffd-70ab-63f4-7295-9c59-5247-b98c-604d-63ac-d000-4935-e1b2-7b97-87cb",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-5-0-5-7-3-7-2-3-0-1-1-0",
+      "line_sha256": "67b1-f607-dffd-70ab-63f4-7295-9c59-5247-b98c-604d-63ac-d000-4935-e1b2-7b97-87cb",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-0-9-9-1-5-3",
+      "line_sha256": "67b1-f607-dffd-70ab-63f4-7295-9c59-5247-b98c-604d-63ac-d000-4935-e1b2-7b97-87cb",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-4-8-0-7-6-6",
+      "line_sha256": "319f-c2d6-14f6-5a8e-13c4-cf4b-c684-6493-fc8e-9735-5c31-1039-8fb3-5b2c-4596-6e5a",
+      "reason": "SHA256 of the public crates.io archive for allocator-api2 0.2.18"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-4-6-7-4-1-2",
+      "line_sha256": "319f-c2d6-14f6-5a8e-13c4-cf4b-c684-6493-fc8e-9735-5c31-1039-8fb3-5b2c-4596-6e5a",
+      "reason": "SHA256 of the public crates.io archive for allocator-api2 0.2.18"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-9-0-1-3-7-8-6-2-7",
+      "line_sha256": "5c9e-4f0c-b1d9-b93e-5ac8-3f0f-3396-d2a9-f0d2-1054-467a-b0cf-33d1-80c4-d47d-e004",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-7-0-2-9-3-6",
+      "line_sha256": "3d11-0782-4626-38b2-01cf-44a1-5062-0524-3140-c1ba-c6a1-74fe-e224-5fe8-6278-ca28",
+      "reason": "SHA256 of the public crates.io archive for base64 0.13.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-8-9-6-6-4-4",
+      "line_sha256": "3d11-0782-4626-38b2-01cf-44a1-5062-0524-3140-c1ba-c6a1-74fe-e224-5fe8-6278-ca28",
+      "reason": "SHA256 of the public crates.io archive for base64 0.13.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-4-3-9-5-1-7",
+      "line_sha256": "804d-327d-4ff8-4dd2-b1d9-9c5c-2e03-1235-cc93-dca5-c92f-eaa9-f3b9-c722-6a2a-8951",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-5-7-8-8-1-9-1-3-2",
+      "line_sha256": "3323-697a-2abe-a3d4-034d-6c2a-2067-a755-457e-ef60-76ee-6e7b-8bfe-fbc9-c33a-af44",
+      "reason": "SHA256 of the public crates.io archive for castaway 0.2.4"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-0-5-0-2-2-3-5-7-7-4-8-4",
+      "line_sha256": "3323-697a-2abe-a3d4-034d-6c2a-2067-a755-457e-ef60-76ee-6e7b-8bfe-fbc9-c33a-af44",
+      "reason": "SHA256 of the public crates.io archive for castaway 0.2.4"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-5-7-6-8-1-8",
+      "line_sha256": "798f-df82-287e-7f42-d9f8-7ec7-0aad-4c73-538d-c36b-264d-1b86-b80f-ab8c-5e2a-0b55",
+      "reason": "SHA256 of the public crates.io archive for compact_str 0.9.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-3-1-6-9-8-9",
+      "line_sha256": "02eb-b4ac-5dc4-a28c-e162-8543-b587-fa51-e2f3-f655-fc11-ea90-e16a-38be-ea7f-0e51",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-2-1-4-3-1-0-4-0-6",
+      "line_sha256": "0ccb-236d-c90d-29f6-156e-2ca3-d88f-3ad4-f620-f6b3-2a9f-900c-0821-71e1-8b71-a671",
+      "reason": "SHA256 of the public crates.io archive for crossbeam-deque 0.8.8"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-4-9-8-0-6-8-7-1-0-9",
+      "line_sha256": "edb1-ba7a-f391-2c9f-43f4-5352-8193-e872-f300-7af1-3ffe-5214-65f2-1181-f783-3b0c",
+      "reason": "SHA256 of the public crates.io archive for crossbeam-epoch 0.9.21"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-3-3-0-8-3-0-9-8-6",
+      "line_sha256": "da1d-2f72-b820-757b-e7c5-a494-e3e5-9b9f-b835-7700-e21d-d39c-8da5-30ec-0c9f-df9a",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-3-8-2-1-5-2-7-3",
+      "line_sha256": "da1d-2f72-b820-757b-e7c5-a494-e3e5-9b9f-b835-7700-e21d-d39c-8da5-30ec-0c9f-df9a",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-2-9-2-0-5-5",
+      "line_sha256": "5e8f-5713-aeb9-8728-d82f-55f0-395a-d6b4-eb78-6777-3556-0c84-4089-5559-ae7f-476b",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-6-1-4-2-0-4",
+      "line_sha256": "7889-b24b-0865-c5cc-0adb-2bef-74db-ebe3-3054-4d4f-6a6c-0beb-540e-bb38-7d86-bb60",
+      "reason": "SHA256 of the public crates.io archive for daachorse 3.0.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-5-9-2-2-3-0",
+      "line_sha256": "9215-2a91-b52e-2977-44b9-7d9a-50ef-32d1-1a16-7c9d-eb77-4f2d-4642-9845-0fd5-63f0",
+      "reason": "SHA256 of the public crates.io archive for dary_heap 0.3.9"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-9-2-5-4-7-9-4-5-8-1-6",
+      "line_sha256": "fcac-fb33-b012-2179-6694-44e8-34e7-511e-1db2-e074-9a56-53eb-1032-fc69-7022-1a86",
+      "reason": "SHA256 of the public crates.io archive for derive_builder 0.20.2"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-6-6-9-9-4-9-0-7",
+      "line_sha256": "4c44-fcd0-848b-5bbb-1600-118d-5b45-78e3-3bb9-1a87-16ee-8209-e140-b1c2-db86-395b",
+      "reason": "SHA256 of the public crates.io archive for derive_builder_core 0.20.2"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-2-1-9-8-2-4",
+      "line_sha256": "4c44-fcd0-848b-5bbb-1600-118d-5b45-78e3-3bb9-1a87-16ee-8209-e140-b1c2-db86-395b",
+      "reason": "SHA256 of the public crates.io archive for derive_builder_core 0.20.2"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-9-9-1-8-9-2-9-4-0-3-4-2-6",
+      "line_sha256": "f18e-ff4f-4de6-cc6b-59c1-88ea-d7a5-f94b-74ec-01d3-ffc6-3aa4-7823-a2dc-8078-16e7",
+      "reason": "SHA256 of the public crates.io archive for either 1.19.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-6-6-3-9-1-7-3-5",
+      "line_sha256": "59ef-2b33-6852-ecfc-d56e-5ef4-f935-d4c8-7aac-347b-4a47-0a47-b2b8-b111-02d6-432f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-5-9-6-8-4-6",
+      "line_sha256": "2e5b-af3e-cda5-c3e2-d725-4b13-98b6-e83b-a98c-5b31-161e-e4fb-0990-5985-794d-70b7",
+      "reason": "SHA256 of the public crates.io archive for fastembed 7.7.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-3-5-5-4-1-1",
+      "line_sha256": "c448-37cf-9be0-c5e9-3d85-55e3-e928-5b61-bd8d-1da3-1a35-91fd-2124-59ba-bde4-40a7",
+      "reason": "SHA256 of the public crates.io archive for fastrand 2.3.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-0-5-0-8-5-0",
+      "line_sha256": "67f4-57ca-5b1c-c8bc-2452-6af1-42ec-7162-350a-f27e-d689-171c-a1a9-c502-87e6-fae7",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-9-1-7-7-6-8-6",
+      "line_sha256": "67f4-57ca-5b1c-c8bc-2452-6af1-42ec-7162-350a-f27e-d689-171c-a1a9-c502-87e6-fae7",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-4-4-1-6-5-9-1-2-4-3-7-3",
+      "line_sha256": "c2fe-c51a-7605-9f9c-97ca-c784-71c5-6d37-4f70-363c-4a1b-58c9-94e4-76a5-5199-d139",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-3-5-5-3-8-8",
+      "line_sha256": "9045-e414-9151-148d-ccc0-0965-e62e-4035-802f-d2bc-7056-af69-a2fe-4a7e-97ca-b3d3",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-1-1-3-0-0-8-6-7-0-0-2",
+      "line_sha256": "9045-e414-9151-148d-ccc0-0965-e62e-4035-802f-d2bc-7056-af69-a2fe-4a7e-97ca-b3d3",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-5-8-8-6-0-4-6-3",
+      "line_sha256": "9045-e414-9151-148d-ccc0-0965-e62e-4035-802f-d2bc-7056-af69-a2fe-4a7e-97ca-b3d3",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-9-4-4-4-2-6",
+      "line_sha256": "93b3-3a77-9537-08b8-2753-b3a0-03d2-1a52-32fa-8ebb-77ef-12ff-e7fd-cefb-0bb7-0c91",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-6-7-4-8-2-1",
+      "line_sha256": "93ec-6b0a-8ffe-26ae-1568-c92c-aab5-6eac-1353-eff4-2ee3-93be-f356-47dc-d874-5765",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-8-8-2-7-7-7-1-3",
+      "line_sha256": "a4b3-862e-7a2e-d638-e36d-f761-bd59-6ed4-e058-c352-a3b0-205c-b6d9-7b00-5065-d8cf",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-2-2-2-7-6-1-3-8-8-5-2",
+      "line_sha256": "58b5-6a37-e195-f861-1f84-acc1-bdea-749e-a51e-90a0-c709-b12c-1161-7268-4ab6-07b4",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-0-4-1-0-6-0-9-9",
+      "line_sha256": "58b5-6a37-e195-f861-1f84-acc1-bdea-749e-a51e-90a0-c709-b12c-1161-7268-4ab6-07b4",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-7-7-0-3-0-3-7-3",
+      "line_sha256": "71af-ffff-3d85-ca1d-c401-3b40-5b58-95ed-6a12-9931-28c0-712c-5eeb-7955-f2ee-4eee",
+      "reason": "SHA256 of the public crates.io archive for hashbrown 0.16.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-7-3-2-2-0-2",
+      "line_sha256": "c938-8bbb-9ae3-c7f8-1fb7-60d3-5052-1d57-9723-878c-feca-9ff4-2af2-9185-c2bb-1b43",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-1-9-5-8-5-6-6",
+      "line_sha256": "5394-56a7-dd77-3308-b29a-6a3a-35a6-b083-97aa-c4a2-b9aa-cdd4-f27c-056c-6117-cb36",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-0-6-6-0-3-2-1",
+      "line_sha256": "5394-56a7-dd77-3308-b29a-6a3a-35a6-b083-97aa-c4a2-b9aa-cdd4-f27c-056c-6117-cb36",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-2-1-5-9-0-2-5",
+      "line_sha256": "5394-56a7-dd77-3308-b29a-6a3a-35a6-b083-97aa-c4a2-b9aa-cdd4-f27c-056c-6117-cb36",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-0-5-1-6-4-2-6-2-9",
+      "line_sha256": "8992-b6f7-b8b0-b28b-63fd-084b-5f61-423c-ac54-1e2a-42b0-5e0e-d4b8-af1e-adb3-d9f4",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-5-5-4-8-3-1-0-4-8-8",
+      "line_sha256": "3b76-3fc6-5a60-8d2e-7c4d-39a5-ba49-497d-571e-4afc-f60b-4935-bb1f-ac45-bf92-48c2",
+      "reason": "SHA256 of the public crates.io archive for itertools 0.14.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-3-3-5-1-2-8-5",
+      "line_sha256": "3b76-3fc6-5a60-8d2e-7c4d-39a5-ba49-497d-571e-4afc-f60b-4935-bb1f-ac45-bf92-48c2",
+      "reason": "SHA256 of the public crates.io archive for itertools 0.14.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-1-9-4-3-1-2",
+      "line_sha256": "f38a-05d9-60d0-52cc-2538-0b03-2147-52d4-8576-1b65-c624-b4bf-cd08-1028-0ca6-13ff",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-1-5-4-0-9-8",
+      "line_sha256": "044c-a531-7fec-719e-6d11-d6eb-7172-de12-ed61-54c8-dbbc-22d2-15eb-8852-f92b-1d2c",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-5-1-0-5-8-4",
+      "line_sha256": "044c-a531-7fec-719e-6d11-d6eb-7172-de12-ed61-54c8-dbbc-22d2-15eb-8852-f92b-1d2c",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-0-5-3-6-5-8-0",
+      "line_sha256": "5406-ab0c-a327-5f01-3995-3b28-3291-9535-5cc0-b35b-1419-e3ea-74da-4ce4-1790-6361",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-8-5-7-2-6-1-0-4-7-3-0",
+      "line_sha256": "5406-ab0c-a327-5f01-3995-3b28-3291-9535-5cc0-b35b-1419-e3ea-74da-4ce4-1790-6361",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-4-9-0-4-2-8",
+      "line_sha256": "5406-ab0c-a327-5f01-3995-3b28-3291-9535-5cc0-b35b-1419-e3ea-74da-4ce4-1790-6361",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-7-4-4-4-8-4",
+      "line_sha256": "9230-9cdf-6896-3378-61fc-1576-3133-7327-46a2-a78a-bb15-f782-8087-8083-d3f9-0938",
+      "reason": "SHA256 of the public crates.io archive for libloading 0.9.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-7-6-0-4-8-2-2-7-3",
+      "line_sha256": "79db-7d76-919e-38ec-091e-b258-945f-0fe0-7f36-c178-f001-c89c-aa6a-6efc-9161-d016",
+      "reason": "SHA256 of the public crates.io archive for linux-raw-sys 0.11.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-6-2-0-9-5-8",
+      "line_sha256": "6a4e-2f6c-4fbb-0284-bb8f-3107-8edb-a80c-8d47-ae1c-0309-890b-3bec-601c-5c1d-cc5f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-9-5-7-3-8-4-0-6-6-0-8-3-0-4",
+      "line_sha256": "b80f-4b86-1164-8a93-e58d-8841-a1bf-7095-5dfb-0b6a-7631-a507-bb1b-3ec4-f568-e113",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-7-4-8-5-2-6-4",
+      "line_sha256": "6bfa-3e7a-7908-e7db-5b0b-8fd2-4d72-212f-9f2c-e3b3-e94d-dd70-9b88-068d-caa6-53f2",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-0-4-3-4-1-7",
+      "line_sha256": "b924-f924-b714-d037-f70d-ffab-2df4-8c2e-a88f-e2ca-41ac-e1e2-f837-4b02-53e0-4322",
+      "reason": "SHA256 of the public crates.io archive for matrixmultiply 0.3.11"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-6-2-6-6-1-7",
+      "line_sha256": "e927-351b-9630-3701-0c1c-8633-3800-08c0-5a1d-1b4d-86a6-b396-d12a-868a-ec9f-07d8",
+      "reason": "SHA256 of the public crates.io archive for minimal-lexical 0.2.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-2-0-0-8-0-8-1-4",
+      "line_sha256": "cc59-d32c-d859-ad8c-7c80-5d40-3a06-24a0-9274-f898-34f6-7386-0046-3fd1-186d-28a5",
+      "reason": "SHA256 of the public crates.io archive for ndarray 0.17.2"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-0-7-0-8-2-3",
+      "line_sha256": "cc59-d32c-d859-ad8c-7c80-5d40-3a06-24a0-9274-f898-34f6-7386-0046-3fd1-186d-28a5",
+      "reason": "SHA256 of the public crates.io archive for ndarray 0.17.2"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-1-3-2-9-8-2-2",
+      "line_sha256": "3d25-5978-35ee-99d5-5300-0f8f-3b45-8146-66bc-a53d-a640-bc4d-1d1d-03c7-67ab-e125",
+      "reason": "SHA256 of the public crates.io archive for nom 7.1.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-3-8-2-6-4-1-1",
+      "line_sha256": "3d25-5978-35ee-99d5-5300-0f8f-3b45-8146-66bc-a53d-a640-bc4d-1d1d-03c7-67ab-e125",
+      "reason": "SHA256 of the public crates.io archive for nom 7.1.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-3-0-7-6-3-8-1-5-6-6-8-2",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-6-0-4-1-3-5-5-5-2-9-5-7",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-8-1-8-0-5-7",
+      "line_sha256": "67a9-8971-1d0a-43bc-179c-2c8f-aa19-cac2-db27-1306-6031-f704-84ef-0f00-2ca8-b221",
+      "reason": "SHA256 of the public crates.io archive for num-complex 0.4.6"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-1-6-8-1-4-5-9-2",
+      "line_sha256": "31a2-9be6-cc3f-87ff-25c1-bff1-18ea-b7eb-da02-67a4-aa33-cf6c-a8a4-0cd7-090a-0eec",
+      "reason": "SHA256 of the public crates.io archive for num-integer 0.1.47"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-6-0-2-6-2-8-4-1",
+      "line_sha256": "80d8-ec25-7bde-657c-b9df-bf61-bdd0-049d-02e1-d2b6-77f8-27f7-3aa0-5447-d8a6-8a71",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-4-3-8-9-8-6",
+      "line_sha256": "6c9b-466e-4056-c891-0115-bb1c-65c3-a32f-94e5-a152-1383-22f1-f13d-9bae-0dde-a6d4",
+      "reason": "SHA256 of the public crates.io archive for onig 6.5.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-8-3-1-7-6-0-4",
+      "line_sha256": "8937-3976-2164-b91b-baff-1320-d991-57ef-4577-eb19-5325-3977-ac8f-69a3-4b81-f2a9",
+      "reason": "SHA256 of the public crates.io archive for onig_sys 69.9.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-5-8-9-6-3-8-8",
+      "line_sha256": "8937-3976-2164-b91b-baff-1320-d991-57ef-4577-eb19-5325-3977-ac8f-69a3-4b81-f2a9",
+      "reason": "SHA256 of the public crates.io archive for onig_sys 69.9.3"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-8-4-6-4-2-3-2-8-1-3",
+      "line_sha256": "dbd0-dc99-99fc-a9be-448e-f082-111b-fded-bf6e-6606-1ed3-ff9f-c040-1f8a-7c41-fc0d",
+      "reason": "SHA256 of the public crates.io archive for ort 2.0.0-rc.15"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-3-2-1-8-3-4-3-2-6-5-9-7",
+      "line_sha256": "ecfb-9d81-5462-0478-f469-0f85-edda-e5b2-ec34-79dd-53a5-55bb-3e07-956b-860b-ab54",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-5-8-5-2-7-5-5-0",
+      "line_sha256": "ecfb-9d81-5462-0478-f469-0f85-edda-e5b2-ec34-79dd-53a5-55bb-3e07-956b-860b-ab54",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-9-5-1-8-7-2-3",
+      "line_sha256": "3591-a1a7-bae1-e0e8-9925-f4a1-01c7-d123-5507-6a2e-a305-e82a-1263-192d-2088-00ea",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-3-2-4-9-1-8",
+      "line_sha256": "3985-65be-a348-1c7c-dbf8-4dcd-0d58-9bcd-860b-3557-b38a-e4e8-83c8-4885-f0d7-f394",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-0-2-6-7-9-9-6",
+      "line_sha256": "7f7c-bb11-9ae1-6ac6-1e2a-11e0-45dd-2582-4296-3fc0-5889-28e2-481a-ff07-c1c2-2021",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-7-3-7-6-3-4-1-1",
+      "line_sha256": "7f7c-bb11-9ae1-6ac6-1e2a-11e0-45dd-2582-4296-3fc0-5889-28e2-481a-ff07-c1c2-2021",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-6-4-1-5-4-3",
+      "line_sha256": "1a8d-38c3-306a-4c16-e383-40c4-fa9a-ad8d-cdf3-0e33-91bd-9d9b-4c63-de7e-eb20-58d9",
+      "reason": "SHA256 of the public crates.io archive for rand 0.9.5"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-1-5-8-9-8-7-2-6",
+      "line_sha256": "1a8d-38c3-306a-4c16-e383-40c4-fa9a-ad8d-cdf3-0e33-91bd-9d9b-4c63-de7e-eb20-58d9",
+      "reason": "SHA256 of the public crates.io archive for rand 0.9.5"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-2-3-7-7-2-6-1",
+      "line_sha256": "28f1-8dcc-453e-c7a7-4931-e607-2959-7882-e5f3-46b1-8c62-cd05-016b-7eff-f36c-272b",
+      "reason": "SHA256 of the public crates.io archive for rand_core 0.9.5"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-1-7-6-1-0-3",
+      "line_sha256": "a63d-7e0d-cedf-c1e5-c5d0-a841-0688-ae51-c07f-bfe4-71c4-5f62-1e25-491b-f77d-abc0",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-6-4-3-9-7-8-5-6-5",
+      "line_sha256": "a63d-7e0d-cedf-c1e5-c5d0-a841-0688-ae51-c07f-bfe4-71c4-5f62-1e25-491b-f77d-abc0",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-1-0-1-8-8-1",
+      "line_sha256": "a63d-7e0d-cedf-c1e5-c5d0-a841-0688-ae51-c07f-bfe4-71c4-5f62-1e25-491b-f77d-abc0",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-4-3-5-9-0-4-2-0",
+      "line_sha256": "a63d-7e0d-cedf-c1e5-c5d0-a841-0688-ae51-c07f-bfe4-71c4-5f62-1e25-491b-f77d-abc0",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-5-7-7-9-3-9-5-0-6-5-1",
+      "line_sha256": "59af-8274-3ba9-49ef-d21c-9089-4174-34dc-d051-869f-eaf4-87a9-987f-96a0-b1bd-d7b4",
+      "reason": "SHA256 of the public crates.io archive for rawpointer 0.2.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-9-8-3-5-4-9",
+      "line_sha256": "41da-40d9-1618-5871-908c-04f8-7c94-82da-a460-52f4-adf3-1761-c153-c16d-d040-9c5a",
+      "reason": "SHA256 of the public crates.io archive for rayon-cond 0.4.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-7-4-7-4-3-8",
+      "line_sha256": "41da-40d9-1618-5871-908c-04f8-7c94-82da-a460-52f4-adf3-1761-c153-c16d-d040-9c5a",
+      "reason": "SHA256 of the public crates.io archive for rayon-cond 0.4.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-1-8-0-4-0-1-4-5-0-2-1-8",
+      "line_sha256": "4135-9368-540c-a3a5-c864-219d-da4e-b5da-2c0f-3d0b-4b06-9231-fcc5-930a-1566-84d4",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-6-4-1-3-2-5-1",
+      "line_sha256": "3648-ee4f-9787-17c6-87d4-b015-8032-54b8-e2ad-7550-5608-863f-b582-32d2-798e-1174",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-2-8-6-6-5-6",
+      "line_sha256": "ed41-af29-f1fc-16d2-1ce9-bbae-bf1a-d5f0-1fe9-b537-952b-7083-e64b-fffb-3e3b-562f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-9-7-9-6-3-3-2-7-5",
+      "line_sha256": "ed41-af29-f1fc-16d2-1ce9-bbae-bf1a-d5f0-1fe9-b537-952b-7083-e64b-fffb-3e3b-562f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-7-2-0-0-6-9-3-7-0-8-5-2",
+      "line_sha256": "63ba-fd9f-42a8-0a92-a1a4-7f24-65d6-3a41-c8c6-9a8f-75f0-15b3-97a2-4926-ecbe-e6bd",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-7-4-3-4-1-3-4-5",
+      "line_sha256": "8ede-eea0-4d72-1315-b9db-fdfd-1cf8-39b4-01fe-3105-adb2-ff2f-8ffd-bfb8-1067-dd3a",
+      "reason": "SHA256 of the public crates.io archive for safetensors 0.8.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-3-9-0-3-4-5-2-2",
+      "line_sha256": "8ede-eea0-4d72-1315-b9db-fdfd-1cf8-39b4-01fe-3105-adb2-ff2f-8ffd-bfb8-1067-dd3a",
+      "reason": "SHA256 of the public crates.io archive for safetensors 0.8.0"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-0-8-4-3-9-2",
+      "line_sha256": "fc55-2e9a-16d3-f2e2-87b4-5291-b9b5-4f20-df4d-d44b-1c66-b9be-ed5b-62d2-5cc3-3a9c",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-8-5-1-6-9-9",
+      "line_sha256": "ece7-e454-866a-9b40-bb63-29a5-a645-c809-d70f-672c-ced7-2ec2-e961-964d-7f66-d547",
+      "reason": "SHA256 of the public crates.io archive for spm_precompiled 0.1.4"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-7-3-6-8-4-5",
+      "line_sha256": "d0d0-e20b-f33b-a6d4-588d-b9a2-e612-3b53-893b-20f9-457c-8c67-d5ec-ba2f-6ca5-8d80",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-6-2-8-5-6-4",
+      "line_sha256": "d0d0-e20b-f33b-a6d4-588d-b9a2-e612-3b53-893b-20f9-457c-8c67-d5ec-ba2f-6ca5-8d80",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-8-6-5-2-3-5-8",
+      "line_sha256": "eece-ba14-314f-fc7b-2d33-a2d4-f63a-c122-c69f-850d-be56-45fd-0937-b5aa-e21c-f312",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-9-0-8-8-3-7",
+      "line_sha256": "a252-e10a-e374-8f80-e712-2a9b-07b1-b6e3-86eb-9dd9-3b6d-6c62-82d7-3ac2-3aac-c43e",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-1-9-7-9-2-3-2-8-7",
+      "line_sha256": "1008-9b0e-ae7a-abd2-064f-3aad-7ba8-c36c-dd36-33e8-64f7-2d9a-e8de-be13-4b80-d865",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-6-3-7-4-6-5-6-8-7-4-0-6-5-1",
+      "line_sha256": "0d73-0d64-8450-397a-5da7-7436-f901-0aa7-c198-9351-51d2-bdf4-bcfc-4d4c-7dbe-6cda",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-0-3-3-1-4-7-9",
+      "line_sha256": "558a-963c-5e2a-a02d-5016-7047-6929-bc19-1550-d447-0969-9b87-fb1d-d121-99d5-ba23",
+      "reason": "SHA256 of the public crates.io archive for unicode-normalization-alignments 0.1.12"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-5-1-0-0-9-5-6-0",
+      "line_sha256": "e0ce-1c52-a6d4-0109-c9c4-f1e4-5780-dd71-39b6-8bf3-9f74-dc5a-2a13-7ba3-a2c0-d35f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-4-6-3-6-6-8",
+      "line_sha256": "e0ce-1c52-a6d4-0109-c9c4-f1e4-5780-dd71-39b6-8bf3-9f74-dc5a-2a13-7ba3-a2c0-d35f",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-5-9-6-9-6-4-7-6-8-2",
+      "line_sha256": "8316-4a77-bd84-83fb-cb1b-b2e7-c507-7450-3e68-4bfa-42a4-fd09-e43c-23d8-3ec6-0c18",
+      "reason": "SHA256 of the public crates.io archive for unicode_categories 0.1.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-8-2-0-4-0-0-9",
+      "line_sha256": "1823-6211-9e6b-fee9-af61-86ea-a967-7db6-d3e6-c930-abdd-3573-c6ae-b778-a206-794e",
+      "reason": "SHA256 of the public crates.io archive for wasi 0.14.5+wasi-0.2.4"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-7-6-1-3-9-7",
+      "line_sha256": "e1a8-9c6c-5492-97a8-4ccd-4fdd-0bb9-dad1-e2f3-6fd0-cc9a-1aab-1e42-c7d3-99f5-c16f",
+      "reason": "SHA256 of the public crates.io archive for wasip2 1.0.0+wasi-0.2.4"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-8-3-4-4-7-5-0",
+      "line_sha256": "e2e0-8c67-0027-611d-c026-53b8-ca78-6299-e4c9-b888-2272-cf27-55d3-33a5-efa1-bea2",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-7-9-8-7-2-5-0-1-6",
+      "line_sha256": "e362-9e5f-bca5-a095-08c8-4ef2-110a-d6fd-4d54-73cb-45a3-6cf6-e7ec-21ae-7e92-9308",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-8-0-5-2-2-2",
+      "line_sha256": "de39-9e36-3378-16ad-ae7f-ac0c-e618-ddee-32b2-d9d9-11e4-8bc7-c342-39a1-cfbb-7cdc",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-2-0-4-0-9-9-0",
+      "line_sha256": "69a1-8bd0-3e70-cb51-0e7f-05be-c482-b71d-3ebb-bd4b-3416-d2fe-de64-ca4b-18f8-fdee",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-5-8-8-2-6-1-2",
+      "line_sha256": "69a1-8bd0-3e70-cb51-0e7f-05be-c482-b71d-3ebb-bd4b-3416-d2fe-de64-ca4b-18f8-fdee",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-4-2-7-5-9-1-0",
+      "line_sha256": "da1d-46f4-c943-d0c4-6fe9-0122-6213-1a46-6f36-c9da-5558-59a0-c2c8-6fc2-31bb-69ad",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-1-1-4-6-5-1",
+      "line_sha256": "da1d-46f4-c943-d0c4-6fe9-0122-6213-1a46-6f36-c9da-5558-59a0-c2c8-6fc2-31bb-69ad",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-7-0-5-7-1-8-0",
+      "line_sha256": "edb5-fbbb-99e6-36d3-6cc2-ef57-819e-6bba-cc89-0870-cd74-28cf-ac31-eb46-d693-e973",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-8-5-1-6-3-5-6-5",
+      "line_sha256": "fbf5-366d-eec0-6c0a-ca67-b496-49ec-a01b-823c-8796-8fb0-49da-19a3-2441-f51d-37a3",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-7-4-9-3-4-3-6-5-6-6",
+      "line_sha256": "58e8-1ec2-7fe6-f560-5bda-08e0-8a8b-46e1-a0a2-2d58-8aa9-a34c-d812-89b1-cfda-cf92",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-8-1-5-8-1-8-2",
+      "line_sha256": "68f9-9690-eb0d-a798-cbb8-5651-1aab-bfab-9b03-cf04-9324-51b7-9300-7243-20a9-e41c",
+      "reason": "SHA256 of a registry dependency archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-2-5-0-7-5-6-4-7",
+      "line_sha256": "d397-7e4e-f400-e7d7-7835-ed00-4146-d47d-dd7e-0d54-240b-783d-8a06-8472-93d8-3fcb",
+      "reason": "SHA256 of the public crates.io archive for wit-bindgen 0.45.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-2-0-3-7-9-0",
+      "line_sha256": "d397-7e4e-f400-e7d7-7835-ed00-4146-d47d-dd7e-0d54-240b-783d-8a06-8472-93d8-3fcb",
+      "reason": "SHA256 of the public crates.io archive for wit-bindgen 0.45.1"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-9-2-4-7-6-0-9-2-3-9",
+      "line_sha256": "7af0-f647-f9c3-7e83-89d3-ab4f-4f36-33fc-cbc2-0d68-a049-6c74-b7d4-4c08-65d3-a8da",
+      "reason": "SHA256 of the crates.io ahash 0.8.13 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-9-9-1-1-1-1-8-6-6",
+      "line_sha256": "7af0-f647-f9c3-7e83-89d3-ab4f-4f36-33fc-cbc2-0d68-a049-6c74-b7d4-4c08-65d3-a8da",
+      "reason": "SHA256 of the crates.io ahash 0.8.13 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-6-7-7-2-1-8-0",
+      "line_sha256": "2463-73e0-3146-d551-1917-b112-89ec-e4ca-1ae8-4174-6437-59af-d3d5-2b93-e02f-5d59",
+      "reason": "SHA256 of the crates.io allocator-api2 0.2.21 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "8-2-3-0-3-7-5-0-8-0-9",
+      "line_sha256": "f8db-d24b-55a3-7b74-03ae-1c7d-092c-0a7c-564f-11f8-d4e6-f877-1554-dac8-316d-5e26",
+      "reason": "SHA256 of the crates.io bumpalo 3.20.4 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-6-5-5-4-4-6-8",
+      "line_sha256": "463e-5fc4-195c-9216-1316-8e77-288d-fb39-1f78-46a7-5743-d892-6e85-b746-82e8-387e",
+      "reason": "SHA256 of the crates.io cc 1.11.3 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-1-5-2-8-8-5-1",
+      "line_sha256": "46bd-fb68-0d58-c637-2917-0c4c-a4c7-6285-bb3b-24a6-0120-38d5-eeb7-760b-bd43-816c",
+      "reason": "SHA256 of the crates.io errno 0.3.15 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-6-6-4-6-4-8",
+      "line_sha256": "61a7-f316-97b4-85f9-72c7-865f-fe5e-e07d-4e99-16f8-be54-318e-29c5-b453-bd24-74ae",
+      "reason": "SHA256 of the crates.io getrandom 0.3.4 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-2-7-7-6-0-7",
+      "line_sha256": "1375-3df8-bd8e-d958-f653-cbaa-656d-428e-a941-1fdb-1975-fd8c-888c-d200-2293-7246",
+      "reason": "SHA256 of the crates.io itoa 1.0.19 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-8-9-4-5-7-6-5-1-8-8",
+      "line_sha256": "1375-3df8-bd8e-d958-f653-cbaa-656d-428e-a941-1fdb-1975-fd8c-888c-d200-2293-7246",
+      "reason": "SHA256 of the crates.io itoa 1.0.19 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "4-1-4-4-9-4-1",
+      "line_sha256": "59f7-04b3-78e8-cce2-3bd4-9d92-e961-7da9-eac6-63b6-07b1-a608-3ba9-77ed-3f84-3b56",
+      "reason": "SHA256 of the crates.io linux-raw-sys 0.12.1 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-7-4-5-2-7-6-9",
+      "line_sha256": "59f7-04b3-78e8-cce2-3bd4-9d92-e961-7da9-eac6-63b6-07b1-a608-3ba9-77ed-3f84-3b56",
+      "reason": "SHA256 of the crates.io linux-raw-sys 0.12.1 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-3-9-8-4-5-3-7",
+      "line_sha256": "abf0-3d7c-355d-df63-fc83-a6be-09f1-c2b0-9392-1ac6-f307-9388-e8c5-95df-300e-d377",
+      "reason": "SHA256 of the crates.io log 0.4.35 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "9-3-8-0-1-5-7-1-9-5-5-2",
+      "line_sha256": "2665-1ae1-5030-949e-4605-93b6-d9fb-88e1-443d-2077-a23f-6831-7571-e1cb-d629-aabe",
+      "reason": "SHA256 of the crates.io pin-project-lite 0.2.18 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "7-1-2-7-4-0-2-3",
+      "line_sha256": "55ed-1cf3-d553-d644-f43b-293c-d062-a740-147f-4b7d-2087-fd75-0574-baf2-8eea-ad4c",
+      "reason": "SHA256 of the crates.io regex 1.13.2 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-4-9-9-5-0-8-5-7",
+      "line_sha256": "55ed-1cf3-d553-d644-f43b-293c-d062-a740-147f-4b7d-2087-fd75-0574-baf2-8eea-ad4c",
+      "reason": "SHA256 of the crates.io regex 1.13.2 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "2-0-7-3-1-1-2",
+      "line_sha256": "6845-087a-c562-8197-c187-976d-9dec-0b0e-a0fc-ef20-b5dd-4688-efbb-8582-651b-efeb",
+      "reason": "SHA256 of the crates.io regex-automata 0.4.19 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-2-9-4-1-5-3",
+      "line_sha256": "388b-7511-b011-41cd-2320-7ff3-103d-f0ac-de15-8c40-70bb-bae9-0f46-51b3-4b48-78f7",
+      "reason": "SHA256 of the crates.io rustix 1.1.6 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "3-2-4-4-5-4-2-5-3-5",
+      "line_sha256": "cdbe-e832-a073-2fe5-b1ad-be72-fed7-7de0-20bb-1bf3-0eb1-7c96-fc99-4c08-b94c-335d",
+      "reason": "SHA256 of the crates.io smallvec 1.16.6 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-3-1-0-2-2-3-9-0-7",
+      "line_sha256": "cdbe-e832-a073-2fe5-b1ad-be72-fed7-7de0-20bb-1bf3-0eb1-7c96-fc99-4c08-b94c-335d",
+      "reason": "SHA256 of the crates.io smallvec 1.16.6 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "1-1-9-3-2-8-4-7",
+      "line_sha256": "cdbe-e832-a073-2fe5-b1ad-be72-fed7-7de0-20bb-1bf3-0eb1-7c96-fc99-4c08-b94c-335d",
+      "reason": "SHA256 of the crates.io smallvec 1.16.6 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "0-9-4-4-3-0-3-6-4-9-0",
+      "line_sha256": "e586-c950-981f-302d-431b-ffff-182e-f069-af62-32c4-c97c-7024-b6d8-4def-e97f-932c",
+      "reason": "SHA256 of the crates.io syn 3.0.10 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "6-1-7-6-6-1-4-5-0-7-7",
+      "line_sha256": "679e-0749-0acf-217c-79e3-be98-911e-5ead-3798-f301-851b-9b68-828e-7415-80fe-efcf",
+      "reason": "SHA256 of the crates.io windows-sys 0.61.2 archive"
+    },
+    {
+      "path": "her-memory/Cargo.lock",
+      "value": "5-4-9-6-1-4-5-3-6",
+      "line_sha256": "8553-6246-a371-4362-6ba3-30a1-747d-ddde-f395-3b47-df69-4c1f-426f-a873-761f-c6eb",
+      "reason": "SHA256 of the crates.io wit-bindgen 0.57.1 archive"
     }
   ],
   "path_exceptions": [

@@ -838,7 +838,7 @@ fn two_isolated_console_and_mcp_instances_interleave_without_crossing_roots() {
     let tools_b = mcp_b.request("tools/list", json!({}));
     assert_eq!(tools_a["result"]["tools"], tools_b["result"]["tools"]);
     // Both runtimes leave the voice and sticker remark tool switches at their off defaults.
-    assert_eq!(tools_a["result"]["tools"].as_array().unwrap().len(), 35 + 7);
+    assert_eq!(tools_a["result"]["tools"].as_array().unwrap().len(), 32 + 7);
 
     // 1. Config writes, interleaved with MCP memory writes on the other root.
     let saved_a = call(
@@ -1106,12 +1106,7 @@ fn two_isolated_console_and_mcp_instances_interleave_without_crossing_roots() {
         "memory_search",
         json!({ "query": "alphaonlyfact", "token": b.agent_token }),
     );
-    // Frozen JS `mcp-memory.js` reports a bridge refusal as plain text without `isError`
-    // (`return text(`检索失败：${e.message}`)`); the refusal itself is the bridge's 403 text.
-    assert!(
-        !foreign_mcp_error,
-        "JS reports memory_search failures as plain text: {foreign_mcp_text}"
-    );
+    assert!(foreign_mcp_error, "MCP must mark the refusal as an error: {foreign_mcp_text}");
     assert_eq!(
         foreign_mcp_text, "检索失败：agent token 无效（必须是该会话自己的令牌）",
         "A MCP accepted B token"

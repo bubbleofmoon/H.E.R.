@@ -283,6 +283,7 @@ fn generated_runtime_entries_start_all_three_selected_servers() {
                             Err(error) => panic!("selected console was not called: {error}"),
                         }
                     };
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                         .unwrap();

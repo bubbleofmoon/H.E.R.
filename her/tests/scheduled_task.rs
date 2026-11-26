@@ -121,6 +121,8 @@ impl Fixture {
             "watchdog",
             "start-all",
             "backup",
+            "memory-backup",
+            "memory-restore-test",
             "memory-digest",
             "memory-digest-check",
             "upstream-check",
@@ -265,6 +267,7 @@ fn check_restart(fixture: &Fixture, xml: &str, expected_alerts: usize) {
         fixture.assert_alive(&mut child);
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -399,6 +402,7 @@ fn supervisor_reports_drift_to_the_administrator_and_keeps_a_matching_task_quiet
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
             Err(e) => panic!("fake administrator gateway: {e}"),
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

@@ -2,13 +2,58 @@
 //! selection and failover, prompt submission and the follow-stream collector, DSH cancellation,
 //! usage ledger rows and the CLI fallback after an exhausted DSH chain. `pipeline.rs` keeps the
 //! code every engine shares and reaches this module only through its registration points: the
-//! `Adapter::Dsh` arm of `run_admitted_turn`, the DSH chat availability and login checks, and the
-//! public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
+//! `Adapter::Dsh` arm of `run_admitted_turn`, chat availability, login and wake parking checks,
+//! and the public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
 //! `ask_with_failover`, `handle_with_failover`).
 
 use super::*;
 use crate::dependency::{Clock, Idempotency, RetryDecision, RetryPolicy, SystemClock};
 use crate::dsh::{FollowStream, TurnUsage};
+
+const ACCESS_REFUSAL_PREFIX: &str = "回合已取消：DSH 会话准入：";
+
+pub(crate) fn is_dsh_access_refusal(error: &str) -> bool {
+    error.starts_with(ACCESS_REFUSAL_PREFIX)
+}
+
+/// A local loss of session authority must bypass backend reporting and failover.
+#[derive(Debug)]
+pub(super) enum DshTurnError {
+    AccessRefused(String),
+    Failure(String),
+    Exhausted { reason: String, session: String },
+}
+
+impl DshTurnError {
+    fn after_exhaustion(reason: String, session: &str, policy_refused: bool) -> Self {
+        if policy_refused {
+            Self::Failure(reason)
+        } else {
+            Self::Exhausted { reason, session: session.to_owned() }
+        }
+    }
+}
+
+impl From<String> for DshTurnError {
+    fn from(error: String) -> Self {
+        Self::Failure(error)
+    }
+}
+
+impl From<&str> for DshTurnError {
+    fn from(error: &str) -> Self {
+        Self::Failure(error.into())
+    }
+}
+
+impl From<DshTurnError> for String {
+    fn from(error: DshTurnError) -> Self {
+        match error {
+            DshTurnError::AccessRefused(reason) => format!("{ACCESS_REFUSAL_PREFIX}{reason}"),
+            DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. } => error,
+        }
+    }
+}
 
 impl Pipeline {
     fn dsh_switch_summary(&self, key: &str, sid: &str, cfg: &serde_json::Value) -> Result<Option<String>, String> {
@@ -41,7 +86,7 @@ impl Pipeline {
             if crate::dsh_health::is_down(&self.context) {
                 return Err("DSH is unavailable for the wake".into());
             }
-            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, cfg)?;
         }
         // A pinned CLI backend was the caller's to run: the DSH adapter's configuration
         // copy drops `backends.sessions`, so its failover never runs that CLI again.
@@ -49,15 +94,26 @@ impl Pipeline {
         if let Some(b) = cfg_dsh.get_mut("backends").and_then(|v| v.as_object_mut()) {
             b.remove("sessions");
         }
-        self.ask_with_failover_with_deadline(key, prompt, timeout, &cfg_dsh).await
+        let result = self.ask_with_failover_with_deadline(key, prompt, timeout, &cfg_dsh).await;
+        if let Err(DshTurnError::Exhausted { session, .. }) = &result {
+            self.send_persona_failure_line(key, Some(session));
+        }
+        result.map_err(String::from)
     }
 
     fn preset_for(&self, key: &str) -> String {
-        if self.context.is_isolated() && crate::console::runtime_mode(&self.context) == "closed-agent" {
+        if self.context.is_isolated()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             return self.preset_closed.clone();
         }
         // Chat mode has one preset for every conversation (JS `modePreset`).
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             return self.preset_chat.clone();
         }
         let owner_key = format!("private:{}", self.owner_qq);
@@ -107,7 +163,7 @@ impl Pipeline {
     }
 
     /// 取（或新建）某个 QQ 会话对应的 DSH sessionId。
-    pub fn ensure_session(&mut self, key: &str) -> Result<String, String> {
+    pub(super) fn ensure_session(&mut self, key: &str) -> Result<String, DshTurnError> {
         if key.starts_with("ab:") {
             return Err("shadow isolation refused: stored shadow sessions cannot use the live session path".into());
         }
@@ -115,7 +171,7 @@ impl Pipeline {
         // it is bound; a revocation, reset or mode change in between archives the new session.
         let epoch = if self.context.is_isolated() { Some(self.access_epoch(key)) } else { None };
         if epoch.as_ref().is_some_and(|e| !matches!(e.allowed, Ok(true))) {
-            return Err(format!("当前模式不允许会话 {key}"));
+            return Err(DshTurnError::AccessRefused(format!("当前模式不允许会话 {key}")));
         }
         if self.context.is_isolated() {
             // Fresh read: the console may have reset or replaced this mapping since the last turn.
@@ -145,8 +201,18 @@ impl Pipeline {
         let preset = self.preset_for(key);
         // A conversation of a QQ group must never fall back to DSH's default preset (it carries local
         // tools): chat refuses to create a session unless DSH offers the configured preset.
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             self.require_preset(&preset)?;
+        }
+        let access_changed = |pipe: &Self| epoch.as_ref().is_some_and(|before| !pipe.access_epoch(key).still(before));
+        let refused = || DshTurnError::AccessRefused(format!("会话创建期间 {key} 已重置或权限已变化"));
+        if access_changed(self) {
+            return Err(refused());
         }
         let create = |rpc: &crate::dsh::Rpc| {
             let mut request = serde_json::json!({ "workspaceId": ws_id });
@@ -160,12 +226,20 @@ impl Pipeline {
         // 不这么做的话，DSH 每重启一次，Rust 就得人工重启才能恢复。
         let created = match create(&self.rpc) {
             Ok(v) => v,
+            Err(_) if access_changed(self) => return Err(refused()),
             Err(e) if e.contains("401") => {
                 println!("[dsh] session/create 401，重读密钥后重试");
                 self.rpc.relogin().map_err(|re| format!("{e}；重新登录也失败：{re}"))?;
-                create(&self.rpc)?
+                if access_changed(self) {
+                    return Err(refused());
+                }
+                match create(&self.rpc) {
+                    Ok(created) => created,
+                    Err(_) if access_changed(self) => return Err(refused()),
+                    Err(error) => return Err(error.into()),
+                }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let sid = created
             .get("sessionId")
@@ -173,7 +247,15 @@ impl Pipeline {
             .ok_or_else(|| format!("session/create 没返回 sessionId：{created}"))?
             .to_string();
 
-        if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, false)));
+        }
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             // Chat: the JS title (`renameSessionForUi`) is resolved after the model is selected and
             // set once the first prompt is in DSH's hands.
             self.title_for = Some((sid.clone(), key.to_string()));
@@ -185,10 +267,8 @@ impl Pipeline {
             );
         }
 
-        if let Some(epoch) = &epoch {
-            if !self.access_epoch(key).still(epoch) {
-                return Err(self.discard_created_session(key, &sid, false));
-            }
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, false)));
         }
         self.store.sessions.insert(
             key.to_string(),
@@ -199,17 +279,15 @@ impl Pipeline {
             if let Err(error) = crate::session_map::bind(&self.context, key, &sid, Some(&policy)) {
                 // Never leave a created session running unbound in DSH.
                 let discarded = self.discard_created_session(key, &sid, false);
-                return Err(format!("绑定新会话失败：{error}；{discarded}"));
+                return Err(format!("绑定新会话失败：{error}；{discarded}").into());
             }
         } else {
             self.store.save_for_runtime(&self.context)?;
         }
         // A change between the check and the binding retires the mapping again (JS re-checks after
         // `saveState`).
-        if let Some(epoch) = &epoch {
-            if !self.access_epoch(key).still(epoch) {
-                return Err(self.discard_created_session(key, &sid, true));
-            }
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, true)));
         }
         Ok(sid)
     }
@@ -217,12 +295,22 @@ impl Pipeline {
     /// What a session's authority depends on: mode file, current allowance, the ledger's reset
     /// count, the conversation token and the session policy.
     fn access_epoch(&self, key: &str) -> AccessEpoch {
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         AccessEpoch {
             mode_stamp: crate::reserved::mode_stamp(&self.context),
-            allowed: self.context.load_config().map(|cfg| crate::console::access_allowed(&cfg, &mode, key)).map_err(str::to_string),
+            allowed: self
+                .context
+                .load_config()
+                .map(|cfg| {
+                    if mode == "reserved2" {
+                        crate::social_state::inbound_admitted(&cfg, key)
+                    } else {
+                        crate::social_state::access_allowed(&cfg, &mode, key)
+                    }
+                })
+                .map_err(str::to_string),
             resets: crate::turn_ledger::reset_count(&self.context, key),
-            token: crate::console::conversation_token(&self.context, key),
+            token: crate::social_state::token(&self.context, key).map_err(String::from),
             policy: self.session_policy(key),
         }
     }
@@ -319,7 +407,7 @@ impl Pipeline {
     pub fn cancel_session(&mut self, key: &str, sid: &str) -> Result<(), String> {
         let stopped = crate::dsh::stop_session_work(&self.rpc, sid);
         if crate::session_map::lookup(&self.context, key)?.as_deref() == Some(sid) {
-            crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+            crate::social_state::ensure_or_rotate(&self.context, key, true)?;
         }
         let current = crate::session_map::lookup(&self.context, key)?;
         if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
@@ -372,7 +460,7 @@ impl Pipeline {
                 // An unmapped first wake can still be waiting for the turn gate.
                 let mut minted = publication.lock().unwrap_or_else(|p| p.into_inner());
                 let current = minted.as_deref().unwrap_or(expected);
-                let token = crate::conversation_authority::revoke_if_current(&self.context, key, current)?;
+                let token = crate::social_state::revoke_if_current(&self.context, key, current)?;
                 if let Some(replacement) = &token {
                     *minted = Some(replacement.clone());
                 }
@@ -382,7 +470,7 @@ impl Pipeline {
         };
         if reason == "turnTimeout" && self.context.is_isolated() && !self.has_dsh() {
             let cfg = self.context.load_config().map_err(str::to_string)?;
-            self.rpc = crate::console::dsh_rpc_for(&self.context, &cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, &cfg)?;
         }
         if self.context.is_isolated() {
             // 被取消/被替代的回合不能再有迟到的结果：先清 inbox（DSH 的 cancel 保留队列）并取消，
@@ -391,7 +479,8 @@ impl Pipeline {
             // It does not finalize the turn: crash recovery must still reconcile live work.
             let open = crate::turn_ledger::read_records(&self.context).ok()
                 .map(|records| crate::turn_ledger::fold(&records).0).unwrap_or_default();
-            let pending_wait = crate::console::observation_wait_turn(&self.context, key).unwrap_or(None);
+            let pending_wait = crate::social_state::observation_wait_turn(&self.context, key)
+                .unwrap_or(None);
             let sleeping = reason == "turnTimeout" && open.iter().any(|t|t.key == key && t.state.is_open()
                 && pending_wait.as_deref() == Some(t.id.as_str()));
             let terminal_reason = if sleeping { "observationSleep" } else { reason };
@@ -402,7 +491,7 @@ impl Pipeline {
                 }
             }
             let stopped = crate::dsh::stop_session_work(&self.rpc, &sid);
-            let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+            let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
             for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
                 let recorder = crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry();
                 let result = if sleeping && stopped.is_ok() {
@@ -462,15 +551,22 @@ impl Pipeline {
             return Ok(false);
         }
         if !self.has_dsh() {
-            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
+            self.rpc = crate::dsh::rpc_for(&self.context, cfg)?;
         }
         let _ = self.rpc.relogin();
         if mode == "closed-agent" { self.preset_closed = self.closed_preset()?; }
         Ok(true)
     }
 
+    pub(super) fn unsubmitted_dsh_deferred(&self) -> bool {
+        self.dispatch_definitely_unsubmitted() && crate::dsh_health::is_down(&self.context)
+    }
+
     pub(super) fn defer_unsubmitted_dsh_chat(&self, key: &str, cfg: &serde_json::Value) -> bool {
-        if !self.dispatch_definitely_unsubmitted() || !crate::dsh_health::is_down(&self.context) {
+        let down = self
+            .chat_failure_defers
+            .unwrap_or_else(|| crate::dsh_health::is_down(&self.context));
+        if !self.dispatch_definitely_unsubmitted() || !down {
             return false;
         }
         crate::admin_alert::notify_notice(
@@ -478,6 +574,11 @@ impl Pipeline {
             &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"), "turn-failure",
         );
         true
+    }
+
+    pub(super) fn reserved2_wake_parks(&self, cfg: &serde_json::Value, key: &str) -> bool {
+        crate::dsh_health::is_down(&self.context)
+            && crate::wake_needs_dsh(&self.context, cfg, key)
     }
 
     /// 作废当前这次尝试：先清 inbox 并取消 DSH 里的回合，再换令牌。
@@ -508,7 +609,7 @@ impl Pipeline {
     /// JS 的会话策略串：`JSON.stringify([mode, preset, closed-agent ? ownerQQ : null])`。
     /// 一并写入映射，回滚到 JS 后它认得这些会话而不是整体退役。未解析的 preset 与 JS 一样序列化为 `""`。
     fn session_policy(&self, key: &str) -> String {
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let owner = if mode == "closed-agent" {
             match self.owner_qq.parse::<i64>() {
                 Ok(n) => serde_json::json!(n),
@@ -530,7 +631,7 @@ impl Pipeline {
         let Some(stored) = doc.get("sessionPolicies").and_then(|p| p.get(key)).and_then(|p| p.as_str()) else {
             return Ok(None);
         };
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let stored_mode = serde_json::from_str::<serde_json::Value>(stored)
             .ok()
             .and_then(|v| v.get(0).and_then(|m| m.as_str()).map(str::to_string));
@@ -544,12 +645,12 @@ impl Pipeline {
     }
 
     /// 会话明确失效（DSH 不认它了）：撤销映射、停掉/归档旧会话、作废旧令牌、换新会话。
-    fn replace_session(&mut self, key: &str, old: &str, reason: &str) -> Result<String, String> {
+    fn replace_session(&mut self, key: &str, old: &str, reason: &str) -> Result<String, DshTurnError> {
         crate::session_map::retire_if(&self.context, key, old)?;
         let _ = crate::dsh::stop_session_work(&self.rpc, old);
         let _ = crate::dsh::archive_session(&self.rpc, old);
         self.rotate_turn_token(key)?;
-        let _ = crate::console::mark_conversation_unbootstrapped(&self.context, key);
+        let _ = crate::social_state::mark_unbootstrapped(&self.context, key);
         self.store.sessions.remove(key);
         self.failover_state().forget_session(old);
         let new = self.ensure_session(key)?;
@@ -676,6 +777,7 @@ impl Pipeline {
     ///
     /// **只在还没发出任何字节时重投**：这里发送发生在回合成功之后，
     /// 所以重投不会重复发言；一旦将来改成流式边说边发，这个前提就得重新审。
+    #[cfg(test)]
     pub async fn ask_with_failover(
         &mut self,
         key: &str,
@@ -683,7 +785,8 @@ impl Pipeline {
         timeout_secs: u64,
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
-        self.ask_with_failover_with_deadline(key, prompt, std::time::Duration::from_secs(timeout_secs), cfg).await
+        self.ask_with_failover_with_deadline(key, prompt, std::time::Duration::from_secs(timeout_secs), cfg)
+            .await.map_err(String::from)
     }
 
     async fn ask_with_failover_with_deadline(
@@ -692,15 +795,15 @@ impl Pipeline {
         prompt: &str,
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<String, DshTurnError> {
         if !self.has_dsh() {
-            return Err(crate::dsh_credential::UNBOUND.to_string());
+            return Err(crate::dsh_credential::UNBOUND.into());
         }
         self.failure_reported = false;
         self.refusals_recorded.clear();
         self.active_candidate = None;
         let result = self.ask_with_failover_inner(key, prompt, timeout, cfg).await;
-        if let Err(error) = &result {
+        if let Err(DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. }) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
                 && !error.contains("preset") && !error.contains("预设")
@@ -713,14 +816,18 @@ impl Pipeline {
         // A failure to reach DSH marks it down (queued work waits for recovery); a call that went through marks it up.
         match &result {
             Ok(_) => crate::dsh_health::note_call_success(&self.context, cfg),
-            Err(error) => crate::dsh_health::note_call_failure(&self.context, cfg, error),
+            Err(DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. }) =>
+                crate::dsh_health::note_call_failure(&self.context, cfg, error),
+            Err(DshTurnError::AccessRefused(_)) => {}
         }
         result
     }
 
-    pub(super) fn cli_fallback(&mut self, cfg: &serde_json::Value, key: &str, prompt: &str, timeout_secs: u64) -> Result<(String, String), String> {
+    pub(super) fn cli_fallback(&mut self, cfg: &serde_json::Value, key: &str, prompt: &str, timeout_secs: u64) -> Result<(String, String), (String, bool)> {
         let context = self.context.clone();
+        let mut policy_refused = false;
         let result = crate::backend::cli_fallback_with_runtime_reporting(&context, cfg, key, prompt, timeout_secs, |id, error| {
+            policy_refused |= crate::model_failure::Failure::classify("", error).class == "refusal";
             let (provider, model) = crate::model_failure::cli_identity(cfg, id);
             self.report_backend_failure(cfg, key, id, &provider, &model, "", error);
         });
@@ -728,12 +835,13 @@ impl Pipeline {
         if result.is_ok() {
             crate::prompt::record_recall_hits(&self.context, &self.compat_recall);
         }
-        result
+        result.map_err(|error| (error, policy_refused))
     }
 
     /// JS `shouldAuditKey`: every conversation is audited except the owner's private chat in closed-agent mode.
     fn should_audit_key(&self, cfg: &serde_json::Value, key: &str) -> bool {
-        !(crate::console::runtime_mode(&self.context) == "closed-agent" && crate::chat::is_owner_key(cfg, key))
+        !(crate::social_state::mode(&self.context) == "closed-agent"
+            && crate::chat::is_owner_key(cfg, key))
     }
 
     /// JS `shouldAuditKey(key) && SENSITIVE_RE.test(text) ? '（含敏感信息，已隐藏）' : text`.
@@ -767,10 +875,7 @@ impl Pipeline {
         prompt: &str,
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
-    ) -> Result<String, String> {
-        // Work on a delivery copy, after chat logging/storage and before either backend.
-        let model_prompt = crate::model_view::strip_text_with_runtime(&self.context, prompt, cfg);
-        let prompt = model_prompt.as_str();
+    ) -> Result<String, DshTurnError> {
         // CLI adapters accept seconds; the DSH collector retains the exact millisecond budget.
         let timeout_secs = timeout.as_secs().saturating_add(u64::from(timeout.subsec_nanos() > 0));
         if key.starts_with("ab:") {
@@ -847,20 +952,20 @@ impl Pipeline {
                 Err(note) => {
                     let (provider, model) = crate::model_failure::cli_identity(cfg, id);
                     self.report_backend_failure(cfg, key, id, &provider, &model, "", &note);
-                    return Err(note);
+                    return Err(note.into());
                 }
             }
         }
         // A pinned CLI may run independently, but its fallback must not contact a DSH already
         // known to be down. Unpinned callers can safely park this unsubmitted turn for recovery.
         if crate::dsh_health::is_down(&self.context) {
-            return Err("DSH 不可用，未提交到 DSH".to_string());
+            return Err("DSH 不可用，未提交到 DSH".into());
         }
         // #179: while a guarded DSH profile row is missing the turn is refused before any DSH call; the guard alerts
         // the owner itself, so no model-failure alert follows.
         if let Err(error) = crate::dsh_profile::admit(&self.context) {
             self.failure_reported = true;
-            return Err(error);
+            return Err(error.into());
         }
         // 按会话取候选链：这个群配了独立模型就用它的，否则回落全局。
         seg_cli = t0.elapsed().as_millis() as i64;
@@ -906,7 +1011,12 @@ impl Pipeline {
                         println!("[failover] 模型全设不上（{e}），改用 CLI 后端 {backend_id} 拿到回复");
                         return Ok(text);
                     }
-                    Err(note) => return Err(format!("{e}；CLI 后端也没成：{note}")),
+                    Err((note, cli_refused)) => {
+                        let refused = crate::model_failure::Failure::classify("", &e).class == "refusal";
+                        return Err(DshTurnError::after_exhaustion(
+                            format!("{e}；CLI 后端也没成：{note}"), &sid, refused || cli_refused,
+                        ));
+                    }
                 }
             },
         };
@@ -932,8 +1042,8 @@ impl Pipeline {
                 .await
                 {
                     Ok(Ok(f)) => f,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err("FollowStream 握手超时（20s）".to_string()),
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => return Err("FollowStream 握手超时（20s）".into()),
                 },
             };
             seg_open += t0.elapsed().as_millis() as i64 - seg_cli - seg_sess - seg_model;
@@ -962,7 +1072,7 @@ impl Pipeline {
                 }
             }
             let handed_over = self.dsh_switch_summary(key, &sid, cfg)?.map(|summary| {
-                crate::model_view::strip_text_with_runtime(&self.context, &format!("{summary}\n\n{prompt_text}"), cfg)
+                format!("{summary}\n\n{prompt_text}")
             });
             if let Some(turn) = &self.cur_turn {
                 turn.attempt_with_layers(&rpc_id, &sid, layers.as_ref())
@@ -1003,7 +1113,7 @@ impl Pipeline {
                     // above); nothing was submitted, and no other candidate may try.
                     follow.close().await;
                     self.failure_reported = true;
-                    return Err(e);
+                    return Err(e.into());
                 }
                 Err(e) if !prompt_error_needs_probe(self.cur_turn.is_some(), &e) => {
                     Err(Submit::Refused(format!("prompt 调用失败：{e}")))
@@ -1030,10 +1140,12 @@ impl Pipeline {
             let mut had_send = false;
             // An attempt that ended in `turn/end` error: (code, detail, the model's message).
             let mut model_failure: Option<(String, String, String)> = None;
+            let mut refusal_sources = crate::dsh::RefusalSources::default();
+            let mut replayable = false;
             let failed: Result<(), String> = match submitted {
                 Err(Submit::Unverified(why)) => {
                     follow.close().await;
-                    return self.pause_unknown(key, "prompt-unverified", &why);
+                    return self.pause_unknown(key, "prompt-unverified", &why).map_err(DshTurnError::from);
                 }
                 Err(Submit::Refused(why)) => {
                     follow.close().await;
@@ -1083,9 +1195,9 @@ impl Pipeline {
                             tokio::select! {
                                 result = &mut completion => break result,
                                 _ = tick.tick() => {
-                                    // Mode/reset handlers hold this gate until retirement completes.
-                                    // On contention keep waiting; do not race their partial state.
-                                    if let Ok(_gate) = crate::closed_agent::lock(&self.context) {
+                                    // A mode write or reset can hold the gate across DSH I/O.
+                                    // Retry on the next tick so the collector yields between checks.
+                                    if let Ok(Some(_gate)) = crate::closed_agent::try_lock(&self.context) {
                                         if let Err(reason) = self.turn_validity(key, &sid) {
                                             let already_ended = self.cur_turn.as_ref().and_then(|turn| {
                                                 crate::turn_ledger::read_records(&self.context).ok().map(|records| {
@@ -1106,7 +1218,7 @@ impl Pipeline {
                         follow.next_turn_with_lifecycle(timeout, on_start, on_end).await
                     };
                     #[cfg(test)]
-                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(); }
+                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(&rpc_id); }
                     seg_turn += t0.elapsed().as_millis() as i64
                         - seg_cli
                         - seg_sess
@@ -1126,7 +1238,7 @@ impl Pipeline {
                                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                                 while self.context.read_optional_text(RuntimeArea::Data, "fault-hold-collector-bookkeeping")?.is_some() {
                                     if tokio::time::Instant::now() >= deadline {
-                                        return Err("collector bookkeeping test gate timed out".to_string());
+                                        return Err("collector bookkeeping test gate timed out".into());
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                                 }
@@ -1152,22 +1264,18 @@ impl Pipeline {
                     let send_tool_ok = follow.tools.iter().any(|t| is_send_tool(&t.name) && t.done && t.ok);
                     if let Some(turn) = &self.cur_turn {
                         if let Some(dsh_turn) = follow.turn_id() {
-                            let _ = turn.dsh_turn(&rpc_id, dsh_turn);
+                            replayable = turn.dsh_turn(&rpc_id, dsh_turn).is_ok();
                         }
                         let _ = turn.tools(follow.tools.iter().map(|t| t.to_json()).collect());
                     }
+                    refusal_sources = std::mem::take(&mut follow.refusal);
                     follow.close().await;
                     let end_kind = ended.pointer("/reason/kind").and_then(|k| k.as_str());
-                    let classified_failure = reply.as_ref().ok().and_then(|text| {
-                        failover::classify_turn_end(&ended).or_else(|| {
-                            if end_kind.is_some_and(|kind| kind != "completed") || text.trim().is_empty() { return None; }
-                            crate::backend::plain_output_failure(text).map(|f| (failover::FailureKind::TurnError, f.code.clone(), f.summary()))
-                        })
-                    });
+                    let classified_failure = failover::classify_turn_end(&ended);
                     if reply.is_err() || classified_failure.is_some() {
                         if let Some(turn) = &self.cur_turn {
                             if let Err(error) = turn.release_completion(&rpc_id) {
-                                return self.pause_unknown(key, "completion-release-failed", &error);
+                                return self.pause_unknown(key, "completion-release-failed", &error).map_err(DshTurnError::from);
                             }
                         }
                     }
@@ -1199,7 +1307,7 @@ impl Pipeline {
                     else { None };
                     // The DSH adapter's reported facts become the turn timing record.
                     self.report_facts(key, &crate::turn_engine::Facts {
-                        ok: reply.is_ok() && cancel_reason.is_none() && failover::classify_turn_end(&ended).is_none(),
+                        ok: reply.is_ok() && cancel_reason.is_none() && classified_failure.is_none(),
                         end_kind: end_kind.map(str::to_string),
                         cancel_reason,
                         attempt: rpc_id.clone(),
@@ -1212,7 +1320,7 @@ impl Pipeline {
                         total_ms: t0.elapsed().as_millis() as i64,
                     });
                     if let Some(reason) = retired {
-                        return Err(format!("回合已取消：{reason}"));
+                        return Err(format!("回合已取消：{reason}").into());
                     }
                     if let Some(reason) = ledger_cancel {
                         // The independent cap/preemption handler owns terminal settlement after
@@ -1220,7 +1328,7 @@ impl Pipeline {
                         // claim stands). DSH's aborted end is still a successful transport result.
                         self.turn_final = true;
                         if observation_sleep { return Ok(String::new()); }
-                        return Err(format!("回合已取消：{reason}"));
+                        return Err(format!("回合已取消：{reason}").into());
                     }
                     match reply {
                         Ok(text) => match classified_failure {
@@ -1273,7 +1381,16 @@ impl Pipeline {
             };
             let (failure_code, failure_detail) = model_failure.as_ref()
                 .map(|(code, detail, _)| (code.as_str(), detail.as_str())).unwrap_or(("", why.as_str()));
-            self.report_backend_failure(cfg, key, "dsh", &chain[idx].provider, &chain[idx].model, failure_code, failure_detail);
+            let failure = crate::model_failure::Failure::classify(failure_code, failure_detail);
+            note_model_error(&self.context, key, &failure.summary());
+            let turn_id = self.cur_turn.as_ref().filter(|_| replayable).map(|turn| turn.id.clone());
+            let call = turn_id.as_deref().map(|turn_id| crate::model_failure::RefusalCall {
+                turn_id,
+                index: refusal_sources.model_call(),
+                rpc_id: Some(&rpc_id),
+            });
+            self.alert_backend_failure(cfg, key, "dsh", &chain[idx].provider, &chain[idx].model, &failure,
+                &refusal_sources.messages, call);
             // 等回复超时 / 流断开：DSH 里这一轮可能还在跑，结果未知。绝不把整条 prompt 交给下一个候选再投一遍
             // （ticket 25 决定 Q3，ticket 10 的未知结果合同）：先清队列并取消 DSH 里的回合、再换令牌，让它之后迟到的
             // 工具调用和发送全部因令牌不符被拒；取消核实不了就暂停交管理员，否则按失败收尾。只有明确的
@@ -1289,7 +1406,7 @@ impl Pipeline {
                             Outcome::Unknown,
                             &format!("{key}: {why}; stopping the DSH turn failed: {stop}"),
                         );
-                        return self.pause_unknown(key, "turn-unverified", &format!("{why}；停止 DSH 回合失败：{stop}"));
+                        return self.pause_unknown(key, "turn-unverified", &format!("{why}；停止 DSH 回合失败：{stop}")).map_err(DshTurnError::from);
                     }
                 }
                 recovery_log::record(
@@ -1300,7 +1417,7 @@ impl Pipeline {
                     Outcome::Unknown,
                     &format!("{key}: {why}; the prompt is not delivered again"),
                 );
-                return Err(format!("{why}（回合状态未知，已取消该回合，不换候选重投）"));
+                return Err(format!("{why}（回合状态未知，已取消该回合，不换候选重投）").into());
             }
             // 重投之前核对这一轮是否仍然有效：会话被重置/替换、令牌被换过都意味着它已被取消，
             // 不能靠重投把它救回来。
@@ -1309,7 +1426,7 @@ impl Pipeline {
                     self.report_turn_error(cfg, key, message);
                 }
                 self.finish_turn("cancelled", &invalid);
-                return Err(format!("回合已取消：{invalid}（此前失败：{why}）"));
+                return Err(format!("回合已取消：{invalid}（此前失败：{why}）").into());
             }
             let kind = failover::classify_message(&why);
             // 这一轮里模型已经发过消息就不再换候选重投：重投会让它再发一遍。
@@ -1322,6 +1439,7 @@ impl Pipeline {
                 ),
                 None => ("prompt-refused".to_string(), crate::activity::redacted_preview(&self.context, &why, 200)),
             };
+            let policy_refused = crate::model_failure::Failure::classify(failure_code, failure_detail).class == "refusal";
             let action = self.failover_state().plan(key, &sid, chain.len(), already_sent);
             let outcome = match action {
                 failover::FailoverAction::Retry { idx: next } => {
@@ -1376,17 +1494,19 @@ impl Pipeline {
                             Outcome::Failed,
                             &format!("{key}: the next candidate could not be selected: {safe}"),
                         );
-                        return self.exhausted_chain(cfg, key, prompt, timeout_secs, format!("{why}；切换候选后设置模型失败：{select_error}"), "select-failed");
+                        return self.exhausted_chain(cfg, key, prompt, timeout_secs, format!("{why}；切换候选后设置模型失败：{select_error}"), "select-failed")
+                            .map_err(|(reason, cli_refused)| DshTurnError::after_exhaustion(reason, &sid, policy_refused || cli_refused));
                     }
                 },
                 Err(failover::GiveUp::AlreadySent) => {
-                    return Err(format!("{why}（模型已发送过消息，不重投、不回落）"));
+                    return Err(format!("{why}（模型已发送过消息，不重投、不回落）").into());
                 }
                 Err(g) => {
                     // DSH 的候选链全挂了 —— 再试 `backends` 里配的 CLI 后端（R4，仅 `backends.failoverFallback` 开启时才会跑）。
                     // 只有整条 DSH 链都失败才走到这里，正常回合不会因此多花时间。
                     let why_full = format!("{}（{}）", why, g.as_str());
-                    return self.exhausted_chain(cfg, key, prompt, timeout_secs, why_full, g.as_str());
+                    return self.exhausted_chain(cfg, key, prompt, timeout_secs, why_full, g.as_str())
+                        .map_err(|(reason, cli_refused)| DshTurnError::after_exhaustion(reason, &sid, policy_refused || cli_refused));
                 }
             }
         }
@@ -1402,7 +1522,7 @@ impl Pipeline {
         timeout_secs: u64,
         why_full: String,
         reason: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, (String, bool)> {
         match self.cli_fallback(cfg, key, prompt, timeout_secs) {
             Ok((backend_id, text)) => {
                 println!("[failover] DSH 全挂，改用 CLI 后端 {backend_id} 拿到回复");
@@ -1416,7 +1536,7 @@ impl Pipeline {
                 );
                 Ok(text)
             }
-            Err(note) => Err(format!("{why_full}；CLI 后端也没成：{note}")),
+            Err((note, policy_refused)) => Err((format!("{why_full}；CLI 后端也没成：{note}"), policy_refused)),
         }
     }
     /// 投一句 prompt 并等到这一轮结束，返回回复正文。
@@ -1495,6 +1615,7 @@ impl Pipeline {
     /// `[SILENT]` 是模型"我选择不说"的合法出口（JS `isSilentMarker`）。
     /// 没有这一步的话，整段 `[SILENT]` 会被原样发到群里 —— 那是最尴尬的一种 bug：
     /// 它只会出现在"AI 决定闭嘴"的时刻，平时测不到。
+    #[allow(dead_code)]
     pub fn reply(&mut self, target: &Target, text: &str) -> Result<Vec<serde_json::Value>, String> {
         if is_silent_marker(text) {
             println!("[pipeline] {} 选择静默（[SILENT]），不发送", target.key());
@@ -1523,8 +1644,6 @@ impl Pipeline {
     /// 完整一轮：投 prompt → 等回复 → 发回 QQ。
     ///
     /// `live=false` 时只走前半段并打印，不发送（影子模式）。
-    // 保留「不带 failover 的简单路径」：排障时能一眼看到单候选下的行为，
-    // 也方便以后写"只想跑一个候选"的测试。主流程一律走 handle_with_failover。
     #[allow(dead_code)]
     pub async fn handle(&mut self, target: &Target, prompt: &str) -> Result<Option<String>, String> {
         let key = target.key();
@@ -1536,35 +1655,6 @@ impl Pipeline {
         }
         if !self.live {
             println!("[pipeline] dry-run {key}：回复 {} 字，未发送", trimmed.chars().count());
-            return Ok(Some(trimmed));
-        }
-        let sent = self.reply(target, &trimmed)?;
-        println!("[pipeline] {key}：已发送 {} 条", sent.len());
-        Ok(Some(trimmed))
-    }
-
-    /// 与 `handle` 相同，但走带 failover 的 ask（主路径用这个）。
-    ///
-    /// 单独开一个方法而不是改 `handle`：`handle` 是「单候选」的最简路径，
-    /// 诊断/探针还会用到；主路径要的是候选链 + 失败重投。
-    pub async fn handle_with_failover(
-        &mut self,
-        target: &Target,
-        prompt: &str,
-        cfg: &serde_json::Value,
-    ) -> Result<Option<String>, String> {
-        let key = target.key();
-        let key: &str = &key;
-        let reply = self.ask_with_failover(&key, prompt, 180, cfg).await?;
-        let trimmed = reply.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("agent 返回了空回复".to_string());
-        }
-        if !self.live {
-            println!(
-                "[pipeline] dry-run {key}：回复 {} 字，未发送",
-                trimmed.chars().count()
-            );
             return Ok(Some(trimmed));
         }
         let sent = self.reply(target, &trimmed)?;

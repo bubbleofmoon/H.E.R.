@@ -37,6 +37,12 @@ pub fn is_audio_file(name: &str) -> bool {
     AUDIO_EXTS.contains(&ext.as_str())
 }
 
+/// QQ voice magic: `#!SILK_V3`, optionally after one 0x02 byte.
+pub fn looks_like_silk(bytes: &[u8]) -> bool {
+    let body = if bytes.first() == Some(&0x02) { &bytes[1..] } else { bytes };
+    body.starts_with(b"#!SILK_V3")
+}
+
 /// JS `Number.prototype.toFixed` for a non-negative finite value: exact decimal rounding where an
 /// exact tie rounds up (Rust's formatter rounds a tie to even).
 pub(crate) fn js_to_fixed(value: f64, digits: usize) -> String {
@@ -879,5 +885,11 @@ mod tests {
         assert_eq!(plain_path(Path::new(r"\\?\C:\a\b.mp3")).unwrap(), r"C:\a\b.mp3");
         assert_eq!(plain_path(Path::new(r"\\?\UNC\host\share\b.mp3")).unwrap(), r"\\host\share\b.mp3");
         assert_eq!(plain_path(Path::new("/tmp/a.mp3")).unwrap(), "/tmp/a.mp3");
+    }
+
+    #[test]
+    fn silk_magic_detection() {
+        assert!(looks_like_silk(b"#!SILK_V3") && looks_like_silk(b"\x02#!SILK_V3"));
+        assert!(!looks_like_silk(b"\x03#!SILK_V3") && !looks_like_silk(b"#!SILK") && !looks_like_silk(b""));
     }
 }
