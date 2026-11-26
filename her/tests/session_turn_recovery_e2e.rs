@@ -3641,7 +3641,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
         assert!(text.contains("【唤醒增量】"), "wake {i}: {text}");
         assert!(!text.contains("【替换简报节 behaviour】"), "wake {i} repeated unchanged rules");
         assert!(!text.contains("operator-briefing-85"));
-        assert!(!text.contains("【首回复节奏】") && !text.contains("【沉睡前强制等待】"));
+        assert!(!text.contains("【替换简报节 reply】") && !text.contains("【回复节奏】需要说话时请直接发起发送工具") && !text.contains("【沉睡前强制等待】"));
         assert!(text.contains("【会话令牌】"));
         assert!(text.contains("【本轮发送】") && text.contains("文本输出不会发送到 QQ"), "wake {i} lost current-turn tool-only delivery instruction");
         assert!(text.contains("【本次消息快照】"));
