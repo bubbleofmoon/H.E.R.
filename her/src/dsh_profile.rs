@@ -59,8 +59,10 @@ const SYSTEM_PROMPT_PACKAGE: &str = "@deepseek-ai/dsh-system-prompt";
 const AGENT_INSTRUCTIONS_PACKAGE: &str = "@deepseek-ai/dsh-agent-instructions";
 const PERSONA_PACKAGE: &str = "@deepseek-ai/dsh-persona";
 const PRESET_PACKAGE: &str = "@deepseek-ai/dsh-agent-preset";
-/// The rows every preset keeps (disabled, or `maxBytes: 0` for `agent-instructions`); a preset without one refuses.
-const REQUIRED_PRESET_ROWS: &[&str] = &["agent-instructions", "tool-bash", "tool-pwsh", "tool-fs", "tool-fs-search"];
+/// The rows every preset keeps (`disabled: true` or `maxBytes: 0` for `agent-instructions`); a preset without one
+/// refuses. Local-tool rows are optional when omitted because presets mount only listed plugins and HER's profile
+/// block disables them globally; any local-tool row that is present still must carry `disabled: true`.
+const REQUIRED_PRESET_ROWS: &[&str] = &["agent-instructions"];
 /// The ids HER's block patches; a top-level patch above the block with one of them is overridden by it.
 const BLOCK_IDS: &[&str] = &[
     "system-prompt",
@@ -365,7 +367,18 @@ fn check_profile(context: &RuntimeContext, problems: &mut BTreeSet<String>) {
     let (begin, end) = (*begin, *end);
     let block = render_block();
     let expected: Vec<&str> = block.trim_end_matches('\n').split('\n').collect();
-    if begin >= end || lines[begin..=end] != expected[..] {
+    // DSH's YAML serializer inserts a blank line before the trailing `END` comment when saving the profile; allow
+    // empty or ASCII-spaces-only lines inside the block while still requiring every managed line verbatim.
+    let actual: Vec<&str> = if begin < end {
+        lines[begin..=end]
+            .iter()
+            .copied()
+            .filter(|line| !line.bytes().all(|b| b == b' '))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if begin >= end || actual != expected {
         problems.insert("profile-file".to_string());
         return;
     }
@@ -458,11 +471,11 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
             problems.insert(format!("persona-text:{label}"));
         }
     }
-    // Every preset (a preset row, or a profile patch that replaces a preset's plugin list) keeps every guarded row;
-    // a preset file without any preset row refuses too.
+    // Every preset (a preset row, or a profile patch that replaces a preset's plugin list) keeps every row in
+    // `REQUIRED_PRESET_ROWS` (`agent-instructions`); a preset file without any preset row refuses too.
     let presets: Vec<&Item> =
         found.iter().filter(|item| is_package(&item.name, PRESET_PACKAGE) || item.plugins.is_some()).collect();
-    if owned.is_none() && presets.is_empty() {
+    if owned.is_none() && !presets.iter().any(|item| is_package(&item.name, PRESET_PACKAGE)) {
         problems.insert(format!("missing-rows:{label}"));
     }
     for preset in presets {

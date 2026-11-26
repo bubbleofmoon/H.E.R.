@@ -131,6 +131,10 @@ const RESERVED2: &[&str] = &[
     "web_search",
     "web_fetch",
     "snowluma_status",
+    super::reminders::CREATE,
+    super::reminders::LIST,
+    super::reminders::CHANGE,
+    super::reminders::CANCEL,
 ];
 
 /// `RESERVED2` plus the owner-only ACL and settings tools.
@@ -180,6 +184,10 @@ const RESERVED2_OWNER: &[&str] = &[
     "web_search",
     "web_fetch",
     "snowluma_status",
+    super::reminders::CREATE,
+    super::reminders::LIST,
+    super::reminders::CHANGE,
+    super::reminders::CANCEL,
 ];
 
 /// The digest is one completion over stored evidence.
@@ -221,13 +229,13 @@ impl Profile {
     pub(crate) fn allows_tool(self, cfg: &Value, conversation: Option<&str>, name: &str) -> bool {
         self.menu().contains(&name)
             && (!matches!(self, Self::Reserved2 | Self::Reserved2Owner)
-                || crate::console::reserved2_menu_tool(cfg, conversation, name))
+                || crate::social_state::reserved2_menu_tool(cfg, conversation, name))
             && match name {
                 "qq_send_private_message" => crate::settings::tool_enabled(cfg, "sendPrivate"),
                 "qq_send_group_message" => crate::settings::tool_enabled(cfg, "sendGroup"),
                 "qq_reply" => crate::settings::tool_enabled(cfg, "reply"),
                 "memory_acl" | "settings_get" | "settings_set" =>
-                    crate::conversation_authority::owner_conversation(cfg)
+                    crate::social_state::owner_conversation(cfg)
                         .is_some_and(|owner| conversation.is_none_or(|key| key == owner)),
                 _ => true,
             }

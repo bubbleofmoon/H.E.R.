@@ -2,6 +2,7 @@
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::task_runs::{Finish, LogStream, RunHandle};
+use crate::tasks::{TaskDef, TaskId};
 use rusqlite::{
     backup::{Backup, StepResult},
     Connection, OpenFlags,
@@ -18,6 +19,14 @@ use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 type Check<'a> = &'a dyn Fn() -> Result<(), String>;
 
+#[derive(Clone, Copy)]
+enum Verification {
+    FullBackup,
+    MemoryBackup,
+    AnyArchive,
+    Restore { memory_only: bool },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDigest {
@@ -32,6 +41,58 @@ pub struct FileDigest {
 pub struct Manifest {
     pub version: u32,
     pub files: BTreeMap<String, FileDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_fingerprint: Option<MemoryFingerprint>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryFingerprint {
+    schema_sha256: String,
+    table_rows: BTreeMap<String, i64>,
+}
+
+fn memory_fingerprint(db: &Connection, check: Check<'_>) -> Result<MemoryFingerprint, String> {
+    let version: i64 = db
+        .query_row("PRAGMA main.user_version", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let mut statement = db
+        .prepare("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name")
+        .map_err(|e| e.to_string())?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut schema = Sha256::new();
+    schema.update(version.to_le_bytes());
+    let mut table_rows = BTreeMap::new();
+    for entry in entries {
+        check()?;
+        let entry = entry.map_err(|e| e.to_string())?;
+        schema.update(serde_json::to_vec(&entry).map_err(|e| e.to_string())?);
+        schema.update(b"\n");
+        let (kind, name, _, _) = entry;
+        if kind == "table" {
+            let quoted = name.replace('"', "\"\"");
+            let count = db
+                .query_row(&format!("SELECT COUNT(*) FROM main.\"{quoted}\""), [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| e.to_string())?;
+            table_rows.insert(name, count);
+        }
+    }
+    check()?;
+    Ok(MemoryFingerprint {
+        schema_sha256: format!("{:x}", schema.finalize()),
+        table_rows,
+    })
 }
 
 /// Backup policy read afresh for each run.
@@ -111,12 +172,20 @@ impl Default for NoticeState {
 
 const NOTICE_STATE: &str = "backup-notices.json";
 
+type Notice = (String, String);
+
+#[derive(Default)]
+struct TaskNotices {
+    failures: Vec<Notice>,
+    missed: Vec<Notice>,
+}
+
 fn claim_notice(
     state: &mut NoticeState,
     now: i64,
     key: String,
     text: String,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<Notice>,
 ) {
     if !state.seen.contains_key(&key) {
         state.seen.insert(key.clone(), now);
@@ -125,10 +194,11 @@ fn claim_notice(
 }
 
 /// Claims are synced before sending; unknown send outcomes are never retried.
-fn update_notices(
+fn update_notices<T>(
     context: &RuntimeContext,
-    update: impl FnOnce(&mut NoticeState) -> Result<Vec<(String, String)>, String>,
-) -> Result<Vec<(String, String)>, String> {
+    state_file: &str,
+    update: impl FnOnce(&mut NoticeState) -> Result<T, String>,
+) -> Result<T, String> {
     let started = Instant::now();
     let _gate = loop {
         match context.open_locked_file(RuntimeArea::Data, "locks/backup-notices.lock") {
@@ -143,7 +213,7 @@ fn update_notices(
         }
     };
     let mut state: NoticeState = match context
-        .read_optional_text(RuntimeArea::Data, NOTICE_STATE)
+        .read_optional_text(RuntimeArea::Data, state_file)
         .map_err(str::to_owned)?
     {
         None => NoticeState::default(),
@@ -157,7 +227,7 @@ fn update_notices(
     let notices = update(&mut state)?;
     context.write_atomic(
         RuntimeArea::Data,
-        NOTICE_STATE,
+        state_file,
         &serde_json::to_vec(&state).map_err(|e| e.to_string())?,
     )?;
     Ok(notices)
@@ -166,7 +236,7 @@ fn update_notices(
 fn send_notices(
     context: &RuntimeContext,
     config: &serde_json::Value,
-    notices: Result<Vec<(String, String)>, String>,
+    notices: Result<Vec<Notice>, String>,
 ) {
     match notices {
         Ok(notices) => {
@@ -185,7 +255,7 @@ pub fn notify_failure(
     reason: &str,
 ) {
     let now = crate::parity_clock::now_ms();
-    let notices = update_notices(context, |state| {
+    let notices = update_notices(context, NOTICE_STATE, |state| {
         let mut notices = Vec::new();
         claim_notice(
             state,
@@ -199,7 +269,7 @@ pub fn notify_failure(
     send_notices(context, config, notices);
 }
 
-/// Observe retained failed runs and elapsed daily slots without catch-up execution.
+/// Observe retained full backup failures and elapsed backup slots without catch-up execution.
 /// A minute's grace allows the scheduler to claim a due slot before it is called missed.
 pub fn monitor_notices(
     context: &RuntimeContext,
@@ -207,16 +277,101 @@ pub fn monitor_notices(
     store: &crate::task_runs::TaskStore,
     now: i64,
 ) -> Result<(), String> {
-    use crate::task_runs::{RunQuery, RunSource, RunState};
-    use crate::tasks::{self, TaskId};
-    let schedule = tasks::configured_schedule(tasks::task_def(TaskId::Backup), config);
-    let on = crate::supervisor::enabled_in(context, config, tasks::task_def(TaskId::Backup));
-    let time = crate::settings::BACKUP_TIME.read(config);
-    let time = time.as_str().expect("resolved backup time");
+    monitor_notices_with(context, config, store, now, |key, text| {
+        crate::admin_alert::notify_notice(context, config, text, key);
+    })
+}
+
+fn monitor_notices_with(
+    context: &RuntimeContext,
+    config: &serde_json::Value,
+    store: &crate::task_runs::TaskStore,
+    now: i64,
+    mut send: impl FnMut(&str, &str),
+) -> Result<(), String> {
+    // An unreadable pause store is not an observed schedule change.
+    let paused = crate::schedule::ScheduleStore::new(context).paused_jobs();
+    let paused = paused.map_err(|error| error.message())?;
+    let mut result = Ok(());
+    let mut missed = Vec::new();
+    let mut failures = Vec::new();
+    for task in [
+        TaskId::Backup,
+        TaskId::MemoryBackup,
+        TaskId::MemoryRestoreTest,
+    ] {
+        match monitor_task_notices(context, config, store, now, task, &paused) {
+            Ok(notices) => {
+                if !notices.missed.is_empty() {
+                    missed.push(notices.missed);
+                }
+                failures.extend(notices.failures);
+            }
+            Err(error) => result = Err(error),
+        }
+    }
+    send_missed_notices(&missed, &mut send);
+    for (key, text) in failures {
+        send(&key, &text);
+    }
+    result
+}
+
+fn send_missed_notices(missed: &[Vec<Notice>], send: &mut impl FnMut(&str, &str)) {
+    let [first_group, rest @ ..] = missed else {
+        return;
+    };
+    if let ([(key, text)], []) = (first_group.as_slice(), rest) {
+        send(key, text);
+        return;
+    }
+
+    // Summarize each job within one alert so a long outage cannot spend the
+    // notice budget on one job before any of the other jobs are mentioned.
+    let mut key = String::from("backup-missed-slots");
+    let mut body = Vec::new();
+    for group in missed {
+        let (_, first) = &group[0];
+        let (last_key, last) = &group[group.len() - 1];
+        key.push('-');
+        key.push_str(last_key);
+        if group.len() == 1 {
+            body.push(first.clone());
+        } else {
+            body.push(format!(
+                "{} missed slots. First: {first} Last: {last}",
+                group.len()
+            ));
+        }
+    }
+    send(&key, &body.join("\n"));
+}
+
+fn monitor_task_notices(
+    context: &RuntimeContext,
+    config: &serde_json::Value,
+    store: &crate::task_runs::TaskStore,
+    now: i64,
+    task: TaskId,
+    paused: &[String],
+) -> Result<TaskNotices, String> {
+    use crate::task_runs::{RunQuery, RunSource, RunState, SlotObservation};
+    use crate::tasks::{self, Due, Schedule};
+
+    let name = task.as_str();
+    let def = tasks::task_def(task);
+    let full = task == TaskId::Backup;
+    let schedule = tasks::configured_schedule(def, config);
+    let on = crate::supervisor::enabled(config, def) && !paused.iter().any(|job| job == name);
+    let (time, cadence) = match schedule {
+        Schedule::Daily { hour, minute } => (format!("{hour:02}:{minute:02}"), "daily"),
+        Schedule::Monthly { hour, minute } => (format!("{hour:02}:{minute:02}"), "monthly"),
+        _ => return Err(format!("unexpected backup schedule for {name}")),
+    };
     let zone = crate::local_time::configured_zone(config);
-    let zone_identity = format!("{zone:?}");
-    let signature = format!("\"{time}\":{on}:{zone_identity}");
-    let notices = update_notices(context, |state| {
+    let signature = format!("\"{time}\":{on}:{zone:?}");
+    let state_file = format!("{name}-notices.json");
+    update_notices(context, &state_file, |state| {
         // The first observation and every time/enabled change start now: neither older
         // history nor slots before this moment (e.g. a time already past) are alerted.
         if state.schedule.as_deref() != Some(signature.as_str()) {
@@ -224,51 +379,59 @@ pub fn monitor_notices(
             state.active_since = now;
             state.checked_through = Some(now);
         }
-        // Read history inside the notice gate: pruning a stale snapshot must
-        // never erase a failure claim concurrently saved by another process.
+        let mut notices = TaskNotices::default();
         let mut runs = Vec::new();
-        let mut before = None;
-        loop {
-            let page = store.list(&RunQuery {
-                task: Some("backup".into()),
-                before,
-                limit: Some(200),
-            })?;
-            before = page.next_before;
-            runs.extend(page.runs);
-            if before.is_none() {
-                break;
+        // The other jobs report ordinary execution failures through the task executor.
+        if full {
+            // Read history inside the notice gate: pruning a stale snapshot must
+            // never erase a failure claim concurrently saved by another process.
+            let mut before = None;
+            loop {
+                let page = store.list(&RunQuery {
+                    task: Some("backup".into()),
+                    before,
+                    limit: Some(200),
+                })?;
+                before = page.next_before;
+                runs.extend(page.runs);
+                if before.is_none() {
+                    break;
+                }
+            }
+            let retained: BTreeSet<_> = runs
+                .iter()
+                .map(|run| format!("backup-failed-{}", run.run_id))
+                .collect();
+            // Failed-run keys need live only as long as their retained task history.
+            state
+                .seen
+                .retain(|key, _| !key.starts_with("backup-failed-") || retained.contains(key));
+            for run in &runs {
+                if run.ended_at.unwrap_or(run.queued_at) < state.active_since {
+                    continue;
+                }
+                if matches!(run.state, RunState::Failed | RunState::Unknown)
+                    || (run.source == RunSource::Scheduled && run.state == RunState::Cancelled)
+                {
+                    claim_notice(
+                        state,
+                        now,
+                        format!("backup-failed-{}", run.run_id),
+                        format!(
+                            "Backup failed ({}): {}",
+                            run.run_id,
+                            run.reason.as_deref().unwrap_or("result unknown")
+                        ),
+                        &mut notices.failures,
+                    );
+                }
             }
         }
-        let retained: BTreeSet<_> = runs
-            .iter()
-            .map(|run| format!("backup-failed-{}", run.run_id))
-            .collect();
-        // Failed-run keys need live only as long as their retained task history.
-        state
-            .seen
-            .retain(|key, _| !key.starts_with("backup-failed-") || retained.contains(key));
-        let mut notices = Vec::new();
-        for run in &runs {
-            if run.ended_at.unwrap_or(run.queued_at) < state.active_since {
-                continue;
-            }
-            if matches!(run.state, RunState::Failed | RunState::Unknown)
-                || (run.source == RunSource::Scheduled && run.state == RunState::Cancelled)
-            {
-                claim_notice(
-                    state,
-                    now,
-                    format!("backup-failed-{}", run.run_id),
-                    format!(
-                        "Backup failed ({}): {}",
-                        run.run_id,
-                        run.reason.as_deref().unwrap_or("result unknown")
-                    ),
-                    &mut notices,
-                );
-            }
-        }
+        let title = match task {
+            TaskId::MemoryBackup => "Memory backup",
+            TaskId::MemoryRestoreTest => "Memory restore test",
+            _ => "Backup",
+        };
         if on {
             let mut after = state
                 .checked_through
@@ -276,24 +439,32 @@ pub fn monitor_notices(
             while let Some(slot) = tasks::next_due(schedule, after, &zone)
                 .filter(|slot| *slot <= now.saturating_sub(60_000))
             {
-                let next_slot = tasks::next_due(schedule, slot, &zone);
-                let attempted = runs.iter().any(|run| {
-                    run.source == RunSource::Scheduled
-                        && run.queued_at >= slot
-                        && next_slot.is_none_or(|next| run.queued_at < next)
-                });
-                if !attempted {
+                let missed = if full {
+                    let next_slot = tasks::next_due(schedule, slot, &zone);
+                    !runs.iter().any(|run| {
+                        run.source == RunSource::Scheduled
+                            && run.queued_at >= slot
+                            && next_slot.is_none_or(|next| run.queued_at < next)
+                    })
+                } else {
+                    match store.record_missed(Due { task, slot })? {
+                        SlotObservation::AwaitingStart => break,
+                        SlotObservation::Covered => false,
+                        SlotObservation::Missed => true,
+                    }
+                };
+                if missed {
                     claim_notice(
                         state,
                         now,
-                        format!("backup-missed-{slot}"),
+                        format!("{name}-missed-{slot}"),
                         format!(
-                            "Backup missed its daily slot at {} UTC (local {} {}).",
+                            "{title} missed its {cadence} slot at {} UTC (local {} {}).",
                             archive_stem(slot).trim_start_matches("qqbot-"),
                             time,
                             crate::local_time::label(&crate::local_time::at(slot, &zone)),
                         ),
-                        &mut notices,
+                        &mut notices.missed,
                     );
                 }
                 state.checked_through = Some(slot);
@@ -301,9 +472,7 @@ pub fn monitor_notices(
             }
         }
         Ok(notices)
-    });
-    send_notices(context, config, notices);
-    Ok(())
+    })
 }
 
 fn ensure_destination(path: &Path) -> Result<(), String> {
@@ -424,7 +593,10 @@ fn publish(candidate: &Path, destination: &Path, check: Check<'_>) -> Result<Pat
             format!("{stem}-{collision}.zip")
         };
         let target = destination.join(name);
-        let mut output = match crate::guarded_credentials::create_credential(&target) {
+        let mut output = match crate::guarded_fs::create_protected_file(
+            &target,
+            crate::guarded_fs::AclPolicy::OwnerOnly,
+        ) {
             Ok(file) => file,
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -696,7 +868,7 @@ impl Scratch {
         #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
         builder.create(&dir).map_err(|e| format!("backup staging unavailable: {}", e.kind()))?;
         let scratch = Self(dir);
-        crate::guarded_credentials::restrict_credential(&scratch.0)
+        crate::guarded_fs::restrict_path(&scratch.0, crate::guarded_fs::AclPolicy::OwnerOnly)
             .map_err(|_| "backup staging permissions unavailable".to_string())?;
         Ok(scratch)
     }
@@ -709,16 +881,16 @@ impl Drop for Scratch {
 
 pub fn run(
     context: &RuntimeContext,
+    task: &TaskDef,
     run: &mut RunHandle,
     cancel: &AtomicBool,
-    timeout: Duration,
 ) -> Finish {
     let started = Instant::now();
     let check = || {
         if cancel.load(Ordering::SeqCst) {
             return Err("backup cancelled".into());
         }
-        if started.elapsed() >= timeout {
+        if started.elapsed() >= task.timeout {
             return Err("backup timed out".into());
         }
         if !matches!(crate::supervisor::desired(context), crate::lifecycle::Effective::Act { wants, .. } if wants.jobs)
@@ -727,12 +899,20 @@ pub fn run(
         }
         Ok(())
     };
-    match create(context, &check) {
+    let (result, message) = match task.id {
+        TaskId::MemoryBackup => (
+            create_memory_snapshot(context, run.view().queued_at, &check, run),
+            "memory backup verified",
+        ),
+        TaskId::MemoryRestoreTest => (restore_test(context, &check), "memory restore verified"),
+        _ => (create(context, &check), "backup verified"),
+    };
+    match result {
         Ok(path) => {
             run.log(
                 LogStream::Meta,
                 &format!(
-                    "backup verified: {}",
+                    "{message}: {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ),
             );
@@ -748,14 +928,223 @@ pub fn run(
     }
 }
 
+const MEMORY_COPIES: usize = 14;
+
+fn memory_destination(context: &RuntimeContext) -> Result<PathBuf, String> {
+    let runtime = context
+        .runtime_root()
+        .ok_or("memory backup requires a selected runtime root")?;
+    let destination = crate::install_root::InstallRoot::configured()?
+        .backup_destination(runtime, Path::new("backups/memory"))?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+        const DRIVE_FIXED: u32 = 3;
+        let Some(Component::Prefix(prefix)) = destination.components().next() else {
+            return Err("memory backups require a local fixed drive".into());
+        };
+        let (Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) = prefix.kind() else {
+            return Err("memory backups require a local fixed drive".into());
+        };
+        let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
+        // SAFETY: root is a NUL-terminated drive root.
+        if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
+            return Err("memory backups require a local fixed drive".into());
+        }
+    }
+    Ok(destination)
+}
+
+fn create_memory_snapshot(
+    context: &RuntimeContext,
+    at: i64,
+    check: Check<'_>,
+    run: &mut RunHandle,
+) -> Result<PathBuf, String> {
+    check()?;
+    let destination = memory_destination(context)?;
+    ensure_destination(&destination)?;
+    let scratch = Scratch::new(&destination)?;
+    let database = scratch.0.join("memory.db");
+    let source = crate::memory::open_read_only_for_runtime(context)?;
+    source.busy_timeout(Duration::from_millis(100)).map_err(|e| e.to_string())?;
+    // Pin the live view through both operations, even if another connection writes to the WAL.
+    source.execute_batch("BEGIN DEFERRED").map_err(|e| e.to_string())?;
+    let fingerprint = memory_fingerprint(&source, check)?;
+    online_snapshot(source, &database, "memory", check)?;
+    let candidate = scratch.0.join("archive.zip");
+    let file = crate::guarded_fs::create_protected_file(
+        &candidate,
+        crate::guarded_fs::AclPolicy::OwnerOnly,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut archive = ZipWriter::new(file);
+    let mut manifest = Manifest {
+        version: 1,
+        files: BTreeMap::new(),
+        memory_fingerprint: Some(fingerprint),
+    };
+    add(
+        &mut archive,
+        &mut manifest,
+        "memory.db",
+        File::open(database).map_err(|e| e.to_string())?,
+        check,
+    )?;
+    finish_archive(archive, &manifest)?;
+    let verification = Scratch::new(&scratch.0)?;
+    verify_payload(
+        File::open(&candidate).map_err(|e| e.to_string())?,
+        check,
+        Verification::MemoryBackup,
+        &verification.0,
+    )?;
+
+    let _lock = DestinationLock::acquire(&destination, check)?;
+    let target = publish_memory(&candidate, &destination, at, check)?;
+    if let Err(error) = prune_memory(&destination, &target, check) {
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        run.log(
+            LogStream::Meta,
+            &format!("warning: memory backup {name} succeeded; retention could not finish: {error}"),
+        );
+    }
+    Ok(target)
+}
+
+fn prune_memory(destination: &Path, target: &Path, check: Check<'_>) -> Result<(), String> {
+    for (_, path, _) in archive_files(destination, check)?
+        .into_iter()
+        .filter(|(_, path, _)| path != target)
+        .skip(MEMORY_COPIES - 1)
+    {
+        check()?;
+        fs::remove_file(path).map_err(|e| e.kind().to_string())?;
+    }
+    Ok(())
+}
+
+fn publish_memory(
+    candidate: &Path,
+    destination: &Path,
+    at: i64,
+    check: Check<'_>,
+) -> Result<PathBuf, String> {
+    let stem = archive_stem(at);
+    for collision in 0u64.. {
+        check()?;
+        let name = if collision == 0 {
+            format!("{stem}.zip")
+        } else {
+            format!("{stem}-{collision}.zip")
+        };
+        let target = destination.join(name);
+        // Publish the synced file without exposing a partially copied archive or replacing a collision.
+        match fs::hard_link(candidate, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("memory backup publication failed: {}", error.kind())),
+        }
+    }
+    Err("memory backup archive names exhausted".into())
+}
+
+fn restore_test(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, String> {
+    check()?;
+    let destination = memory_destination(context)?;
+    if !inspect_destination(&destination, false)? {
+        return Err("no local memory backup to restore".into());
+    }
+    let _lock = DestinationLock::acquire(&destination, check)?;
+    let archive = archive_files(&destination, check)?
+        .into_iter()
+        .filter_map(|(_, path, _)| {
+            let name = path.file_stem()?.to_str()?;
+            // archive_files already checked the fixed-width ASCII timestamp and suffix shape.
+            let (stamp, suffix) = name.split_at("qqbot-YYYY-MM-DDTHH-mm-ss".len());
+            let collision = match suffix.strip_prefix('-') {
+                Some(number) => number.parse::<u64>().ok()?,
+                None => 0,
+            };
+            Some(((stamp.to_owned(), collision), path))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, path)| path)
+        .ok_or("no local memory backup to restore")?;
+    let scratch = Scratch::new(&destination)?;
+    for directory in ["config", "data", "resources"] {
+        fs::create_dir(scratch.0.join(directory)).map_err(|e| e.to_string())?;
+    }
+    for (path, contents) in [
+        ("config/config.json", r#"{"consoleToken":"memory-restore-test"}"#),
+        ("data/social-v2.json", "{}"),
+        ("dependencies.json", r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#),
+    ] {
+        fs::write(scratch.0.join(path), contents).map_err(|e| e.to_string())?;
+    }
+    let runtime = RuntimeContext::from_root(&scratch.0)?;
+    let file = File::open(&archive).map_err(|e| e.to_string())?;
+    let verified = verify_payload(file, check, Verification::MemoryBackup, runtime.data_dir())?;
+    let expected = verified
+        .manifest
+        .memory_fingerprint
+        .ok_or("memory backup fingerprint missing")?;
+    // Compare the restored bytes before the normal application open can migrate them.
+    let restored = crate::memory::open_read_only_for_runtime(&runtime)?;
+    if memory_fingerprint(&restored, check)? != expected {
+        return Err("restored memory fingerprint mismatch".into());
+    }
+    drop(restored);
+    let db = crate::memory::open_ready_for_runtime(&runtime)?;
+    db.query_row("SELECT EXISTS(SELECT 1 FROM memory)", [], |row| {
+        row.get::<_, bool>(0)
+    })
+    .map_err(|e| format!("restored memory is unreadable: {e}"))?;
+    check()?;
+    Ok(archive)
+}
+
 /// One selected-runtime snapshot, verified before publication and retention.
 pub fn create(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, String> {
-    create_snapshot(context, check, false)
+    let (_, raw) = snapshot_config(context)?;
+    let include_state = crate::config::backup_config(&raw)?["includeState"]
+        .as_bool()
+        .expect("validated state setting");
+    create_snapshot(context, check, ArchiveScope::Full { include_state }, false)
 }
 
 /// A complete rollback snapshot, protected from ordinary retention for seven days.
+#[cfg(test)]
 pub fn create_pre_restore(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, String> {
-    create_snapshot(context, check, true)
+    create_pre_restore_scoped(context, false, check)
+}
+
+/// A restore-scoped rollback snapshot (`memory.db`-only or full runtime), protected for seven days.
+pub(crate) fn create_pre_restore_scoped(
+    context: &RuntimeContext,
+    memory_only: bool,
+    check: Check<'_>,
+) -> Result<PathBuf, String> {
+    let scope = if memory_only {
+        ArchiveScope::MemoryOnly
+    } else {
+        ArchiveScope::Full {
+            include_state: true,
+        }
+    };
+    create_snapshot(context, check, scope, true)
+}
+
+/// Validate the pre-restore destination path before stopping owners without opening databases.
+pub(crate) fn check_pre_restore_destination(context: &RuntimeContext) -> Result<(), String> {
+    let root = context
+        .runtime_root()
+        .ok_or("backup requires a selected runtime root")?;
+    let (_, raw) = snapshot_config(context)?;
+    let settings = Settings::from_config_resolved(root, &raw)?;
+    ensure_destination(&settings.destination)
 }
 
 /// Renew seven full days after restored health (or rollback restart), under the pruning gate.
@@ -845,19 +1234,190 @@ fn online_snapshot(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveScope {
+    MemoryOnly,
+    Full { include_state: bool },
+}
+
+impl ArchiveScope {
+    pub(crate) fn for_restore(memory_only: bool) -> Self {
+        if memory_only {
+            Self::MemoryOnly
+        } else {
+            Self::Full {
+                include_state: true,
+            }
+        }
+    }
+
+    pub(crate) fn is_memory_only(self) -> bool {
+        matches!(self, Self::MemoryOnly)
+    }
+
+    pub(crate) fn databases(self) -> &'static [&'static str] {
+        if self.is_memory_only() {
+            &["memory.db"]
+        } else {
+            &["memory.db", "conversations.db", "settings.db"]
+        }
+    }
+}
+
+/// Map a payload path inside a backup ZIP to its confined runtime area and relative path.
+pub(crate) fn archive_location(name: &str) -> Result<(RuntimeArea, String), String> {
+    let simple = |s: &str| !s.is_empty() && !s.contains(['/', '\\', ':']) && s != "." && s != "..";
+    match name {
+        "memory.db" | "conversations.db" | "settings.db" => Ok((RuntimeArea::Data, name.into())),
+        "config.json" => Ok((RuntimeArea::Config, "config.json".into())),
+        crate::console_auth::RESTORE_GENERATION_FILE => {
+            Err("cannot restore a destination console generation".into())
+        }
+        "说明.md" => Ok((RuntimeArea::Resources, name.into())),
+        _ if name.starts_with("state/") => {
+            let relative = &name[6..];
+            if !simple(relative) || !relative.ends_with(".json") {
+                return Err("unsupported restore state path".into());
+            }
+            Ok((RuntimeArea::Data, relative.into()))
+        }
+        _ if name.starts_with("roles/")
+            || name.starts_with("patches/")
+            || name.starts_with("docs/") =>
+        {
+            if !name.split('/').all(simple)
+                || (name.starts_with("roles/") && name.split('/').count() != 2)
+            {
+                return Err("unsupported restore resource path".into());
+            }
+            Ok((RuntimeArea::Resources, name.into()))
+        }
+        _ => Err(format!("unsupported restore payload: {name}")),
+    }
+}
+
+/// Shared runtime archive file inventory used by both backup creation and restore planning.
+pub(crate) fn runtime_inventory(
+    context: &RuntimeContext,
+    scope: ArchiveScope,
+    check: Check<'_>,
+) -> Result<BTreeMap<String, (RuntimeArea, String)>, String> {
+    check()?;
+    let mut files = BTreeMap::from([("memory.db".into(), archive_location("memory.db")?)]);
+    let ArchiveScope::Full { include_state } = scope else {
+        return Ok(files);
+    };
+    let conversations = conversation_db_path(context)?;
+    if conversations.try_exists().map_err(|e| e.to_string())? {
+        files.insert(
+            "conversations.db".into(),
+            archive_location("conversations.db")?,
+        );
+    }
+    if crate::settings::store_path(context)?
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        files.insert("settings.db".into(), archive_location("settings.db")?);
+    }
+    files.insert("config.json".into(), archive_location("config.json")?);
+    if include_state {
+        let data = context.resolve_path(RuntimeArea::Data, "", PathIntent::ReadDirectory)?;
+        for entry in fs::read_dir(data).map_err(|e| e.to_string())? {
+            check()?;
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "state filename is not UTF-8")?;
+            if name.ends_with(".json") {
+                context.resolve_path(RuntimeArea::Data, &name, PathIntent::ReadFile)?;
+                files.insert(format!("state/{name}"), (RuntimeArea::Data, name));
+            }
+        }
+    }
+    fn tree(
+        context: &RuntimeContext,
+        relative: &str,
+        recursive: bool,
+        out: &mut BTreeMap<String, (RuntimeArea, String)>,
+        check: Check<'_>,
+    ) -> Result<(), String> {
+        check()?;
+        let base = context.resolve_path(RuntimeArea::Resources, "", PathIntent::ReadDirectory)?;
+        match fs::symlink_metadata(base.join(relative)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => {}
+        }
+        let path =
+            context.resolve_path(RuntimeArea::Resources, relative, PathIntent::ReadDirectory)?;
+        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+            check()?;
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "resource filename is not UTF-8")?;
+            let child = format!("{relative}/{name}");
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                // Resolve even skipped role subdirectories so redirected descendants never get followed.
+                context.resolve_path(RuntimeArea::Resources, &child, PathIntent::ReadDirectory)?;
+                if recursive {
+                    tree(context, &child, true, out, check)?;
+                }
+            } else {
+                context.resolve_path(RuntimeArea::Resources, &child, PathIntent::ReadFile)?;
+                out.insert(child.clone(), (RuntimeArea::Resources, child));
+            }
+        }
+        Ok(())
+    }
+    for (name, recursive) in [("roles", false), ("patches", true), ("docs", true)] {
+        tree(context, name, recursive, &mut files, check)?;
+    }
+    let readme = context.resolve_path(
+        RuntimeArea::Resources,
+        "说明.md",
+        PathIntent::ReadOptionalFile,
+    )?;
+    if readme.try_exists().map_err(|e| e.to_string())? {
+        files.insert("说明.md".into(), archive_location("说明.md")?);
+    }
+    Ok(files)
+}
+
+/// Parse raw `config.json` bytes (accepting a leading UTF-8 BOM).
+pub(crate) fn parse_archive_config(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "backup config is not UTF-8")?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("backup config is invalid: {e}"))
+}
+
+/// Overlay `settings_overlay` onto parsed `config.json` and validate canonical and backup settings.
+pub(crate) fn validate_archive_config(
+    runtime: &Path,
+    mut raw: serde_json::Value,
+    settings_overlay: &[(&'static crate::settings::Setting, serde_json::Value)],
+) -> Result<(serde_json::Value, Settings), String> {
+    crate::settings::overlay_values(&mut raw, settings_overlay);
+    let (config, _) = crate::config::canonical_config(&raw)?;
+    let settings = Settings::from_config_resolved(runtime, &config)?;
+    Ok((config, settings))
+}
+
 /// The stored `config.json` bytes the archive keeps, and the configuration the snapshot's settings come from: the
 /// same bytes parsed, with the settings overlay applied as for every configuration reader.
 pub(crate) fn snapshot_config(context: &RuntimeContext) -> Result<(Vec<u8>, serde_json::Value), String> {
     let config = context.read_file(RuntimeArea::Config, "config.json")?;
-    let text = std::str::from_utf8(&config).map_err(|_| "backup config is not UTF-8")?;
-    let raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-        .map_err(|_| "backup config is invalid")?;
+    let raw = parse_archive_config(&config)?;
     Ok((config, context.overlay_config(raw)))
 }
 
 fn create_snapshot(
     context: &RuntimeContext,
     check: Check<'_>,
+    scope: ArchiveScope,
     pre_restore: bool,
 ) -> Result<PathBuf, String> {
     check()?;
@@ -869,6 +1429,7 @@ fn create_snapshot(
     let destination = settings.destination;
     ensure_destination(&destination)?;
     let scratch = Scratch::new(&destination)?;
+    let inventory = runtime_inventory(context, scope, check)?;
     online_snapshot(
         crate::memory::open_read_only_for_runtime(context)?,
         &scratch.0.join("memory.db"),
@@ -876,34 +1437,40 @@ fn create_snapshot(
         check,
     )?;
     let mut databases = vec!["memory.db"];
-    let conversations = conversation_db_path(context)?;
-    if conversations.try_exists().map_err(|e| e.to_string())? {
-        let db = Connection::open_with_flags(
-            conversations,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|_| "cannot open conversation backup source")?;
-        online_snapshot(
-            db,
-            &scratch.0.join("conversations.db"),
-            "conversation",
-            check,
-        )?;
-        databases.push("conversations.db");
-    }
-    // The settings store is optional too. One that cannot be read safely fails the backup, as a damaged conversation
-    // database does, so no archive silently lacks it.
-    if let Some(db) =
-        crate::settings::backup_source(context).map_err(|error| format!("settings backup: {error}"))?
-    {
-        online_snapshot(db, &scratch.0.join("settings.db"), "settings", check)?;
-        databases.push("settings.db");
+    if !scope.is_memory_only() {
+        if inventory.contains_key("conversations.db") {
+            let conversations = conversation_db_path(context)?;
+            let db = Connection::open_with_flags(
+                conversations,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(|_| "cannot open conversation backup source")?;
+            online_snapshot(
+                db,
+                &scratch.0.join("conversations.db"),
+                "conversation",
+                check,
+            )?;
+            databases.push("conversations.db");
+        }
+        // The settings store is optional too. One that cannot be read safely fails the backup, as a damaged conversation
+        // database does, so no archive silently lacks it.
+        if let Some(db) = crate::settings::backup_source(context)
+            .map_err(|error| format!("settings backup: {error}"))?
+        {
+            let snapshot = scratch.0.join("settings.db");
+            online_snapshot(db, &snapshot, "settings", check)?;
+            crate::console_auth::scrub_auth_snapshot(&snapshot, check)
+                .map_err(|error| format!("settings backup: {error}"))?;
+            databases.push("settings.db");
+        }
     }
     let candidate = scratch.0.join("archive.zip");
     let mut archive = ZipWriter::new(File::create(&candidate).map_err(|e| e.to_string())?);
     let mut manifest = Manifest {
         version: 1,
         files: BTreeMap::new(),
+        memory_fingerprint: None,
     };
     for name in databases {
         add(
@@ -914,64 +1481,41 @@ fn create_snapshot(
             check,
         )?;
     }
-    add(
-        &mut archive,
-        &mut manifest,
-        "config.json",
-        config.as_slice(),
-        check,
-    )?;
-    if settings.include_state || pre_restore {
-        let data = context.resolve_path(RuntimeArea::Data, "", PathIntent::ReadDirectory)?;
-        for entry in fs::read_dir(data).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "state filename is not UTF-8")?;
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let path = context.resolve_path(RuntimeArea::Data, &name, PathIntent::ReadFile)?;
-            add(
-                &mut archive,
-                &mut manifest,
-                &format!("state/{name}"),
-                File::open(path).map_err(|e| e.to_string())?,
-                check,
-            )?;
-        }
-    }
-    for (directory, recursive) in [("roles", false), ("patches", true), ("docs", true)] {
-        resource_tree(
-            context,
-            directory,
-            recursive,
+    if !scope.is_memory_only() {
+        add(
             &mut archive,
             &mut manifest,
+            "config.json",
+            config.as_slice(),
             check,
         )?;
     }
-    let readme = context.resolve_path(
-        RuntimeArea::Resources,
-        "说明.md",
-        PathIntent::ReadOptionalFile,
-    )?;
-    match File::open(readme) {
-        Ok(file) => add(&mut archive, &mut manifest, "说明.md", file, check)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("backup readme unavailable: {}", error.kind())),
+    for (name, (area, relative)) in &inventory {
+        if matches!(
+            name.as_str(),
+            "memory.db" | "conversations.db" | "settings.db" | "config.json"
+        ) {
+            continue;
+        }
+        let path = context.resolve_path(*area, relative, PathIntent::ReadFile)?;
+        add(
+            &mut archive,
+            &mut manifest,
+            name,
+            File::open(path).map_err(|e| e.to_string())?,
+            check,
+        )?;
     }
-    archive
-        .start_file("manifest.json", FileOptions::default())
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut archive, &manifest).map_err(|e| e.to_string())?;
-    archive
-        .finish()
-        .map_err(|e| e.to_string())?
-        .sync_all()
-        .map_err(|e| e.to_string())?;
-    verify_archive(&candidate, check)?;
+    finish_archive(archive, &manifest)?;
+    verify_file_inner(
+        File::open(&candidate).map_err(|e| e.to_string())?,
+        check,
+        if scope.is_memory_only() {
+            Verification::MemoryBackup
+        } else {
+            Verification::FullBackup
+        },
+    )?;
     check()?;
     let _lock = DestinationLock::acquire(&destination, check)?;
     let target = publish(&candidate, &destination, check)?;
@@ -990,6 +1534,18 @@ fn create_snapshot(
     }
     prune(&destination, &target, settings.keep_days, check)?;
     Ok(target)
+}
+
+fn finish_archive(mut archive: ZipWriter<File>, manifest: &Manifest) -> Result<(), String> {
+    archive
+        .start_file("manifest.json", FileOptions::default())
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut archive, manifest).map_err(|e| e.to_string())?;
+    archive
+        .finish()
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .map_err(|e| e.to_string())
 }
 
 fn add(
@@ -1027,50 +1583,10 @@ fn add(
     Ok(())
 }
 
-fn resource_tree(
-    context: &RuntimeContext,
-    relative: &str,
-    recursive: bool,
-    archive: &mut ZipWriter<File>,
-    manifest: &mut Manifest,
-    check: Check<'_>,
-) -> Result<(), String> {
-    check()?;
-    let base = context.resolve_path(RuntimeArea::Resources, "", PathIntent::ReadDirectory)?;
-    match fs::symlink_metadata(base.join(relative)) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-        Ok(_) => {}
-    }
-    let directory =
-        context.resolve_path(RuntimeArea::Resources, relative, PathIntent::ReadDirectory)?;
-    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
-        check()?;
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "resource filename is not UTF-8")?;
-        let relative = format!("{relative}/{name}");
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            // Resolve even skipped role subdirectories so redirected descendants never get followed.
-            context.resolve_path(RuntimeArea::Resources, &relative, PathIntent::ReadDirectory)?;
-            if recursive {
-                resource_tree(context, &relative, true, archive, manifest, check)?;
-            }
-        } else {
-            let path =
-                context.resolve_path(RuntimeArea::Resources, &relative, PathIntent::ReadFile)?;
-            add(
-                archive,
-                manifest,
-                &relative,
-                File::open(path).map_err(|e| e.to_string())?,
-                check,
-            )?;
-        }
-    }
-    Ok(())
+pub(crate) struct VerifiedArchive {
+    pub manifest: Manifest,
+    pub credentials: crate::console_auth::ArchivedCredentials,
+    pub settings_overlay: Vec<(&'static crate::settings::Setting, serde_json::Value)>,
 }
 
 /// Reopen, hash every payload and integrity-check the extracted database. Never extracts archive paths.
@@ -1079,15 +1595,38 @@ pub fn verify_archive(path: &Path, check: Check<'_>) -> Result<Manifest, String>
     verify_file(File::open(path).map_err(|e| e.to_string())?, check)
 }
 
-pub(crate) fn verify_archive_for_restore(path: &Path, inspect_settings: bool) -> Result<(Manifest, bool), String> {
-    verify_file_inner(File::open(path).map_err(|e| e.to_string())?, &|| Ok(()), inspect_settings)
+pub(crate) fn verify_archive_for_restore(
+    path: &Path,
+    full_scope: bool,
+) -> Result<VerifiedArchive, String> {
+    verify_file_inner(
+        File::open(path).map_err(|e| e.to_string())?,
+        &|| Ok(()),
+        Verification::Restore {
+            memory_only: !full_scope,
+        },
+    )
 }
 
 fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
-    verify_file_inner(file, check, false).map(|(manifest, _)| manifest)
+    verify_file_inner(file, check, Verification::AnyArchive).map(|verified| verified.manifest)
 }
 
-fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Result<(Manifest, bool), String> {
+fn verify_file_inner(
+    file: File,
+    check: Check<'_>,
+    verification: Verification,
+) -> Result<VerifiedArchive, String> {
+    let scratch = Scratch::new(&std::env::temp_dir())?;
+    verify_payload(file, check, verification, &scratch.0)
+}
+
+fn verify_payload(
+    file: File,
+    check: Check<'_>,
+    verification: Verification,
+    restored: &Path,
+) -> Result<VerifiedArchive, String> {
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
     let manifest: Manifest = {
         let file = archive
@@ -1095,13 +1634,19 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
             .map_err(|_| "backup manifest missing")?;
         serde_json::from_reader(file).map_err(|e| format!("backup manifest invalid: {e}"))?
     };
-    if manifest.version != 1
-        || !manifest.files.contains_key("memory.db")
-        || !manifest.files.contains_key("config.json")
-    {
+    let has_config = manifest.files.contains_key("config.json");
+    let memory_only_manifest =
+        manifest.files.len() == 1 && manifest.files.contains_key("memory.db");
+    let valid_scope = match verification {
+        Verification::FullBackup | Verification::Restore { memory_only: false } => has_config,
+        Verification::MemoryBackup => memory_only_manifest,
+        Verification::AnyArchive | Verification::Restore { memory_only: true } => {
+            has_config || memory_only_manifest
+        }
+    };
+    if manifest.version != 1 || !manifest.files.contains_key("memory.db") || !valid_scope {
         return Err("backup manifest incomplete or unsupported".into());
     }
-    let scratch = Scratch::new(&std::env::temp_dir())?;
     let mut seen = BTreeSet::new();
     for index in 0..archive.len() {
         check()?;
@@ -1109,6 +1654,19 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
         let name = file.name().to_string();
         if !safe_name(&name) || !seen.insert(name.clone()) {
             return Err("backup contains unsafe or duplicate paths".into());
+        }
+        let auth_path = name.to_ascii_lowercase();
+        let auth_path = auth_path.strip_prefix("state/").or_else(|| auth_path.strip_prefix("data/")).unwrap_or(&auth_path);
+        if matches!(
+            auth_path,
+            crate::console_auth::RESTORE_GENERATION_FILE
+                | crate::console_auth::TOKEN_FILE
+                | crate::console_auth::ROTATION_FILE
+                | crate::console_auth::DESKTOP_GRANTS_FILE
+                | crate::restore::RECOVERY_DIR
+        ) || auth_path.starts_with("console-restore-recovery/")
+        {
+            return Err("backup contains destination console authentication state".into());
         }
         if name == "manifest.json" {
             continue;
@@ -1120,8 +1678,9 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
         if file.size() != expected.size {
             return Err(format!("backup size mismatch: {name}"));
         }
-        let mut db = if matches!(name.as_str(), "memory.db" | "conversations.db" | "settings.db") {
-            Some(File::create(scratch.0.join(&name)).map_err(|e| e.to_string())?)
+        let full_dbs = ArchiveScope::for_restore(false).databases();
+        let mut db = if full_dbs.contains(&name.as_str()) {
+            Some(File::create(restored.join(&name)).map_err(|e| e.to_string())?)
         } else {
             None
         };
@@ -1149,13 +1708,14 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
     if seen.len() != manifest.files.len() + 1 {
         return Err("backup files missing from ZIP".into());
     }
-    let mut has_endpoint_credentials = false;
-    for name in ["memory.db", "conversations.db", "settings.db"] {
+    let mut credentials = crate::console_auth::ArchivedCredentials::default();
+    let mut settings_overlay = Vec::new();
+    for &name in ArchiveScope::for_restore(false).databases() {
         if !manifest.files.contains_key(name) {
             continue;
         }
         let db = Connection::open_with_flags(
-            scratch.0.join(name),
+            restored.join(name),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|e| format!("backup integrity check ({name}): {e}"))?;
@@ -1176,13 +1736,21 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
         if !ok {
             return Err("backup database integrity check returned no result".into());
         }
-        if inspect_settings && name == "settings.db" {
-            // A future settings schema can still be restored when its credential presence is unknown.
-            has_endpoint_credentials = crate::settings::archive_has_endpoint_credentials(&db).unwrap_or(true);
+        if matches!(verification, Verification::Restore { memory_only: false })
+            && name == "settings.db"
+        {
+            credentials = crate::console_auth::archive_credentials(&db)
+                .map_err(|error| format!("backup settings verification: {error}"))?;
+            settings_overlay = crate::settings::read_archive_values(&db)
+                .map_err(|error| format!("backup settings overlay: {error}"))?;
         }
     }
     check()?;
-    Ok((manifest, has_endpoint_credentials))
+    Ok(VerifiedArchive {
+        manifest,
+        credentials,
+        settings_overlay,
+    })
 }
 
 fn safe_name(name: &str) -> bool {
@@ -1212,6 +1780,198 @@ mod tests {
     };
 
     struct Fixture(PathBuf);
+    #[test]
+    fn nightly_memory_backup_keeps_fourteen_copies() {
+        let fixture = Fixture::new("nightly-memory");
+        let context = fixture.context();
+        let db = Connection::open(fixture.0.join("data/memory.db")).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE fixture (value TEXT);
+             INSERT INTO fixture VALUES ('recent memory');",
+        ).unwrap();
+
+        let root = fixture.0.join("backups/memory");
+        fs::create_dir_all(&root).unwrap();
+        let unrelated = root.join("keep.txt");
+        fs::write(&unrelated, "unrelated").unwrap();
+        let config_path = fixture.0.join("config/config.json");
+        let mut config = context.load_config().unwrap();
+        config["backup"]["dir"] = json!("elsewhere");
+        fs::write(config_path, config.to_string()).unwrap();
+
+        let run_nightly = |day: u8| {
+            let now = timestamp(&format!("2026-01-{day:02}T04:00:00Z"));
+            let done = run_scheduled(&fixture, TaskId::MemoryBackup, now);
+            assert_eq!(done.state, RunState::Succeeded, "{done:?}");
+        };
+        run_nightly(1);
+        let first = root.join("qqbot-2026-01-01T04-00-00.zip");
+        assert!(first.is_file(), "nightly copies stay in the local backup set");
+        for day in 1..14 {
+            let path = root.join(format!("qqbot-2026-01-{day:02}T04-00-00.zip"));
+            if day > 1 {
+                fs::copy(&first, &path).unwrap();
+            }
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(86_400 * day);
+            fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        }
+        run_nightly(14);
+        assert!(first.exists(), "the fourteenth slot keeps the oldest copy");
+
+        run_nightly(15);
+        let copies = super::archive_files(&root, &|| Ok(())).unwrap();
+        assert_eq!(copies.len(), 14, "the fifteenth copy prunes exactly one backup");
+        assert!(!first.exists());
+        assert!(unrelated.is_file());
+        assert!(!fixture.0.join("elsewhere").exists());
+
+        let latest = root.join("qqbot-2026-01-15T04-00-00.zip");
+        let preview = crate::restore::preview(&context, &latest, true).unwrap();
+        assert_eq!(preview["replaces"], json!(["data/memory.db"]));
+        assert!(crate::restore::preview(&context, &latest, false).is_err());
+        let mut zip = zip::ZipArchive::new(fs::File::open(latest).unwrap()).unwrap();
+        assert_eq!(zip.len(), 2, "the archive holds only memory and its manifest");
+        let restored = fixture.0.join("restored.db");
+        std::io::copy(
+            &mut zip.by_name("memory.db").unwrap(),
+            &mut fs::File::create(&restored).unwrap(),
+        ).unwrap();
+        let restored = Connection::open(restored).unwrap();
+        let value: String = restored.query_row("SELECT value FROM fixture", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "recent memory", "committed WAL content was recovered");
+    }
+
+    #[test]
+    fn monthly_memory_restore_drill_runs_from_the_fake_clock() {
+        let fixture = Fixture::new("monthly-memory");
+        let root = fixture.0.join("backups/memory");
+        let context = fixture.context();
+        let db = crate::memory::open_ready_for_runtime(&context).unwrap();
+        let january = timestamp("2026-01-31T04:00:00Z");
+        let february = timestamp("2026-02-01T05:30:00Z");
+        let march = timestamp("2026-03-01T05:30:00Z");
+        let task = TaskId::MemoryRestoreTest;
+        let nightly = run_scheduled(&fixture, TaskId::MemoryBackup, january);
+        assert_eq!(nightly.state, RunState::Succeeded, "{nightly:?}");
+        let archive = root.join("qqbot-2026-01-31T04-00-00.zip");
+
+        let before = fs::read(&archive).unwrap();
+        let older = root.join("qqbot-2026-01-30T04-00-00.zip");
+        fs::copy(&archive, &older).unwrap();
+        fs::OpenOptions::new().write(true).open(older).unwrap().set_modified(
+            std::time::UNIX_EPOCH + Duration::from_secs(86_400),
+        ).unwrap();
+        db.execute_batch("CREATE TABLE live_only (value TEXT);").unwrap();
+        let completed = run_scheduled(&fixture, task, february);
+        assert_eq!(completed.state, RunState::Succeeded, "{completed:?}");
+        assert_eq!(fs::read(&archive).unwrap(), before, "the drill preserves its input");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3, "the throwaway runtime was removed");
+        let live = Connection::open(fixture.0.join("data/memory.db")).unwrap();
+        assert!(live.prepare("SELECT value FROM live_only").is_ok(), "the live memory stays in place");
+
+        fs::write(&archive, "broken ZIP").unwrap();
+        let failed = run_scheduled(&fixture, task, march);
+        assert_eq!(failed.state, RunState::Failed, "the drill must fail when restoration fails");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3, "the failed drill also removes its runtime");
+    }
+
+    #[test]
+    fn monthly_drill_checks_the_fingerprint_of_the_newest_named_archive() {
+        let fixture = Fixture::new("monthly-fingerprint");
+        let context = fixture.context();
+        let db = crate::memory::open_ready_for_runtime(&context).unwrap();
+        db.execute_batch(r#"CREATE TABLE "quoted""table" (value TEXT);
+                            INSERT INTO "quoted""table" VALUES ('fixture');"#).unwrap();
+        let nightly = run_scheduled(
+            &fixture, TaskId::MemoryBackup, timestamp("2026-01-31T04:00:00Z"),
+        );
+        assert_eq!(nightly.state, RunState::Succeeded, "{nightly:?}");
+
+        let root = fixture.0.join("backups/memory");
+        let latest = root.join("qqbot-2026-01-31T04-00-00.zip");
+        fs::write(root.join("qqbot-2026-01-30T04-00-00.zip"), "broken older ZIP").unwrap();
+        fs::File::options().write(true).open(&latest).unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400)).unwrap();
+        db.execute_batch(r#"INSERT INTO "quoted""table" VALUES ('after backup');"#).unwrap();
+        let completed = run_scheduled(
+            &fixture, TaskId::MemoryRestoreTest, timestamp("2026-02-01T05:30:00Z"),
+        );
+        assert_eq!(completed.state, RunState::Succeeded, "the filename timestamp selects the archive: {completed:?}");
+
+        // Keep the ZIP and the database file hash valid while altering the expected fingerprint.
+        use std::io::{Read, Write};
+        let mut archive = zip::ZipArchive::new(fs::File::open(&latest).unwrap()).unwrap();
+        let mut database = Vec::new();
+        archive.by_name("memory.db").unwrap().read_to_end(&mut database).unwrap();
+        let manifest: serde_json::Value = serde_json::from_reader(
+            archive.by_name("manifest.json").unwrap(),
+        ).unwrap();
+        drop(archive);
+        for (date, field) in [
+            ("2026-03-01T05:30:00Z", "table_rows"),
+            ("2026-04-01T05:30:00Z", "schema_sha256"),
+        ] {
+            let mut manifest = manifest.clone();
+            let fingerprint = &mut manifest["memory_fingerprint"];
+            assert_eq!(fingerprint["table_rows"]["quoted\"table"], json!(1));
+            match field {
+                "table_rows" => fingerprint[field]["quoted\"table"] = json!(2),
+                _ => fingerprint[field] = json!("different schema digest"),
+            }
+            let mut writer = zip::ZipWriter::new(fs::File::create(&latest).unwrap());
+            writer.start_file("memory.db", zip::write::FileOptions::default()).unwrap();
+            writer.write_all(&database).unwrap();
+            writer.start_file("manifest.json", zip::write::FileOptions::default()).unwrap();
+            serde_json::to_writer(&mut writer, &manifest).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            let failed = run_scheduled(&fixture, TaskId::MemoryRestoreTest, timestamp(date));
+            assert_eq!(failed.reason.as_deref(), Some("restored memory fingerprint mismatch"),
+                "the drill must reject a mismatched {field}: {failed:?}");
+            assert_eq!(failed.state, RunState::Failed);
+        }
+    }
+
+    fn timestamp(utc: &str) -> i64 {
+        utc.parse::<jiff::Timestamp>().unwrap().as_millisecond()
+    }
+
+    fn run_scheduled(fixture: &Fixture, task: TaskId, at: i64) -> crate::task_runs::RunView {
+        use crate::tasks::Clock;
+        use std::sync::Arc;
+
+        let lead_hours = if task == TaskId::MemoryRestoreTest { 96 } else { 18 };
+        let start = at - lead_hours * 60 * 60 * 1_000;
+        let clock = Arc::new(crate::dependency::ManualClock::new(start));
+        let context = fixture.context();
+        let cfg = context.load_config().unwrap();
+        let api = crate::supervisor::task_api_with_clock(&context, &cfg, clock.clone()).unwrap();
+        let due = {
+            let mut scheduler = api.scheduler.lock().unwrap();
+            // Test against explicit UTC slots regardless of the host's configured zone.
+            scheduler.set_zone(jiff::tz::TimeZone::UTC, start);
+            assert_eq!(scheduler.next_run(task), Some(at), "the next calendar slot must match");
+            clock.set(at - 1);
+            assert!(!scheduler.tick(clock.now_ms()).iter().any(|slot| slot.task == task));
+            clock.set(at);
+            let due = scheduler.tick(clock.now_ms()).into_iter().find(|slot| slot.task == task).unwrap();
+            assert!(!scheduler.tick(clock.now_ms()).iter().any(|slot| slot.task == task));
+            due
+        };
+        let Trigger::Started(run) = api.dispatcher.on_due(due, &crate::supervisor::desired(&context)) else {
+            panic!("scheduled job did not start");
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let view = api.dispatcher.store().get(&run.run_id).unwrap().unwrap();
+            if view.state.is_terminal() {
+                return view;
+            }
+            assert!(Instant::now() < deadline, "scheduled job did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn backup_daily_schedule_refresh_preserves_due_slots_and_applies_changed_time() {
         use crate::tasks::{Schedule, Scheduler};
@@ -1978,16 +2738,291 @@ mod tests {
     }
 
     #[test]
-    fn backup_notice_first_observation_starts_now_and_later_occurrences_alert_once() {
-        use crate::task_runs::{Finish, RunSource};
-        let fixture = Fixture::new("first-observation");
+    fn missed_memory_slots_are_recorded_and_alerted_once_after_restart() {
+        use crate::task_runs::{RunQuery, RunSource};
+        use crate::tasks::Clock;
+
+        let fixture = Fixture::new("missed-memory-slots");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let clock = std::sync::Arc::new(crate::dependency::ManualClock::new(start));
+        let task_api = || crate::supervisor::task_api_with_clock(&context, &config, clock.clone()).unwrap();
+        let observe = |api: &crate::console_tasks::TasksApi| {
+            super::monitor_notices(&context, &config, api.dispatcher.store(), clock.now_ms())
+                .unwrap();
+        };
+        observe(&task_api());
+        // No scheduler ran while either calendar slot elapsed.
+        clock.set(timestamp("2026-02-01T05:30:59Z"));
+        let api = task_api();
+        observe(&api);
+        assert!(api.dispatcher.store().list(&RunQuery {
+            task: Some(TaskId::MemoryRestoreTest.as_str().into()),
+            before: None,
+            limit: None,
+        }).unwrap().runs.is_empty(), "the drill still has its minute of grace");
+        drop(api);
+
+        clock.set(timestamp("2026-02-01T05:31:00Z"));
+        let api = task_api();
+        observe(&api);
+        observe(&api);
+        for (task, slot) in [
+            (TaskId::MemoryBackup, timestamp("2026-02-01T04:00:00Z")),
+            (TaskId::MemoryRestoreTest, timestamp("2026-02-01T05:30:00Z")),
+        ] {
+            let name = task.as_str();
+            let runs = api.dispatcher.store().list(&RunQuery {
+                task: Some(name.into()),
+                before: None,
+                limit: None,
+            }).unwrap().runs;
+            assert_eq!(runs.len(), 1, "one history entry for each missed memory slot: {name}");
+            let run = &runs[0];
+            assert_eq!((run.source, run.state, run.queued_at), (RunSource::Scheduled, RunState::Cancelled, slot));
+            assert!(run.started_at.is_none());
+            assert!(run.reason.as_deref().unwrap().contains("missed"));
+            let notices = context.read_optional_text(
+                crate::runtime::RuntimeArea::Data,
+                &format!("{name}-notices.json"),
+            ).unwrap().unwrap();
+            let notices: serde_json::Value = serde_json::from_str(&notices).unwrap();
+            assert_eq!(notices["seen"].as_object().unwrap().keys().collect::<Vec<_>>(),
+                [&format!("{name}-missed-{slot}")]);
+        }
+    }
+
+    #[test]
+    fn ten_missed_nights_deliver_memory_recovery_notices() {
+        let fixture = Fixture::new("ten-missed-nights");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+        let start = timestamp("2026-01-31T06:00:00Z");
+        let restart = timestamp("2026-02-10T06:00:00Z");
+        let mut limiter = crate::admin_alert::AlertLimiter::new();
+        let mut delivered = Vec::new();
+        let record_delivery = |key: &str, body: &str| {
+            if limiter.check("backup-fixture", key, restart).is_send() {
+                delivered.push(crate::admin_alert::prepare_body(body, str::to_owned));
+            }
+        };
+
+        super::monitor_notices_with(&context, &config, store, start, |_, _| {
+            panic!("first observation must stay quiet");
+        })
+        .unwrap();
+        super::monitor_notices_with(&context, &config, store, restart, record_delivery).unwrap();
+        assert!(
+            delivered.iter().any(|body| body.contains("Memory backup missed")),
+            "ten full-backup misses must leave room for the memory backup notice"
+        );
+        assert!(
+            delivered.iter().any(|body| body.contains("Memory restore test missed")),
+            "ten full-backup misses must leave room for the restore test notice"
+        );
+        assert_eq!(delivered.len(), 1, "one missed-slots notice per pass");
+        assert_eq!(delivered[0].matches("10 missed slots.").count(), 2);
+        super::monitor_notices_with(&context, &config, store, restart, |_, _| {
+            panic!("already reported slots must stay quiet");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn queued_memory_run_recovered_as_unknown_alerts_once() {
+        use crate::task_runs::{Claim, RunSource};
+        use crate::tasks::Due;
+
+        let fixture = Fixture::new("queued-memory-run");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        config["tasks"]["backup"] = json!({"enabled":false});
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let clock = std::sync::Arc::new(crate::dependency::ManualClock::new(start));
+        let task_api = || {
+            crate::supervisor::task_api_with_clock(&context, &config, clock.clone()).unwrap()
+        };
+        let api = task_api();
+        let store = api.dispatcher.store();
+        let no_notice = |_: &str, _: &str| {
+            panic!("expected no backup notice");
+        };
+        super::monitor_notices_with(&context, &config, store, start, no_notice).unwrap();
+
+        let claim = |due: Due| {
+            let Claim::Started(run) = store.claim(
+                due.task.as_str(),
+                RunSource::Scheduled,
+                None,
+                Some(&due.dedup_key()),
+                "scheduler",
+                due.slot,
+            ) else {
+                panic!("fixture slot claim failed");
+            };
+            run
+        };
+        let queued_slot = timestamp("2026-02-01T04:00:00Z");
+        let queued = claim(Due {
+            task: TaskId::MemoryBackup,
+            slot: queued_slot,
+        });
+        let queued_id = queued.run_id().to_owned();
+        super::monitor_notices_with(&context, &config, store, queued_slot + 60_000, no_notice)
+            .unwrap();
+
+        let drill_slot = timestamp("2026-02-01T05:30:00Z");
+        let mut drill = claim(Due {
+            task: TaskId::MemoryRestoreTest,
+            slot: drill_slot,
+        });
+        drill.mark_running(None, drill_slot).unwrap();
+        let drill_id = drill.run_id().to_owned();
+        queued.simulate_crash();
+        drill.simulate_crash();
+        drop(api);
+
+        let restart = drill_slot + 60_000;
+        clock.set(restart);
+        let api = task_api();
+        let store = api.dispatcher.store();
+        for (id, started_at) in [(&queued_id, None), (&drill_id, Some(drill_slot))] {
+            let recovered = store.get(id).unwrap().unwrap();
+            assert_eq!(
+                (recovered.state, recovered.started_at),
+                (RunState::Unknown, started_at)
+            );
+        }
+
+        let mut notices = Vec::new();
+        super::monitor_notices_with(&context, &config, store, restart, |key, _| {
+            notices.push(key.to_owned());
+        })
+        .unwrap();
+        assert_eq!(
+            notices,
+            [format!("memory-backup-missed-{queued_slot}")],
+            "only the recovered run that never started must alert"
+        );
+        assert_eq!(store.list(&Default::default()).unwrap().runs.len(), 2);
+        super::monitor_notices_with(&context, &config, store, restart + 60_000, no_notice).unwrap();
+    }
+
+    #[test]
+    fn unreadable_schedule_preserves_missed_memory_slots_across_restart() {
+        use crate::runtime::RuntimeArea;
+
+        let fixture = Fixture::new("unreadable-schedule");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        crate::schedule::ScheduleStore::new(&context)
+            .set_system_paused("backup", true)
+            .unwrap();
+        let schedule_path = fixture.0.join("data/schedule.json");
+        let readable_schedule = fs::read(&schedule_path).unwrap();
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let restart = timestamp("2026-02-01T05:31:00Z");
+        let no_notice = |_: &str, _: &str| {
+            panic!("expected no backup notice");
+        };
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        super::monitor_notices_with(&context, &config, api.dispatcher.store(), start, no_notice)
+            .unwrap();
+        drop(api);
+        let saved_state = || {
+            [
+                "backup-notices.json",
+                "memory-backup-notices.json",
+                "memory-restore-test-notices.json",
+            ]
+            .map(|file| {
+                context
+                    .read_optional_text(RuntimeArea::Data, file)
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let before = saved_state();
+        fs::write(&schedule_path, b"not json").unwrap();
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+        let unreadable = super::monitor_notices_with(&context, &config, store, restart, no_notice);
+        assert_eq!(
+            saved_state(),
+            before,
+            "an unreadable schedule must preserve the notice cursors and signatures"
+        );
+        assert!(unreadable.is_err());
+
+        fs::write(&schedule_path, readable_schedule).unwrap();
+        let mut notices = Vec::new();
+        super::monitor_notices_with(&context, &config, store, restart + 60_000, |_, body| {
+            notices.push(body.to_owned());
+        })
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Memory backup missed"));
+        assert!(notices[0].contains("Memory restore test missed"));
+        assert_eq!(store.list(&Default::default()).unwrap().runs.len(), 2);
+        super::monitor_notices_with(&context, &config, store, restart + 120_000, no_notice)
+            .unwrap();
+    }
+
+    struct NoticeFixture {
+        fixture: Fixture,
+        config_path: PathBuf,
+        context: RuntimeContext,
+        config: serde_json::Value,
+        schedule: crate::tasks::Schedule,
+        zone: jiff::tz::TimeZone,
+    }
+
+    fn notice_fixture(name: &str) -> NoticeFixture {
+        let fixture = Fixture::new(name);
         let config_path = fixture.0.join("config/config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         config["backup"] = json!({"time":"04:00"});
         config["tasks"]["backup"] = json!({"enabled":true});
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let now = crate::parity_clock::now_ms();
+        let context = fixture.context();
+        let config = context.load_config().unwrap();
+        let zone = crate::local_time::configured_zone(&config);
+        let schedule =
+            crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
+        NoticeFixture {
+            fixture,
+            config_path,
+            context,
+            config,
+            schedule,
+            zone,
+        }
+    }
+
+    #[test]
+    fn backup_notice_first_observation_starts_now_and_later_occurrences_alert_once() {
+        use crate::task_runs::{Finish, RunSource};
+        let NoticeFixture {
+            fixture,
+            config_path,
+            context,
+            config,
+            schedule,
+            zone,
+        } = notice_fixture("first-observation");
+        let first_slot =
+            crate::tasks::next_due(schedule, crate::parity_clock::now_ms(), &zone).unwrap();
+        // Anchor 10 minutes past a scheduled slot so `now..=now + 180_000` always has
+        // >22 hours of headroom before the next daily slot across timezones and DST.
+        let now = first_slot + 600_000;
         let days = |n: u64| Duration::from_secs(n * 86_400);
         let wall = std::time::UNIX_EPOCH + Duration::from_millis(now as u64);
         fs::File::options()
@@ -1996,8 +3031,6 @@ mod tests {
             .unwrap()
             .set_modified(wall - days(9))
             .unwrap();
-        let context = fixture.context();
-        let config = context.load_config().unwrap();
         let api = crate::supervisor::task_api(&context, &config).unwrap();
         let store = api.dispatcher.store();
         let failed = |reason: &str| Finish::Failed {
@@ -2028,14 +3061,44 @@ mod tests {
         super::monitor_notices(&context, &config, store, now + 180_000).unwrap();
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
 
-        let schedule = crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
-        let slot = crate::tasks::next_due(schedule, now + 180_000, &crate::local_time::configured_zone(&config))
-            .unwrap();
+        let slot = crate::tasks::next_due(schedule, now + 180_000, &zone).unwrap();
         super::monitor_notices(&context, &config, store, slot + 61_000).unwrap();
         let mut expected = expected;
         expected.insert(format!("backup-missed-{slot}"));
         assert_eq!(claimed_notices(&fixture), expected, "a later missed slot alerts once");
         super::monitor_notices(&context, &config, store, slot + 3_600_000).unwrap();
+        assert_eq!(claimed_notices(&fixture), expected, "and only once");
+    }
+
+    #[test]
+    fn backup_notice_first_observation_near_slot_boundary_alerts_once_when_slot_passes() {
+        let NoticeFixture {
+            fixture,
+            context,
+            config,
+            schedule,
+            zone,
+            ..
+        } = notice_fixture("near-slot-boundary");
+        let first_slot =
+            crate::tasks::next_due(schedule, crate::parity_clock::now_ms(), &zone).unwrap();
+        let now = first_slot - 60_000;
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+
+        super::monitor_notices(&context, &config, store, now).unwrap();
+        assert!(claimed_notices(&fixture).is_empty());
+
+        super::monitor_notices(&context, &config, store, first_slot + 61_000).unwrap();
+        let expected: std::collections::BTreeSet<_> =
+            [format!("backup-missed-{first_slot}")].into();
+        assert_eq!(
+            claimed_notices(&fixture),
+            expected,
+            "missed slot alerts once when crossed"
+        );
+
+        super::monitor_notices(&context, &config, store, first_slot + 180_000).unwrap();
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
     }
 

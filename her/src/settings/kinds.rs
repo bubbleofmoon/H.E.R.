@@ -1,6 +1,7 @@
 //! Setting kinds: each kind is a struct in its own file implementing `SettingKind`, the one interface the registry,
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
+mod bounded_number;
 mod choice;
 mod daily_time;
 mod id_list;
@@ -11,12 +12,14 @@ mod rollout_list;
 mod probability;
 mod route_id;
 mod route_list;
+mod route_tokens;
 mod secret;
 mod switch;
 mod text;
 mod time_zone;
 mod voice_number;
 
+pub(crate) use bounded_number::BoundedNumber;
 pub(crate) use choice::Choice;
 pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
@@ -29,7 +32,8 @@ pub(crate) use rollout_list::RolloutList;
 pub(crate) use probability::Probability;
 pub(crate) use route_id::RouteId;
 pub(crate) use route_list::RouteList;
-pub(crate) use secret::ApiKey;
+pub(crate) use route_tokens::RouteTokens;
+pub(crate) use secret::{AdministratorPasswordPhc, ApiKey};
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
 pub(crate) use time_zone::TimeZoneName;
@@ -95,7 +99,7 @@ pub(crate) trait SettingKind: Sync {
     }
 
     /// Whether a change of this kind is an access change, revoked like a whitelist write (an allow or deny list, the
-    /// owner: `console::access_setting_change`).
+    /// owner: `config_tx::commit_access_setting_change`).
     fn access(&self) -> bool {
         false
     }

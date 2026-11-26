@@ -200,7 +200,7 @@ pub fn handle_update_command(
         // this exact report has a confirmed QQ receipt and the owner is rechecked.
         say(&lines.join("\n"))?;
         let Some((name, version)) = proposed else { return Ok(()); };
-        let _gate = crate::console::acquire_social_state_gate(context).map_err(|(_, error)| error)?;
+        let _gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
         let latest = context.load_config().map_err(str::to_string)?;
         if !is_owner_key(&latest, key) || owner_qq(&latest) != sender { return Err("administrator changed".into()); }
         return crate::supervisor_dependencies::upgrades::approve(context, &latest, name, &version).map(|_| ());
@@ -220,19 +220,28 @@ pub fn handle_update_command(
         "准备更新 HER：{} → {tag}。",
         state["current"].as_str().unwrap_or("未知版本")
     ))?;
-    let _gate = crate::console::acquire_social_state_gate(context).map_err(|(_, error)| error)?;
-    let latest = context.load_config().map_err(str::to_string)?;
-    if !is_owner_key(&latest, key) || owner_qq(&latest) != sender {
-        return Err("administrator changed".into());
-    }
-    crate::release::approve(context, &latest, tag).map(|_| ())
+    crate::release::approve_authorized_under_turn_guard(context, tag, || {
+        let gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
+        let latest = context.load_config().map_err(str::to_string)?;
+        if !is_owner_key(&latest, key) || owner_qq(&latest) != sender {
+            return Err("administrator changed".into());
+        }
+        Ok((gate, latest))
+    })
+    .map(|_| ())
+    .map_err(|error| match error {
+        crate::release::ApproveError::Release(error)
+        | crate::release::ApproveError::Authorize(error) => error,
+    })
 }
 
-/// The /update reply when nothing can be approved: a discovery refusal or error is
-/// reported, never hidden behind "no update".
+/// The /update reply reports discovery failures and recovered authority distinctly.
 fn no_update_reply(state: &Value) -> String {
     let current = state["current"].as_str().unwrap_or("未知版本");
     match state["error"].as_str() {
+        Some(crate::update::LOST_CURRENT) => format!(
+            "HER 当前版本：{current}；暂无可用更新。当前版本的发布元数据无法验证，已使用可信的已安装版本检查更新。请在控制台检查。"
+        ),
         Some(error) => format!("HER 当前版本：{current}；更新检查未通过：{error}。请在控制台检查。"),
         None => format!("HER 当前版本：{current}；暂无可用更新（或更新已关闭）。"),
     }
@@ -485,7 +494,8 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
             }
             "/active" | "/speak" => return Decision::SetRoleMode { mode: "active", say: "已退出静默模式，恢复正常回复。" },
             other if other == "/role" || other.starts_with("/role ") => {
-                let name = crate::console::sanitize_role_name(crate::role::js_trim(&f.plain.chars().skip(5).collect::<String>()));
+                let raw = f.plain.chars().skip(5).collect::<String>();
+                let name = crate::role::sanitize_name(crate::role::js_trim(&raw));
                 if name.is_empty() || name == "off" || name == "clear" {
                     return Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".to_string() };
                 }
@@ -608,6 +618,9 @@ pub struct SendReport {
     pub parts: usize,
     pub confirmed: usize,
     pub error: Option<String>,
+    /// At least one part may have reached QQ without confirmation.
+    pub delivery_unknown: bool,
+    /// Recovery lacks durable proof of at least one outcome.
     pub unknown: bool,
 }
 
@@ -634,12 +647,13 @@ pub fn send_recorded(
     delay_ms: u64,
     guard: &dyn Fn() -> Result<(), String>,
 ) -> SendReport {
-    crate::recorded_send::off_worker(|| {
-        send_recorded_inline(context, ob, key, epoch, purpose, text, delay_ms, guard)
+    send_recorded_with_chain(context, ob, key, epoch, purpose, text, delay_ms, guard, || {
+        Ok(crate::recorded_send::send_chain())
     })
 }
 
-fn send_recorded_inline(
+/// Enter the send chain with any additional locks the caller needs through delivery.
+pub(crate) fn send_recorded_with_chain<Locks>(
     context: &RuntimeContext,
     ob: &OneBot,
     key: &str,
@@ -648,31 +662,67 @@ fn send_recorded_inline(
     text: &str,
     delay_ms: u64,
     guard: &dyn Fn() -> Result<(), String>,
+    acquire_chain: impl FnOnce() -> Result<Locks, String>,
 ) -> SendReport {
-    use crate::recorded_send::{send_chain, BeginError, History, Proof, Recorded, BATCH_BUSY};
+    crate::recorded_send::off_worker(|| {
+        send_recorded_inline(context, ob, key, epoch, purpose, text, delay_ms, guard, acquire_chain)
+    })
+}
+
+fn send_recorded_inline<Locks>(
+    context: &RuntimeContext,
+    ob: &OneBot,
+    key: &str,
+    epoch: &str,
+    purpose: &str,
+    text: &str,
+    delay_ms: u64,
+    guard: &dyn Fn() -> Result<(), String>,
+    acquire_chain: impl FnOnce() -> Result<Locks, String>,
+) -> SendReport {
+    use crate::recorded_send::{BeginError, History, Proof, Recorded, BATCH_BUSY};
     use crate::send_outbox::ItemState;
     let mut report = SendReport::default();
     let (Some(target), Some((kind, id_s))) = (target_of(key), key.split_once(':')) else {
         report.error = Some(format!("无效会话 {key}"));
         return report;
     };
-    let canonical = crate::outbound_message::normalize(text);
-    // The wire renderer trims bubble boundaries. Persist those exact parts, including when
-    // the preferred newline boundary or a whitespace-only part came from the length splitter.
-    let parts: Vec<_> = crate::onebot::split_message(&canonical, QQ_PART_LIMIT).into_iter()
-        .map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()).collect();
+    let literal = purpose == crate::send_outbox::PERSONA_FAILURE_SEND;
+    let parts = if literal {
+        vec![text.to_owned()]
+    } else {
+        let canonical = crate::outbound_message::normalize(text);
+        // The wire renderer trims bubble boundaries. Persist those exact parts.
+        crate::onebot::split_message(&canonical, QQ_PART_LIMIT).into_iter()
+            .map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()).collect()
+    };
     report.parts = parts.len();
     if parts.is_empty() {
         return report;
     }
     // Owner rule (issue #70): a chat send may wait briefly behind another send in exchange for
     // one runner per batch and no blind duplicate.
-    let _chain = send_chain();
+    let _locks = match acquire_chain() {
+        Ok(locks) => locks,
+        Err(error) => {
+            report.error = Some(error);
+            return report;
+        }
+    };
+    if literal {
+        if let Err(why) = guard() {
+            report.error = Some(why);
+            return report;
+        }
+    }
     let delays: Vec<i64> = vec![delay_ms as i64; parts.len().saturating_sub(1)];
-    let fields = json!({
+    let mut fields = json!({
         "key": key, "epoch": epoch, "purpose": purpose, "messages": parts,
         "delays": delays, "replyTo": Value::Null, "atUser": Value::Null
     });
+    if literal {
+        fields["messages"] = json!([crate::onebot::escape_cq(text)]);
+    }
     let recorded = match Recorded::begin(context, now_ms, now_ms(), fields) {
         Ok(recorded) => recorded,
         Err(BeginError::Busy) => {
@@ -718,9 +768,14 @@ fn send_recorded_inline(
             report.error.get_or_insert(why.clone());
             continue;
         }
-        let outcome = ob.send_one_outcome(&target, part, None, None);
-        let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
-        report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
+        let (outcome, proof) = if literal {
+            (ob.send_payload_outcome(target.action(), &OneBot::literal_payload(&target, part)), Proof::LiteralText(part))
+        } else {
+            (ob.send_one_outcome(&target, part, None, None), Proof::Text(part))
+        };
+        let settled = recorded.settle(idx, attempt_ms, outcome, &history, proof, &confirmed_ids);
+        report.delivery_unknown |= settled.state.needs_verification();
+        report.unknown |= report.delivery_unknown || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;
             confirmed_ids.extend(message_id);
@@ -950,9 +1005,11 @@ impl Hub {
         let context = self.context.clone();
         let guard_cfg = cfg.clone();
         let guard_key = key.to_string();
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         let guard = move || -> Result<(), String> {
-            if crate::console::runtime_mode(&context) != mode || !matches!(mode.as_str(), "chat" | "closed-agent") {
+            if crate::social_state::mode(&context) != mode
+                || !matches!(mode.as_str(), "chat" | "closed-agent")
+            {
                 return Err("模式已变化".to_string());
             }
             if !allowed_in_mode(&guard_cfg, &mode, &guard_key) {
@@ -994,7 +1051,10 @@ impl Hub {
         }
         let owner = owner_qq(cfg);
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
-        if is_owner && !plain.is_empty() && crate::console::runtime_mode(&self.context) == "closed-agent" {
+        if is_owner
+            && !plain.is_empty()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             if let Some(interactions) = &self.interactions {
                 let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
                 use crate::harness::interactions::Answer;
@@ -1027,7 +1087,7 @@ impl Hub {
                 }
             }
         }
-        let role_state = crate::console::chat_role_state(&self.context)?;
+        let role_state = crate::social_state::role_state(&self.context)?;
         let role = role_state.get("role").and_then(Value::as_str).map(str::to_string);
         let role_mode = role_state.get("mode").and_then(Value::as_str).unwrap_or("active").to_string();
         let session = crate::session_map::lookup(&self.context, &key)?;
@@ -1063,23 +1123,27 @@ impl Hub {
                 if crate::persona::applies(&self.context) {
                     self.say(cfg, &key, crate::persona_command::ROLE_RETIRED);
                 } else {
-                    crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    crate::social_state::write_role_state(
+                        &self.context,
+                        name.as_deref(),
+                        &role_mode,
+                    )?;
                     self.say(cfg, &key, &say);
                 }
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }
             Decision::SetRoleMode { mode, say } => {
-                crate::console::chat_write_role_state(&self.context, role.as_deref(), mode)?;
+                crate::social_state::write_role_state(&self.context, role.as_deref(), mode)?;
                 self.say(cfg, &key, say);
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }
             Decision::Reset => {
-                match crate::console::chat_reset_conversation(&self.context, &key) {
-                    Ok(()) => self.say(cfg, &key, "已重置会话，下次消息将开新上下文"),
-                    Err((404, _)) => {}
-                    Err((_, error)) => {
+                match crate::social_state::reset_conversation(&self.context, &key) {
+                    Ok(_) => self.say(cfg, &key, "已重置会话，下次消息将开新上下文"),
+                    Err(crate::social_state::SocialError::NotFound(_)) => {}
+                    Err(error) => {
                         println!("[chat] {key} 重置失败：{error}");
                         self.say(cfg, &key, &format!("重置失败：{error}"));
                     }
@@ -1113,7 +1177,7 @@ impl Hub {
                     &text,
                     &media_hint(&message_ref, media_count(&inb.message)),
                 );
-                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::console::runtime_mode(&self.context), owner: is_owner, resets: None, mode_stamp: None, admission_retries: 0 });
+                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::social_state::mode(&self.context), owner: is_owner, resets: None, mode_stamp: None, admission_retries: 0 });
                 Ok(Outcome::Dispatched { plain, sender })
             }
         }
@@ -1141,7 +1205,7 @@ impl Hub {
 
 /// Why a queued job must not run any more (its epoch ended), or `None` when it is still current.
 fn stale_job(context: &RuntimeContext, cfg: &Value, key: &str, job: &Job) -> Option<&'static str> {
-    if crate::console::runtime_mode(context) != job.mode || !allowed_in_mode(cfg, &job.mode, key) {
+    if crate::social_state::mode(context) != job.mode || !allowed_in_mode(cfg, &job.mode, key) {
         return Some("");
     }
     // Fail closed: a job whose epoch cannot be proven current (not read at dispatch, or not
@@ -1340,13 +1404,22 @@ mod tests {
 
     #[test]
     fn update_reply_surfaces_a_discovery_refusal_instead_of_no_update() {
-        let refused = "release checksum signature missing, invalid or untrusted";
-        let reply = no_update_reply(&json!({"current":"v1.2.3","available":null,"error":refused}));
-        assert!(reply.contains(refused), "{reply}");
-        assert!(reply.contains("v1.2.3"), "{reply}");
-        assert!(!reply.contains("暂无可用更新"), "{reply}");
-        let reply = no_update_reply(&json!({"current":"v1.2.3","available":null,"error":null}));
-        assert!(reply.contains("暂无可用更新"), "{reply}");
+        for (error, expected) in [
+            (
+                Some("release checksum signature missing, invalid or untrusted"),
+                "HER 当前版本：v1.2.3；更新检查未通过：release checksum signature missing, invalid or untrusted。请在控制台检查。",
+            ),
+            (
+                Some(crate::update::LOST_CURRENT),
+                "HER 当前版本：v1.2.3；暂无可用更新。当前版本的发布元数据无法验证，已使用可信的已安装版本检查更新。请在控制台检查。",
+            ),
+            (None, "HER 当前版本：v1.2.3；暂无可用更新（或更新已关闭）。"),
+        ] {
+            assert_eq!(
+                no_update_reply(&json!({"current":"v1.2.3","available":null,"error":error})),
+                expected
+            );
+        }
     }
 
     struct Fake {

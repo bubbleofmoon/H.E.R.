@@ -163,7 +163,7 @@ async fn cli_pin_added_at_admission(expire: bool) {
     let runtime = SeamRuntime::new("seam-cli-pin-at-admission", "reserved2", false, queued);
     let queued = runtime.cfg();
     let key = "group:42";
-    let token = crate::console::ensure_or_rotate_agent_token(&runtime.context, key, false).unwrap();
+    let token = crate::social_state::ensure_or_rotate(&runtime.context, key, false).unwrap();
     let gate = crate::engine_switch::turn_gate(&runtime.context, key).await.unwrap();
     let mut pipe = Pipeline::new_without_dsh(&runtime.context, &queued, true).unwrap();
     pipe.expect_dispatch_token(token);

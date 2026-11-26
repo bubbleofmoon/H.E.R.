@@ -1,19 +1,15 @@
-//! The Digest module: reads stored conversation evidence after its cursor, asks a model through a port and writes inferences with bridge-set provenance. The nightly job, the backlog check and reserved2 idle rotation all call it.
+//! The Digest module: reads stored conversation evidence after its cursor, asks a model through
+//! `harness::one_shot` and writes inferences with bridge-set provenance. The nightly job, the
+//! backlog check and reserved2 idle rotation all call it.
 mod conversation;
 mod evidence;
-mod model;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use conversation::{Digest, DigestError, Limits, Outcome};
-pub(crate) use model::{model_for, DigestModel, ModelError};
 use conversation::Hold;
-#[cfg(test)]
-pub(crate) use model::install_test_model;
-/// What the digest's model port reads from the configuration (`settings_tests`).
-#[cfg(test)]
-pub(crate) use model::{model_id as digest_model_id, timeout as digest_timeout};
-/// The digest's model prompt, for the model-visible text guard (`console::tests::model_text_guard_tests`).
+/// The digest's model prompt, for the model-visible text guard
+/// (`console::tests::model_text_guard_tests`).
 #[cfg(test)]
 pub(crate) use conversation::PROMPT as DIGEST_PROMPT;
 
@@ -60,9 +56,9 @@ fn check_min_messages(cfg: &Value) -> usize {
 }
 
 pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel: &AtomicBool) -> Finish {
-    let current = match context.runtime_root().and_then(|root| RuntimeContext::from_root(root).ok()) {
-        Some(context) => context,
-        None => return failed("selected digest runtime unavailable"),
+    let current = match context.refreshed() {
+        Ok(context) => context,
+        Err(_) => return failed("selected digest runtime unavailable"),
     };
     let context = &current;
     // Once stop is observed, it stays in force for the whole job.
@@ -99,7 +95,7 @@ pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel:
     if is_cancelled() {
         return cancelled();
     }
-    let model = match model_for(context, &cfg) {
+    let model = match crate::harness::one_shot::digest_model(context, &cfg) {
         Ok(model) => model,
         Err(error) => return failed(&format!("digest model unavailable: {}", error.0)),
     };

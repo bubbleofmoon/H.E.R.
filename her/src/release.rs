@@ -9,9 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 use std::{
-    io::Read,
     path::Path,
-    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -42,102 +40,70 @@ pub fn settings(cfg: &Value) -> Result<Value, String> {
 }
 
 pub(crate) fn validate_url(raw: &str) -> Result<(), String> {
-    let url = url::Url::parse(raw).map_err(|_| "release URL is invalid")?;
-    let loopback = url.host_str().is_some_and(|h| {
-        h == "localhost"
-            || h.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
-    {
-        return Err("release URL requires HTTPS or a loopback HTTP fixture, without credentials or fragment".into());
-    }
-    Ok(())
+    crate::guarded_fetch::validate_url_syntax(
+        raw,
+        crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+    )
+    .map(|_| ())
 }
 
-/// Curl owns TLS, runs hidden, has no inherited curlrc, and is bounded in time and bytes.
+fn fetch_with_policy(
+    raw: &str,
+    max: usize,
+    policy: crate::guarded_fetch::FetchPolicy,
+) -> Result<Vec<u8>, String> {
+    let options = crate::guarded_fetch::FetchOptions {
+        policy,
+        max_bytes: max,
+        max_redirects: 5,
+        budget: crate::guarded_fetch::BudgetMode::PerHop {
+            hop_timeout: Duration::from_secs(30),
+            attempt_cap: Some(Duration::from_secs(10)),
+        },
+        connect_timeout: Some(Duration::from_secs(5)),
+        max_addresses: 4,
+        min_remaining: Duration::ZERO,
+        headers: vec![("user-agent".into(), "HER-release-manager".into())],
+        strip_fragment_on_redirect: true,
+        pass_max_filesize: true,
+        accept: None,
+        #[cfg(test)]
+        allow_loopback_pin_for_test: false,
+    };
+    crate::guarded_fetch::fetch_bytes_with(
+        raw,
+        &options,
+        &crate::guarded_fetch::SystemDnsResolver,
+        &crate::guarded_fetch::CurlTransfer,
+    )
+    .map(|out| out.bytes)
+}
+
+/// Guarded release download over `guarded_fetch` (HTTPS or loopback HTTP fixture, public IP
+/// pinning, revalidated redirects, bounded time and bytes, hardened curl).
 pub(crate) fn fetch(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_url(raw)?;
-    transfer(raw,max,"=https")
+    fetch_with_policy(
+        raw,
+        max,
+        crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+    )
 }
 
 /// Preserve the managed npm install's existing HTTP(S), credential-free registry contract.
 pub(crate) fn validate_registry_url(raw: &str) -> Result<(), String> {
-    let url=url::Url::parse(raw).map_err(|_|"dependencies.dsh.registry is invalid")?;
-    if !matches!(url.scheme(),"http"|"https") || !url.username().is_empty() || url.password().is_some() {
-        return Err("dependencies.dsh.registry must be an http(s) URL without credentials".into());
-    }
-    Ok(())
+    crate::guarded_fetch::validate_url_syntax(
+        raw,
+        crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
+    )
+    .map(|_| ())
 }
+
 pub(crate) fn fetch_registry(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_registry_url(raw)?;
-    transfer(raw,max,"=https,http")
-}
-fn transfer(raw: &str, max: usize, redirects: &str) -> Result<Vec<u8>, String> {
-    let mut child =
-        crate::subprocess::command_without_console(if cfg!(windows) { "curl.exe" } else { "curl" })
-            .args([
-                "-q",
-                "--silent",
-                "--fail",
-                "--location",
-                "--max-redirs",
-                "5",
-                "--proto",
-                "=https,http",
-                "--proto-redir",
-                redirects,
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "30",
-                "--user-agent",
-                "HER-release-manager",
-                "--max-filesize",
-                &max.to_string(),
-                "--url",
-                raw,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "release transfer could not start")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("release transfer pipe unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(max as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(35);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("release transfer timed out or became unavailable");
-            }
-        }
-    };
-    let bytes = reader
-        .join()
-        .map_err(|_| "release transfer reader failed")?
-        .map_err(|_| "release transfer read failed")?;
-    if !status?.success() || bytes.len() > max {
-        return Err("release transfer failed or exceeded its size limit".into());
-    }
-    Ok(bytes)
+    fetch_with_policy(
+        raw,
+        max,
+        crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,14 +295,27 @@ pub fn install(
     let root = installation()?;
     version(&release.tag).ok_or("release tag must be vX.Y.Z")?;
     required_assets(release)?;
-    let _update = installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
-    if !newer(release, current(&root).as_deref()) {
+    let update_gate =
+        installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
+    install_with_gate(context, &root, release, lost_alerted, &update_gate)
+}
+
+fn install_with_gate(
+    context: &RuntimeContext,
+    root: &InstallRoot,
+    release: &Release,
+    lost_alerted: &mut Option<String>,
+    update_gate: &fs::File,
+) -> Result<InstalledRelease, String> {
+    version(&release.tag).ok_or("release tag must be vX.Y.Z")?;
+    required_assets(release)?;
+    if !newer(release, current(root).as_deref()) {
         return Err(release_signature::REFUSED.into());
     }
     let releases = root.root().join("releases");
     directory(&releases)?;
     let _gate = installation_gate(&releases.join(".install.lock"))?;
-    recover_staging(&root, &releases)?;
+    recover_staging(root, &releases)?;
     let target = releases.join(&release.tag);
     if fs::symlink_metadata(&target).is_ok() {
         return Err("release folder already exists; it will not be overwritten".into());
@@ -349,7 +328,7 @@ pub fn install(
             .expect("required_assets checked")
             .url
     };
-    let authority = crate::update::admitted_authority(&root, Some(&_update), lost_alerted)?;
+    let authority = crate::update::admitted_authority(root, Some(update_gate), lost_alerted)?;
     let (checksum, signature) = signed_list(release, &authority).inspect_err(|error| {
         if let Ok(cfg) = context.load_config() {
             signature_notice(context, &cfg, error);
@@ -431,7 +410,10 @@ impl Default for CheckState {
     }
 }
 fn read_state(context: &RuntimeContext) -> Result<CheckState, String> {
-    let trust = cache_authority()?;
+    read_state_for(&InstallRoot::configured()?, context)
+}
+fn read_state_for(root: &InstallRoot, context: &RuntimeContext) -> Result<CheckState, String> {
+    let trust = cache_authority_for(root)?;
     let Some(text) = context
         .read_optional_text(crate::runtime::RuntimeArea::Data, "releases.json")
         .map_err(str::to_string)?
@@ -455,12 +437,19 @@ fn stamp_of(authority: &Result<crate::update::Authority, String>) -> String {
         .as_ref()
         .map_or_else(|_| REFUSED_STAMP.into(), |authority| authority.stamp.clone())
 }
-fn cache_authority() -> Result<String, String> {
-    Ok(stamp_of(&crate::update::authority(&InstallRoot::configured()?)))
+fn cache_authority_for(root: &InstallRoot) -> Result<String, String> {
+    Ok(stamp_of(&crate::update::authority(root)))
 }
 fn save_state(context: &RuntimeContext, state: &CheckState) -> Result<(), String> {
+    save_state_for(&InstallRoot::configured()?, context, state)
+}
+fn save_state_for(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    state: &CheckState,
+) -> Result<(), String> {
     // Never stamp decisions with authority newer than the one that verified them.
-    if state.trust != cache_authority()? {
+    if state.trust != cache_authority_for(root)? {
         return Err("current release changed during discovery".into());
     }
     context.write_atomic(
@@ -478,13 +467,14 @@ pub fn status(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     let settings = settings(cfg)?;
     let state = read_state(context)?;
     let current = current(&InstallRoot::configured()?);
-    let available = state.available.filter(|release| {
-        settings["policy"] != "off"
-            && state.feed_url == settings["feedUrl"].as_str().unwrap()
-            && newer(release, current.as_deref())
-    });
+    let active_feed = settings["policy"] != "off"
+        && state.feed_url == settings["feedUrl"].as_str().unwrap();
+    let available = state
+        .available
+        .filter(|release| active_feed && newer(release, current.as_deref()));
+    let error = state.error.filter(|_| active_feed);
     Ok(
-        json!({"ok":true,"settings":settings,"current":current,"available":available,"lastCheckedAt":state.last_checked_at,"error":state.error,"approval":state.approval,"updateError":state.update_error}),
+        json!({"ok":true,"settings":settings,"current":current,"available":available,"lastCheckedAt":state.last_checked_at,"error":error,"approval":state.approval,"updateError":state.update_error}),
     )
 }
 
@@ -508,21 +498,158 @@ fn approval_installation(context: &RuntimeContext) -> Result<InstallRoot, String
     Ok(root)
 }
 
+/// Canonical lock acquisition hierarchy across release, turn, and configuration gates:
+///
+/// 1. `runtime/data/locks/update-restore.lock` (`restore_gate`)
+/// 2. `locks/turn-update.lock`
+/// 3. `locks/release-check.lock` (`release_check_gate`)
+/// 4. `locks/social-v2.lock` (`SOCIAL_STATE_GATE` / `social_state::acquire_config_gate` / `conversation_state::acquire`)
+///
+/// Every caller across `release.rs`, `update.rs`, `handover.rs`, `dependency_upgrade.rs`,
+/// `engine_switch.rs`, `restore.rs`, `console.rs`, and `chat.rs` acquires locks strictly in
+/// ascending order (`1 -> 2 -> 3 -> 4`) and never waits on a lower-numbered lock while holding
+/// a higher-numbered one. Callers already holding shared `(2) turn-update.lock` (such as
+/// `chat::handle_update_command` via `approve_authorized_under_turn_guard`) acquire `(3) -> (4)`
+/// and only probe `(1)` non-blockingly via `gate_contended` without holding or waiting on `(1)`.
+const GATE_RETRY_WINDOW: Duration = Duration::from_millis(500);
+const GATE_RETRY_STEP: Duration = Duration::from_millis(20);
+
+fn retry_contended_gate<T>(
+    is_contended: impl Fn(&str) -> bool,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = Instant::now() + GATE_RETRY_WINDOW;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_contended(&error) && Instant::now() < deadline => {
+                std::thread::sleep(GATE_RETRY_STEP);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn restore_gate(root: &InstallRoot) -> Result<fs::File, String> {
+    retry_contended_gate(
+        |error| error == "another release installation or restore is running",
+        || {
+            crate::release_store::installation_gate(
+                &root.root().join("runtime/data/locks/update-restore.lock"),
+            )
+        },
+    )
+}
+
+fn release_check_gate(context: &RuntimeContext) -> Result<fs::File, String> {
+    retry_contended_gate(
+        |error| error == "runtime file is already locked",
+        || {
+            context.open_locked_file(
+                crate::runtime::RuntimeArea::Data,
+                "locks/release-check.lock",
+            )
+        },
+    )
+}
+
+pub enum ApproveError<E> {
+    Release(String),
+    Authorize(E),
+}
+
 /// Approval binds to the version displayed by discovery; it never silently chooses a newer tag.
-pub fn approve(context: &RuntimeContext, cfg: &Value, tag: &str) -> Result<Value, String> {
-    let root = approval_installation(context)?;
+///
+/// Follows the canonical 4-lock hierarchy (`1 -> 3 -> 4`): acquires `restore_gate` (1) then
+/// `release_check_gate` (3) before running `authorize` (which acquires `SOCIAL_STATE_GATE` (4)
+/// and returns `(gate, latest_cfg)`), then drops `(4) -> (3) -> (1)` on return.
+pub fn approve_authorized<G, E, F>(
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    let root = approval_installation(context).map_err(ApproveError::Release)?;
+    approve_authorized_in_root(&root, context, tag, authorize)
+}
+
+/// Approval variant for callers that already hold shared `(2) turn-update.lock` (`turn_guard`):
+/// follows `2 -> 3 -> 4` and probes `(1) update-restore.lock` non-blockingly via `gate_contended`
+/// without holding or waiting on `(1)`.
+pub fn approve_authorized_under_turn_guard<G, E, F>(
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    let root = approval_installation(context).map_err(ApproveError::Release)?;
+    approve_authorized_under_turn_guard_in_root(&root, context, tag, authorize)
+}
+
+fn approve_authorized_in_root<G, E, F>(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
     // Do not queue a second attempt while a helper is judging this candidate.
     // In particular, a drained /update reply must not reapprove it for rollback.
-    let _installation = crate::release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
-    )?;
-    let mut state = read_state(context)?;
+    let _installation = restore_gate(root).map_err(ApproveError::Release)?;
+    approve_with_release_check(root, context, tag, false, authorize)
+}
+
+fn approve_authorized_under_turn_guard_in_root<G, E, F>(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    approve_with_release_check(root, context, tag, true, authorize)
+}
+
+fn approve_with_release_check<G, E, F>(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    tag: &str,
+    probe_restore_gate: bool,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    let _gate = release_check_gate(context).map_err(ApproveError::Release)?;
+    let (_config_gate, cfg) = authorize().map_err(ApproveError::Authorize)?;
+    if probe_restore_gate
+        && crate::release_store::gate_contended(
+            &root.root().join("runtime/data/locks/update-restore.lock"),
+        )
+    {
+        return Err(ApproveError::Release(
+            "another release installation or restore is running".into(),
+        ));
+    }
+    approve_with_gates(root, context, &cfg, tag).map_err(ApproveError::Release)
+}
+
+fn approve_with_gates(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    cfg: &Value,
+    tag: &str,
+) -> Result<Value, String> {
+    let mut state = read_state_for(root, context)?;
     let settings = settings(cfg)?;
-    let current = current(&root).ok_or("current release unavailable")?;
+    let current = current(root).ok_or("current release unavailable")?;
     let release = state
         .available
         .as_ref()
@@ -544,7 +671,7 @@ pub fn approve(context: &RuntimeContext, cfg: &Value, tag: &str) -> Result<Value
         automatic: false,
     });
     state.update_error = None;
-    save_state(context, &state)?;
+    save_state_for(root, context, &state)?;
     Ok(json!({"ok":true,"current":current,"approved":tag}))
 }
 
@@ -580,35 +707,49 @@ fn ledger_idle(context: &RuntimeContext) -> Result<bool, String> {
 
 /// Only the supervisor consumes approvals. Auto attempts once per admitted discovery check;
 /// an administrator can explicitly retry a candidate that was already staged.
+///
+/// Follows the canonical 4-lock hierarchy (`1 -> 2 -> 3`): peeks state under (3); for auto
+/// acquires `update-restore.lock` (1) BEFORE `locks/turn-update.lock` (2) outside (3),
+/// re-reads/claims under (3) strictly in `1 -> 2 -> 3` order, downloads/verifies under `(1, 2)`
+/// (or outside all gates for manual), drops (2), then holds `(1) -> (3)` to publish and pass
+/// the held `update-restore.lock` directly into `handover_with_policy_gate`.
 fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
-    )?;
-    let mut state = read_state(context)?;
-    let cfg = context.load_config().map_err(str::to_string)?;
-    let settings = settings(&cfg)?;
-    if state.approval.is_none()
-        && settings["policy"] == "auto"
-        && settings["feedUrl"] == state.feed_url
-    {
-        let root = approval_installation(context)?;
-        let current = current(&root).ok_or("current release unavailable")?;
-        if let Some(release) = state.available.as_ref().filter(|release| {
-            newer(release, Some(&current)) && state.auto_attempted.as_deref() != Some(&release.tag)
-        }) {
-            state.approval = Some(Approval {
-                current,
-                release: release.clone(),
-                feed_url: state.feed_url.clone(),
-                automatic: true,
-            });
+    // Step A (Peek): check whether a manual approval or eligible auto candidate exists.
+    let need_auto_fence = {
+        let _gate = release_check_gate(context)?;
+        let state = read_state(context)?;
+        let cfg = context.load_config().map_err(str::to_string)?;
+        let settings = settings(&cfg)?;
+        if let Some(approval) = &state.approval {
+            approval.automatic
+        } else if settings["policy"] == "auto" && settings["feedUrl"] == state.feed_url {
+            let root = approval_installation(context)?;
+            let current = current(&root).ok_or("current release unavailable")?;
+            if state.available.as_ref().is_some_and(|release| {
+                newer(release, Some(&current))
+                    && state.auto_attempted.as_deref() != Some(&release.tag)
+            }) {
+                true
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
         }
-    }
-    let Some(approval) = state.approval.clone() else {
-        return Ok(());
     };
-    let mut idle = if approval.automatic {
+
+    // Step B (Auto restore + turn fence): acquire update-restore.lock (1) BEFORE
+    // turn-update.lock (2), both outside release-check.lock (3).
+    let (mut update_gate, mut idle) = if need_auto_fence {
+        let root = approval_installation(context)?;
+        let gate = match installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))
+        {
+            Ok(gate) => gate,
+            Err(error) if error == "another release installation or restore is running" => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let guard = match context
             .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/turn-update.lock")
         {
@@ -619,79 +760,201 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         if !ledger_idle(context)? {
             return Ok(());
         }
-        Some(guard)
+        (Some(gate), Some(guard))
     } else {
-        None
+        (None, None)
     };
-    let result: Result<(), String> = (|| {
+
+    // Step C (Confirm & Claim): re-read and claim under release-check.lock (strictly 1 -> 2 -> 3).
+    let (approval, settings, orig_lost_alerted) = {
+        let _gate = release_check_gate(context)?;
+        let mut state = read_state(context)?;
+        let cfg = context.load_config().map_err(str::to_string)?;
+        let settings = settings(&cfg)?;
         let root = approval_installation(context)?;
-        if current(&root).as_deref() != Some(&approval.current)
-            || settings["policy"] == "off"
-            || settings["feedUrl"] != approval.feed_url
-            || approval.automatic && settings["policy"] != "auto"
-        {
-            return Err("approved release or update settings changed; approve again".into());
-        }
-        if approval.automatic {
+        let current_tag = current(&root);
+        if let Some(existing) = state.approval.clone() {
+            if current_tag.as_deref() != Some(&existing.current)
+                || settings["policy"] == "off"
+                || settings["feedUrl"] != existing.feed_url
+                || existing.automatic && settings["policy"] != "auto"
+            {
+                let reason =
+                    "approved release or update settings changed; approve again".to_string();
+                state.approval = None;
+                state.update_error = Some(reason.clone());
+                save_state(context, &state)?;
+                return Err(reason);
+            }
+            if existing.automatic {
+                if idle.is_none() || update_gate.is_none() {
+                    return Ok(());
+                }
+                state.approval = None;
+                state.auto_attempted = Some(existing.release.tag.clone());
+                save_state(context, &state)?;
+            }
+            let orig = state.lost_alerted.clone();
+            (existing, settings, orig)
+        } else {
+            if !need_auto_fence
+                || settings["policy"] != "auto"
+                || settings["feedUrl"] != state.feed_url
+            {
+                return Ok(());
+            }
+            let current_tag = current_tag.ok_or("current release unavailable")?;
+            let Some(release) = state.available.as_ref().filter(|release| {
+                newer(release, Some(&current_tag))
+                    && state.auto_attempted.as_deref() != Some(&release.tag)
+            }) else {
+                return Ok(());
+            };
+            let approval = Approval {
+                current: current_tag,
+                release: release.clone(),
+                feed_url: state.feed_url.clone(),
+                automatic: true,
+            };
+            // Persist only auto_attempted (never state.approval) so a failed auto attempt cannot
+            // remain stuck as pending approval across retries.
             state.auto_attempted = Some(approval.release.tag.clone());
+            save_state(context, &state)?;
+            let orig = state.lost_alerted.clone();
+            (approval, settings, orig)
         }
-        save_state(context, &state)?;
+    };
+    if !approval.automatic {
+        drop(idle.take());
+        drop(update_gate.take());
+    }
+
+    // Step D (Download/Verify): auto reuses held update_gate (1) under idle (2) without re-acquiring (1);
+    // manual runs outside both (1) and (3).
+    let mut lost_alerted = orig_lost_alerted.clone();
+    let install_result: Result<(), String> = (|| {
+        let root = approval_installation(context)?;
         let path = root.root().join("releases").join(&approval.release.tag);
         if fs::symlink_metadata(&path).is_ok() {
-            crate::update::verify(&root, &approval.release.tag)?;
+            crate::update::verify_staged(&root, &approval.release.tag, update_gate.as_ref())?;
+        } else if let Some(gate) = update_gate.as_ref() {
+            install_with_gate(context, &root, &approval.release, &mut lost_alerted, gate)?;
         } else {
-            install(context, &approval.release, &mut state.lost_alerted)?;
+            install(context, &approval.release, &mut lost_alerted)?;
         }
         // Configuration can change while a download is in progress.
         let latest = settings_of_context(context)?;
         if latest != settings {
             return Err("update settings changed during installation; approve again".into());
         }
-        state.approval = None;
-        state.update_error = None;
-        save_state(context, &state)?;
-        // Release the staging fence before launch. The helper takes its own fence after
-        // the trial, drains any intervening turn and retains it after this supervisor exits.
-        drop(idle.take());
-        handover_with_policy(context, &approval.release.tag, approval.automatic)?;
         Ok(())
     })();
-    state.approval = None;
-    state.update_error = result.as_ref().err().cloned();
-    save_state(context, &state)?;
-    result
+    // Release the staging turn fence before Step E; keep update_gate (1) for Step E (`1 -> 3`).
+    drop(idle);
+
+    // Step E (Publish & Atomic Handover Fence): hold update-restore.lock (1) -> release_check_gate (3),
+    // verify manual approval still stands, then pass the held gate directly to launcher.
+    let record_error = |error: &str, lost: &Option<String>| -> Result<(), String> {
+        let _gate = release_check_gate(context)?;
+        let mut state = read_state(context)?;
+        if lost != &orig_lost_alerted {
+            state.lost_alerted = lost.clone();
+        }
+        if !approval.automatic {
+            state.approval = None;
+        }
+        state.update_error = Some(error.to_string());
+        save_state(context, &state)
+    };
+    if let Err(error) = install_result {
+        record_error(&error, &lost_alerted)?;
+        return Err(error);
+    }
+    let gate = match update_gate {
+        Some(gate) => gate,
+        None => match approval_installation(context).and_then(|root| restore_gate(&root)) {
+            Ok(gate) => gate,
+            Err(error) => {
+                record_error(&error, &lost_alerted)?;
+                return Err(error);
+            }
+        },
+    };
+    let should_handover = {
+        let _gate = release_check_gate(context)?;
+        let mut state = read_state(context)?;
+        let lost_changed = lost_alerted != orig_lost_alerted;
+        if lost_changed {
+            state.lost_alerted = lost_alerted.clone();
+        }
+        if !approval.automatic
+            && !state.approval.as_ref().is_some_and(|pending| {
+                pending.release.tag == approval.release.tag
+                    && pending.feed_url == approval.feed_url
+            })
+        {
+            // Concurrent poll() cleared pending approval (e.g. on feed failure) during download.
+            if lost_changed {
+                save_state(context, &state)?;
+            }
+            false
+        } else {
+            state.approval = None;
+            state.update_error = None;
+            save_state(context, &state)?;
+            true
+        }
+    };
+    if !should_handover {
+        return Ok(());
+    }
+    if let Err(error) =
+        handover_with_policy_gate(context, &approval.release.tag, approval.automatic, Some(gate))
+    {
+        let _gate = release_check_gate(context)?;
+        let mut state = read_state(context)?;
+        state.update_error = Some(error.clone());
+        save_state(context, &state)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn settings_of_context(context: &RuntimeContext) -> Result<Value, String> {
     settings(&context.load_config().map_err(str::to_string)?)
 }
 
-
+/// Follows the canonical 4-lock hierarchy (`1 -> 3`): releases `release-check.lock` (3) across
+/// network feed I/O, acquires `restore_gate` (1) before `release_check_gate` (3) when publishing
+/// post-I/O state, and emits `signature_notice` / `notify_notice` only after dropping both gates.
 fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
     let settings = settings(cfg)?;
     if settings["policy"] == "off" {
         return Ok(());
     }
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
-    )?;
-    let mut state = read_state(context)?;
     let feed = settings["feedUrl"].as_str().unwrap();
-    if state.feed_url != feed {
-        state.feed_url = feed.into();
-        state.last_checked_at = None;
-        state.available = None;
-        state.error = None;
-    }
-    if state
-        .last_checked_at
-        .is_none_or(|last| now.saturating_sub(last) >= CHECK_INTERVAL_MS)
-    {
-        // Persist admission before I/O: restarts and failures cannot turn into a request storm.
-        state.last_checked_at = Some(now);
-        state.auto_attempted = None;
-        save_state(context, &state)?;
+    let should_check = {
+        let _gate = release_check_gate(context)?;
+        let mut state = read_state(context)?;
+        if state.feed_url != feed {
+            state.feed_url = feed.into();
+            state.last_checked_at = None;
+            state.available = None;
+            state.error = None;
+        }
+        let due = state
+            .last_checked_at
+            .is_none_or(|last| now.saturating_sub(last) >= CHECK_INTERVAL_MS);
+        if due {
+            // Persist admission before I/O: restarts and failures cannot turn into a request storm.
+            state.last_checked_at = Some(now);
+            state.auto_attempted = None;
+            save_state(context, &state)?;
+        }
+        due
+    };
+    if should_check {
+        let mut pending_signature_notice: Option<String> = None;
         loop {
             let root = InstallRoot::configured()?;
             let authority = crate::update::authority(&root);
@@ -699,25 +962,39 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
                 Ok(authority) => check_feed_with_authority(cfg, authority),
                 Err(error) => Err(error.clone()),
             };
-            // Installation/handover can proceed during network I/O. Publish only
-            // while the exact verifying context is still current, fenced against switch.
-            let _installation = installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
+            // Installation/handover can proceed during network I/O. Publish only while the
+            // exact verifying context and policy/feed are still current (order: 1 -> 3).
+            let _installation = restore_gate(&root)?;
+            let _gate = release_check_gate(context)?;
+            let current_settings = settings_of_context(context)?;
+            if current_settings["policy"] == "off" || current_settings["feedUrl"] != feed {
+                break;
+            }
             let stamp = stamp_of(&authority);
-            if stamp != cache_authority()? {
-                state = CheckState { trust: cache_authority()?, feed_url: feed.into(),
-                    last_checked_at: Some(now), ..CheckState::default() };
+            if stamp != cache_authority_for(&root)? {
                 continue;
             }
+            let mut state = read_state_for(&root, context)?;
             state.trust = stamp;
+            state.feed_url = feed.into();
+            state.last_checked_at = Some(now);
             // This check is admission. A lost current alerts once per lost tag whatever
             // the feed did; a refusal once per new cached discovery error.
             if authority.is_ok() {
-                crate::update::admission_alert(&root, &authority, Some(&_installation), &mut state.lost_alerted)?;
+                crate::update::admission_alert(
+                    &root,
+                    &authority,
+                    Some(&_installation),
+                    &mut state.lost_alerted,
+                )?;
             }
             match result {
                 Ok(available) => {
                     state.available = available;
-                    state.error = authority.as_ref().ok().and_then(|authority| authority.lost.as_ref())
+                    state.error = authority
+                        .as_ref()
+                        .ok()
+                        .and_then(|authority| authority.lost.as_ref())
                         .map(|_| crate::update::LOST_CURRENT.to_string());
                 }
                 Err(error) => {
@@ -725,47 +1002,75 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
                     state.approval = None;
                     if state.error.as_ref() != Some(&error) {
                         if authority.is_err() {
-                            crate::update::admission_alert(&root, &authority, Some(&_installation), &mut state.lost_alerted)?;
+                            crate::update::admission_alert(
+                                &root,
+                                &authority,
+                                Some(&_installation),
+                                &mut state.lost_alerted,
+                            )?;
                         } else {
-                            signature_notice(context, cfg, &error);
+                            pending_signature_notice = Some(error.clone());
                         }
                     }
                     state.error = Some(error);
                 }
             }
-            save_state(context, &state)?;
+            save_state_for(&root, context, &state)?;
             break;
+        }
+        if let Some(error) = pending_signature_notice {
+            let latest = context.load_config().map_err(str::to_string)?;
+            signature_notice(context, &latest, &error);
         }
     }
     // Re-read policy after network I/O so an off/feed edit suppresses stale notices.
     let latest = context.load_config().map_err(str::to_string)?;
     let latest_settings = self::settings(&latest)?;
     if latest_settings["policy"] == "notify" && latest_settings["feedUrl"] == settings["feedUrl"] {
-        let current = current(&InstallRoot::configured()?);
-        if let Some(release) = state
-            .available
-            .as_ref()
-            .filter(|release| newer(release, current.as_deref()))
-        {
-            let tag = release.tag.clone();
-            if !state.notified.contains(&tag) && crate::admin_alert::owner_id(&latest).is_some() {
-                // Claim before admission/delivery so a crash leaves an uncertain send
-                // deduplicated. Only a definite non-admission releases the claim.
-                state.notified.push(tag.clone());
-                save_state(context, &state)?;
-                let admitted = crate::admin_alert::notify_notice(
-                    context,
-                    &latest,
-                    &format!(
-                        "HER 更新可用：{} → {tag}。请在控制台查看更新策略。",
-                        current.as_deref().unwrap_or("未知版本")
-                    ),
-                    &format!("release-available:{tag}"),
-                );
-                if !admitted {
-                    state.notified.retain(|notified| notified != &tag);
-                    save_state(context, &state)?;
+        let claim = {
+            let _gate = release_check_gate(context)?;
+            let mut state = read_state(context)?;
+            if state.feed_url == latest_settings["feedUrl"].as_str().unwrap() {
+                let current = current(&InstallRoot::configured()?);
+                if let Some(release) = state
+                    .available
+                    .as_ref()
+                    .filter(|release| newer(release, current.as_deref()))
+                {
+                    let tag = release.tag.clone();
+                    if !state.notified.contains(&tag)
+                        && crate::admin_alert::owner_id(&latest).is_some()
+                    {
+                        // Claim before admission/delivery so a crash leaves an uncertain send
+                        // deduplicated. Only a definite non-admission releases the claim.
+                        state.notified.push(tag.clone());
+                        save_state(context, &state)?;
+                        Some((tag, current))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            } else {
+                None
+            }
+        };
+        if let Some((tag, current)) = claim {
+            let admitted = crate::admin_alert::notify_notice(
+                context,
+                &latest,
+                &format!(
+                    "HER 更新可用：{} → {tag}。请在控制台查看更新策略。",
+                    current.as_deref().unwrap_or("未知版本")
+                ),
+                &format!("release-available:{tag}"),
+            );
+            if !admitted {
+                let _gate = release_check_gate(context)?;
+                let mut state = read_state(context)?;
+                state.notified.retain(|notified| notified != &tag);
+                save_state(context, &state)?;
             }
         }
     }
@@ -867,12 +1172,6 @@ pub fn start(context: RuntimeContext) {
     });
 }
 
-/// Appended to the runtime-supplied main console page; the Schedule page owns settings controls.
-pub const BANNER: &str = r#"<aside id="her-update-banner" role="status" hidden></aside>
-<script>(()=>{const box=document.getElementById('her-update-banner');const token=()=>new URLSearchParams(location.search).get('token')||sessionStorage.getItem('consoleToken')||'';
-async function refresh(){try{const r=await fetch('/api/releases',{headers:{'x-console-token':token()}});if(!r.ok){box.hidden=true;return}const j=await r.json();box.hidden=!j.available;if(j.available){box.textContent='HER 更新可用：'+(j.current||'未知版本')+' → '+j.available.tag+' ';const button=document.createElement('button');button.textContent='批准更新';button.disabled=!!j.approval;button.onclick=async()=>{if(!confirm('批准更新 HER：'+(j.current||'未知版本')+' → '+j.available.tag+'？'))return;button.disabled=true;try{const r=await fetch('/api/releases/approve',{method:'POST',headers:{'x-console-token':token(),'content-type':'application/json'},body:JSON.stringify({confirm:true,tag:j.available.tag})});const result=await r.json();if(!r.ok||!result.ok)throw Error(result.error||'更新被拒绝');box.textContent='HER 更新已批准：'+result.current+' → '+result.approved}catch(e){button.disabled=false;alert(e.message)}};box.append(button);const link=document.createElement('a');link.textContent='更新策略';link.href='/schedule?'+new URLSearchParams({token:token()})+'#updates';box.append(link)}}catch{box.hidden=true}}
-refresh();setInterval(refresh,30000)})();</script>"#;
-
 pub fn run_cli(args: &[String]) -> i32 {
     if args.first().is_some_and(|arg| arg == "handover") {
         let result = (|| -> Result<Value, String> {
@@ -956,8 +1255,11 @@ fn retire_cli(args: &[String]) -> i32 {
     let args = if automatic { &args[1..] } else { args };
     let mut stopped = false;
     let result = (|| -> Result<(), String> {
-        use crate::lifecycle::{OwnerGate, OwnerProbe};
-        use crate::process_identity::{self, KillOutcome, Liveness, ProcessIdentity};
+        use crate::lifecycle::{
+            collect_verified_owners, retire_verified_owners, ImagePolicy, LiveLifecycle,
+            OwnerRole, ProbeMode,
+        };
+        use crate::process_identity::ProcessIdentity;
         if args.len() != 6
             || args[0] != "--old-pid"
             || args[2] != "--old-start"
@@ -973,50 +1275,28 @@ fn retire_cli(args: &[String]) -> i32 {
         };
         let current = crate::update::link_tag(&root, "current")?
             .ok_or("current release unavailable")?;
-        if !crate::update::release_owner_image(&root, &current, &old.exe) {
+        let policy = ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: current,
+        };
+        if !policy.matches("", &old.exe) {
             return Err("retirement image is not current".into());
         }
         let data = root.root().join("runtime/data");
-        crate::lifecycle::validate_existing_owner_gate_paths(&data)?;
-        let mut owners = Vec::new();
-        for (name, role) in [
-            (crate::lifecycle::SUPERVISOR_LOCK, "supervisor"),
-            (crate::lifecycle::LIVE_LOCK, "live"),
-            ("rbridge-console.lock", "console"),
-        ] {
-            let gate = OwnerGate::new(data.join("logs").join(name));
-            let marker = match gate.probe_existing() {
-                OwnerProbe::Free { .. }
-                    if role != "supervisor"
-                        || old.pid == 0
-                        || matches!(
-                            process_identity::check_liveness(old.pid, old.start),
-                            Liveness::Gone | Liveness::Mismatch(_)
-                        ) =>
-                {
-                    continue
-                }
-                OwnerProbe::Held {
-                    marker: Some(marker),
-                } if marker.role == role => marker,
-                _ => return Err(format!("{role} owner is not identified")),
-            };
-            if !crate::update::release_owner_image(&root, &current, &marker.identity.exe)
-                || role == "supervisor" && !process_identity::same_identity(&old, &marker.identity)
-            {
-                return Err(format!("{role} owner is not the old release"));
-            }
-            if process_identity::check_identity(&marker.identity) != Liveness::Matches {
-                return Err(format!("{role} identity cannot be verified"));
-            }
-            owners.push((gate, marker, role));
-        }
-        #[cfg(feature = "parity-clock")]
-        let mut retired = 0u64;
+        let mut backend = LiveLifecycle;
+        let owners = collect_verified_owners(
+            &mut backend,
+            &data,
+            &[OwnerRole::Supervisor, OwnerRole::Live, OwnerRole::Console],
+            &policy,
+            ProbeMode::Existing,
+            Some(&old),
+        )?;
         #[cfg(feature = "parity-clock")]
         let fault_after = crate::update::handover_control(&root)?
             .and_then(|(_, value)| value["retireFailAfter"].as_u64());
-        #[cfg(feature = "parity-clock")]
+        #[cfg(not(feature = "parity-clock"))]
+        let fault_after: Option<u64> = None;
         if fault_after == Some(0) {
             return Err("injected retirement failure".into());
         }
@@ -1031,37 +1311,27 @@ fn retire_cli(args: &[String]) -> i32 {
                 Err(error) => Some(format!("automatic handover deferred: idle state unavailable: {error}; approve again")),
             };
             if let Some(reason) = refusal {
-                let _gate = context.open_locked_file(
-                    crate::runtime::RuntimeArea::Data, "locks/release-check.lock",
-                )?;
+                // Helper already holds update-restore.lock (1) and turn-update.lock (2) -> (3).
+                let _gate = release_check_gate(&context)?;
                 let mut state = read_state(&context)?;
                 state.update_error = Some(reason.clone());
                 save_state(&context, &state)?;
                 return Err(reason);
             }
         }
-        for (gate, marker, role) in owners {
-            match process_identity::kill_verified(&marker.identity) {
-                KillOutcome::Gone | KillOutcome::Killed => stopped = true,
-                _ => return Err(format!("{role} owner could not be retired")),
-            }
-            #[cfg(feature = "parity-clock")]
-            {
-                retired += 1;
-                if fault_after == Some(retired) {
-                    return Err("injected retirement failure".into());
-                }
-            }
-            let end = Instant::now() + Duration::from_secs(5);
-            loop {
-                match gate.probe_existing() {
-                    OwnerProbe::Free { .. } => break,
-                    _ if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
-                    _ => return Err(format!("{role} owner did not release")),
-                }
-            }
-        }
-        Ok(())
+        retire_verified_owners(
+            &mut backend,
+            &data,
+            &owners,
+            ProbeMode::Existing,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            fault_after,
+        )
+        .map_err(|failure| {
+            stopped = failure.stopped;
+            failure.reason
+        })
     })();
     match result {
         Ok(()) => 0,
@@ -1079,10 +1349,18 @@ fn retire_cli(args: &[String]) -> i32 {
 /// Approval/idle admission belongs to the caller; this interface accepts only an
 /// already installed release and the installation's own runtime.
 pub fn handover(context: &RuntimeContext, target: &str) -> Result<u32, String> {
-    handover_with_policy(context, target, false)
+    handover_with_policy_gate(context, target, false, None)
 }
 
-fn handover_with_policy(context: &RuntimeContext, target: &str, automatic: bool) -> Result<u32, String> {
+fn handover_with_policy_gate(
+    context: &RuntimeContext,
+    target: &str,
+    automatic: bool,
+    gate: Option<fs::File>,
+) -> Result<u32, String> {
+    use crate::lifecycle::{
+        verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+    };
     let root = installation()?;
     if context.runtime_root()
         != Some(
@@ -1093,35 +1371,46 @@ fn handover_with_policy(context: &RuntimeContext, target: &str, automatic: bool)
     {
         return Err("handover requires the install runtime".into());
     }
-    let gate = crate::lifecycle::OwnerGate::new(
-        context
-            .data_dir()
-            .join("logs")
-            .join(crate::lifecycle::SUPERVISOR_LOCK),
-    );
-    let old = match gate.probe_existing() {
-        crate::lifecycle::OwnerProbe::Held {
+    let current_tag = current(&root).ok_or("current image unavailable")?;
+    let old = match verify_owner(
+        &mut LiveLifecycle,
+        &context.data_dir(),
+        OwnerRole::Supervisor,
+        &ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: current_tag,
+        },
+        ProbeMode::Existing,
+    ) {
+        OwnerObservation::Verified(owner) => owner.marker.identity,
+        OwnerObservation::Mismatch {
+            marker: Some(_),
+            liveness: Some(_),
+            ..
+        } => return Err("supervisor identity cannot be verified".into()),
+        OwnerObservation::Mismatch {
             marker: Some(marker),
-        } if marker.role == "supervisor" => marker.identity,
+            liveness: None,
+            ..
+        } if marker.role == OwnerRole::Supervisor.as_str() => {
+            return Err("supervisor is not the current release".into());
+        }
         _ => return Err("supervisor owner cannot be identified".into()),
     };
-    let current = fs::canonicalize(root.root().join("current/her.exe"))
-        .map_err(|_| "current image unavailable")?;
-    if !crate::update::same_release_image(&current.to_string_lossy(), &old.exe) {
-        return Err("supervisor is not the current release".into());
-    }
-    if crate::process_identity::check_identity(&old) != crate::process_identity::Liveness::Matches {
-        return Err("supervisor identity cannot be verified".into());
-    }
-    if automatic {
-        crate::update::launch_automatic(&root, target, &old)
-    } else {
-        crate::update::launch(&root, target, &old)
+    match gate {
+        Some(gate) => crate::update::launch_with_gate(&root, target, &old, automatic, gate),
+        None => {
+            debug_assert!(!automatic);
+            crate::update::launch(&root, target, &old)
+        }
     }
 }
 
 fn retire_current_cli(args: &[String]) -> i32 {
     let result = (|| -> Result<Vec<String>, String> {
+        use crate::lifecycle::{
+            verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+        };
         if args.len() != 2 || args[0] != "--tag" {
             return Err("invalid retirement tag".into());
         }
@@ -1130,16 +1419,20 @@ fn retire_current_cli(args: &[String]) -> i32 {
             return Err("retirement tag is not current".into());
         }
         let image = crate::update::release_path(&root, &args[1])?.join("her.exe");
-        let gate = crate::lifecycle::OwnerGate::new(
-            root.root()
-                .join("runtime/data/logs")
-                .join(crate::lifecycle::SUPERVISOR_LOCK),
-        );
-        let identity = match gate.probe_existing() {
-            crate::lifecycle::OwnerProbe::Held {
-                marker: Some(marker),
-            } if marker.role == "supervisor" => marker.identity,
-            crate::lifecycle::OwnerProbe::Free { .. } => crate::process_identity::ProcessIdentity {
+        let data = root.root().join("runtime/data");
+        let policy = ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: args[1].clone(),
+        };
+        let identity = match verify_owner(
+            &mut LiveLifecycle,
+            &data,
+            OwnerRole::Supervisor,
+            &policy,
+            ProbeMode::Existing,
+        ) {
+            OwnerObservation::Verified(owner) => owner.marker.identity,
+            OwnerObservation::Free { .. } => crate::process_identity::ProcessIdentity {
                 pid: 0,
                 start: 0,
                 exe: image.to_string_lossy().into(),
@@ -1167,7 +1460,7 @@ fn retire_current_cli(args: &[String]) -> i32 {
 /// Count installed current starts before parsing runtime config. A duplicate
 /// launch while an owner is held is not an unhealthy supervisor start.
 pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
-    use crate::lifecycle::{OwnerGate, OwnerProbe};
+    use crate::lifecycle::{LifecycleBackend as _, LiveLifecycle, OwnerProbe, OwnerRole, ProbeMode};
     let root = InstallRoot::configured()?;
     let selected = root.root().join("runtime");
     if runtime != selected
@@ -1204,12 +1497,11 @@ pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
         return Ok(false);
     }
     if matches!(
-        OwnerGate::new(
-            selected
-                .join("data/logs")
-                .join(crate::lifecycle::SUPERVISOR_LOCK)
-        )
-        .probe_existing(),
+        LiveLifecycle.probe_owner(
+            &selected.join("data"),
+            OwnerRole::Supervisor,
+            ProbeMode::Existing,
+        ),
         OwnerProbe::Held { .. }
     ) {
         return Ok(false);
@@ -1222,5 +1514,280 @@ pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(error) if error == "another release installation or restore is running" => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempInstall(PathBuf);
+    impl TempInstall {
+        fn new(name: &str) -> (Self, InstallRoot, RuntimeContext) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let base = crate::install_root::development_root(std::env::temp_dir().join(format!(
+                "her-release-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )));
+            for dir in [
+                "releases/v0.0.0",
+                "runtime/config",
+                "runtime/data/locks",
+                "runtime/resources",
+            ] {
+                fs::create_dir_all(base.join(dir)).unwrap();
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                base.join("releases").join("v0.0.0"),
+                base.join("current"),
+            )
+            .unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let out = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(base.join("current"))
+                    .arg(base.join("releases").join("v0.0.0"))
+                    .creation_flags(0x0800_0000)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+            }
+            let runtime = base.join("runtime");
+            fs::write(
+                runtime.join("config/config.json"),
+                json!({
+                    "consoleToken": "fixture-token",
+                    "update": {
+                        "policy": "notify",
+                        "feedUrl": "http://127.0.0.1:9999/feed"
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(runtime.join("data/social-v2.json"), "{}").unwrap();
+            fs::write(
+                runtime.join("dependencies.json"),
+                json!({
+                    "dsh": "http://127.0.0.1:1",
+                    "model": "http://127.0.0.1:1",
+                    "onebot": "http://127.0.0.1:1"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let root = InstallRoot::new(&base).unwrap();
+            let context = RuntimeContext::from_root(&runtime).unwrap();
+            (Self(base), root, context)
+        }
+    }
+    impl Drop for TempInstall {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed_available(root: &InstallRoot, context: &RuntimeContext, tag: &str) -> Value {
+        let cfg = context.load_config().unwrap();
+        let state = CheckState {
+            version: 3,
+            trust: cache_authority_for(root).unwrap(),
+            feed_url: "http://127.0.0.1:9999/feed".into(),
+            last_checked_at: Some(1),
+            available: Some(Release {
+                tag: tag.into(),
+                assets: Vec::new(),
+            }),
+            notified: Vec::new(),
+            error: None,
+            approval: None,
+            update_error: None,
+            auto_attempted: None,
+            lost_alerted: None,
+        };
+        save_state_for(root, context, &state).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn approve_retries_transient_restore_lock_and_rejects_persistent_hold() {
+        let (_guard, root, context) = TempInstall::new("approve-lock-retry");
+        let cfg = seed_available(&root, &context, "v1.2.3");
+        let restore_lock = root.root().join("runtime/data/locks/update-restore.lock");
+
+        // Brief (~60ms) transient hold on update-restore.lock succeeds within the 500ms window.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder_path = restore_lock.clone();
+        let holder = std::thread::spawn(move || {
+            let gate = crate::release_store::installation_gate(&holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            drop(gate);
+        });
+        locked_rx.recv().unwrap();
+        let approved = approve_authorized_in_root(&root, &context, "v1.2.3", || {
+            Ok::<_, (u16, String)>(((), cfg.clone()))
+        });
+        holder.join().unwrap();
+        let approved = approved.ok().unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.3");
+
+        // Brief (~60ms) transient hold on locks/release-check.lock also succeeds.
+        let cfg = seed_available(&root, &context, "v1.2.4");
+        let (check_tx, check_rx) = std::sync::mpsc::channel();
+        let check_context = context.clone();
+        let check_holder = std::thread::spawn(move || {
+            let gate = check_context
+                .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/release-check.lock")
+                .unwrap();
+            check_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            drop(gate);
+        });
+        check_rx.recv().unwrap();
+        let approved = approve_authorized_in_root(&root, &context, "v1.2.4", || {
+            Ok::<_, (u16, String)>(((), cfg.clone()))
+        });
+        check_holder.join().unwrap();
+        let approved = approved.ok().unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.4");
+
+        // A persistently held update-restore.lock (>500ms) still fails with 409 text.
+        let cfg = seed_available(&root, &context, "v1.2.5");
+        let _held = crate::release_store::installation_gate(&restore_lock).unwrap();
+        let started = Instant::now();
+        let err = approve_authorized_in_root(&root, &context, "v1.2.5", || {
+            Ok::<_, (u16, String)>(((), cfg.clone()))
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ApproveError::Release(ref message) if message == "another release installation or restore is running"
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(450));
+    }
+
+    #[test]
+    fn approve_authorized_acquires_release_gates_before_authorize_and_preserves_status() {
+        let (_guard, root, context) = TempInstall::new("approve-order-status");
+        let _cfg = seed_available(&root, &context, "v1.2.3");
+        let restore_lock = root.root().join("runtime/data/locks/update-restore.lock");
+
+        let err = approve_authorized_in_root(&root, &context, "v1.2.3", || {
+            // Both outer gates (1) update-restore.lock and (3) release-check.lock must already be held
+            // when the caller acquires (4) SOCIAL_STATE_GATE.
+            assert!(crate::release_store::installation_gate(&restore_lock).is_err());
+            assert!(context
+                .open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+                .is_err());
+            Err::<((), Value), (u16, String)>((503, "selected runtime social state is busy".into()))
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ApproveError::Authorize((503, ref msg)) if msg == "selected runtime social state is busy"
+        ));
+    }
+
+    #[test]
+    fn approve_under_turn_guard_probes_restore_gate_without_waiting() {
+        let (_guard, root, context) = TempInstall::new("approve-under-turn-guard");
+        let cfg = seed_available(&root, &context, "v1.2.3");
+        let restore_lock = root.root().join("runtime/data/locks/update-restore.lock");
+
+        let held = crate::release_store::installation_gate(&restore_lock).unwrap();
+        let started = Instant::now();
+        let err = approve_authorized_under_turn_guard_in_root(&root, &context, "v1.2.3", || {
+            assert!(context
+                .open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+                .is_err());
+            Ok::<_, String>(((), cfg.clone()))
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ApproveError::Release(ref message) if message == "another release installation or restore is running"
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(held);
+
+        let approved =
+            approve_authorized_under_turn_guard_in_root(&root, &context, "v1.2.3", || {
+                Ok::<_, String>(((), cfg.clone()))
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.3");
+    }
+
+    #[test]
+    fn release_fetch_enforces_private_host_policy_and_curl_hardening() {
+        assert!(validate_url("https://169.254.169.254/feed").is_err(), "link-local metadata IP must be refused");
+        assert!(validate_url("https://10.0.0.1/feed").is_err(), "RFC1918 private IP must be refused");
+        assert!(validate_url("https://printer.local/feed").is_err(), ".local host must be refused");
+        assert!(validate_registry_url("http://10.0.0.1/npm").is_err(), "private registry IP must be refused");
+        assert!(validate_registry_url("http://printer.local/npm").is_err(), ".local registry host must be refused");
+        assert!(validate_url(DEFAULT_FEED).is_ok());
+        assert!(validate_registry_url("http://registry.example.invalid/npm/?view=versions").is_ok());
+
+        let url = url::Url::parse("https://api.github.com/repos/bubbleofmoon/H.E.R./releases?token=s").unwrap();
+        let req = crate::guarded_fetch::TransferRequest {
+            url: &url,
+            pin: "140.82.112.5".parse().unwrap(),
+            headers: vec![("user-agent".into(), "HER-release-manager".into())],
+            body: None,
+            budget: Duration::from_secs(30),
+            connect_timeout: Some(Duration::from_secs(5)),
+            max_filesize: Some(1024),
+        };
+        let (command, config) = crate::guarded_fetch::build_curl_command(&req).unwrap();
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+        assert!(args.windows(2).any(|w| w == ["-K", "-"]), "release curl must read URL via -K -: {args:?}");
+        assert!(!args.iter().any(|a| a.contains("api.github.com/repos")), "release URL must not appear in CLI args: {args:?}");
+        assert!(args.windows(2).any(|w| w == ["--noproxy", "*"]), "release curl must pass --noproxy *: {args:?}");
+        assert!(config.contains("url = \"https://api.github.com/repos/bubbleofmoon/H.E.R./releases?token=s\""));
+    }
+
+    #[test]
+    fn release_fetch_loopback_fixture_enforces_size_cap_and_refuses_private_redirects() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let response = match path {
+                    "/ok" => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+                    "/big" => "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij".to_string(),
+                    "/redir-private" => "HTTP/1.1 302 Found\r\nLocation: https://169.254.169.254/latest\r\nConnection: close\r\n\r\n".to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        assert_eq!(fetch(&format!("http://127.0.0.1:{port}/ok"), 16).unwrap(), b"ok");
+        assert!(fetch(&format!("http://127.0.0.1:{port}/big"), 4).is_err(), "oversized release response must fail");
+        assert!(fetch(&format!("http://127.0.0.1:{port}/redir-private"), 1024).is_err(), "redirect to private IP must fail");
     }
 }

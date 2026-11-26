@@ -68,7 +68,7 @@ pub fn live_target_from_config(cfg: &Value) -> Result<LiveTarget, String> {
 }
 
 /// #186: where `rollout.rustGroups` (the conversations a live owner is started to serve, `--live-groups`) and the
-/// inbound gate (`console::inbound_admitted`: listed in an allow list and not denied) disagree.
+/// inbound gate (`social_state::inbound_admitted`: listed in an allow list and not denied) disagree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeGaps {
     /// Served but refused by the inbound gate: their events are dropped before the journal.
@@ -111,14 +111,14 @@ pub fn rollout_scope_gaps(cfg: &Value) -> ScopeGaps {
         .collect();
     let mut not_allowed: Vec<String> = Vec::new();
     for key in &served {
-        if !crate::console::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
+        if !crate::social_state::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
             not_allowed.push(key.clone());
         }
     }
     let mut not_served: Vec<String> = Vec::new();
     if cfg.pointer("/rollout/enabled").and_then(Value::as_bool) != Some(false) {
         for kind in ["group", "private"] {
-            for id in crate::console::admitted_ids(cfg, kind) {
+            for id in crate::social_state::admitted_ids(cfg, kind) {
                 let key = format!("{kind}:{id}");
                 if !served.contains(&key) && !not_served.contains(&key) {
                     not_served.push(key);
@@ -142,25 +142,59 @@ pub enum ConsoleProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heartbeat {
     Fresh { live: bool, groups: Vec<String> },
+    /// The live bridge initialized and is retrying its OneBot gateway connection.
+    WaitingForGateway { live: bool, groups: Vec<String> },
     Stale { age_ms: i64 },
     /// No heartbeat file: the owner has not written one.
     Missing,
     /// A heartbeat file that is not a heartbeat (the owner wrote garbage).
     Invalid,
+    /// A heartbeat file written by another PID or before the current owner acquired its gate.
+    WrongOwner,
     /// The file exists but could not be read: says nothing about the owner.
     Unknown(String),
 }
 
-/// Classify the result of reading `rust-heartbeat-live.json` (`{ts, pid, live, groups}`).
+fn parse_ts_ms(raw: Option<&Value>) -> Option<i64> {
+    let raw = raw?;
+    if let Some(ts) = raw.as_i64() {
+        return Some(ts);
+    }
+    raw.as_f64().filter(|ts| ts.is_finite()).map(|ts| ts as i64)
+}
+
+/// Classify the result of reading `rust-heartbeat-live.json` (`{ts, pid, live, groups, ...}`).
 pub fn read_heartbeat(read: std::io::Result<Vec<u8>>, now_ms: i64) -> Heartbeat {
+    read_heartbeat_for_owner(read, None, now_ms)
+}
+
+/// Classify `rust-heartbeat-live.json`, requiring ownership by `marker` when provided.
+pub fn read_heartbeat_for_owner(
+    read: std::io::Result<Vec<u8>>,
+    marker: Option<&OwnerMarker>,
+    now_ms: i64,
+) -> Heartbeat {
     let bytes = match read {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Heartbeat::Missing,
         Err(error) => return Heartbeat::Unknown(format!("heartbeat is unreadable: {}", error.kind())),
     };
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return Heartbeat::Invalid };
-    let Some(ts) = value.get("ts").and_then(Value::as_f64) else { return Heartbeat::Invalid };
-    let age_ms = now_ms - ts as i64;
+    let Some(ts) = parse_ts_ms(value.get("ts")) else { return Heartbeat::Invalid };
+    if let Some(marker) = marker {
+        let pid_matches =
+            value.get("pid").and_then(Value::as_u64) == Some(u64::from(marker.identity.pid));
+        let ts_matches = value.get("ts").is_some_and(|raw| {
+            raw.as_i64().map_or_else(
+                || raw.as_f64().is_some_and(|v| v.is_finite() && v >= marker.acquired_at as f64),
+                |v| v >= marker.acquired_at,
+            )
+        });
+        if !pid_matches || !ts_matches {
+            return Heartbeat::WrongOwner;
+        }
+    }
+    let age_ms = now_ms - ts;
     if age_ms >= HEARTBEAT_FRESH_MS {
         return Heartbeat::Stale { age_ms };
     }
@@ -170,7 +204,23 @@ pub fn read_heartbeat(read: std::io::Result<Vec<u8>>, now_ms: i64) -> Heartbeat 
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|g| g.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    Heartbeat::Fresh { live, groups }
+    let state = match value.get("state") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Heartbeat::Invalid,
+    };
+    let gateway_connected = match value.get("gatewayConnected") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Heartbeat::Invalid,
+    };
+    match (state, gateway_connected) {
+        (None | Some("ready"), None | Some(true)) => Heartbeat::Fresh { live, groups },
+        (Some("waiting-for-gateway"), None | Some(false)) | (None, Some(false)) => {
+            Heartbeat::WaitingForGateway { live, groups }
+        }
+        _ => Heartbeat::Invalid,
+    }
 }
 
 /// The live owner as seen through its OS lock, its marker and the OS.
@@ -344,7 +394,10 @@ pub fn decide(obs: &Observation, previous: &WatchState) -> Decision {
                 return d;
             }
             match &obs.heartbeat {
-                Heartbeat::Fresh { live: true, groups } if same_groups(groups, &target.groups) => {
+                Heartbeat::Fresh { live: true, groups }
+                | Heartbeat::WaitingForGateway { live: true, groups }
+                    if same_groups(groups, &target.groups) =>
+                {
                     d.state.stale_count = 0;
                 }
                 Heartbeat::Unknown(reason) => {
@@ -601,6 +654,117 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_reads_recognize_waiting_for_gateway_and_reject_previous_owner_or_mismatch() {
+        let now = 1_000_000;
+        let marker = OwnerMarker {
+            v: 1,
+            role: "live".into(),
+            identity: identity(42),
+            acquired_at: 995_000,
+            refreshed_at: 995_000,
+            groups: Some(groups(&["g1"])),
+        };
+        let waiting = json!({
+            "ts": now - 1000,
+            "pid": 42,
+            "live": true,
+            "groups": ["g1"],
+            "state": "waiting-for-gateway",
+            "gatewayConnected": false
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(
+            read_heartbeat_for_owner(Ok(waiting), Some(&marker), now),
+            Heartbeat::WaitingForGateway { live: true, groups: groups(&["g1"]) }
+        );
+        let ready = json!({
+            "ts": now - 1000,
+            "pid": 42,
+            "live": true,
+            "groups": ["g1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(read_heartbeat_for_owner(Ok(ready), Some(&marker), now), fresh(&["g1"]));
+
+        // Previous owner PID or ts < acquired_at must be rejected even if fresh.
+        let wrong_pid = json!({
+            "ts": now - 1000,
+            "pid": 7,
+            "live": true,
+            "groups": ["g1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(
+            read_heartbeat_for_owner(Ok(wrong_pid), Some(&marker), now),
+            Heartbeat::WrongOwner
+        );
+        let before_acquire = json!({
+            "ts": 994_999,
+            "pid": 42,
+            "live": true,
+            "groups": ["g1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(
+            read_heartbeat_for_owner(Ok(before_acquire), Some(&marker), now),
+            Heartbeat::WrongOwner
+        );
+
+        // Contradictory or unknown state strings are invalid.
+        for bad in [
+            json!({
+                "ts": now, "pid": 42, "live": true, "groups": ["g1"],
+                "state": "ready", "gatewayConnected": false
+            }),
+            json!({
+                "ts": now, "pid": 42, "live": true, "groups": ["g1"],
+                "state": "waiting-for-gateway", "gatewayConnected": true
+            }),
+            json!({"ts": now, "pid": 42, "live": true, "groups": ["g1"], "state": "bogus"}),
+            json!({"ts": now, "pid": 42, "live": true, "groups": ["g1"], "state": 123}),
+        ] {
+            assert_eq!(
+                read_heartbeat_for_owner(Ok(bad.to_string().into_bytes()), Some(&marker), now),
+                Heartbeat::Invalid,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_for_gateway_is_preserved_across_ticks_while_wrong_owner_restarts() {
+        let waiting = Heartbeat::WaitingForGateway { live: true, groups: groups(&["g1", "g2"]) };
+        let o = obs(running(), held(5, &["g1", "g2"], Liveness::Matches), waiting);
+        let first = decide(&o, &WatchState::default());
+        assert!(first.actions.is_empty() && !first.failed && first.state.stale_count == 0);
+        let second = decide(&o, &first.state);
+        assert!(second.actions.is_empty() && !second.failed && second.state.stale_count == 0);
+
+        let wrong_owner = obs(
+            running(),
+            held(5, &["g1", "g2"], Liveness::Matches),
+            Heartbeat::WrongOwner,
+        );
+        let one = decide(&wrong_owner, &WatchState::default());
+        assert!(one.actions.is_empty() && one.state.stale_count == 1);
+        let two = decide(&wrong_owner, &one.state);
+        assert_eq!(
+            two.actions,
+            vec![Action::StopLive { identity: identity(5), restart: Some(groups(&["g1", "g2"])) }]
+        );
+    }
+
+    #[test]
     fn invalid_configuration_starts_and_stops_nothing() {
         let mut o = obs(running(), LiveObservation::Free, Heartbeat::Missing);
         o.target = Err("rustGroups must be an explicit array".into());
@@ -841,5 +1005,65 @@ mod tests {
         let d = Decision { actions: vec![Action::StartLive { groups: groups(&["g1"]) }], ..Decision::default() };
         let out = apply(&d, &mut fx);
         assert!(out.failed && out.alerts[0].contains("spawn failed"));
+    }
+
+    #[test]
+    fn fake_lifecycle_drives_live_observation_and_stale_heartbeat_restart() {
+        use crate::lifecycle::{
+            live_observation, verify_live_heartbeat, FakeLifecycle, ImagePolicy, OwnerMarker,
+            OwnerProbe, OwnerRole, ProbeMode,
+        };
+        let mut fake = FakeLifecycle::default();
+        let owner_id = ProcessIdentity {
+            pid: 77,
+            start: 700,
+            exe: "/opt/her/her".into(),
+        };
+        let marker = OwnerMarker {
+            v: 1,
+            role: "live".into(),
+            identity: owner_id.clone(),
+            acquired_at: 500_000,
+            refreshed_at: 500_000,
+            groups: Some(groups(&["g1", "g2"])),
+        };
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(marker.clone()),
+            },
+        );
+        fake.now_ms = 510_000;
+        fake.heartbeat = Some(Ok(
+            json!({"ts": 499_999, "pid": 77, "live": true, "groups": ["g1", "g2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        assert!(
+            verify_live_heartbeat(
+                &mut fake,
+                std::path::Path::new("/unused"),
+                &marker,
+                &groups(&["g1", "g2"]),
+            )
+            .is_err()
+        );
+        let live = live_observation(
+            &mut fake,
+            std::path::Path::new("/unused"),
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Existing,
+        );
+        let o = obs(running(), live, Heartbeat::Stale { age_ms: 95_000 });
+        let first = decide(&o, &WatchState::default());
+        assert!(first.actions.is_empty());
+        let second = decide(&o, &first.state);
+        assert_eq!(
+            second.actions,
+            vec![Action::StopLive {
+                identity: owner_id,
+                restart: Some(groups(&["g1", "g2"])),
+            }]
+        );
     }
 }

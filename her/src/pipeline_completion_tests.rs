@@ -173,7 +173,7 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
         if sleep {
             turn.verified("cancel-requested", "observationSleep")
                 .unwrap();
-            crate::console::ensure_or_rotate_agent_token(&cap_context, key, true).unwrap();
+            crate::social_state::ensure_or_rotate(&cap_context, key, true).unwrap();
             turn.end_cancellation("completed", "observationSleep")
                 .unwrap();
         } else {

@@ -17,7 +17,7 @@ fn ticket219_core_registry_and_chat() {
         .filter(|setting| setting.secret)
         .map(|setting| setting.key)
         .collect();
-    assert_eq!(registered, [SEARCH, CLI], "only endpoint API keys are secret");
+    assert_eq!(registered, [SEARCH, CLI, "console.administratorPassword"]);
     assert!(
         crate::settings::registry().all(|setting| !setting.secret || !setting.chat),
         "a credential cannot be chat-visible",

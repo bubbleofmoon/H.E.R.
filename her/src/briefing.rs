@@ -208,7 +208,9 @@ pub fn persona_core(context: &RuntimeContext, cfg: &Value, key: &str) -> String 
 fn empty_protected(counts: &Counts, key: &str, cfg: &Value) -> Vec<Layer> {
     let mut empty = Vec::new();
     if counts.identity == 0 { empty.push(Layer::Identity); }
-    if counts.relationship == 0 && crate::conversation_authority::owner_conversation(cfg).as_deref() == Some(key) {
+    if counts.relationship == 0
+        && crate::social_state::owner_conversation(cfg).as_deref() == Some(key)
+    {
         empty.push(Layer::Relationship);
     }
     empty

@@ -124,7 +124,7 @@ async fn reserved2_response_after_cap(response: String, recall: bool) -> (Rig, R
     let budget = crate::pipeline::Reserved2Budget {
         deadline: began - 1, cap_ms: 60_000, ceiling: began + 120_000, began,
     };
-    crate::console::mutate_social_state_for(&rig.context, |state| {
+    crate::conversation_state::update_raw(&rig.context, |state| {
         state["conversations"][key]["engagedAt"] = json!(began);
         Ok(())
     }).unwrap();
@@ -143,7 +143,7 @@ async fn reserved2_response_after_cap(response: String, recall: bool) -> (Rig, R
         let (mut socket, _) = model.accept().await.unwrap();
         assert_eq!(read_body(&mut socket).await["stream"], true);
         // Returning to observation removes the extension. The dispatch deadline is already past.
-        crate::console::mutate_social_state_for(&context, |state| {
+        crate::conversation_state::update_raw(&context, |state| {
             state["conversations"][key]["engagedAt"] = json!(0);
             Ok(())
         }).unwrap();
@@ -216,7 +216,7 @@ async fn rig(tag: &str, harness: Value, console: Option<u16>) -> Rig {
     if let Some(port) = console {
         context = context.with_console_port(port);
     }
-    let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+    let token = crate::social_state::ensure_or_rotate(&context, "private:8808", false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     Rig {
         root,

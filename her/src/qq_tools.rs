@@ -116,9 +116,9 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
                         tool["description"] = json!(format!("{description} {} 重复消息或本轮发送上限会拒绝整个批次，请遵循返回的停止指令。", crate::outbound_message::GUIDANCE));
                     }
                     if tool["name"] == "qq_wait_for_messages" {
-                        let policy = crate::console::wait_policy(cfg);
+                        let policy = crate::social_state::wait_policy(cfg);
                         tool["inputSchema"]["properties"]["purpose"]["description"] = json!("messages：等待对方下文/回复或沉睡前观察；reply：可选的短静默观察。发送工具自动控制回复节奏，首答无需先调用等待工具");
-                        tool["description"] = json!(format!("发送工具自动控制回复节奏，首答无需先等待；本工具留给确实要等对方下文或沉睡观察时。等待分两种用途：reply 按最后来信补足 quietMs 静默，已安静足够就返回，不能代替沉睡观察；messages 等到新消息后合批，每条来信重置 {}ms 窗口，从首条起最多 {}ms；你成功发送后的互动窗口（preSleepWaitMs，只有你自己的发送重新计时）内则只在有给你的消息（forYou=true）时立即返回、不合批，只有闲聊时等到互动窗口结束再一起返回。@你或管理员来信立即返回。每条 newMessages 带桥接提示 forYou（true/false）和 forYouReason；它只是提示，是否回复由你决定。返回了给你的消息的等待不占本轮次数（每轮最多与发送上限 send.maxPerTurn 相同的次数）。互动窗口结束时返回 engagementEnded=true 和退出指令，桥接让你干净地沉睡并保留唤醒配置。直接读取 newMessages 和 readThroughSeq，无需重复查询。本轮两种用途合计最多 {} 次，最后一次在需要时自动转为完整沉睡观察。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发送消息。若仍调用 mark_read/set_wake_config 收尾，观察不足时桥接强制 30 秒后再唤醒。未达上限且需要沉睡观察时使用 messages 和完整观察 timeoutMs；preSleepWaitSatisfied/Observed 表示观察资格，短 reply 不授予。", policy.window_ms, policy.max_ms, policy.max_per_turn));
+                        tool["description"] = json!(format!("发送工具自动控制回复节奏，首答无需先等待；本工具留给确实要等对方下文或沉睡观察时。等待分两种用途：reply 按最后来信补足 quietMs 静默，已安静足够就返回，不能代替沉睡观察；messages 等到新消息后合批，每条来信重置 {}ms 窗口，从首条起最多 {}ms；你成功发送后的互动窗口（preSleepWaitMs，只有你自己的发送重新计时）内则只在有给你的消息（forYou=true）时立即返回、不合批，只有闲聊时等到互动窗口结束再一起返回。@你或管理员来信立即返回。每条 newMessages 带桥接提示 forYou（true/false）和 forYouReason；它只是提示，是否回复由你决定。返回了给你的消息的等待不占本轮次数（每轮最多与发送上限 send.maxPerTurn 相同的次数）。互动窗口结束时返回 engagementEnded=true 和退出指令，桥接让你干净地沉睡并保留唤醒配置。直接读取 newMessages 和 readThroughSeq，无需重复查询。本轮两种用途合计最多 {} 次，最后一次在需要时自动转为完整沉睡观察。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发送消息。若最后一次等待带回给你的消息，先处理该消息；用完额度后桥接按当前唤醒配置结束本轮。需要沉睡观察时使用 messages，时长按会话指引；preSleepWaitSatisfied/Observed 表示观察资格。", policy.window_ms, policy.max_ms, policy.max_per_turn));
                         tool["inputSchema"]["properties"]["quietMs"]["description"] = json!("reply 用途的静默窗口；messages 的合批窗口由后台 batchWindowMs/batchMaxMs 决定");
                         tool["inputSchema"]["properties"]["minNewMessages"]["description"] = json!("messages 用途期望的最少新消息数，默认 1；从首条起的合批硬上限到时仍返回已收集消息。reply 和保留的沉睡观察忽略此参数");
                     }
@@ -162,19 +162,53 @@ fn describe_text_batch(tool: &mut Value, cfg: &Value) {
 
 // ----- HTTP plumbing --------------------------------------------------------------------------------------
 
-pub(crate) struct HttpReply {
-    pub(crate) status: u16,
-    pub(crate) body: Vec<u8>,
+fn post_wake_snapshot(
+    context: &RuntimeContext,
+    cfg: &Value,
+    body: Value,
+    label: &str,
+) -> Result<Value, String> {
+    let port = context
+        .console_port()
+        .or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok()))
+        .ok_or_else(|| format!("{label} console port unavailable"))?;
+    let endpoint = crate::loopback_http::LoopbackEndpoint::localhost_v4(port)?;
+    let console_token = context.effective_console_token(cfg);
+    let body = body.to_string();
+    let reply = crate::loopback_http::request(
+        &crate::loopback_http::TcpTransport,
+        &endpoint,
+        &crate::loopback_http::HttpRequest {
+            method: "POST",
+            path: "/api/socialV2/wake-snapshot",
+            headers: &[
+                ("x-console-token", console_token.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            body: Some(body.as_bytes()),
+        },
+        crate::loopback_http::Deadlines::with_shared_transmit(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
+        ),
+        crate::loopback_http::ResponseLimits::new(crate::loopback_http::DEFAULT_MAX_BODY_BYTES),
+    )
+    .map_err(|err| err.to_qq_tools_message())?;
+    if reply.status != 200 {
+        return Err(format!("{label} refused: {}", reply.status));
+    }
+    reply
+        .parse_json::<Value>(crate::loopback_http::JsonSurrogates::Strict)
+        .map(|(packet, _)| packet)
 }
 
 pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str, redact: bool) -> Result<String, String> {
-    let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok())).ok_or("wake snapshot console port unavailable")?;
-    let body = serde_json::json!({"key":key,"token":token,"turnId":turn}).to_string();
-    let reply = http_request(&format!("127.0.0.1:{port}"), "POST", "/api/socialV2/wake-snapshot",
-        &[("x-console-token".into(), context.effective_console_token(cfg)), ("Content-Type".into(), "application/json".into())],
-        Some(&body), std::time::Duration::from_secs(5))?;
-    if reply.status != 200 { return Err(format!("wake snapshot refused: {}", reply.status)); }
-    let packet: Value = serde_json::from_slice(&reply.body).map_err(|e| e.to_string())?;
+    let packet = post_wake_snapshot(
+        context,
+        cfg,
+        serde_json::json!({"key": key, "token": token, "turnId": turn}),
+        "wake snapshot",
+    )?;
     if packet.is_null() { return Ok(String::new()); }
     let guidance = "以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。";
     // DSH sends this text immediately. The harness keeps the original packet for replay.
@@ -192,166 +226,59 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
 
 /// Query only positive urgent-message delivery evidence; never grant new receipts.
 pub(crate) fn wake_delivered_urgent(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<Vec<i64>, String> {
-    let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p|u16::try_from(p).ok())).ok_or("wake evidence console port unavailable")?;
-    let body = serde_json::json!({"key":key,"token":token,"turnId":turn,"readOnly":true}).to_string();
-    let reply = http_request(&format!("127.0.0.1:{port}"), "POST", "/api/socialV2/wake-snapshot",
-        &[("x-console-token".into(),context.effective_console_token(cfg)),("Content-Type".into(),"application/json".into())],
-        Some(&body),std::time::Duration::from_secs(5))?;
-    if reply.status != 200 { return Err(format!("wake evidence refused: {}",reply.status)); }
-    let packet: Value = serde_json::from_slice(&reply.body).map_err(|e|e.to_string())?;
+    let packet = post_wake_snapshot(
+        context,
+        cfg,
+        serde_json::json!({"key": key, "token": token, "turnId": turn, "readOnly": true}),
+        "wake evidence",
+    )?;
     serde_json::from_value(packet["urgentDeliveredSeqs"].clone()).map_err(|e|e.to_string())
 }
 
-pub(crate) fn http_request(
-    host_port: &str,
-    method: &str,
-    path: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
-    timeout: std::time::Duration,
-) -> Result<HttpReply, String> {
-    http_request_with_connect_timeout(host_port, method, path, headers, body, timeout,
-        std::time::Duration::from_secs(10))
-}
-
-fn http_request_with_connect_timeout(
-    host_port: &str,
-    method: &str,
-    path: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
-    timeout: std::time::Duration,
-    connect_timeout: std::time::Duration,
-) -> Result<HttpReply, String> {
-    use std::io::{Read, Write};
-    let deadline = std::time::Instant::now() + timeout;
-    // Connection and transmission have their own short budget; a connected console may hold
-    // the response for reply timing, so its response budget must remain independent.
-    let transmission_deadline = std::time::Instant::now() + timeout.min(connect_timeout);
-    let timeout_error = || "The operation was aborted due to timeout".to_string();
-    let addr = host_port
-        .parse::<std::net::SocketAddr>()
-        .ok()
-        .or_else(|| std::net::ToSocketAddrs::to_socket_addrs(host_port).ok().and_then(|mut a| a.next()))
-        .ok_or_else(|| "fetch failed".to_string())?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr,
-        transmission_deadline.saturating_duration_since(std::time::Instant::now()))
-        .map_err(|_| "fetch failed".to_string())?;
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n");
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    if let Some(b) = body {
-        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
-    }
-    req.push_str("\r\n");
-    if let Some(b) = body {
-        req.push_str(b);
-    }
-    let mut pending = req.as_bytes();
-    while !pending.is_empty() {
-        let left = transmission_deadline.checked_duration_since(std::time::Instant::now())
-            .filter(|left| !left.is_zero()).ok_or_else(timeout_error)?;
-        stream.set_write_timeout(Some(left)).map_err(|_| "fetch failed".to_string())?;
-        match stream.write(pending) {
-            Ok(0) => return Err("fetch failed".to_string()),
-            Ok(count) => pending = &pending[count..],
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err("fetch failed".to_string()),
-        }
-    }
-    let mut raw: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return Err(timeout_error());
-        }
-        stream.set_read_timeout(Some(left.min(std::time::Duration::from_secs(3600)))).ok();
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > 64 * 1024 * 1024 {
-                    return Err("fetch failed".to_string());
-                }
-            }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(timeout_error()),
-            Err(_) => break,
-        }
-    }
-    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| "fetch failed".to_string())?;
-    let head = String::from_utf8_lossy(&raw[..sep]).to_string();
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| "fetch failed".to_string())?;
-    let mut payload = raw[sep + 4..].to_vec();
-    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i < payload.len() {
-            let Some(le) = payload[i..].windows(2).position(|w| w == b"\r\n") else { break };
-            let line = String::from_utf8_lossy(&payload[i..i + le]).to_string();
-            let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16) else { break };
-            i += le + 2;
-            if size == 0 {
-                break;
-            }
-            let end = (i + size).min(payload.len());
-            out.extend_from_slice(&payload[i..end]);
-            i = end + 2;
-        }
-        payload = out;
-    }
-    Ok(HttpReply { status, body: payload })
-}
-
-/// Bridge console (host, port). The console serves `/api/*` on `consolePort`, not on the OneBot port.
-fn console_base(context: &RuntimeContext, cfg: &Value) -> Result<(String, u16), String> {
+/// Bridge console port. The console serves `/api/*` on `consolePort`, not on the OneBot port.
+fn console_port(context: &RuntimeContext, cfg: &Value) -> Result<u16, String> {
     let configured_port = cfg
         .get("consolePort")
         .and_then(|p| p.as_u64())
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port != 0);
-    let port = if context.is_isolated() {
+    if context.is_isolated() {
         context
             .console_port()
             .filter(|port| *port != 0)
             .or(configured_port)
-            .ok_or_else(|| "isolated runtime requires an explicit console port".to_string())?
+            .ok_or_else(|| "isolated runtime requires an explicit console port".to_string())
     } else {
-        configured_port.unwrap_or(3100)
-    };
-    Ok(("127.0.0.1".to_string(), port))
+        Ok(configured_port.unwrap_or(3100))
+    }
 }
 
-/// (host:port, onebot token). Isolated mode accepts only the selected runtime's dependency URL.
-fn onebot_base(context: &RuntimeContext, cfg: &Value) -> Result<(String, String), String> {
+/// Selected OneBot adapter. Isolated mode accepts only the selected runtime's dependency URL.
+fn onebot_for_tools(context: &RuntimeContext, cfg: &Value) -> Result<crate::onebot::OneBot, String> {
     let url = if context.is_isolated() {
         context
             .dependency_url("onebot")
             .ok_or_else(|| "isolated runtime OneBot dependency is unavailable".to_string())?
     } else {
-        cfg.get("snowluma").and_then(|s| s.get("httpUrl")).and_then(|u| u.as_str()).unwrap_or("http://127.0.0.1:3000")
+        cfg.get("snowluma")
+            .and_then(|s| s.get("httpUrl"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("http://127.0.0.1:3000")
+            .trim_end_matches('/')
     };
-    let host_port = if context.is_isolated() {
-        url.strip_prefix("http://")
-            .filter(|authority| !authority.is_empty() && !authority.contains('/'))
-            .ok_or_else(|| "isolated runtime OneBot dependency is invalid".to_string())?
-            .to_string()
-    } else {
-        let host_port = url.trim_start_matches("http://").trim_end_matches('/').to_string();
-        let (host, port) = host_port
-            .split_once(':')
-            .map(|(host, port)| (host.to_string(), port.parse().unwrap_or(3000)))
-            .unwrap_or((host_port.clone(), 3000));
-        format!("{host}:{port}")
-    };
-    let token = cfg.get("snowluma").and_then(|s| s.get("accessToken")).and_then(|t| t.as_str()).unwrap_or("").to_string();
-    Ok((host_port, token))
+    let token = cfg
+        .get("snowluma")
+        .and_then(|s| s.get("accessToken"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    crate::onebot::OneBot::try_new_url(url, token).map_err(|_| {
+        if context.is_isolated() {
+            "isolated runtime OneBot dependency is invalid".to_string()
+        } else {
+            "fetch failed".to_string()
+        }
+    })
 }
 
 /// Selected-runtime config document from the loader; legacy contexts tolerate a missing/invalid file (JS
@@ -443,6 +370,7 @@ impl<'a> ApiCall {
     }
 }
 
+#[derive(Debug)]
 struct ApiFailure {
     message: String,
     delivery_unknown: bool,
@@ -481,9 +409,10 @@ impl Api<'_> {
         Ok(parsed.unwrap_or(Value::Null))
     }
 
-    fn request(&self, call: ApiCall, send: bool) -> Result<HttpReply, ApiFailure> {
+    fn request(&self, call: ApiCall, send: bool) -> Result<crate::loopback_http::HttpResponse, ApiFailure> {
         let cfg = config(self.context)?;
-        let (host, port) = console_base(self.context, &cfg)?;
+        let port = console_port(self.context, &cfg)?;
+        let endpoint = crate::loopback_http::LoopbackEndpoint::localhost_v4(port)?;
         let token = console_token(self.context, &cfg);
         if self.context.is_isolated() && token.is_empty() {
             return Err("isolated runtime console token is unavailable".to_string().into());
@@ -494,16 +423,36 @@ impl Api<'_> {
         }
         headers.extend(call.headers.iter().cloned());
         headers.push(("x-agent-call".to_string(), "1".to_string()));
+        let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let timeout = std::time::Duration::from_millis(call.timeout_ms.max(if call.long_poll { 1000 } else { 1 }));
-        let reply = http_request_with_connect_timeout(&format!("{host}:{port}"), call.method, &call.path, &headers,
-            call.body.as_deref(), timeout, std::time::Duration::from_millis(call.connect_timeout_ms)).map_err(|e| {
-            if call.long_poll && e.contains("timeout") {
-                ApiFailure { message: format!("等待超时（{}s）", (call.timeout_ms as f64 / 1000.0).round() as i64), delivery_unknown: send }
+        let connect_timeout = std::time::Duration::from_millis(call.connect_timeout_ms);
+        let req = crate::loopback_http::HttpRequest {
+            method: call.method,
+            path: &call.path,
+            headers: &header_refs,
+            body: call.body.as_deref().map(str::as_bytes),
+        };
+        crate::loopback_http::request(
+            &crate::loopback_http::TcpTransport,
+            &endpoint,
+            &req,
+            crate::loopback_http::Deadlines::with_shared_transmit(connect_timeout, timeout),
+            crate::loopback_http::ResponseLimits::new(crate::loopback_http::DEFAULT_MAX_BODY_BYTES),
+        )
+        .map_err(|err| {
+            let delivery_unknown = send && err.status == crate::loopback_http::CommitStatus::Unknown;
+            if call.long_poll && err.timed_out {
+                ApiFailure {
+                    message: format!("等待超时（{}s）", (call.timeout_ms as f64 / 1000.0).round() as i64),
+                    delivery_unknown,
+                }
             } else {
-                ApiFailure { message: e, delivery_unknown: send }
+                ApiFailure {
+                    message: err.to_qq_tools_message(),
+                    delivery_unknown,
+                }
             }
-        })?;
-        Ok(reply)
+        })
     }
 
     fn response(&self, call: ApiCall) -> Result<(u16, Value), String> {
@@ -515,12 +464,20 @@ impl Api<'_> {
     /// JS `onebot(action, params)`: Ok(data) or Err(message).
     fn onebot(&self, action: &str, params: Value) -> Result<Value, String> {
         let cfg = config(self.context)?;
-        let (host_port, token) = onebot_base(self.context, &cfg)?;
-        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-        if !token.is_empty() {
-            headers.push(("authorization".to_string(), format!("Bearer {token}")));
-        }
-        let reply = http_request(&host_port, "POST", &format!("/{action}"), &headers, Some(&params.to_string()), std::time::Duration::from_secs(15))?;
+        let ob = onebot_for_tools(self.context, &cfg)?;
+        let reply = ob
+            .post_raw(
+                &format!("/{action}"),
+                &params.to_string(),
+                crate::loopback_http::Deadlines::with_shared_transmit(
+                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(15),
+                ),
+                crate::loopback_http::ResponseLimits::new(
+                    crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+                ),
+            )
+            .map_err(|err| err.to_qq_tools_message())?;
         if !(200..300).contains(&reply.status) {
             let hint = if reply.status == 426 {
                 "；HTTP 426 通常表示 httpUrl 指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址"
@@ -530,11 +487,9 @@ impl Api<'_> {
             return Err(format!("HTTP {}{hint}", reply.status));
         }
         // Accepted deviation 18: a lone surrogate escape becomes U+FFFD instead of failing the call.
-        let body: Value = std::str::from_utf8(&reply.body)
-            .ok()
-            .and_then(|text| crate::aux_text::parse_json_replacing_lone_surrogates::<Value>(text).ok())
-            .map(|(value, _)| value)
-            .ok_or_else(|| "Unexpected end of JSON input".to_string())?;
+        let (body, _) = reply
+            .parse_json::<Value>(crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd)
+            .map_err(|_| "Unexpected end of JSON input".to_string())?;
         let status_ok = body.get("status").and_then(Value::as_str) == Some("ok");
         let retcode_ok = body.get("retcode").and_then(Value::as_i64) == Some(0);
         if !status_ok || !retcode_ok {
@@ -893,7 +848,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
             let cfg = match config(context) { Ok(cfg) => cfg, Err(e) => return fail("等待失败：", e) };
             let mut call = with_token(ApiCall::post("/api/socialV2/wait", Value::Object(body)));
             call.long_poll = true;
-            call.timeout_ms = crate::console::wait_client_timeout_ms(&cfg, args);
+            call.timeout_ms = crate::social_state::wait_client_timeout_ms(&cfg, args);
             result(&api, call, "等待失败：")
         }
         "qq_report_feedback" => {
@@ -1307,6 +1262,153 @@ mod tests {
         let data = Api { context: &context, filter_reads: true }.onebot("get_group_msg_history", json!({"group_id": 1})).expect("a lone surrogate must not fail the call");
         assert_eq!(data["messages"][0]["raw_message"], "hi \u{FFFD} there");
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qq_tools_console_and_onebot_handle_chunked_replies_and_failure_modes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let replies = [
+                // 1. Chunked 200 ok:true for console send.
+                ("200 OK", true, r#"{"ok":true,"sent":1}"#),
+                // 2. HTTP 429 refusal -> delivery_unknown: false.
+                ("429 Too Many Requests", false, r#"{"ok":false,"error":"rate limit"}"#),
+                // 3. HTTP 503 -> delivery_unknown: true.
+                ("503 Service Unavailable", false, r#"{"error":"busy"}"#),
+                // 4. HTTP 200 missing ok:true on send -> delivery_unknown: true.
+                ("200 OK", false, r#"{"sent":0}"#),
+                // 5. HTTP 200 ok:false on send -> delivery_unknown: false.
+                ("200 OK", false, r#"{"ok":false,"error":"muted"}"#),
+                // 6. Chunked OneBot reply with lone surrogate.
+                ("200 OK", true, r#"{"status":"ok","retcode":0,"data":{"nickname":"n\ud83d"}}"#),
+                // 7. OneBot HTTP 426 hint.
+                ("426 Upgrade Required", false, "upgrade"),
+                // 8. OneBot HTTP 200 non-ok envelope.
+                ("200 OK", false, r#"{"status":"failed","retcode":1404,"wording":"nope"}"#),
+            ];
+            for (status, chunked, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).unwrap();
+                if chunked {
+                    let mid = body.len() / 2;
+                    let (a, b) = body.split_at(mid);
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
+                        a.len(),
+                        b.len()
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+            // 9. Accept and hold open to force read timeout on console send.
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-qq-tools-modes-")),
+        );
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"synthetic-review-token-abcdefghij"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            format!(
+                r#"{{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:{port}"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+
+        let context = RuntimeContext::from_root(&root).unwrap().with_console_port(port);
+        let api = Api {
+            context: &context,
+            filter_reads: false,
+        };
+
+        let ok = api
+            .call_classified(
+                ApiCall::post("/api/socialV2/send-message", json!({"key":"group:1","messages":["hi"]}))
+                    .token("t"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(ok["sent"], 1);
+
+        let e429 = api
+            .call_classified(ApiCall::post("/api/socialV2/send-message", json!({})), true)
+            .unwrap_err();
+        assert!(!e429.delivery_unknown, "429 is a definite refusal");
+
+        let e503 = api
+            .call_classified(ApiCall::post("/api/socialV2/send-message", json!({})), true)
+            .unwrap_err();
+        assert!(e503.delivery_unknown, "5xx without outbox proof is unknown");
+
+        let unconfirmed = api
+            .call_classified(ApiCall::post("/api/socialV2/send-message", json!({})), true)
+            .unwrap_err();
+        assert!(unconfirmed.delivery_unknown);
+
+        let refused = api
+            .call_classified(ApiCall::post("/api/socialV2/send-message", json!({})), true)
+            .unwrap_err();
+        assert!(!refused.delivery_unknown);
+
+        let login = api.onebot("get_login_info", json!({})).unwrap();
+        assert_eq!(login["nickname"], "n\u{FFFD}");
+
+        let e426 = api.onebot("get_login_info", json!({})).unwrap_err();
+        assert!(e426.contains("426"), "{e426}");
+
+        let non_ok = api.onebot("get_login_info", json!({})).unwrap_err();
+        assert!(non_ok.contains("1404"), "{non_ok}");
+
+        // 9. Read timeout on send -> delivery_unknown: true.
+        let timed_out = api
+            .call_classified(
+                ApiCall::post("/api/socialV2/send-message", json!({})).timeout(120),
+                true,
+            )
+            .unwrap_err();
+        assert!(timed_out.delivery_unknown, "read timeout after write is unknown");
+        assert_eq!(timed_out.message, "The operation was aborted due to timeout");
+
+        server.join().unwrap();
+
+        // 10. Closed port (connect refused -> NotCommitted) on send -> delivery_unknown: false.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let closed_ctx = RuntimeContext::from_root(&root).unwrap().with_console_port(closed);
+        let closed_api = Api {
+            context: &closed_ctx,
+            filter_reads: false,
+        };
+        let not_committed = closed_api
+            .call_classified(ApiCall::post("/api/socialV2/send-message", json!({})), true)
+            .unwrap_err();
+        assert!(!not_committed.delivery_unknown, "connect refusal is not committed");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

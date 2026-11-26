@@ -344,7 +344,7 @@
   },
   {
    "name": "qq_mark_read",
-   "description": "将指定会话已查看的未读消息标记为已读。throughSeq 使用最近读取结果的 readThroughSeq，避免清除读取后才到达的新消息；省略 throughSeq 会按旧行为清空当前全部未读，因此推荐始终带上水位。注意：每次设置潜水/下一次唤醒前，桥接要求先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可 mark_read 收尾沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与也可直接 mark_read 收尾；若你参与了回复，则下次想睡需重新等待观察窗口。",
+   "description": "将指定会话已查看的未读消息标记为已读。必须把已查看结果中的 readThroughSeq 作为 throughSeq；更晚到达的消息保持未读。群聊需要观察时，按会话指引处理。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -365,7 +365,8 @@
     },
     "required": [
      "key",
-     "token"
+     "token",
+     "throughSeq"
     ],
     "$schema": "http://json-schema.org/draft-07/schema#"
    },
@@ -375,7 +376,7 @@
   },
   {
    "name": "qq_set_wake_config",
-   "description": "设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。",
+   "description": "设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。群聊需要观察时，按会话指引处理。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -663,7 +664,7 @@
   },
   {
    "name": "qq_wait_for_messages",
-   "description": "等待分两种用途。首答前已读消息、只想确认有没有补充：用 purpose=\"reply\"，按最后来信时间补足 quietMs 静默，已安静足够就立即返回；读取/思考时新到的消息也会返回，新消息重算静默。timeoutMs 是最长预算，不要求等满；预算到但 quiet=false 不代表对方已说完。此用途绝不代替沉睡前观察。等对方继续说、等回复或睡前观察：用默认 purpose=\"messages\"；先等新消息，收到后才按 quietMs 等静默，没有新消息会等到 timeoutMs，单传 quietMs 不会缩短总等待。静默下限由后台配置，默认 10000ms。直接看 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询；仍有未展示未读才补读。决定潜水/收尾时才用默认用途加 timeoutMs=300000 完成沉睡前观察，不能把 5 分钟观察放在首答之前；短等待不能代替。全程无人说话返回 preSleepWaitSatisfied=true；观察期间来了新消息返回 preSleepWaitObserved=true，读后不需参与可收尾，参与回复则下次收尾重新观察。preSleepWaitRemainingMs 仅供准备收尾时参考。",
+   "description": "messages 等待对方下文或在需要时观察群聊；reply 按最后来信补足可选的静默时间。首答由发送工具控制节奏。读取 newMessages 和 readThroughSeq；仍有未展示未读时继续读取。观察时长按会话指引。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -684,7 +685,7 @@
       ]
      },
      "timeoutMs": {
-      "description": "等待预算毫秒数，默认 30000、最大 600000；reply 达到静默即返回，不必等满；沉睡前观察用 messages 并传 300000",
+      "description": "等待预算毫秒数，按当前等待设置限制；reply 达到静默即返回；需要群聊观察时用 messages，时长按会话指引",
       "type": "number"
      },
      "minNewMessages": {

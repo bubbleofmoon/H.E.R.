@@ -5,15 +5,24 @@
 #![allow(dead_code)]
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::settings::{
+    REMINDER_CONVERSATION_CAP, REMINDER_HORIZON, REMINDER_REPEAT_FLOOR, REMINDER_TOTAL_CAP,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::time::{Duration, Instant};
 
 const STORE_FILE: &str = "schedule.json";
 const TIMERS_FILE: &str = "schedule-timers.json";
+// Lock ordering: always load config / enter `config_gate` before taking `locks/schedule.lock`;
+// never call `load_config_requiring_settings` or touch `settings.db` inside `self.update`.
 const LOCK_FILE: &str = "locks/schedule.lock";
 pub const REMINDER_REASON: &str = "reminder:";
-const LATE_GRACE_MS: i64 = 60_000;
-const MAX_AHEAD_MS: i64 = 366 * 86_400_000;
+const MINUTE_MS: i64 = 60_000;
+const LATE_GRACE_MS: i64 = MINUTE_MS;
+const DAY_MS: i64 = 24 * 60 * MINUTE_MS;
+pub(crate) const MAX_AHEAD_DAYS: i64 = 366;
+const MAX_AHEAD_MS: i64 = MAX_AHEAD_DAYS * DAY_MS;
 const HISTORY_CAP: usize = 500;
 const FINISHED_ITEM_CAP: usize = 200;
 const TIMER_CANCEL_TTL_MS: i64 = 120_000;
@@ -24,12 +33,19 @@ const RECENT_FINISH_MS: i64 = 24 * 3_600_000;
 /// HER's timer snapshot older than this is shown as stale and cannot be cancelled against (the hub is not running).
 const STALE_TIMERS_MS: i64 = 2 * TIMERS_REFRESH_MS;
 /// The shortest repeat the store accepts, for the owner and for HER.
-const MIN_REPEAT_MINUTES: u32 = 15;
+pub(crate) const MIN_REPEAT_MINUTES: u32 = 15;
 /// The model-facing note for a reminder that was cancelled or deleted before its wake ran.
 pub const REMINDER_GONE: &str = "【提醒内容】这条提醒已被取消或删除。\n\n";
 /// Set once an unreadable store has been logged; cleared by the next good read, so a new failure logs again.
 static PAUSE_READ_FAILURE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub const PAUSABLE_JOBS: &[&str] = &["memory-digest", "memory-digest-check", "backup", "upstream-check"];
+pub const PAUSABLE_JOBS: &[&str] = &[
+    "memory-digest",
+    "memory-digest-check",
+    "backup",
+    "memory-backup",
+    "memory-restore-test",
+    "upstream-check",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,7 +95,7 @@ impl Repeat {
         match self {
             Repeat::Once => None,
             Repeat::Every { minutes } => {
-                let period = minutes as i64 * 60_000;
+                let period = i64::from(minutes) * MINUTE_MS;
                 if period <= 0 {
                     None
                 } else if at > now {
@@ -285,8 +301,22 @@ fn is_finished(status: ItemStatus) -> bool {
     matches!(status, ItemStatus::Done | ItemStatus::Cancelled)
 }
 
-fn find_mut<'a>(doc: &'a mut Document, id: &str) -> Result<&'a mut Item, StoreError> {
-    doc.items.iter_mut().find(|item| item.id == id).ok_or(StoreError::NotFound)
+fn her_reminder_in(item: &Item, conversation: &str) -> bool {
+    item.creator == Creator::Her && item.conversation == conversation
+}
+
+fn find_mut<'a>(
+    doc: &'a mut Document,
+    id: &str,
+    her_origin: Option<&str>,
+) -> Result<&'a mut Item, StoreError> {
+    doc.items
+        .iter_mut()
+        .find(|item| {
+            item.id == id
+                && her_origin.is_none_or(|conversation| her_reminder_in(item, conversation))
+        })
+        .ok_or(StoreError::NotFound)
 }
 
 fn valid_conversation(key: &str) -> bool {
@@ -318,6 +348,85 @@ fn check_at(at: i64, now: i64) -> Result<(), StoreError> {
     } else {
         Err(StoreError::Invalid("提醒时间必须在现在起一年之内".into()))
     }
+}
+
+/// The console and harness accept the same UTC instant or local wall-clock minute.
+pub(crate) fn optional_time(
+    fields: &Map<String, Value>,
+    cfg: &Value,
+) -> Result<Option<i64>, StoreError> {
+    let invalid = || StoreError::Invalid("提醒时间无效".into());
+    let at = fields.get("at").filter(|value| !value.is_null());
+    let local = fields.get("localAt").filter(|value| !value.is_null());
+    match (at, local) {
+        (None, None) => Ok(None),
+        (Some(at), None) => at.as_i64().map(Some).ok_or_else(invalid),
+        (None, Some(local)) => local
+            .as_str()
+            .and_then(|text| {
+                crate::local_time::parse_wall_minute(text, &crate::local_time::configured_zone(cfg))
+            })
+            .map(Some)
+            .ok_or_else(invalid),
+        (Some(_), Some(_)) => Err(invalid()),
+    }
+}
+
+fn check_her_capacity(
+    config: &Value,
+    items: &[Item],
+    conversation: &str,
+) -> Result<(), StoreError> {
+    let (mut in_conversation, mut total) = (0, 0);
+    for item in items
+        .iter()
+        .filter(|item| item.creator == Creator::Her && !is_finished(item.status))
+    {
+        total += 1;
+        if item.conversation == conversation {
+            in_conversation += 1;
+        }
+    }
+    let conversation_cap = REMINDER_CONVERSATION_CAP.integer(config);
+    if in_conversation >= conversation_cap {
+        return Err(StoreError::Conflict(format!(
+            "本会话的提醒已达上限（{conversation_cap} 条）"
+        )));
+    }
+    let total_cap = REMINDER_TOTAL_CAP.integer(config);
+    if total >= total_cap {
+        return Err(StoreError::Conflict(format!(
+            "提醒总数已达上限（{total_cap} 条）"
+        )));
+    }
+    Ok(())
+}
+
+fn check_her_timing(
+    config: &Value,
+    at: Option<i64>,
+    repeat: Option<Repeat>,
+    now: i64,
+) -> Result<(), StoreError> {
+    let horizon_days = REMINDER_HORIZON.integer(config);
+    if at.is_some_and(|at| at > now + horizon_days * DAY_MS) {
+        return Err(StoreError::Invalid(format!(
+            "提醒时间不能超过未来 {horizon_days} 天"
+        )));
+    }
+    let floor = REMINDER_REPEAT_FLOOR.integer(config);
+    if let Some(Repeat::Every { minutes }) = repeat {
+        let minutes = i64::from(minutes);
+        if minutes < floor {
+            return Err(StoreError::Invalid(format!("重复间隔至少 {floor} 分钟")));
+        }
+        if minutes * MINUTE_MS > horizon_days * DAY_MS {
+            return Err(StoreError::Invalid(format!(
+                "重复间隔不能超过 {horizon_days} 天"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Keeps the newest history records and the most recently finished items. Items finished in the last day, and any
@@ -434,8 +543,17 @@ impl ScheduleStore {
             last_result: None,
             finished_at: None,
         };
+        let her_cfg = if item.creator == Creator::Her {
+            Some(self.context.load_config_requiring_settings()?)
+        } else {
+            None
+        };
         let stored = item.clone();
         self.update(|doc| {
+            if let Some(cfg) = her_cfg.as_ref() {
+                check_her_capacity(cfg, &doc.items, &item.conversation)?;
+                check_her_timing(cfg, Some(item.next_at), Some(item.repeat), now)?;
+            }
             doc.items.push(item);
             Ok(stored)
         })
@@ -449,9 +567,44 @@ impl ScheduleStore {
         Ok(self.read()?.items.into_iter().find(|item| item.id == id))
     }
 
+    pub(crate) fn list_her(&self, conversation: &str) -> Result<Vec<Item>, StoreError> {
+        let _gate = self.lock()?;
+        Ok(self
+            .read()?
+            .items
+            .into_iter()
+            .filter(|item| her_reminder_in(item, conversation) && !is_finished(item.status))
+            .collect())
+    }
+
     pub fn update_item(&self, id: &str, change: ItemChange, now: i64) -> Result<Item, StoreError> {
+        self.update_item_for(id, change, now, None)
+    }
+
+    pub(crate) fn change_her(
+        &self,
+        conversation: &str,
+        id: &str,
+        change: ItemChange,
+        now: i64,
+    ) -> Result<Item, StoreError> {
+        self.update_item_for(id, change, now, Some(conversation))
+    }
+
+    fn update_item_for(
+        &self,
+        id: &str,
+        change: ItemChange,
+        now: i64,
+        her_origin: Option<&str>,
+    ) -> Result<Item, StoreError> {
+        let her_cfg = if her_origin.is_some() && (change.at.is_some() || change.repeat.is_some()) {
+            Some(self.context.load_config_requiring_settings()?)
+        } else {
+            None
+        };
         self.update(|doc| {
-            let item = find_mut(doc, id)?;
+            let item = find_mut(doc, id, her_origin)?;
             if is_finished(item.status) {
                 return Err(finished_conflict());
             }
@@ -461,6 +614,9 @@ impl ScheduleStore {
             }
             if let Some(repeat) = change.repeat {
                 repeat.validate()?;
+            }
+            if let Some(cfg) = her_cfg.as_ref() {
+                check_her_timing(cfg, change.at, change.repeat, now)?;
             }
             if let Some(text) = text {
                 item.text = text;
@@ -477,7 +633,7 @@ impl ScheduleStore {
 
     pub fn set_item_paused(&self, id: &str, paused: bool) -> Result<Item, StoreError> {
         self.update(|doc| {
-            let item = find_mut(doc, id)?;
+            let item = find_mut(doc, id, None)?;
             match item.status {
                 ItemStatus::Done | ItemStatus::Cancelled => return Err(finished_conflict()),
                 ItemStatus::Active if paused => item.status = ItemStatus::Paused,
@@ -489,8 +645,21 @@ impl ScheduleStore {
     }
 
     pub fn cancel(&self, id: &str, now: i64) -> Result<Item, StoreError> {
+        self.cancel_for(id, now, None)
+    }
+
+    pub(crate) fn cancel_her(
+        &self,
+        conversation: &str,
+        id: &str,
+        now: i64,
+    ) -> Result<Item, StoreError> {
+        self.cancel_for(id, now, Some(conversation))
+    }
+
+    fn cancel_for(&self, id: &str, now: i64, her_origin: Option<&str>) -> Result<Item, StoreError> {
         self.update(|doc| {
-            let item = find_mut(doc, id)?;
+            let item = find_mut(doc, id, her_origin)?;
             if is_finished(item.status) {
                 return Err(finished_conflict());
             }
@@ -511,7 +680,7 @@ impl ScheduleStore {
 
     pub fn run_now(&self, id: &str) -> Result<Item, StoreError> {
         self.update(|doc| {
-            let item = find_mut(doc, id)?;
+            let item = find_mut(doc, id, None)?;
             if is_finished(item.status) {
                 return Err(finished_conflict());
             }
@@ -782,6 +951,13 @@ pub fn system_job_paused(context: &RuntimeContext, job: &str) -> bool {
     }
 }
 
+fn reminder_prompt_text(text: &str) -> String {
+    text.replace("\r\n", " ")
+        .replace(['\n', '\r', '\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'], " ")
+        .replace('【', "〔")
+        .replace('】', "〕")
+}
+
 /// The model-facing line for a reminder wake: the reminder text, or a note that it was cancelled or deleted.
 /// Empty for other reasons and when the store cannot be read.
 #[cfg(test)]
@@ -795,12 +971,12 @@ pub(crate) fn reminder_line_for_model(context: &RuntimeContext, reason: &str, vi
     };
     match ScheduleStore::new(context).item(id) {
         Ok(Some(item)) if item.status != ItemStatus::Cancelled => {
-            let label = match item.creator {
-                Creator::Owner => "管理员",
-                Creator::Her => "你自己",
-                Creator::System => "系统",
+            let (label, text) = match item.creator {
+                Creator::Owner => ("管理员", item.text),
+                Creator::Her => ("你自己", reminder_prompt_text(&item.text)),
+                Creator::System => ("系统", item.text),
             };
-            format!("【提醒内容】{}\n（由{}设置）\n\n", crate::model_view::strip_from_model_text(&item.text, view), label)
+            format!("【提醒内容】{}\n（由{label}设置）\n\n", crate::model_view::strip_from_model_text(&text, view))
         }
         Ok(_) => REMINDER_GONE.to_string(),
         Err(_) => String::new(),
@@ -848,6 +1024,225 @@ mod tests {
 
     fn owner(conversation: &str, text: &str, at: i64, repeat: Repeat) -> NewItem {
         NewItem { creator: Creator::Owner, conversation: conversation.into(), text: text.into(), at, repeat }
+    }
+
+    fn her_reminder(conversation: &str) -> NewItem {
+        NewItem {
+            creator: Creator::Her,
+            ..owner(conversation, "喝水", NOW + DAY, Repeat::Once)
+        }
+    }
+
+    fn with_limits(fixture: &Fixture, limits: serde_json::Value) -> ScheduleStore {
+        let path = fixture.0.join("config/config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["reminders"] = limits;
+        std::fs::write(path, config.to_string()).unwrap();
+        ScheduleStore::new(&fixture.context())
+    }
+
+    #[test]
+    fn her_reminder_conversation_cap() {
+        let fixture = Fixture::new();
+        let store = with_limits(&fixture, serde_json::json!({"maxPerConversation": 2}));
+        let key = "private:31";
+        store
+            .create(owner(key, "管理员提醒", NOW + DAY, Repeat::Once), NOW)
+            .unwrap();
+        let first = store.create(her_reminder(key), NOW).unwrap();
+        store.set_item_paused(&first.id, true).unwrap();
+        store.create(her_reminder(key), NOW).unwrap();
+        assert_eq!(
+            store.create(her_reminder(key), NOW).map(|_| ()),
+            Err(StoreError::Conflict("本会话的提醒已达上限（2 条）".into())),
+            "conversation cap counts paused HER reminders",
+        );
+        store.create(her_reminder("private:32"), NOW).unwrap();
+        store.cancel_her(key, &first.id, NOW).unwrap();
+        store.create(her_reminder(key), NOW).unwrap();
+    }
+
+    #[test]
+    fn her_reminder_total_cap() {
+        let fixture = Fixture::new();
+        let store = with_limits(&fixture, serde_json::json!({"maxTotal": 2}));
+        store
+            .create(
+                owner("private:33", "管理员提醒", NOW + DAY, Repeat::Once),
+                NOW,
+            )
+            .unwrap();
+        let first = store.create(her_reminder("private:31"), NOW).unwrap();
+        store.set_item_paused(&first.id, true).unwrap();
+        store.create(her_reminder("private:32"), NOW).unwrap();
+        assert_eq!(
+            store.create(her_reminder("private:33"), NOW).map(|_| ()),
+            Err(StoreError::Conflict("提醒总数已达上限（2 条）".into())),
+            "total cap counts paused HER reminders across conversations",
+        );
+        store.cancel_her("private:31", &first.id, NOW).unwrap();
+        store.create(her_reminder("private:33"), NOW).unwrap();
+    }
+
+    #[test]
+    fn her_reminder_repeat_floor() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let key = "private:31";
+        let item = |minutes| NewItem {
+            repeat: Repeat::Every { minutes },
+            ..her_reminder(key)
+        };
+        assert_eq!(
+            store.create(item(59), NOW).map(|_| ()),
+            Err(StoreError::Invalid("重复间隔至少 60 分钟".into())),
+            "a 59-minute HER repeat is refused",
+        );
+        let at_floor = store.create(item(60), NOW).unwrap();
+        let edit = |minutes| ItemChange {
+            repeat: Some(Repeat::Every { minutes }),
+            ..ItemChange::default()
+        };
+        assert_eq!(
+            store.change_her(key, &at_floor.id, edit(59), NOW).map(|_| ()),
+            Err(StoreError::Invalid("重复间隔至少 60 分钟".into()))
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_floor.id, edit(60), NOW)
+                .unwrap()
+                .repeat,
+            item(60).repeat
+        );
+        store
+            .create(
+                owner(key, "管理员提醒", NOW + DAY, Repeat::Every { minutes: 15 }),
+                NOW,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn her_reminder_horizon() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let key = "private:31";
+        let horizon = NOW + 365 * DAY;
+        let item = |at| NewItem {
+            at,
+            ..her_reminder(key)
+        };
+        let at_limit = store.create(item(horizon), NOW).unwrap();
+        assert_eq!(
+            store.create(item(horizon + 1), NOW).map(|_| ()),
+            Err(StoreError::Invalid("提醒时间不能超过未来 365 天".into())),
+            "one millisecond beyond the HER horizon is refused",
+        );
+        let edit = |at| ItemChange {
+            at: Some(at),
+            ..ItemChange::default()
+        };
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(horizon + 1), NOW)
+                .map(|_| ()),
+            Err(StoreError::Invalid("提醒时间不能超过未来 365 天".into()))
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(horizon), NOW)
+                .unwrap()
+                .next_at,
+            horizon
+        );
+        store
+            .create(owner(key, "管理员提醒", NOW + 366 * DAY, Repeat::Once), NOW)
+            .unwrap();
+    }
+
+    #[test]
+    fn her_reminder_repeat_horizon() {
+        let fixture = Fixture::new();
+        let store = with_limits(&fixture, serde_json::json!({"maxAheadDays": 2}));
+        let key = "private:31";
+        let item = |minutes| NewItem {
+            repeat: Repeat::Every { minutes },
+            ..her_reminder(key)
+        };
+        let at_limit = store.create(item(2_880), NOW).unwrap();
+        let edit = |minutes| ItemChange {
+            repeat: Some(Repeat::Every { minutes }),
+            ..ItemChange::default()
+        };
+        assert_eq!(
+            store.create(item(2_881), NOW).map(|_| ()),
+            Err(StoreError::Invalid("重复间隔不能超过 2 天".into())),
+            "an interval one minute beyond the HER horizon is refused on create"
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(2_881), NOW)
+                .map(|_| ()),
+            Err(StoreError::Invalid("重复间隔不能超过 2 天".into())),
+            "an interval one minute beyond the HER horizon is refused on a repeat-only change"
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(2_880), NOW)
+                .unwrap()
+                .repeat,
+            Repeat::Every { minutes: 2_880 }
+        );
+    }
+
+    fn assert_hidden(store: &ScheduleStore, key: &str, hidden: &Item, rule: &str) {
+        let visible = store.create(her_reminder(key), NOW).unwrap();
+        let listed = store.list_her(key).unwrap();
+        let edit = ItemChange {
+            text: Some("换一个提醒".into()),
+            ..ItemChange::default()
+        };
+        let changed = store.change_her(key, &hidden.id, edit, NOW);
+        let cancelled = store.cancel_her(key, &hidden.id, NOW);
+        assert_eq!(
+            (listed, changed, cancelled),
+            (
+                vec![visible],
+                Err(StoreError::NotFound),
+                Err(StoreError::NotFound)
+            ),
+            "{rule}",
+        );
+        assert_eq!(store.item(&hidden.id).unwrap().as_ref(), Some(hidden));
+    }
+
+    #[test]
+    fn her_reminders_hide_owner_items() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let key = "private:31";
+        let hidden = store
+            .create(owner(key, "管理员提醒", NOW + DAY, Repeat::Once), NOW)
+            .unwrap();
+        assert_hidden(
+            &store,
+            key,
+            &hidden,
+            "owner reminder must stay hidden even in the same conversation",
+        );
+    }
+
+    #[test]
+    fn her_reminders_hide_other_conversations() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let hidden = store.create(her_reminder("private:32"), NOW).unwrap();
+        assert_hidden(
+            &store,
+            "private:31",
+            &hidden,
+            "another conversation's HER reminder must stay hidden",
+        );
     }
 
     #[test]
@@ -1223,6 +1618,28 @@ mod tests {
         // The oldest finishes (the highest indices) went first; the 50 newest old items remain.
         assert!(items.iter().any(|item| item.id == "rem-o49"));
         assert!(items.iter().all(|item| item.id != "rem-o50"), "rem-o50 finished before rem-o49 and is dropped first");
+    }
+
+    #[test]
+    fn her_reminder_text_stays_within_its_prompt_section() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let store = ScheduleStore::new(&context);
+        let item = store
+            .create(
+                NewItem {
+                    text: "记得喝水\r\n【便签】\u{2028}带伞".into(),
+                    ..her_reminder("private:31")
+                },
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reminder_line(&context, &format!("reminder:{}", item.id)),
+            "【提醒内容】记得喝水 〔便签〕 带伞\n（由你自己设置）\n\n",
+            "HER reminder text stays on one line with no section markers"
+        );
     }
 
     #[test]

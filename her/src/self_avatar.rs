@@ -283,8 +283,8 @@ fn transfer_folder(context: &RuntimeContext) -> Result<PathBuf, String> {
 }
 
 #[cfg(not(test))]
-fn transfer(url: &str, folder: &Path) -> Result<Vec<u8>, String> {
-    crate::safe_fetch::fetch_exact(url, MAX_BYTES, FETCH_BUDGET, folder).map(|fetched| fetched.bytes)
+fn transfer(url: &str, _folder: &Path) -> Result<Vec<u8>, String> {
+    crate::safe_fetch::fetch_exact(url, MAX_BYTES, FETCH_BUDGET).map(|fetched| fetched.bytes)
 }
 
 #[cfg(test)]
@@ -297,7 +297,7 @@ fn transfer(url: &str, _folder: &Path) -> Result<Vec<u8>, String> {
 
 /// Avatar bytes the model may see: within `MAX_BYTES`, image magic, and they normalize.
 fn decode(bytes: &[u8], max_pixels: u64) -> Option<Normalized> {
-    if bytes.is_empty() || bytes.len() > MAX_BYTES || !crate::safe_fetch::looks_like_image(bytes) {
+    if bytes.is_empty() || bytes.len() > MAX_BYTES || !crate::media_normalize::looks_like_image(bytes) {
         return None;
     }
     #[cfg(test)]

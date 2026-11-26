@@ -10,7 +10,7 @@ pub(crate) const RELATED_TOP_K: Setting = Setting {
     applies: "next wake",
     group: "memory and digest",
     label: "Recalled memories per wake",
-    hint: "Maximum related memories offered to a wake.",
+    hint: "Requested recall depth for a wake, with a delivery cap of five memories.",
     chat: true,
     secret: false,
 };

@@ -12,26 +12,11 @@ use crate::runtime::RuntimeContext;
 /// 校验会话令牌：读所选运行时 `social-v2.json` 里的 agentToken。
 #[cfg(test)]
 fn token_ok(context: &RuntimeContext, key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let Some(state) = context.read_social_state().ok() else {
-        return false;
-    };
-    let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) else {
-        return false;
-    };
-    let expected = conv
-        .get("agentToken")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    // 定长比较，避免按字节提前返回
-    expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .read(key)
+        .ok()
+        .flatten()
+        .is_some_and(|conv| conv.matches_token(token))
 }
 
 #[cfg(test)]
@@ -185,7 +170,7 @@ pub(crate) fn discovered_tools(cfg: &Value, mode: Option<&str>, key: Option<&str
         None => return Vec::new(),
     };
     let profile = if let Some(key) = key {
-        if !crate::console::access_allowed(cfg, mode, key) {
+        if !crate::social_state::access_allowed(cfg, mode, key) {
             return Vec::new();
         }
         Profile::of_conversation(cfg, mode, key)
@@ -262,7 +247,14 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
     Ok(match name {
         "memory_write" => {
             if result["deduped"] == true {
-                format!("已存在相同记忆（#{}），已更新使用时间。", result["id"])
+                if result["archived"] == true {
+                    format!(
+                        "已存在相同记忆（#{}，已归档，当前不会参与检索）。",
+                        result["id"]
+                    )
+                } else {
+                    format!("已存在相同记忆（#{}），已更新使用时间。", result["id"])
+                }
             } else {
                 format!("已记住（#{}）。", result["id"])
             }
@@ -277,9 +269,10 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                     .enumerate()
                     .map(|(i, m)| {
                         format!(
-                            "{}. [#{} {}{}] {}",
+                            "{}. [#{} {}·{}{}] {}",
                             i + 1,
                             m.id,
+                            m.provenance_label(),
                             m.kind,
                             m.subject
                                 .as_ref()
@@ -636,7 +629,7 @@ pub fn serve_with_context(context: &RuntimeContext) -> std::io::Result<()> {
             Err(_) if !discovery_context.is_isolated() => json!({}),
             Err(_) => return Vec::new(),
         };
-        let mode = crate::console::current_mode_for(&discovery_context).ok();
+        let mode = crate::social_state::mode_checked(&discovery_context).ok();
         let key = key.trim();
         discovered_tools(&cfg, mode.as_deref(), (!key.is_empty()).then_some(key))
     });

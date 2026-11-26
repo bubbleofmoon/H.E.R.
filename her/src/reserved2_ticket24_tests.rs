@@ -20,7 +20,10 @@ async fn a_revoked_then_regranted_conversation_never_runs_its_queued_wake() {
     let id = recent["entries"][0]["id"].clone();
     let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(crate::console::inbound_admitted(&hub.context.load_config().unwrap(), revoked), "undo restored access");
+    assert!(
+        crate::social_state::inbound_admitted(&hub.context.load_config().unwrap(), revoked),
+        "undo restored access"
+    );
     hub.tick("bot", 9001).await.unwrap();
     let ran = abort_all(&mut hub);
     let event = format!("{revoked}|message:1");
@@ -89,7 +92,7 @@ async fn a_manual_wake_bootstraps_once_then_wakes_as_admin_and_buffers_while_bus
     // Keep that turn running: the fixture DSH is unreachable and would end it at once.
     let first = hub.active.remove(key).unwrap();
     first.task.abort();
-    hub.active.insert(key.into(), Active { task: tokio::spawn(async { std::future::pending::<()>().await; (Ok(0), false) }), ..first });
+    hub.active.insert(key.into(), Active { task: tokio::spawn(std::future::pending::<DispatchResult>()), ..first });
     // While that turn runs, two identical manual wakes are buffered once (JS busy queue).
     let (_, reply) = wake(&hub.context);
     assert_eq!(reply["reason"], "operator");
@@ -102,7 +105,7 @@ async fn a_manual_wake_bootstraps_once_then_wakes_as_admin_and_buffers_while_bus
     // A request made under an epoch that ended is dropped.
     abort_all(&mut hub);
     wake(&hub.context);
-    console::ensure_or_rotate_agent_token(&hub.context, key, true).unwrap();
+    crate::social_state::ensure_or_rotate(&hub.context, key, true).unwrap();
     hub.tick("bot", 9001).await.unwrap();
     let ran = abort_all(&mut hub);
     let queued = hub.state().unwrap()["conversations"][key].get("adminWakes").cloned();
@@ -123,7 +126,10 @@ async fn a_whole_reset_keeps_a_running_turn_attached_until_it_ends() {
     let state = hub.state().unwrap();
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
     hub.active.insert(key.into(), Active {
-        task: tokio::spawn(async move { let _ = wait.await; (Ok(0), false) }),
+        task: tokio::spawn(async move {
+            let _ = wait.await;
+            DispatchResult::new(Ok(0), false)
+        }),
         inbound: event.clone(), reason: "operatorMarker".into(), previous: state["conversations"][key].clone(),
         at: crate::now_ms() as i64, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted: Default::default(), cap_abort_at: None,
         route: Default::default(), admitted: Default::default(),
@@ -212,12 +218,12 @@ async fn a_reset_observed_late_never_cancels_the_replacement_session() {
     let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/socialV2/reset", Some(&json!({})));
     assert_eq!(status, 200, "{reply}");
     // Before the scheduler's next tick a new turn binds a replacement session and token.
-    let token = console::ensure_or_rotate_agent_token(&hub.context, key, false).unwrap();
+    let token = crate::social_state::ensure_or_rotate(&hub.context, key, false).unwrap();
     crate::session_map::bind(&hub.context, key, "replacement-session", None).unwrap();
     let turn = crate::turn_ledger::Recorder::begin(&hub.context, key, "dsh", "chat", "epoch", &[], None).unwrap();
     hub.tick("bot", 9001).await.unwrap();
     abort_all(&mut hub);
-    let token_after = console::conversation_token(&hub.context, key).unwrap();
+    let token_after = crate::social_state::token(&hub.context, key).unwrap();
     let mapping = crate::session_map::lookup(&hub.context, key).unwrap();
     let (turns, _) = crate::turn_ledger::fold(&crate::turn_ledger::read_records(&hub.context).unwrap());
     let state = turns.iter().find(|t| t.id == turn.id).unwrap().state;

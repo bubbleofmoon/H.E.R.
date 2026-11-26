@@ -10,26 +10,6 @@ use std::time::{Duration, Instant};
 
 #[path = "supervisor_relay.rs"]
 mod relay;
-
-#[cfg(all(test, windows))]
-pub(crate) fn credential_file_is_private(path: &std::path::Path, settings: bool) -> bool {
-    relay::credential_file_is_private(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn create_credential_file(path: &std::path::Path, settings: bool) -> std::io::Result<std::fs::File> {
-    relay::windows_create_credential(path, settings)
-}
-
-#[cfg(windows)]
-pub(crate) fn restrict_credential_path(path: &std::path::Path, metadata: &std::fs::Metadata, settings: bool) -> Result<(), String> {
-    if settings {
-        relay::windows_private_settings(path, metadata)
-    } else {
-        relay::windows_private(path, metadata)
-    }
-    .map_err(String::from)
-}
 #[path = "dependency_upgrade.rs"]
 pub(crate) mod upgrades;
 
@@ -73,6 +53,28 @@ pub fn pinned_version(cfg: &Value, name: &str) -> Result<Option<String>, String>
             }
         )),
     }
+}
+
+fn require_dsh_contract(version: &str) -> Result<(), String> {
+    if include_str!("../dsh-contract-versions.txt")
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .any(|(listed, _)| listed == version)
+    {
+        Ok(())
+    } else {
+        Err(format!("DSH version {version} has no credential contract coverage"))
+    }
+}
+
+/// Validate a pin for startup or health judgment. Process retirement uses the configured
+/// identity even when the pin is no longer eligible to run.
+pub(crate) fn runnable_pin(cfg: &Value, name: &str) -> Result<Option<String>, String> {
+    let version = pinned_version(cfg, name)?;
+    if let ("dsh", Some(version)) = (name, version.as_deref()) {
+        require_dsh_contract(version)?;
+    }
+    Ok(version)
 }
 
 struct Clock {
@@ -898,6 +900,7 @@ fn prepare(
     name: &'static str,
     states: &mut Value,
 ) -> Result<Option<Dependency>, String> {
+    runnable_pin(cfg, name)?;
     let mut dependency = configuration(context, cfg, name)?;
     if let Some(settings) = &dependency.relay {
         relay::restrict(&settings.folder)?;
@@ -1193,23 +1196,23 @@ fn run_npm(
             install.version
         )
     };
-    let mut tree = os::NpmTree::spawn(command)?;
+    let mut tree = crate::process_tree::ProcessTree::spawn(command, Duration::from_secs(30))?;
     let deadline = Instant::now() + NPM_INSTALL_LIMIT;
     loop {
         if !wanted(context) {
-            tree.stop();
+            let _ = tree.stop();
             return Ok(false);
         }
-        match tree.child().try_wait() {
+        match tree.child_mut().try_wait() {
             Ok(Some(status)) if status.success() => return Ok(true),
             Ok(Some(_)) => return Err(failed("npm could not install")),
             Ok(None) if Instant::now() >= deadline => {
-                tree.stop();
+                let _ = tree.stop();
                 return Err(failed("npm timed out after 10 minutes installing"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => {
-                tree.stop();
+                let _ = tree.stop();
                 return Err(failed("npm could not be observed installing"));
             }
         }
@@ -2317,7 +2320,6 @@ fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
 
 #[cfg(windows)]
 mod os {
-    pub(super) use super::relay::windows_private as private;
     use super::*;
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -2375,23 +2377,6 @@ mod os {
         fn CreateMutexW(attributes: *const c_void, owner: i32, name: *const u16) -> HANDLE;
         fn ReleaseMutex(handle: HANDLE) -> i32;
         fn WaitForSingleObject(handle: HANDLE, timeout: u32) -> u32;
-    }
-    /// npm and its descendants run in a kill-on-close job.
-    pub struct NpmTree(crate::backend::windows_cli_lifecycle::CliProcessTree);
-    impl NpmTree {
-        pub fn spawn(command: std::process::Command) -> Result<Self, String> {
-            crate::backend::windows_cli_lifecycle::CliProcessTree::spawn_task(
-                command,
-                Duration::from_secs(30),
-            )
-            .map(Self)
-        }
-        pub fn child(&mut self) -> &mut std::process::Child {
-            self.0.child_mut()
-        }
-        pub fn stop(&mut self) {
-            let _ = self.0.stop_task();
-        }
     }
     pub struct Gate(HANDLE);
     impl Drop for Gate {
@@ -2483,33 +2468,7 @@ mod os {
 
 #[cfg(unix)]
 mod os {
-    pub(super) use super::relay::unix_private as private;
     use super::*;
-    /// npm runs as its own process group so a stop reaches its descendants.
-    pub struct NpmTree(std::process::Child);
-    impl NpmTree {
-        pub fn spawn(mut command: std::process::Command) -> Result<Self, String> {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-            command
-                .spawn()
-                .map(Self)
-                .map_err(|e| format!("npm could not start: {}", e.kind()))
-        }
-        pub fn child(&mut self) -> &mut std::process::Child {
-            &mut self.0
-        }
-        pub fn stop(&mut self) {
-            // The unreaped leader keeps its PID, so the group id cannot have been reused.
-            if let Ok(pid) = i32::try_from(self.0.id()) {
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            }
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     pub fn processes() -> Result<Vec<Entry>, String> {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir("/proc")

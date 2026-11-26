@@ -60,6 +60,7 @@ struct HttpReq {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
+    stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -152,6 +153,7 @@ struct DshInner {
     accepted_results: Vec<Value>,
     drop_result_response: usize,
     hold_result_response: bool,
+    trickle_next_result: Option<std::sync::mpsc::Sender<()>>,
     hold_settings_update: bool,
 }
 
@@ -171,7 +173,7 @@ fn event(sess: &mut Sess, kind: &str, data: Value) {
 impl Dsh {
     fn new() -> Arc<Self> {
         Arc::new(Self { loop_fixture: Mutex::new(None), loop_results: Mutex::new(Vec::new()), requests: Mutex::default(), inner: Mutex::new(DshInner { sessions: HashMap::new(), next_sid: 0, rpc: Vec::new(), prompts: Vec::new(), refuse_prompt: false, preview_fault: None, interactions: Vec::new(), event_clients: 0, drop_interaction_stream: false, stall_handshakes: false, stalled_handshakes: 0, fail_settings: false,
-            archive_failures: 0, presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, hold_settings_update: false }), trace: Arc::default() })
+            archive_failures: 0, presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, trickle_next_result: None, hold_settings_update: false }), trace: Arc::default() })
     }
 
     fn prompts(&self) -> Vec<PromptRec> {
@@ -450,6 +452,24 @@ impl Dsh {
         if prompt.contains("#RATE81#") {
             return finish(json!({"kind":"error","error":{"code":"QUOTA_EXCEEDED","message":"HTTP 429 quota exceeded CHAT_SECRET_81"}}));
         }
+        if prompt.contains("#REFUSE47#") {
+            let mut inner = lock(&self.inner);
+            let session = inner.sessions.get_mut(sid).unwrap();
+            for (step, name, field, id, seq) in [
+                (0, "qq_wait_for_messages", "newMessages", "wait-fixture-one", 71),
+                (1, "qq_wait_for_messages", "newMessages", "wait-fixture-two", 72),
+                (1, "qq_get_unread_messages", "messages", "unread-fixture", 73),
+            ] {
+                let call = format!("fixture-read-{seq}");
+                event(session, "tool/call", json!({"turn":turn,"step":step,"callId":call,"name":format!("mcp__snowluma__{name}")}));
+                let packet = json!({(field):[{"messageId":id,"seq":seq,"text":"CHAT_SECRET_47"}]});
+                event(session, "tool/result", json!({"turn":turn,"message":{
+                    "source":{"callId":call},"content":[{"type":"text","text":packet.to_string()}]}}));
+            }
+            event(session, "llm/retry-started", json!({"turn":turn,"step":2,"retry":1}));
+            drop(inner);
+            return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content"}}));
+        }
         if prompt.contains("#REFUSE83#") {
             return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content CHAT_SECRET_83"}}));
         }
@@ -546,7 +566,21 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
     if method == "$events/result" && outcome.is_ok() {
         let mut inner = lock(&world.inner);
         if inner.drop_result_response > 0 { inner.drop_result_response -= 1; return; }
+        let trickle = inner.trickle_next_result.take();
         drop(inner);
+        if let Some(closed) = trickle {
+            // Keep the response in progress beyond the bridge's total deadline.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let limit = Instant::now() + Duration::from_secs(45);
+            while Instant::now() < limit {
+                if stream.write_all(b" ").is_err() {
+                    let _ = closed.send(());
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            return;
+        }
         while lock(&world.inner).hold_result_response { thread::sleep(Duration::from_millis(20)); }
     }
     if method == "settings/update" {
@@ -995,9 +1029,22 @@ impl Rig {
     }
 
     fn data_lines(&self, name: &str) -> Vec<Value> {
-        fs::read_to_string(self.root.join("data").join(name))
-            .unwrap_or_default()
-            .lines()
+        let path = self.root.join("data").join(name);
+        let mut text = String::new();
+        for attempt in 0..20 {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    text = content;
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) if cfg!(windows) && err.raw_os_error() == Some(33) && attempt < 19 => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("read {}: {err}", path.display()),
+            }
+        }
+        text.lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     }

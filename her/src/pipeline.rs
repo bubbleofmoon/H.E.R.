@@ -20,6 +20,7 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 // The DSH turn adapter (`turn_engine::Adapter::Dsh`): its sessions, model failover, prompt
 // submission, collector, cancellation and usage rows.
 mod dsh_adapter;
+pub(crate) use dsh_adapter::is_dsh_access_refusal;
 
 /// The explicit per-conversation CLI route, using the same rules as turn dispatch.
 pub(crate) fn pinned_cli_backend<'a>(cfg: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -421,7 +422,7 @@ pub(crate) fn revoke_reserved2_epoch(
 ) -> Result<(), String> {
     // Same order as the hub's epoch observation and DSH's own epoch publication.
     let mut minted = publication.map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
-    let replacement = crate::conversation_authority::revoke_if_current(context, key, token)?;
+    let replacement = crate::social_state::revoke_if_current(context, key, token)?;
     if let (Some(slot), Some(token)) = (minted.as_mut(), replacement) {
         **slot = Some(token);
     }
@@ -438,7 +439,13 @@ pub(crate) struct Reserved2Budget {
 
 impl Reserved2Budget {
     pub(crate) fn deadline_for(&self, conv: &serde_json::Value) -> i64 {
-        crate::console::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv)
+        crate::social_state::reserved2_deadline(
+            self.deadline,
+            self.cap_ms,
+            self.ceiling,
+            self.began,
+            conv,
+        )
     }
 
     pub(crate) fn expired(&self, conv: &serde_json::Value) -> bool {
@@ -501,6 +508,15 @@ pub struct Pipeline {
     #[cfg(test)]
     pub(crate) admission_clock: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
     dispatch_unsubmitted: bool,
+    // Set by the hub for its own wakes. Compatibility turns have no hub retry.
+    reserved2_retries_remaining: Option<bool>,
+    // Once the final unsubmitted failure is eligible for a line, the worker and hub
+    // must use the same DSH parking decision even if health changes before collection.
+    reserved2_failure_parks: Option<bool>,
+    // Set by the reserved hub (`work.attempt < 3`) and synced for DSH parking.
+    reserved_retries_remaining: Option<bool>,
+    reserved_failure_parks: Option<bool>,
+    chat_failure_defers: Option<bool>,
     /// Chat mode (ticket 12): the run state of the chat turn in flight.
     chat: Option<ChatRun>,
     /// Facts of the last finished turn, for the chat reply decision.
@@ -619,10 +635,6 @@ pub fn patch_token_line(prompt: &str, token: &str) -> String {
 }
 
 impl Pipeline {
-    pub fn new(cfg: &serde_json::Value, live: bool) -> Result<Self, String> {
-        Self::new_with_runtime(&RuntimeContext::legacy(), cfg, live)
-    }
-
     pub fn new_with_runtime(
         context: &RuntimeContext,
         cfg: &serde_json::Value,
@@ -781,6 +793,11 @@ impl Pipeline {
             #[cfg(test)]
             admission_clock: None,
             dispatch_unsubmitted: true,
+            reserved2_retries_remaining: None,
+            reserved2_failure_parks: None,
+            reserved_retries_remaining: None,
+            reserved_failure_parks: None,
+            chat_failure_defers: None,
             chat: None,
             last_report: None,
             failure_reported: false,
@@ -822,6 +839,22 @@ impl Pipeline {
     pub fn expect_dispatch_deadline(&mut self, at: i64) { self.dispatch_deadline = Some(at); }
     pub fn dispatch_definitely_unsubmitted(&self) -> bool { self.dispatch_unsubmitted }
 
+    pub(crate) fn set_reserved2_retry_budget(&mut self, retries_remaining: bool) {
+        self.reserved2_retries_remaining = Some(retries_remaining);
+    }
+
+    pub(crate) fn reserved2_failure_parks(&self) -> Option<bool> {
+        self.reserved2_failure_parks
+    }
+
+    pub(crate) fn set_reserved_retry_budget(&mut self, retries_remaining: bool) {
+        self.reserved_retries_remaining = Some(retries_remaining);
+    }
+
+    pub(crate) fn reserved_failure_parks(&self) -> Option<bool> {
+        self.reserved_failure_parks
+    }
+
     fn set_turn_token(&mut self, token: String) {
         self.turn_epoch = crate::send_outbox::token_epoch(&token);
         self.turn_epochs.push(self.turn_epoch.clone());
@@ -845,7 +878,15 @@ impl Pipeline {
         }
         self.turn_final = true;
         if let Some(turn) = &self.cur_turn {
-            let budget_sleep = outcome == "completed" && crate::console::turn_budget_ended(&self.context, &turn.key, &turn.id);
+            let budget_sleep = outcome == "completed"
+                && (crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id)
+                    || (self.reserved2_budget.is_some()
+                        && crate::social_state::turn_wait_limit_reached(
+                            &self.context,
+                            &turn.key,
+                            &turn.id,
+                            &self.turn_token,
+                        )));
             let reason = if budget_sleep { "observationSleep" } else { reason };
             let writer = if retry { turn.clone() } else { turn.clone().without_retry() };
             let result = match rpc_id {
@@ -868,7 +909,7 @@ impl Pipeline {
         let mut minted = shared.as_ref().map(|slot| slot.lock().unwrap_or_else(|p|p.into_inner()));
         #[cfg(test)]
         if let Some(hook) = self.rotation_locked_hook.take() { hook(); }
-        let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, true)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
         #[cfg(test)]
         if let Some(hook) = self.after_abandon_rotation.take() { hook(); }
         if let Some(slot) = minted.as_mut() { **slot = Some(token.clone()); }
@@ -911,13 +952,17 @@ impl Pipeline {
         }
         if let Some(chat) = self.chat.as_ref().filter(|c| c.reserved.is_none()) {
             let cfg = self.context.load_config().map_err(|e| e.to_string())?;
-            if crate::console::runtime_mode(&self.context) != chat.mode || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key) {
+            if crate::social_state::mode(&self.context) != chat.mode
+                || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
         if self.chat.is_none() {
-            let cfg = self.context.load_config().map_err(|e|e.to_string())?;
-            if crate::console::runtime_mode(&self.context) != "reserved2" || !crate::console::inbound_admitted(&cfg,key) {
+            let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+            if crate::social_state::mode(&self.context) != "reserved2"
+                || !crate::social_state::inbound_admitted(&cfg, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
@@ -929,10 +974,10 @@ impl Pipeline {
                 Err(error) => return Err(error),
             }
         }
-        match crate::console::conversation_token(&self.context, key) {
+        match crate::social_state::token(&self.context, key) {
             Ok(Some(token)) if crate::send_outbox::token_epoch(&token) == self.turn_epoch => Ok(()),
             Ok(_) => Err("会话令牌已变化（重置、取消或被替代）".to_string()),
-            Err(error) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -959,20 +1004,11 @@ impl Pipeline {
 /// 用途：判断"这一轮里模型有没有自己调发送工具"。发送路径（MCP → console →
 /// OneBot）成功后会更新这个字段，所以它比任何内存状态都可靠。
 fn last_ai_reply_at(context: &RuntimeContext, key: &str) -> i64 {
-    let state = if context.is_isolated() {
-        context.read_social_state().ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    };
-    state
-        .and_then(|v| {
-            v.get("conversations")
-                .and_then(|c| c.get(key))
-                .and_then(|c| c.get("lastAiReplyAt"))
-                .and_then(|t| t.as_i64())
-        })
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .read_optional_document()
+        .ok()
+        .and_then(|doc| doc.conversation(key))
+        .and_then(|conv| conv.field("lastAiReplyAt").and_then(|t| t.as_i64()))
         .unwrap_or(0)
 }
 
@@ -1005,15 +1041,29 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn report_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, code: &str, message: &str) {
         let failure = crate::model_failure::Failure::classify(code, message);
         note_model_error(&self.context, key, &failure.summary());
-        self.alert_backend_failure(cfg, key, backend, provider, model, &failure);
+        self.alert_backend_failure(cfg, key, backend, provider, model, &failure, &[], None);
     }
 
     /// The owner's alert and refusal record of one failed backend request, without a model error note: a request that
     /// only failed over is no turn failure (`report_backend_failure` adds the note for the failure that ended the turn).
-    fn alert_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, failure: &crate::model_failure::Failure) {
+    #[allow(clippy::too_many_arguments)]
+    fn alert_backend_failure(
+        &mut self,
+        cfg: &serde_json::Value,
+        key: &str,
+        backend: &str,
+        provider: &str,
+        model: &str,
+        failure: &crate::model_failure::Failure,
+        tool_refs: &[serde_json::Value],
+        call: Option<crate::model_failure::RefusalCall<'_>>,
+    ) {
         self.failure_reported = true;
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
-            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, &self.carried_messages);
+            let mut messages = self.carried_messages.clone();
+            crate::model_failure::merge_refs(&mut messages, tool_refs.to_vec());
+            let input = crate::model_failure::RefusalInput { messages: &messages, call };
+            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, input);
         }
         crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure);
     }
@@ -1067,10 +1117,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             .or_else(|| crate::model_failure::snapshot_refs(cli_prompt));
         let refs = WakePromptRefs { dsh: dsh_refs, cli: cli_refs };
         if !self.context.is_isolated() {
-            crate::console::begin_legacy_wait_turn(&self.context, &key)?;
+            crate::social_state::begin_legacy_wait_turn(&self.context, &key)?;
             let deadline = self.dispatch_deadline.take().unwrap_or_else(||crate::turn_ledger::now_ms()
                 .saturating_add(crate::wake::turn_budget(cfg).hard_cap_ms));
-            crate::console::set_legacy_wait_deadline(&self.context, &key, deadline)?;
+            crate::social_state::set_legacy_wait_deadline(&self.context, &key, deadline)?;
             self.carried_messages.clear();
             return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
@@ -1132,7 +1182,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if let Some((at, previous)) = self.dispatch_wake.take() {
                 let claim = serde_json::json!({"at":at,"previous":previous});
                 self.cur_turn.as_ref().unwrap().wake_claim(&claim)?;
-                crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous)?;
+                crate::social_state::consume_reserved2_deadline(
+                    &self.context,
+                    &key,
+                    &token,
+                    at,
+                    &previous,
+                )?;
             }
             Ok(())
         })();
@@ -1151,8 +1207,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else {
             result
         };
-        self.reserved2_budget = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
+        self.reserved2_budget = None;
         result
     }
 
@@ -1182,7 +1238,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             let message = format!("{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）", blocking.id);
             return Err(LedgerAdmissionError::Held { message, record });
         }
-        let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, false)?;
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, false)
+            .map_err(String::from)?;
         if self.dispatch_token.take().is_some_and(|expected| expected != token) {
             return Err("queued wake token invalidated".to_string().into());
         }
@@ -1207,6 +1264,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn end_ledger_turn(&mut self, outcome: Result<(), &str>) {
         match outcome {
             Ok(()) => self.finish_turn("completed", "ok"),
+            Err(error) if is_dsh_access_refusal(error) => self.finish_turn("cancelled", error),
             Err(error) => self.finish_turn("failed", error),
         }
         self.cur_turn = None;
@@ -1221,15 +1279,19 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let cfg = self.context.load_config().map_err(|e| e.to_string())?;
         if let Some(authority) = self.chat.as_ref().and_then(|c| c.reserved.as_ref()) {
             authority.check_generation(&self.context, key)?;
-            if crate::console::chat_role_state(&self.context)?["mode"] == "silent"
+            if crate::social_state::role_state(&self.context)?["mode"] == "silent"
                 && !crate::chat::is_owner_key(&cfg, key)
             {
                 return Err("静默模式已启用".into());
             }
-        } else if self.chat.as_ref().is_none_or(|chat| crate::console::runtime_mode(&self.context) != chat.mode) {
+        } else if self
+            .chat
+            .as_ref()
+            .is_none_or(|chat| crate::social_state::mode(&self.context) != chat.mode)
+        {
             return Err("模式已变化".to_string());
         }
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::social_state::mode(&self.context);
         if !crate::chat::allowed_in_mode(&cfg, &mode, key) {
             return Err("会话或白名单已变化".to_string());
         }
@@ -1351,6 +1413,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 );
                 total.parts += report.parts;
                 total.confirmed += report.confirmed;
+                total.delivery_unknown |= report.delivery_unknown;
+                total.unknown |= report.unknown;
                 if let Some(e) = report.error {
                     total.error = Some(e);
                 }
@@ -1385,8 +1449,107 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         report
     }
 
-    /// One chat turn: ledger entry, DSH turn on the chat preset session, then the automatic reply.
-    /// Failures stay local (ledger, log); nothing internal is sent to the conversation.
+    /// A terminal backend failure may send one owner-authored line while the turn still owns its
+    /// conversation. It uses the mode's send guards and the shared recorded text send.
+    fn send_persona_failure_line(&mut self, key: &str, dsh_session: Option<&str>) {
+        let Some(turn) = self.cur_turn.as_ref() else { return };
+        let mode = self.chat.as_ref().map_or("reserved2", |chat| chat.mode.as_str());
+        if !self.live || self.turn_final || mode == "closed-agent" || self.current_reason == "wakeReminder"
+            || self.chat.as_ref().is_some_and(|chat| chat.silent)
+        {
+            return;
+        }
+        let configured_line = || crate::persona::failure_line(&self.context, key);
+        let Some(line) = configured_line() else { return };
+        if self.turn_has_send_batch(key) {
+            return;
+        }
+        if self.dispatch_unsubmitted {
+            match mode {
+                "reserved2" => {
+                    if let Some(retries_remaining) = self.reserved2_retries_remaining {
+                        if retries_remaining {
+                            return;
+                        }
+                        let Ok(cfg) = self.context.load_config() else { return };
+                        let parks = self.reserved2_wake_parks(&cfg, key);
+                        self.reserved2_failure_parks = Some(parks);
+                        if parks {
+                            return;
+                        }
+                    }
+                }
+                "reserved" => {
+                    if self.reserved_retries_remaining == Some(true) {
+                        return;
+                    }
+                    let parks = self.unsubmitted_dsh_deferred();
+                    self.reserved_failure_parks = Some(parks);
+                    if parks {
+                        return;
+                    }
+                }
+                "chat" if dsh_session.is_some() => {
+                    let defers = self.unsubmitted_dsh_deferred();
+                    self.chat_failure_defers = Some(defers);
+                    if defers {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let guard = || {
+            let cfg = self.context.load_config().map_err(str::to_string)?;
+            if mode == "reserved2" {
+                if !crate::social_state::inbound_admitted(&cfg, key) {
+                    return Err("conversation access changed".into());
+                }
+                if self.reserved2_budget.is_some() && self.check_harness_turn(key)? {
+                    return Err("turn budget expired".into());
+                }
+                crate::console::send_guard(&self.context, &cfg, key, &self.turn_epoch)
+                    .map_err(|(_, reason)| reason)?;
+                if let Some(session) = dsh_session {
+                    self.turn_validity(key, session)?;
+                }
+            } else {
+                self.chat_guard(key, dsh_session.unwrap_or_default())?;
+                if crate::social_state::silent_blocks_send(&self.context, &cfg, key)
+                    .map_err(|error| error.message().to_string())?
+                {
+                    return Err("silent mode".into());
+                }
+            }
+            let offset = self.turn_ledger_offset.ok_or("missing turn ledger offset")?;
+            let current = crate::turn_ledger::fold_turn_since(&self.context, offset, &turn.id)?
+                .ok_or("missing turn ledger entry")?;
+            if !current.state.is_open() || matches!(current.finalization_claim(), Some(("cancel-requested", _))) {
+                return Err("turn ended or cancelled".into());
+            }
+            if configured_line().as_deref() != Some(line.as_str()) {
+                return Err("persona failure line changed".into());
+            }
+            let records = crate::send_outbox::read_records(&self.context)?;
+            if crate::send_outbox::blocks_persona_failure(&records, key, &self.turn_epochs, self.turn_began) {
+                return Err("conversation already replied or has an unresolved send".into());
+            }
+            let mut secrets = self.secrets.clone();
+            secrets.push(self.turn_token.clone());
+            if configured_outbound_violation(&cfg, &line, &secrets).is_some() {
+                return Err("persona failure line blocked by outbound policy".into());
+            }
+            Ok(())
+        };
+        let report = crate::chat::send_recorded(
+            &self.context, &self.ob, key, &self.turn_epoch, crate::send_outbox::PERSONA_FAILURE_SEND, &line, 0, &guard,
+        );
+        if report.unknown {
+            let _ = self.pause_unknown(key, "send-unresolved", "persona failure line delivery is unverified");
+        }
+    }
+
+    /// One chat turn: ledger entry, turn on the chat preset session, then the automatic reply.
     pub(crate) async fn run_chat_turn(
         &mut self,
         key: &str,
@@ -1399,6 +1562,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         owner_started: bool,
     ) -> Result<ChatTurnOutcome, String> {
         self.owner_interaction_closed = false;
+        self.chat_failure_defers = None;
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
@@ -1462,6 +1626,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         authority: crate::reserved::Authority,
     ) -> Result<(), String> {
         authority.check(&self.context, key)?;
+        self.reserved_failure_parks = None;
         self.expect_dispatch_token(authority.token.clone());
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.note_turn(
@@ -1629,17 +1794,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return self.chat_guard(key, "").map(|()| serde_json::Value::Null);
         }
         let cfg = self.context.load_config().map_err(str::to_string)?;
-        let state = self.context.read_social_state()?;
-        let conv = &state["conversations"][key];
+        let doc = crate::conversation_state::ConversationState::for_runtime(&self.context)
+            .read_document()
+            .map_err(|(_, e)| e)?;
+        let conv_token = doc
+            .conversation(key)
+            .and_then(|c| c.token().map(str::to_string));
         if crate::harness::Tools::current_mode(&self.context) != "reserved2"
-            || !crate::console::inbound_admitted(&cfg, key)
+            || !crate::social_state::inbound_admitted(&cfg, key)
             || cfg.pointer("/socialV2/enabled") == Some(&serde_json::json!(false))
-            || state["paused"] == true
-            || conv["agentToken"].as_str() != Some(self.turn_token.as_str())
+            || doc.paused()
+            || conv_token.as_deref() != Some(self.turn_token.as_str())
         {
             return Err("mode, permission or turn generation changed".into());
         }
-        Ok(state)
+        Ok(doc.into_value())
     }
 
     fn check_harness_turn(&self, key: &str) -> Result<bool, String> {
@@ -1810,7 +1979,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     match self.check_harness_turn(key) {
                         Ok(false) => continue,
                         Ok(true) => {
-                            if crate::console::observation_wait_turn(&self.context, key)
+                            if crate::social_state::observation_wait_turn(&self.context, key)
                                 .ok().flatten().as_deref() == Some(recorder.id.as_str())
                             {
                                 // Publish the sleep before revocation can release the handler.
@@ -1837,11 +2006,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             capped = true;
         }
         let turn_ms = started.elapsed().as_millis() as i64;
-        for reference in turn.message_refs() {
-            if !self.carried_messages.contains(&reference) {
-                self.carried_messages.push(reference);
-            }
-        }
         // The runner may have committed completion while the cap poll was checking authority.
         let settled_cap = match &status {
             Status::ObservationSleep => Some("observationSleep"),
@@ -1873,7 +2037,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if observation { return Ok(String::new()); }
             Err(crate::harness::DEADLINE_EXCEEDED.to_owned())
         } else { result };
-        match status {
+        match &status {
             crate::harness::Status::Paused { .. } => self.turn_final = true,
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
             _ => {}
@@ -1885,17 +2049,25 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let count = failures.len();
         for (index, failure) in failures.iter().enumerate() {
             println!("[failover] {key} harness route {} failed ({})", failure.route, failure.summary);
+            let classified = crate::model_failure::Failure::classify("", &failure.summary);
             if model_end && index + 1 == count {
-                self.report_backend_failure(cfg, key, "harness", "openai", &failure.model, "", &failure.summary);
-            } else {
-                let classified = crate::model_failure::Failure::classify("", &failure.summary);
-                self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified);
+                note_model_error(&self.context, key, &classified.summary());
             }
+            let call = crate::model_failure::RefusalCall {
+                turn_id: &recorder.id,
+                index: Some(failure.model_call),
+                rpc_id: None,
+            };
+            self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified,
+                &failure.message_refs, Some(call));
         }
         // When every route of the chain has failed, the owner is told once per outage, after the route reports above
         // (`harness::route_health`).
         if count > 0 {
             crate::harness::route_health::alert_if_owed(&self.context, cfg, key);
+        }
+        if matches!(&status, Status::Failed(_)) && turn.route_chain_exhausted() && !capped && !invalidated {
+            self.send_persona_failure_line(key, None);
         }
         let text = match result {
             Ok(text) => text,
@@ -1940,7 +2112,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let audit = outbound_guard_enabled(&reply_cfg)
             && (!self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") || !crate::chat::is_owner_key(cfg, key));
         let mut secrets = self.secrets.clone();
-        if let Ok(Some(token)) = crate::console::conversation_token(&self.context, key) {
+        if let Ok(Some(token)) = crate::social_state::token(&self.context, key) {
             secrets.push(token);
         }
         if let Some(command) = report.command {
@@ -1982,7 +2154,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 self.send_chat_text(key, &sid, "reply", "⏹️ 已停止");
             }
             crate::chat::Reply::Send(plain) => {
-                let silent_for_members = crate::console::chat_role_state(&self.context)
+                let silent_for_members = crate::social_state::role_state(&self.context)
                     .ok()
                     .is_some_and(|state| state.get("mode").and_then(|m| m.as_str()) == Some("silent"))
                     && !crate::chat::is_owner_key(cfg, key);
@@ -2006,7 +2178,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     where F: FnMut(&str) -> Result<(String, String), String> + Send {
         let key = target.key();
         let token = if self.cur_turn.is_some() { self.turn_token.clone() }
-            else { crate::console::ensure_or_rotate_agent_token(&self.context, &key, false)? };
+            else { crate::social_state::ensure_or_rotate(&self.context, &key, false)? };
         let mut draft_prompt = cli_prompt.to_owned();
         // Match the shared hold's three revisions. The fourth draft uses its fixed deadline.
         for revision in 0..=3 {
@@ -2027,6 +2199,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     let failure = crate::model_failure::Failure::classify("", &note);
                     let (provider, model) = crate::model_failure::cli_identity(cfg,id);
                     self.report_backend_failure(cfg,&key,id,&provider,&model,"",&note);
+                    if failure.class != "refusal" {
+                        self.send_persona_failure_line(&key, None);
+                    }
                     return Err(failure.summary());
                 }
             };
@@ -2159,7 +2334,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let n = trimmed.chars().count();
         // 记录模型到底输出了什么（截断）：既用于判断它有没有说话，也是排障的唯一线索。
         let preview = internal_output_preview(&self.context, trimmed);
-        if crate::console::runtime_mode(&self.context) == "reserved2" {
+        if crate::social_state::mode(&self.context) == "reserved2" {
             self.log_internal_output(key, trimmed);
         }
         println!(
@@ -2642,7 +2817,7 @@ mod tests {
         let (context, mut pipe) = pipeline_for_fake_dsh(&root, listener.local_addr().unwrap().port());
         let key = "group:42";
         crate::session_map::bind(&context, key, "sid-136", None).unwrap();
-        let before = crate::console::ensure_or_rotate_agent_token(&context, key, false).unwrap();
+        let before = crate::social_state::ensure_or_rotate(&context, key, false).unwrap();
         let epoch = crate::send_outbox::token_epoch(&before);
         let turn = crate::turn_ledger::Recorder::begin(&context, key, "dsh", "test", &epoch, &[], None).unwrap();
         turn.session("sid-136").unwrap();
@@ -2665,7 +2840,7 @@ mod tests {
         })));
         let result = pipe.cancel_with_reason(key, "turnTimeout");
         crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
-        let after = crate::console::conversation_token(&context, key).unwrap().unwrap();
+        let after = crate::social_state::token(&context, key).unwrap().unwrap();
         let methods = server.join().unwrap();
         let records = crate::turn_ledger::read_records(&context).unwrap();
         std::fs::remove_dir_all(root).unwrap();
@@ -2683,11 +2858,11 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
         let (context, mut pipe) = pipeline_for_fake_dsh(&root, listener.local_addr().unwrap().port());
         let key = "group:42";
-        let before = crate::console::ensure_or_rotate_agent_token(&context,key,false).unwrap();
+        let before = crate::social_state::ensure_or_rotate(&context,key,false).unwrap();
         let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         pipe.share_minted_epoch(minted.clone());
         let result = pipe.pause_unknown(key,"turn-unverified","synthetic unknown collector outcome");
-        let after = crate::console::conversation_token(&context,key).unwrap().unwrap();
+        let after = crate::social_state::token(&context,key).unwrap().unwrap();
         let published = minted.lock().unwrap().clone();
         std::fs::remove_dir_all(root).unwrap();
         assert!(result.is_err());
@@ -3139,10 +3314,9 @@ mod tests {
     /// Ticket 24 S3: an access change (revocation or whole reset) that lands while DSH is creating a
     /// conversation's session must not let the new session be bound; it is archived instead (JS
     /// `ensureSession` re-checks epoch, policy and mode after creation).
-    #[test]
-    fn ticket24_a_session_created_across_a_revocation_or_reset_is_archived_not_bound() {
+    #[tokio::test]
+    async fn ticket24_a_session_created_across_a_revocation_or_reset_is_archived_not_bound() {
         use std::net::TcpListener;
-        let _env_lock = DSH_HOME_TEST_LOCK.lock().unwrap();
         for (tag, path, body) in [
             ("t24-create-revoke", "/api/whitelist", serde_json::json!({"allow": {"groups": []}, "confirm": true})),
             ("t24-create-reset", "/api/socialV2/reset", serde_json::json!({})),
@@ -3175,13 +3349,76 @@ mod tests {
                 }
                 seen
             });
-            let result = pipeline.ensure_session("group:42");
+            let cfg = context.load_config().unwrap();
+            let result = pipeline.ask_with_failover("group:42", "fixture prompt", 5, &cfg).await;
             let seen = server.join().unwrap();
-            assert!(result.is_err(), "{tag}: a session created across the change was used: {result:?}");
+            assert!(is_dsh_access_refusal(&result.unwrap_err()), "{tag}: the authority change must cancel admission");
+            assert!(take_model_error(&context, "group:42").is_none() && !pipeline.failure_reported);
+            assert!(!seen.iter().any(|p| p == "/api/session/prompt" || p == "/api/session/selectModel"));
             assert_eq!(crate::session_map::lookup(&context, "group:42").unwrap(), None, "{tag}: the new session was bound");
             assert!(seen.iter().any(|p| p == "/api/workspace/archiveSession"), "{tag}: the new session must be archived: {seen:?}");
             drop(pipeline);
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_session_admission_is_not_a_model_error() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        for (allow, deny, admitted) in [
+            (serde_json::json!([]), serde_json::json!([]), false),
+            (serde_json::json!([42]), serde_json::json!([42]), false),
+            (serde_json::json!([42]), serde_json::json!([]), true),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let root = fake_runtime_root("t48-session-admission");
+            let config = serde_json::json!({"consoleToken":"fixture-token","ownerQQ":"7001",
+                "allow":{"groups":allow},"deny":{"groups":deny},"allowAllWhenEmpty":true});
+            std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+            std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+            write_selected_secret(&root, [0x48; 32]);
+            let dependencies = serde_json::json!({
+                "dsh":format!("http://127.0.0.1:{port}"),
+                "model":format!("http://127.0.0.1:{port}"),
+                "onebot":format!("http://127.0.0.1:{port}")
+            });
+            std::fs::write(root.join("dependencies.json"), dependencies.to_string()).unwrap();
+            let context = RuntimeContext::from_root(&root).unwrap();
+            let cfg = context.load_config().unwrap();
+            let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                while let Some((mut stream, request)) =
+                    fake_dsh_accept(&listener, std::time::Duration::from_secs(2))
+                {
+                    if request.path == "/send_private_msg" {
+                        let body = r#"{"status":"ok","retcode":0,"data":{"message_id":123}}"#;
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    } else {
+                        // DSH returns a malformed workspace result. This is a genuine backend failure.
+                        fake_dsh_respond(&mut stream, &request, 200, serde_json::json!({}));
+                    }
+                    paths.push(request.path);
+                }
+                paths
+            });
+            let error = pipeline.ask_with_failover("group:42", "fixture prompt", 5, &cfg).await.unwrap_err();
+            let note = take_model_error(&context, "group:42");
+            let reported = pipeline.failure_reported;
+            let paths = server.join().unwrap();
+            drop(pipeline);
+            std::fs::remove_dir_all(root).unwrap();
+            if admitted {
+                assert!(note.is_some() && reported, "backend failure must be reported: {error}");
+                assert_eq!(paths, ["/api/workspace/create", "/send_private_msg"]);
+            } else {
+                assert!(note.is_none(), "session admission must not leave a model error note: {note:?}");
+                assert!(!reported && paths.is_empty(), "session admission must not call DSH or alert the owner: {paths:?}");
+                assert!(is_cancellation_error(&error), "{error}");
+            }
         }
     }
 
@@ -3273,7 +3510,7 @@ mod tests {
             });
             let result = pipeline.ensure_session("group:42");
             let seen = server.join().unwrap();
-            let error = result.expect_err(&format!("{tag}: the session was used"));
+            let error = String::from(result.expect_err(&format!("{tag}: the session was used")));
             assert!(seen.iter().any(|p| p == "/api/workspace/archiveSession"), "{tag}: the new session must be archived: {seen:?}");
             if refuse_archive {
                 assert!(error.contains("fixture-archive-refused"), "{tag}: the archive failure was swallowed: {error}");
@@ -3349,7 +3586,7 @@ mod tests {
                 seen
             });
 
-            let error = pipeline.ensure_session("group:42").unwrap_err();
+            let error = String::from(pipeline.ensure_session("group:42").unwrap_err());
             assert!(error.contains("重新登录也失败"), "unexpected refresh error: {error}");
             let seen = server.join().unwrap();
             assert_eq!(seen.len(), 2, "isolated refresh must not use ambient DSH_HOME: {seen:?}");
@@ -3512,5 +3749,343 @@ mod tests {
         assert_eq!(records[0]["step"], 0, "step=0 表示无明细，不冒充正常 step");
         // 连 turn/start 都没看到（prompt 未被接受）：不要凭空造一行
         assert!(turn_records("group:1", "sid-test-3", &[], 0, None, &None, &None, 0).is_empty());
+    }
+
+    struct FakeUnsubmittedDsh {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+        port: u16,
+    }
+
+    impl FakeUnsubmittedDsh {
+        fn start(unreachable_prompt: bool) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let server = std::thread::spawn(move || {
+                let mut clients = vec![];
+                while !stopping.load(Ordering::SeqCst) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    clients.push(std::thread::spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                            .unwrap();
+                        let mut head = [0; 4];
+                        if stream.peek(&mut head).is_err() {
+                            return;
+                        }
+                        if &head[..3] == b"GET" {
+                            use tokio_tungstenite::tungstenite::{accept, Message};
+                            let Ok(mut ws) = accept(stream) else { return };
+                            let Ok(msg) = ws.read() else { return };
+                            let Ok(text) = msg.to_text() else { return };
+                            let Ok(open) = serde_json::from_str::<Value>(text) else { return };
+                            let id = &open["streamId"];
+                            let _ = ws.send(Message::Text(
+                                serde_json::json!({
+                                    "type": "item",
+                                    "streamId": id,
+                                    "value": {"type": "snapshot", "records": [], "hasMore": false}
+                                })
+                                .to_string(),
+                            ));
+                            let _ = ws.read();
+                        } else {
+                            let mut stream = stream;
+                            let mut bytes = vec![];
+                            let (path, body) = loop {
+                                let mut chunk = [0; 4096];
+                                let Ok(n) = stream.read(&mut chunk) else { return };
+                                if n == 0 {
+                                    return;
+                                }
+                                bytes.extend_from_slice(&chunk[..n]);
+                                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                    continue;
+                                };
+                                let head = String::from_utf8_lossy(&bytes[..end]);
+                                let len = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().unwrap_or(0))
+                                    })
+                                    .unwrap_or(0);
+                                if bytes.len() >= end + 4 + len {
+                                    break (
+                                        head.lines()
+                                            .next()
+                                            .unwrap()
+                                            .split_whitespace()
+                                            .nth(1)
+                                            .unwrap()
+                                            .to_string(),
+                                        String::from_utf8_lossy(&bytes[end + 4..end + 4 + len])
+                                            .to_string(),
+                                    );
+                                }
+                            };
+                            if path == "/api/session/prompt" && unreachable_prompt {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json"
+                                );
+                            } else {
+                                let value = match path.as_str() {
+                                    "/api/session/prompt" => serde_json::json!({"accepted": false}),
+                                    "/api/session/projections" => serde_json::json!({"values": []}),
+                                    _ => serde_json::json!({}),
+                                };
+                                fake_dsh_respond(
+                                    &mut stream,
+                                    &FakeDshRequest {
+                                        path,
+                                        cookie: None,
+                                        body,
+                                    },
+                                    200,
+                                    value,
+                                );
+                            }
+                        }
+                    }));
+                }
+                for client in clients {
+                    let _ = client.join();
+                }
+            });
+            Self {
+                stop,
+                server: Some(server),
+                port,
+            }
+        }
+    }
+
+    impl Drop for FakeUnsubmittedDsh {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    struct FailureLineFixture {
+        root: PathBuf,
+        context: RuntimeContext,
+        cfg: serde_json::Value,
+        ob_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ob_reqs: std::sync::Arc<std::sync::Mutex<Vec<FakeDshRequest>>>,
+        ob_server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FailureLineFixture {
+        fn finish(mut self) -> (Vec<Value>, Vec<FakeDshRequest>) {
+            self.ob_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(server) = self.ob_server.take() {
+                server.join().unwrap();
+            }
+            let outbox = crate::send_outbox::read_records(&self.context).unwrap();
+            let reqs = self.ob_reqs.lock().unwrap().drain(..).collect();
+            std::fs::remove_dir_all(&self.root).unwrap();
+            (outbox, reqs)
+        }
+    }
+
+    fn setup_failure_line_fixture(
+        tag: &str,
+        mode: &str,
+        dsh_port: u16,
+        line: &str,
+    ) -> FailureLineFixture {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let root = fake_runtime_root(tag);
+        write_selected_secret(&root, [0x48; 32]);
+        let onebot = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        onebot.set_nonblocking(true).unwrap();
+        let onebot_port = onebot.local_addr().unwrap().port();
+        let ob_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ob_reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ob_stopping = ob_stop.clone();
+        let ob_seen = ob_reqs.clone();
+        let ob_server = std::thread::spawn(move || {
+            while !ob_stopping.load(Ordering::SeqCst) {
+                if let Some((mut stream, req)) =
+                    fake_dsh_accept(&onebot, std::time::Duration::from_millis(20))
+                {
+                    ob_seen.lock().unwrap().push(req);
+                    let body = r#"{"status":"ok","retcode":0,"data":{"message_id":123}}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+        let cfg = serde_json::json!({
+            "consoleToken": "fixture-token",
+            "allow": {"groups": [42]},
+            "dsh": {"provider": "p1", "model": "m1"}
+        });
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            root.join("data/mode.json"),
+            serde_json::json!({"mode": mode}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            serde_json::json!({
+                "dsh": format!("http://127.0.0.1:{dsh_port}"),
+                "model": "http://127.0.0.1:43202",
+                "onebot": format!("http://127.0.0.1:{onebot_port}")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("data/personas.json"),
+            serde_json::json!({
+                "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+                "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+                    {"version": 1, "approved": true, "name": "Fixture", "core": "Speak plainly.", "failureLine": line}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        crate::session_map::bind(&context, "group:42", "sid-48", None).unwrap();
+        FailureLineFixture {
+            root,
+            context,
+            cfg,
+            ob_stop,
+            ob_reqs,
+            ob_server: Some(ob_server),
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_chat_unsubmitted_dsh_deferral_suppresses_failure_line_until_terminal() {
+        let line = "A moment, please.";
+        for (case, unreachable_prompt, expect_wait_for_dsh, expect_send) in [
+            ("deferred-wait-for-dsh", true, true, false),
+            ("terminal-prompt-refused", false, false, true),
+        ] {
+            let dsh = FakeUnsubmittedDsh::start(unreachable_prompt);
+            let fx = setup_failure_line_fixture(&format!("t48-chat-{case}"), "chat", dsh.port, line);
+            let mut pipe = Pipeline::new_with_runtime(&fx.context, &fx.cfg, true).unwrap();
+            let result = pipe
+                .run_chat_turn(
+                    "group:42",
+                    "hello chat".into(),
+                    None,
+                    &fx.cfg,
+                    &["e1".into()],
+                    &[],
+                    "chat",
+                    false,
+                )
+                .await;
+            drop(pipe);
+            drop(dsh);
+            let (outbox, reqs) = fx.finish();
+
+            if expect_wait_for_dsh {
+                assert!(
+                    matches!(result, Ok(ChatTurnOutcome::WaitForDsh)),
+                    "{case}: expected WaitForDsh, got {result:?}"
+                );
+            } else {
+                assert!(result.is_err(), "{case}: expected terminal Err, got {result:?}");
+            }
+            let sent_count = reqs.len();
+            assert_eq!(
+                sent_count,
+                usize::from(expect_send),
+                "{case}: onebot failure-line send count"
+            );
+            assert_eq!(
+                outbox
+                    .iter()
+                    .filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure")
+                    .count(),
+                usize::from(expect_send),
+                "{case}: durable failure-line intent count"
+            );
+            if expect_send {
+                assert_eq!(reqs[0].path, "/send_group_msg");
+                let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+                assert_eq!(body["message"], serde_json::json!([{"type": "text", "data": {"text": line}}]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_reserved_unsubmitted_dsh_retries_and_parking_suppress_failure_line_until_terminal() {
+        let line = "A moment, please.";
+        for (case, retries_remaining, unreachable_prompt, expect_parks, expect_send) in [
+            ("retryable-attempt", true, false, None, false),
+            ("parked-on-dsh-down", false, true, Some(true), false),
+            ("terminal-retries-exhausted", false, false, Some(false), true),
+        ] {
+            let dsh = FakeUnsubmittedDsh::start(unreachable_prompt);
+            let fx =
+                setup_failure_line_fixture(&format!("t48-reserved-{case}"), "reserved", dsh.port, line);
+            let authority = crate::reserved::authority_for_test(&fx.context, "group:42").unwrap();
+            let mut pipe = Pipeline::new_with_runtime(&fx.context, &fx.cfg, true).unwrap();
+            pipe.set_reserved_retry_budget(retries_remaining);
+            let result = pipe
+                .run_reserved_turn(
+                    "group:42",
+                    "hello reserved",
+                    &fx.cfg,
+                    &["e1".into()],
+                    &[],
+                    false,
+                    authority,
+                )
+                .await;
+            let parks = pipe.reserved_failure_parks();
+            let unsubmitted = pipe.dispatch_definitely_unsubmitted();
+            drop(pipe);
+            drop(dsh);
+            let (outbox, reqs) = fx.finish();
+
+            assert!(result.is_err(), "{case}: turn failed");
+            assert!(unsubmitted, "{case}: prompt must stay unsubmitted");
+            assert_eq!(parks, expect_parks, "{case}: reserved_failure_parks");
+            assert_eq!(
+                reqs.len(),
+                usize::from(expect_send),
+                "{case}: onebot failure-line send count"
+            );
+            assert_eq!(
+                outbox
+                    .iter()
+                    .filter(|r| r["k"] == "intent" && r["purpose"] == "persona-failure")
+                    .count(),
+                usize::from(expect_send),
+                "{case}: durable failure-line intent count"
+            );
+            if expect_send {
+                assert_eq!(reqs[0].path, "/send_group_msg");
+                let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+                assert_eq!(body["message"], serde_json::json!([{"type": "text", "data": {"text": line}}]));
+            }
+        }
     }
 }

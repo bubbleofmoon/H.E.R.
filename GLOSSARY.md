@@ -92,6 +92,18 @@ _Avoid_: setting type, value kind
 Whether a live setting has one value for the whole bridge (global) or one value per conversation, keyed by the conversation's canonical key and kept in the settings store only; a conversation without its own value uses the global setting. The turn engine has both: a global default and a per-conversation choice.
 _Avoid_: override, per-chat config
 
+**Administrator password (管理员密码)**:
+The one password that lets the administrator open the console in a browser; there are no usernames or other accounts.
+_Avoid_: login, user password, account
+
+**Console token (控制台令牌)**:
+The machine credential that `her-cli`, scripts and the desktop app's sign-in proof present to the console; a browser never uses it, except once to set the first administrator password.
+_Avoid_: admin token, API key
+
+**Browser session (浏览器会话)**:
+The administrator's signed-in state in one browser, started by the administrator password or verified local loopback auto sign-in and ended by logout, expiry, a password change, a password reset or a console token rotation.
+_Avoid_: login session, cookie
+
 **Health check (健康检查)**:
 The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it. The health of each model route is reported beside it and never fails it.
 

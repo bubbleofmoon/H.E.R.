@@ -9,6 +9,8 @@ scripts) never runs; the shard case runs the full list, where the scripts target
 because the fake build leaves no binaries.
 Run: python -I scripts/tests/test_ci_suite.py
 """
+import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / 'scripts' / 'ci'))
@@ -47,6 +50,28 @@ echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 exit 0
 '''
 LIST_HEADER = '# Known red for the fake run.\n'
+
+
+class DshContract(unittest.TestCase):
+    def test_stage_refuses_mismatched_dsh_integrity(self):
+        spec = importlib.util.spec_from_file_location('dsh_contract', ROOT / 'scripts/ci/dsh-contract.py')
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        version = '0.2.1-rc.2'
+        location = 'node_modules/@deepseek-ai/dsh'
+
+        def fake_npm(*args, cwd, **kwargs):
+            (cwd / 'package-lock.json').write_text(json.dumps({'packages': {location: {
+                'version': version,
+                'resolved': f'https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-{version}.tgz',
+                'integrity': 'sha512-' + 'A' * 86 + '==',
+            }}}), encoding='utf-8')
+
+        integrity = contract.read_pins()[version]
+        with tempfile.TemporaryDirectory() as temp, patch.object(contract.subprocess, 'run', side_effect=fake_npm):
+            root = Path(temp).resolve()
+            with self.assertRaisesRegex(RuntimeError, 'npm lock integrity does not match the pinned DSH integrity'):
+                contract.stage(root, root / 'node', root / 'npm', version, integrity)
 
 
 class KnownRedList(unittest.TestCase):
@@ -213,6 +238,13 @@ class RunTests(unittest.TestCase):
     def test_only_runs_build_and_the_named_target(self):
         result = self.run_tests('--only', 'harness_e2e')
         self.assertEqual(self.run_names(result.stdout), ['build', 'harness_e2e'], result.stdout + result.stderr)
+
+    def test_herupdate_runs_the_binary_test_target(self):
+        result = self.run_tests('--only', 'herupdate')
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        self.assertEqual(self.run_names(result.stdout), ['build', 'herupdate'], out)
+        self.assertIn('--bin herupdate -- --test-threads=1', self.cargo_log.read_text())
 
     def test_only_unknown_name_exits_2_listing_valid_names(self):
         result = self.run_tests('--only', 'nope')

@@ -338,11 +338,20 @@ mod tests {
         let wake = json!({"mode": "diving", "infinite": true, "triggers": {"atMention": true, "keywords": ["海"], "dropNames": ["小鲸鱼"]},
             "noActionCount": 2, "confirmedAt": 5, "confirmedBy": "default"});
         std::fs::write(root.join("data/social-v2.json"), json!({"conversations": {"group:1": {"agentToken": "t1", "wakeConfig": wake, "lastActionAt": 0, "lastAiReplyAt": 0}}}).to_string()).unwrap();
-        crate::console::refresh_default_wake_configs(&context).unwrap();
+        crate::config_tx::refresh_default_wake_configs(&context).unwrap();
         let state = context.read_social_state().unwrap();
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["triggers"]["dropNames"], json!(["小鲸鱼"]), "the default refresh keeps them");
         // A third turn without any action resets the configuration to the defaults (noActionLimit 3).
-        crate::console::complete_reserved2_turn(&context, &json!({}), "group:1", "t1", Some(1), &json!(5), 0).unwrap();
+        crate::social_state::complete_reserved2_turn(
+            &context,
+            &json!({}),
+            "group:1",
+            "t1",
+            Some(1),
+            &json!(5),
+            0,
+        )
+        .unwrap();
         let state = context.read_social_state().unwrap();
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["noActionCount"], json!(0), "the no-action reset ran");
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["triggers"]["dropNames"], json!(["小鲸鱼"]));
@@ -351,7 +360,16 @@ mod tests {
         let wake = json!({"mode": "active", "infinite": true, "triggers": {"atMention": true, "keywords": ["海"], "dropNames": ["小鲸鱼"]},
             "confirmedAt": 7, "confirmedBy": "set_wake_config"});
         std::fs::write(root.join("data/social-v2.json"), json!({"conversations": {"group:1": {"agentToken": "t1", "wakeConfig": wake}}}).to_string()).unwrap();
-        crate::console::complete_reserved2_turn(&context, &json!({}), "group:1", "t1", None, &json!(7), 2).unwrap();
+        crate::social_state::complete_reserved2_turn(
+            &context,
+            &json!({}),
+            "group:1",
+            "t1",
+            None,
+            &json!(7),
+            2,
+        )
+        .unwrap();
         let state = context.read_social_state().unwrap();
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["mode"], json!("diving"), "the missed-closure reset ran");
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["triggers"]["dropNames"], json!(["小鲸鱼"]));
