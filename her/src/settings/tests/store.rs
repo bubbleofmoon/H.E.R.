@@ -870,3 +870,77 @@ fn settings_store_refusals_do_not_stall() {
         );
     }
 }
+
+#[test]
+fn settings_backup_source_retries_missing_shm_and_bounds_read_busy_timeout() {
+    let (root, context) = settings_fixture("settings backup source wal retry");
+    let (status, body) = set_quiet(&context, json!(1000));
+    assert_eq!(status, 200, "{body}");
+
+    let crate::settings::StoreInspection::Ready(inspected) =
+        crate::settings::inspect_store(&context).unwrap()
+    else {
+        panic!("expected ready settings store");
+    };
+    let timeout: i64 = inspected
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        timeout > 0 && timeout < 1000,
+        "read inspection busy_timeout must stay well below WAL_SWITCH_WAIT: {timeout}"
+    );
+    drop(inspected);
+
+    let shm = root.0.join("data/settings.db-shm");
+    let _ = std::fs::remove_file(&shm);
+    assert!(!shm.exists(), "missing-shm test starts without settings.db-shm");
+
+    let wal = root.0.join("data/settings.db-wal");
+    std::fs::write(&wal, vec![0u8; 4096]).unwrap();
+
+    let started = std::time::Instant::now();
+    let (conn, waited) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match std::fs::remove_file(&wal) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot remove synthetic wal: {error}"),
+                }
+            }
+        });
+        let conn = crate::settings::backup_source(&context).unwrap().unwrap();
+        let waited = started.elapsed();
+        writer.join().unwrap();
+        (conn, waited)
+    });
+    assert!(
+        waited >= std::time::Duration::from_millis(60),
+        "backup_source returned before synthetic WAL transition cleared: {waited:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        0,
+        "synthetic non-empty WAL must be cleared before backup_source returns"
+    );
+    let backup_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        backup_timeout > 0 && backup_timeout < 1000,
+        "backup_source busy_timeout must stay well below WAL_SWITCH_WAIT: {backup_timeout}"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [QUIET_KEY],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "1000");
+}

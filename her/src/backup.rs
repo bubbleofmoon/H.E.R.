@@ -1187,6 +1187,17 @@ pub(crate) fn conversation_db_path(context: &RuntimeContext) -> Result<PathBuf, 
         .map_err(str::to_owned)
 }
 
+fn is_transient_snapshot_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+                | rusqlite::ErrorCode::FileLockingProtocolFailed
+        )
+    )
+}
+
 fn online_snapshot(
     db: Connection,
     snapshot: &Path,
@@ -1198,35 +1209,39 @@ fn online_snapshot(
     let mut copy = Connection::open(snapshot).map_err(|e| e.to_string())?;
     {
         let started = Instant::now();
-        let backup =
-            Backup::new(&db, &mut copy).map_err(|e| format!("{label} online backup: {e}"))?;
         loop {
             check()?;
-            // A live writer may keep restarting a stepped backup, even without a
-            // BUSY result. Bound the whole snapshot, including successful partial steps.
             if started.elapsed() >= Duration::from_secs(30) {
                 return Err(format!("{label} online backup timed out"));
             }
-            let step = match backup.step(256) {
-                Ok(step) => step,
-                Err(error)
-                    if matches!(
-                        error.sqlite_error_code(),
-                        Some(
-                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                        )
-                    ) =>
-                {
-                    StepResult::Busy
+            match Backup::new(&db, &mut copy) {
+                Ok(backup) => {
+                    loop {
+                        check()?;
+                        // A live writer may keep restarting a stepped backup, even without a
+                        // BUSY result. Bound the whole snapshot, including successful partial steps.
+                        if started.elapsed() >= Duration::from_secs(30) {
+                            return Err(format!("{label} online backup timed out"));
+                        }
+                        let step = match backup.step(256) {
+                            Ok(step) => step,
+                            Err(error) if is_transient_snapshot_error(&error) => StepResult::Busy,
+                            Err(error) => return Err(format!("{label} online backup: {error}")),
+                        };
+                        match step {
+                            StepResult::Done => break,
+                            StepResult::Busy | StepResult::Locked => {
+                                std::thread::sleep(Duration::from_millis(20))
+                            }
+                            _ => {}
+                        }
+                    }
+                    break;
+                }
+                Err(error) if is_transient_snapshot_error(&error) => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => return Err(format!("{label} online backup: {error}")),
-            };
-            match step {
-                StepResult::Done => break,
-                StepResult::Busy | StepResult::Locked => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                _ => {}
             }
         }
     }
@@ -3187,5 +3202,40 @@ mod tests {
         assert_eq!(settings.destination, unc);
         assert_eq!(settings.keep_days, 7);
         assert!(settings.include_state);
+    }
+
+    #[test]
+    fn online_snapshot_error_classification_retries_protocol_and_keeps_corruption_fatal() {
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+            rusqlite::ErrorCode::FileLockingProtocolFailed,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            assert!(super::is_transient_snapshot_error(&error), "{code:?}");
+        }
+        for (code, extended_code) in [
+            (rusqlite::ErrorCode::NotADatabase, 0),
+            (rusqlite::ErrorCode::DatabaseCorrupt, 0),
+            (
+                rusqlite::ErrorCode::ReadOnly,
+                rusqlite::ffi::SQLITE_READONLY_ROLLBACK,
+            ),
+        ] {
+            let error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code,
+                },
+                None,
+            );
+            assert!(!super::is_transient_snapshot_error(&error), "{code:?}");
+        }
     }
 }

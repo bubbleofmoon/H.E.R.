@@ -239,19 +239,41 @@ fn place(document: &mut Value, stored: Vec<(&'static Setting, Value)>) -> (bool,
     (changed, blocked)
 }
 
-/// Validates the store and its sidecars through the runtime's containment checks.
-fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path::PathBuf, String> {
-    for name in SIDECARS {
-        context.resolve_path(RuntimeArea::Data, name, intent).map_err(|_| STORAGE_ERROR.to_string())?;
-    }
-    context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
+/// Resolves a store or gate file with detailed I/O error classification so transient sidecar
+/// transitions retry cleanly while symlink/containment policy refusals fail immediately.
+fn resolve_store_file_checked(
+    context: &RuntimeContext,
+    name: &str,
+    intent: PathIntent,
+) -> Result<std::path::PathBuf, InspectError> {
+    context
+        .resolve_path_detailed(RuntimeArea::Data, name, intent)
+        .map_err(|error| {
+            if is_transient_resolve_error(&error) {
+                InspectError::Retry(STORAGE_ERROR.to_string())
+            } else {
+                InspectError::Fatal(STORAGE_ERROR.to_string())
+            }
+        })
 }
 
-fn resolve_store_db_checked(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    check_gate_file(context)?;
-    context
-        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())
+/// Validates the store and its sidecars through the runtime's containment checks, retrying
+/// transient sidecar transitions up to `deadline`.
+fn check_write_paths(
+    context: &RuntimeContext,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
+    retry_until(deadline, || {
+        for name in SIDECARS {
+            resolve_store_file_checked(context, name, PathIntent::WriteFile)?;
+        }
+        resolve_store_file_checked(context, DB, PathIntent::WriteFile)
+    })
+}
+
+fn resolve_store_db_checked(context: &RuntimeContext) -> Result<std::path::PathBuf, InspectError> {
+    check_gate_file_checked(context)?;
+    resolve_store_file_checked(context, DB, PathIntent::ReadOptionalFile)
 }
 
 /// The store's path for a restore's file set: the gate and store pass containment (no link; a
@@ -259,9 +281,11 @@ fn resolve_store_db_checked(context: &RuntimeContext) -> Result<std::path::PathB
 /// to `WAL_SWITCH_WAIT`, without taking the store gate. A missing store is a path that does not
 /// exist.
 pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    let path = resolve_store_db_checked(context)?;
-    retry_sidecars(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
-    Ok(path)
+    retry_until(std::time::Instant::now() + WAL_SWITCH_WAIT, || {
+        let path = resolve_store_db_checked(context)?;
+        check_sidecars(context)?;
+        Ok(path)
+    })
 }
 
 /// The store gate for a restore, taken with the same wait as a settings write. A writer that holds it makes the restore
@@ -278,26 +302,47 @@ pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, St
 ///
 /// A writer's last connection removes the WAL and its index when it closes, and the next writer creates them again,
 /// so a sidecar check can meet one halfway (on Windows a removed file refuses every open until its last handle
-/// closes). The sidecar checks are tried again until `WAL_SWITCH_WAIT`; the database's own checks are not, so a
-/// redirected or hard-linked store fails at once. Once this connection is open no writer is the last connection, so
-/// the sidecars stay for the snapshot.
+/// closes). The sidecar checks, read-only open, and initial WAL open retry transient concurrent-writer
+/// transitions up to `WAL_SWITCH_WAIT`; genuine hard-link, containment, leftover-journal, or non-database refusals
+/// fail at once.
 pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
     if !context.is_isolated() {
         return Ok(None);
     }
+    retry_until(std::time::Instant::now() + WAL_SWITCH_WAIT, || {
+        backup_source_attempt(context)
+    })
+}
+
+fn backup_source_attempt(
+    context: &RuntimeContext,
+) -> Result<Option<Connection>, InspectError> {
     let path = resolve_store_db_checked(context)?;
-    if file_len(&path)?.is_none() {
+    let [wal_len, shm_len, _journal_len] = check_sidecars(context)?;
+    let wal_len = wal_len.unwrap_or(0);
+    let shm_present = shm_len.unwrap_or(0) > 0;
+    let Some(len) = file_len_checked(&path)? else {
         return Ok(None);
+    };
+    refuse_hard_links_checked(&path)?;
+    if len == 0 && wal_len > 0 {
+        return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
     }
-    refuse_hard_links(&path)?;
-    retry_sidecars(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
+    if wal_len > 0 && !shm_present {
+        return Err(InspectError::Retry(STORAGE_ERROR.to_string()));
+    }
     let conn = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
-    .map_err(|_| STORAGE_ERROR.to_string())?;
+    .map_err(InspectError::from_sqlite)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(InspectError::from_sqlite)?;
+    if len > 0 {
+        conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))
+            .map_err(InspectError::from_sqlite)?;
+        let _ = schema_version_checked(&conn)?;
+    }
     Ok(Some(conn))
 }
 
@@ -334,6 +379,7 @@ fn is_transient_sqlite(error: &rusqlite::ffi::Error) -> bool {
             | rusqlite::ErrorCode::CannotOpen
             | rusqlite::ErrorCode::SystemIoFailure
             | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::FileLockingProtocolFailed
             | rusqlite::ErrorCode::SchemaChanged
     )
 }
@@ -341,7 +387,7 @@ fn is_transient_sqlite(error: &rusqlite::ffi::Error) -> bool {
 fn is_transient_io(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
         || error.kind() == std::io::ErrorKind::Interrupted
-        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303))
 }
 
 fn is_transient_resolve_error(error: &str) -> bool {
@@ -350,22 +396,15 @@ fn is_transient_resolve_error(error: &str) -> bool {
             || error.contains("kind=NotFound")
             || error.contains("os=Some(5)")
             || error.contains("os=Some(32)")
-            || error.contains("os=Some(33)"))
+            || error.contains("os=Some(33)")
+            || error.contains("os=Some(303)"))
 }
 
 fn resolve_optional_store_file(
     context: &RuntimeContext,
     name: &str,
 ) -> Result<std::path::PathBuf, InspectError> {
-    context
-        .resolve_path_detailed(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
-        .map_err(|error| {
-            if is_transient_resolve_error(&error) {
-                InspectError::Retry(STORAGE_ERROR.to_string())
-            } else {
-                InspectError::Fatal(STORAGE_ERROR.to_string())
-            }
-        })
+    resolve_store_file_checked(context, name, PathIntent::ReadOptionalFile)
 }
 
 fn check_optional_store_file(
@@ -401,13 +440,6 @@ fn retry_until<T>(
             Err(error) => return Err(error.into_message()),
         }
     }
-}
-
-fn retry_sidecars(
-    context: &RuntimeContext,
-    deadline: std::time::Instant,
-) -> Result<(), String> {
-    retry_until(deadline, || check_sidecars(context).map(|_| ()))
 }
 
 pub(crate) fn schema_version_checked(conn: &Connection) -> Result<i64, InspectError> {
@@ -466,9 +498,13 @@ fn file_len(path: &std::path::Path) -> Result<Option<u64>, String> {
     file_len_checked(path).map_err(InspectError::into_message)
 }
 
-fn refuse_hard_links_checked(path: &std::path::Path) -> Result<(), InspectError> {
-    match link_count(path) {
+fn classify_link_count(links: std::io::Result<u64>) -> Result<(), InspectError> {
+    match links {
         Ok(1) => Ok(()),
+        // On Windows, a file unlinked between `File::open` and `GetFileInformationByHandle`
+        // reports zero links while delete-pending; treat that as a transient transition, not
+        // a hard link.
+        Ok(0) => Err(InspectError::Retry(STORAGE_ERROR.to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) if is_transient_io(&error) => {
             Err(InspectError::Retry(STORAGE_ERROR.to_string()))
@@ -479,8 +515,8 @@ fn refuse_hard_links_checked(path: &std::path::Path) -> Result<(), InspectError>
 
 /// Refuses a store file with another hard link: the containment checks see paths, not files, so
 /// another name for another database would pass them. A missing file passes.
-fn refuse_hard_links(path: &std::path::Path) -> Result<(), String> {
-    refuse_hard_links_checked(path).map_err(InspectError::into_message)
+fn refuse_hard_links_checked(path: &std::path::Path) -> Result<(), InspectError> {
+    classify_link_count(link_count(path))
 }
 
 #[cfg(unix)]
@@ -496,19 +532,17 @@ fn link_count(path: &std::path::Path) -> std::io::Result<u64> {
 
 /// The gate file (`locks/settings-store.lock`) must be a plain file with one link or missing, whether or not the store
 /// exists: a second name for another file would otherwise pass the store's checks and keep an invalid gate.
-fn check_gate_file(context: &RuntimeContext) -> Result<(), String> {
-    let path = context
-        .resolve_path(RuntimeArea::Data, STORE_GATE, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    file_len(&path)?;
-    refuse_hard_links(&path)
+fn check_gate_file_checked(context: &RuntimeContext) -> Result<(), InspectError> {
+    let path = resolve_store_file_checked(context, STORE_GATE, PathIntent::ReadOptionalFile)?;
+    file_len_checked(&path)?;
+    refuse_hard_links_checked(&path)
 }
 
 /// Takes the store gate, waiting until `deadline`. The gate file is opened read-write and locked, so it must be a
 /// plain file with one link before it is opened, and still have one once it is open; a second name for another file
 /// is refused. `Gate::Create`'s other callers keep their own checks.
 fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<std::fs::File, String> {
-    check_gate_file(context)?;
+    retry_until(deadline, || check_gate_file_checked(context))?;
     loop {
         match context.open_locked_file(RuntimeArea::Data, STORE_GATE) {
             Ok(gate) if file_link_count(&gate).is_ok_and(|links| links == 1) => return Ok(gate),
@@ -593,8 +627,10 @@ fn inspect_at(
     context: &RuntimeContext,
     deadline: std::time::Instant,
 ) -> Result<Inspection, String> {
-    let path = resolve_store_db_checked(context)?;
-    retry_until(deadline, || inspect_attempt(context, &path))
+    retry_until(deadline, || {
+        let path = resolve_store_db_checked(context)?;
+        inspect_attempt(context, &path)
+    })
 }
 
 fn inspect_attempt(
@@ -605,7 +641,7 @@ fn inspect_attempt(
     let [wal_len, shm_len, journal_len] = check_sidecars(context)?;
     let journal_len = journal_len.unwrap_or(0);
     let wal_len = wal_len.unwrap_or(0);
-    let shm_present = shm_len.is_some();
+    let shm_present = shm_len.unwrap_or(0) > 0;
     let Some(len) = file_len_checked(path)? else {
         return if journal_len > 0 {
             Err(InspectError::Fatal(LEFTOVER_JOURNAL_ERROR.to_string()))
@@ -643,11 +679,13 @@ fn inspect_attempt(
     .map_err(InspectError::from_sqlite)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
         .map_err(InspectError::from_sqlite)?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")
+    // Keep the per-attempt SQLite busy wait short so `retry_until` can drop a stale connection,
+    // re-inspect transitioning `-wal`/`-shm` sidecars, and reopen within `WAL_SWITCH_WAIT`.
+    conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))
         .map_err(InspectError::from_sqlite)?;
     // A journal is hot when no connection holds the store's write lock: a leftover
     // (`SQLITE_READONLY_ROLLBACK`), which this read-only connection refuses to play back. A live
-    // writer's journal is waited for under `busy_timeout`.
+    // writer's journal is retried across `WAL_SWITCH_WAIT`.
     if check_schema_checked(&conn)? {
         Ok(Inspection::Ready(conn))
     } else {
@@ -659,9 +697,9 @@ pub(crate) fn read_store<T>(
     context: &RuntimeContext,
     mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
 ) -> Result<T, String> {
-    let path = resolve_store_db_checked(context)?;
     let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
     retry_until(deadline, || {
+        let path = resolve_store_db_checked(context)?;
         let conn = match inspect_attempt(context, &path)? {
             Inspection::Missing | Inspection::Fresh => None,
             Inspection::Ready(conn) => Some(conn),
@@ -928,6 +966,9 @@ fn report_refused_text(key: &'static str) {
 /// How long a writer waits for the store gate and for other connections to let go while it switches a new store to
 /// WAL (the same as `busy_timeout`).
 const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Per-attempt busy wait for read-only inspection and backup connections inside `retry_until`, so
+/// a single busy wait cannot consume the full `WAL_SWITCH_WAIT` budget before sidecars are re-checked.
+const READ_BUSY_TIMEOUT_MS: u64 = 100;
 
 /// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
 /// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. The
@@ -945,7 +986,12 @@ fn enable_wal(conn: &Connection) -> Result<(), String> {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
             Ok(_) => true,
             Err(rusqlite::Error::SqliteFailure(error, _)) => {
-                matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy
+                        | rusqlite::ErrorCode::DatabaseLocked
+                        | rusqlite::ErrorCode::FileLockingProtocolFailed
+                )
             }
             Err(_) => false,
         };
@@ -1072,6 +1118,30 @@ pub(crate) fn open_store_for_write(context: &RuntimeContext) -> Result<Connectio
     open_for_write(context)
 }
 
+fn is_transient_acl_error(reason: &str) -> bool {
+    reason.contains("Win32 error 5)")
+        || reason.contains("Win32 error 32)")
+        || reason.contains("Win32 error 33)")
+        || reason.contains("Win32 error 303)")
+}
+
+fn restrict_store_file(
+    file: &std::path::Path,
+    optional: bool,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    retry_until(deadline, || {
+        match crate::guarded_fs::restrict_file(file, crate::guarded_fs::AclPolicy::OwnerSystemAdmins) {
+            Ok(()) => Ok(()),
+            Err(crate::guarded_fs::AclError::Missing(_)) if optional => Ok(()),
+            Err(crate::guarded_fs::AclError::Refused(reason)) if is_transient_acl_error(&reason) => {
+                Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+            }
+            Err(_) => Err(InspectError::Fatal(STORAGE_ERROR.to_string())),
+        }
+    })
+}
+
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
 /// schema is newer than this release's (checked before anything is written). A new store gets schema version 1; a
 /// write that keeps a conversation's value migrates it to version 2 inside its own transaction (`migrate`). The caller
@@ -1079,7 +1149,8 @@ pub(crate) fn open_store_for_write(context: &RuntimeContext) -> Result<Connectio
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
-    let path = check_paths(context, PathIntent::WriteFile)?;
+    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+    let path = check_write_paths(context, deadline)?;
     // Protect existing files before opening a write connection. SQLite's Unix sidecars use the database mode.
     match crate::guarded_fs::create_protected_file(
         &path,
@@ -1090,11 +1161,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
         Err(_) => return Err(STORAGE_ERROR.to_string()),
     }
     for file in std::iter::once(path.clone()).chain(SIDECARS.map(|name| path.with_file_name(name))) {
-        match crate::guarded_fs::restrict_file(&file, crate::guarded_fs::AclPolicy::OwnerSystemAdmins) {
-            Ok(()) => {}
-            Err(crate::guarded_fs::AclError::Missing(_)) if file != path => {}
-            Err(_) => return Err(STORAGE_ERROR.to_string()),
-        }
+        restrict_store_file(&file, file != path, deadline)?;
     }
     let mut conn = Connection::open_with_flags(
         &path,
@@ -1105,7 +1172,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     // The same checks again, for a store changed since the inspection.
-    check_schema(&conn)?;
+    retry_until(deadline, || check_schema_checked(&conn))?;
     enable_wal(&conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
@@ -1113,13 +1180,9 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // The journal used for switching to WAL carries SQLite's database header page only.
     #[cfg(windows)]
     for name in &SIDECARS[..2] {
-        crate::guarded_fs::restrict_file(
-            &path.with_file_name(name),
-            crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
-        )
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        restrict_store_file(&path.with_file_name(name), false, deadline)?;
     }
-    match schema_version(&tx)? {
+    match retry_until(deadline, || schema_version_checked(&tx))? {
         0 => {
             for (_, _, _, sql) in SCHEMA_V1 {
                 tx.execute_batch(sql).map_err(|_| STORAGE_ERROR.to_string())?;
@@ -2344,7 +2407,10 @@ pub(crate) fn store_mark(context: &RuntimeContext) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_resolve_error, InspectError, LEFTOVER_JOURNAL_ERROR, STORAGE_ERROR};
+    use super::{
+        classify_link_count, is_transient_acl_error, is_transient_resolve_error, InspectError,
+        LEFTOVER_JOURNAL_ERROR, STORAGE_ERROR,
+    };
 
     #[test]
     fn sqlite_error_classification_keeps_leftover_journal_and_corruption_fatal() {
@@ -2366,6 +2432,7 @@ mod tests {
             rusqlite::ErrorCode::CannotOpen,
             rusqlite::ErrorCode::SystemIoFailure,
             rusqlite::ErrorCode::ReadOnly,
+            rusqlite::ErrorCode::FileLockingProtocolFailed,
             rusqlite::ErrorCode::SchemaChanged,
         ] {
             let err = rusqlite::Error::SqliteFailure(
@@ -2381,17 +2448,23 @@ mod tests {
             );
         }
 
-        let corrupt = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::DatabaseCorrupt,
-                extended_code: 0,
-            },
-            None,
-        );
-        assert!(matches!(
-            InspectError::from_sqlite(corrupt),
-            InspectError::Fatal(message) if message == STORAGE_ERROR
-        ));
+        for code in [
+            rusqlite::ErrorCode::DatabaseCorrupt,
+            rusqlite::ErrorCode::NotADatabase,
+            rusqlite::ErrorCode::PermissionDenied,
+        ] {
+            let corrupt = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error { code, extended_code: 0 },
+                None,
+            );
+            assert!(
+                matches!(
+                    InspectError::from_sqlite(corrupt),
+                    InspectError::Fatal(message) if message == STORAGE_ERROR
+                ),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
@@ -2399,6 +2472,7 @@ mod tests {
         assert!(is_transient_resolve_error("class=leaf/metadata kind=PermissionDenied os=Some(5)"));
         assert!(is_transient_resolve_error("class=path/canonicalize kind=NotFound os=Some(2)"));
         assert!(is_transient_resolve_error("class=leaf/metadata kind=Uncategorized os=Some(32)"));
+        assert!(is_transient_resolve_error("class=leaf/metadata kind=Uncategorized os=Some(303)"));
         assert!(!is_transient_resolve_error("runtime path policy rejected class=path"));
         assert!(!is_transient_resolve_error(
             "runtime path has non-file leaf or non-directory parent"
@@ -2406,5 +2480,37 @@ mod tests {
         assert!(!is_transient_resolve_error(
             "class=root/metadata kind=PermissionDenied os=Some(5)"
         ));
+    }
+
+    #[test]
+    fn link_count_classification_retries_delete_pending_zero_and_refuses_hard_links() {
+        assert!(classify_link_count(Ok(1)).is_ok());
+        assert!(classify_link_count(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_ok());
+        assert!(matches!(
+            classify_link_count(Ok(0)),
+            Err(InspectError::Retry(message)) if message == STORAGE_ERROR
+        ));
+        assert!(matches!(
+            classify_link_count(Err(std::io::Error::from_raw_os_error(32))),
+            Err(InspectError::Retry(message)) if message == STORAGE_ERROR
+        ));
+        assert!(matches!(
+            classify_link_count(Ok(2)),
+            Err(InspectError::Fatal(message)) if message == STORAGE_ERROR
+        ));
+        assert!(matches!(
+            classify_link_count(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))),
+            Err(InspectError::Fatal(message)) if message == STORAGE_ERROR
+        ));
+    }
+
+    #[test]
+    fn acl_error_classification_retries_only_transient_win32_sharing_and_delete_errors() {
+        assert!(is_transient_acl_error("private ACL settings.db-wal: CreateFileW failed (Win32 error 5)"));
+        assert!(is_transient_acl_error("private ACL settings.db-wal: CreateFileW failed (Win32 error 32)"));
+        assert!(is_transient_acl_error("private ACL settings.db-shm: CreateFileW failed (Win32 error 33)"));
+        assert!(is_transient_acl_error("private ACL settings.db-shm: CreateFileW failed (Win32 error 303)"));
+        assert!(!is_transient_acl_error("private ACL settings.db: reparse points are refused"));
+        assert!(!is_transient_acl_error("private ACL settings.db: unexpected entry type"));
     }
 }
