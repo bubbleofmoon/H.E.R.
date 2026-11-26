@@ -10,9 +10,8 @@ pub(crate) use crate::guarded_fetch::{
     Flow, Head, TransferError, TransferRequest as Transfer,
 };
 use crate::guarded_fetch::{
-    CurlTransfer, FnResolver, FnTransfer, SystemDnsResolver, TextFetchOptions,
-    fetch_text_with as guarded_fetch_text_with, post_json_with as guarded_post_json_with,
-    resolve_public_addresses_with,
+    FnResolver, FnTransfer, TextFetchOptions, fetch_text_with as guarded_fetch_text_with,
+    post_json_with as guarded_post_json_with, resolve_public_addresses_with,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -98,18 +97,7 @@ pub(crate) fn fetch_text_with(
 }
 
 pub(crate) fn fetch_text(raw_url: &str, max_chars: usize) -> Result<Value, String> {
-    let outcome = guarded_fetch_text_with(
-        raw_url,
-        &text_options(max_chars),
-        &SystemDnsResolver,
-        &CurlTransfer,
-    )?;
-    Ok(json!({
-        "url": outcome.url,
-        "statusCode": outcome.status,
-        "truncated": outcome.truncated,
-        "body": outcome.body,
-    }))
+    fetch_text_with(raw_url, max_chars, &system_resolver, &curl_transfer)
 }
 
 /// One JSON POST to an endpoint whose addresses already passed the policy. Redirects are refused;

@@ -620,9 +620,10 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
+            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
             true,
         );
-        let direct = fetch_bytes_with(
+        let direct = crate::guarded_fetch::fetch_bytes_with(
             &format!("http://fake.test:{port}/a.png"),
             &direct_opts,
             &resolver,
@@ -630,7 +631,7 @@ mod tests {
         )
         .expect("direct download");
         assert_eq!(direct.bytes, png);
-        let redirected = fetch_bytes_with(
+        let redirected = crate::guarded_fetch::fetch_bytes_with(
             &format!("http://fake.test:{port}/go"),
             &direct_opts,
             &resolver,
@@ -647,10 +648,11 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
+            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
             true,
         );
         assert!(
-            fetch_bytes_with(
+            crate::guarded_fetch::fetch_bytes_with(
                 &format!("http://fake.test:{port}/big.png"),
                 &small_opts,
                 &resolver,
@@ -798,9 +800,10 @@ mod tests {
                 attempt_cap: Some(Duration::from_secs(8)),
             },
             crate::media_normalize::looks_like_image,
+            "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）",
             true,
         );
-        let direct = fetch_bytes_with(
+        let direct = crate::guarded_fetch::fetch_bytes_with(
             &format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640"),
             &options,
             &resolver,
@@ -809,7 +812,7 @@ mod tests {
         .expect("direct avatar");
         assert_eq!(direct.bytes, png);
         assert!(
-            fetch_bytes_with(
+            crate::guarded_fetch::fetch_bytes_with(
                 &format!("http://fake.test:{port}/go"),
                 &options,
                 &resolver,
@@ -1103,7 +1106,7 @@ mod tests {
             allow_loopback_pin_for_test: true,
         };
         let url = format!("http://fake.test:{port}/v.silk");
-        let fetched = fetch_bytes_with(&url, &options, &resolver, &CurlTransfer);
+        let fetched = crate::guarded_fetch::fetch_bytes_with(&url, &options, &resolver, &CurlTransfer);
         assert_eq!(fetched.expect("the voice record").bytes, silk);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Verify streaming mode executes curl cleanly without leaving her-fetch-* files in temp_dir.

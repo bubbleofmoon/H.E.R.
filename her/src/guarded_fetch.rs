@@ -748,13 +748,19 @@ pub(crate) fn build_curl_command(
 
 fn spawn_curl(transfer: &TransferRequest<'_>) -> Result<ChildGuard, TransferError> {
     let (mut command, config) = build_curl_command(transfer)?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: only async-signal-safe prctl between fork and exec; the child dies with this parent.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe prctl/getppid between fork and exec; the child dies with this parent.
         unsafe {
-            command.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other("parent exited before curl exec"));
+                }
                 Ok(())
             });
         }
@@ -1006,6 +1012,22 @@ fn attempt_budget(
     (!budget.is_zero()).then_some(budget)
 }
 
+fn bare_host(url: &Url) -> String {
+    url.host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
+}
+
+fn format_attempts_error(last_error: Option<String>, host: &str, attempts: usize) -> String {
+    let mut err = last_error.unwrap_or_else(|| format!("请求失败：{host}"));
+    if attempts > 1 && !err.is_empty() {
+        err = format!("{err}（已尝试 {attempts} 个地址）");
+    }
+    err
+}
+
 fn transfer_error_message(error: &TransferError, host: &str) -> String {
     match error {
         TransferError::Timeout => format!("请求超时：{host}"),
@@ -1050,13 +1072,7 @@ pub(crate) fn fetch_bytes_with(
         if initial_is_loopback.is_none() {
             initial_is_loopback = Some(validated.is_loopback);
         }
-        let host = validated
-            .url
-            .host_str()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string();
+        let host = bare_host(&validated.url);
         let attempts = validated.addresses.len().min(options.max_addresses);
         let mut last_error: Option<String> = None;
         let mut hop_result: Option<Result<BytesHopOutcome, String>> = None;
@@ -1141,13 +1157,7 @@ pub(crate) fn fetch_bytes_with(
             }
             Some(Ok(BytesHopOutcome::Response(status, body))) => (status, body),
             Some(Err(err)) => return Err(err),
-            None => {
-                let mut err = last_error.unwrap_or_else(|| format!("请求失败：{host}"));
-                if attempts > 1 && !err.is_empty() {
-                    err = format!("{err}（已尝试 {attempts} 个地址）");
-                }
-                return Err(err);
-            }
+            None => return Err(format_attempts_error(last_error, &host, attempts)),
         };
 
         if !(200..300).contains(&status) {
@@ -1186,13 +1196,7 @@ pub(crate) fn fetch_text_with(
 
     let mut current = validate_fetch_url_with(raw_url, resolver)?;
     for hop in 0..=options.max_redirects {
-        let host = current
-            .url
-            .host_str()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string();
+        let host = bare_host(&current.url);
         let hop_deadline = Instant::now() + options.hop_timeout;
         let attempts = current.addresses.len().min(options.max_addresses);
         let mut last_error: Option<String> = None;
@@ -1273,13 +1277,7 @@ pub(crate) fn fetch_text_with(
                 current = validate_fetch_url_with(next.as_str(), resolver)?;
             }
             Some(Err(err)) => return Err(err),
-            None => {
-                let mut error = last_error.unwrap_or_else(|| format!("请求失败：{host}"));
-                if attempts > 1 && !error.is_empty() {
-                    error = format!("{error}（已尝试 {attempts} 个地址）");
-                }
-                return Err(error);
-            }
+            None => return Err(format_attempts_error(last_error, &host, attempts)),
         }
     }
     Err("重定向次数过多，已停止".to_string())

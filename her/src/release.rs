@@ -47,12 +47,13 @@ pub(crate) fn validate_url(raw: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
-/// Guarded release download over `guarded_fetch` (HTTPS or loopback HTTP fixture, public IP
-/// pinning, revalidated redirects, bounded time and bytes, hardened curl).
-pub(crate) fn fetch(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_url(raw)?;
+fn fetch_with_policy(
+    raw: &str,
+    max: usize,
+    policy: crate::guarded_fetch::FetchPolicy,
+) -> Result<Vec<u8>, String> {
     let options = crate::guarded_fetch::FetchOptions {
-        policy: crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+        policy,
         max_bytes: max,
         max_redirects: 5,
         budget: crate::guarded_fetch::BudgetMode::PerHop {
@@ -76,6 +77,16 @@ pub(crate) fn fetch(raw: &str, max: usize) -> Result<Vec<u8>, String> {
         &crate::guarded_fetch::CurlTransfer,
     )
     .map(|out| out.bytes)
+}
+
+/// Guarded release download over `guarded_fetch` (HTTPS or loopback HTTP fixture, public IP
+/// pinning, revalidated redirects, bounded time and bytes, hardened curl).
+pub(crate) fn fetch(raw: &str, max: usize) -> Result<Vec<u8>, String> {
+    fetch_with_policy(
+        raw,
+        max,
+        crate::guarded_fetch::FetchPolicy::ReleaseHttpsOrLoopbackFixture,
+    )
 }
 
 /// Preserve the managed npm install's existing HTTP(S), credential-free registry contract.
@@ -88,32 +99,11 @@ pub(crate) fn validate_registry_url(raw: &str) -> Result<(), String> {
 }
 
 pub(crate) fn fetch_registry(raw: &str, max: usize) -> Result<Vec<u8>, String> {
-    validate_registry_url(raw)?;
-    let options = crate::guarded_fetch::FetchOptions {
-        policy: crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
-        max_bytes: max,
-        max_redirects: 5,
-        budget: crate::guarded_fetch::BudgetMode::PerHop {
-            hop_timeout: Duration::from_secs(30),
-            attempt_cap: Some(Duration::from_secs(10)),
-        },
-        connect_timeout: Some(Duration::from_secs(5)),
-        max_addresses: 4,
-        min_remaining: Duration::ZERO,
-        headers: vec![("user-agent".into(), "HER-release-manager".into())],
-        strip_fragment_on_redirect: true,
-        pass_max_filesize: true,
-        accept: None,
-        #[cfg(test)]
-        allow_loopback_pin_for_test: false,
-    };
-    crate::guarded_fetch::fetch_bytes_with(
+    fetch_with_policy(
         raw,
-        &options,
-        &crate::guarded_fetch::SystemDnsResolver,
-        &crate::guarded_fetch::CurlTransfer,
+        max,
+        crate::guarded_fetch::FetchPolicy::RegistryHttpOrHttps,
     )
-    .map(|out| out.bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
