@@ -36,52 +36,6 @@ struct WakePromptRefs {
     cli: Option<Vec<serde_json::Value>>,
 }
 
-#[cfg(not(test))]
-const SESSION_FILE: &str = crate::legacy_path!("state/rust-sessions.json");
-
-#[cfg(test)]
-// Keep legacy-wrapper tests off the fixed production path; an unscoped test call fails closed.
-mod legacy_session_file_scope {
-    use std::cell::RefCell;
-    use std::path::PathBuf;
-
-    std::thread_local! {
-        static PATHS: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-    }
-
-    struct ScopeGuard;
-
-    impl Drop for ScopeGuard {
-        fn drop(&mut self) {
-            PATHS.with(|paths| {
-                let popped = paths.borrow_mut().pop();
-                debug_assert!(popped.is_some(), "legacy session file scope stack underflow");
-            });
-        }
-    }
-
-    pub(super) fn current() -> Option<PathBuf> {
-        PATHS.with(|paths| paths.borrow().last().cloned())
-    }
-
-    pub(super) fn with_path<T>(path: PathBuf, action: impl FnOnce() -> T) -> T {
-        PATHS.with(|paths| paths.borrow_mut().push(path));
-        let _scope = ScopeGuard;
-        action()
-    }
-}
-
-#[cfg(test)]
-fn session_store_file_path() -> PathBuf {
-    legacy_session_file_scope::current()
-        .expect("legacy SessionStore I/O in unit tests must use a scoped synthetic path")
-}
-
-#[cfg(not(test))]
-fn session_store_file_path() -> PathBuf {
-    PathBuf::from(SESSION_FILE)
-}
-
 /// 一个 QQ 会话在 DSH 侧的映射。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionRef {
@@ -100,17 +54,7 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn load() -> Self {
-        std::fs::read_to_string(session_store_file_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn load_for_runtime(context: &RuntimeContext) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Ok(Self::load());
-        }
+    pub fn load(context: &RuntimeContext) -> Result<Self, String> {
         // The selected runtime shares one mapping with the admin console (`session_map`).
         let mut store = Self::default();
         store.workspace_id = crate::session_map::workspace_id(context)?.unwrap_or_default();
@@ -118,23 +62,6 @@ impl SessionStore {
             store.sessions.insert(key, SessionRef { session_id, workspace_id: store.workspace_id.clone() });
         }
         Ok(store)
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let session_file = session_store_file_path();
-        if let Some(dir) = session_file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(session_file, text).map_err(|e| format!("写会话映射失败：{e}"))
-    }
-
-    pub fn save_for_runtime(&self, context: &RuntimeContext) -> Result<(), String> {
-        if !context.is_isolated() {
-            return self.save();
-        }
-        // Selected runtimes write through `session_map` (locked, merge-preserving); nothing to do.
-        Ok(())
     }
 }
 
@@ -323,7 +250,7 @@ fn model_errors() -> &'static Mutex<HashMap<(String, String), String>> {
 }
 
 fn error_scope(context: &RuntimeContext) -> String {
-    context.runtime_root().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "legacy".to_string())
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 fn note_model_error(context: &RuntimeContext, key: &str, message: &str) {
@@ -345,10 +272,7 @@ pub fn forget_failover_session(context: &RuntimeContext, session: &str) {
 
 fn failover_state_for(context: &RuntimeContext) -> Arc<Mutex<FailoverState>> {
     static STATES: OnceLock<Mutex<HashMap<String, Arc<Mutex<FailoverState>>>>> = OnceLock::new();
-    let scope = context
-        .runtime_root()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "legacy".to_string());
+    let scope = context.runtime_root().to_string_lossy().to_string();
     STATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -663,40 +587,21 @@ impl Pipeline {
         // Validate selected-root session state before constructing any live dependencies or
         // creating the candidate workspace. A corrupt file must not silently start a new session
         // and later overwrite the evidence needed to repair it.
-        let store = SessionStore::load_for_runtime(context)?;
+        let store = SessionStore::load(context)?;
         let rpc = if !dsh {
-            if !context.is_isolated() {
-                return Err("a pipeline without DSH requires a selected runtime".to_string());
-            }
             Rpc::unbound(context, context.dependency_url("dsh").unwrap_or_default())
         } else {
-            let base = if context.is_isolated() {
-                context
-                    .dependency_url("dsh")
-                    .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
-                    .to_string()
-            } else {
-                cfg
-                .get("dsh")
-                .and_then(|d| d.get("baseUrl"))
-                .and_then(|b| b.as_str())
-                .unwrap_or("http://127.0.0.1:3080")
-                .to_string()
-            };
-            Rpc::connect_with_runtime(context, &base)?
+            let base = context
+                .dependency_url("dsh")
+                .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
+                .to_string();
+            Rpc::connect(context, &base)?
         };
 
-        let http_url = if context.is_isolated() {
-            context
-                .dependency_url("onebot")
-                .ok_or_else(|| "runtime OneBot dependency is unavailable".to_string())?
-                .to_string()
-        } else { cfg
-            .get("snowluma")
-            .and_then(|s| s.get("httpUrl"))
-            .and_then(|u| u.as_str())
-            .unwrap_or("http://127.0.0.1:3000")
-            .to_string() };
+        let http_url = context
+            .dependency_url("onebot")
+            .ok_or_else(|| "runtime OneBot dependency is unavailable".to_string())?
+            .to_string();
         let token = cfg
             .get("snowluma")
             .and_then(|s| s.get("accessToken"))
@@ -724,24 +629,13 @@ impl Pipeline {
             .unwrap_or(&preset_group)
             .to_string();
         let owner_qq = crate::chat::owner_qq(cfg);
-        let workspace_dir = if context.is_isolated() {
-            context
-                .resolve_path(RuntimeArea::Data, "agents", PathIntent::CreateDirectory)
-                .map_err(str::to_string)?
-                .to_string_lossy()
-                .to_string()
-        } else {
-            cfg.get("sessionCwd")
-                .and_then(|c| c.as_str())
-                .unwrap_or(crate::legacy_path!("state/agents"))
-                .to_string()
-        };
+        let workspace_dir = context
+            .resolve_path(RuntimeArea::Data, "agents", PathIntent::CreateDirectory)
+            .map_err(str::to_string)?
+            .to_string_lossy()
+            .to_string();
 
-        let ob = if context.is_isolated() {
-            OneBot::try_new_url(&http_url, token.clone())?
-        } else {
-            OneBot::new(&http_url, token.clone())
-        };
+        let ob = OneBot::try_new_url(&http_url, token.clone())?;
 
         Ok(Self {
             failover: failover_state_for(context),
@@ -1023,19 +917,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     let safe = crate::activity::mask_log_text(line, &crate::activity::known_session_tokens(context));
     let mut bytes = safe.into_bytes();
     bytes.push(b'\n');
-    if context.is_isolated() {
-        context.append_bytes(RuntimeArea::Logs, relative, &bytes)
-    } else {
-        use std::io::Write as _;
-        let name = relative.strip_prefix("logs/").unwrap_or(relative);
-        let path = PathBuf::from(format!("{}/logs/{name}", crate::legacy_path!()));
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&bytes).map_err(|error| error.to_string())
-    }
+    context.append_bytes(RuntimeArea::Logs, relative, &bytes)
 }
 
     fn report_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, code: &str, message: &str) {
@@ -1116,14 +998,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let cli_refs = crate::model_failure::take_prompt_refs(&self.context, &key, "cli", cli_prompt)
             .or_else(|| crate::model_failure::snapshot_refs(cli_prompt));
         let refs = WakePromptRefs { dsh: dsh_refs, cli: cli_refs };
-        if !self.context.is_isolated() {
-            crate::social_state::begin_legacy_wait_turn(&self.context, &key)?;
-            let deadline = self.dispatch_deadline.take().unwrap_or_else(||crate::turn_ledger::now_ms()
-                .saturating_add(crate::wake::turn_budget(cfg).hard_cap_ms));
-            crate::social_state::set_legacy_wait_deadline(&self.context, &key, deadline)?;
-            self.carried_messages.clear();
-            return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
-        }
         let admission = self.turn_adapter(&key, "reserved2").await;
         if let Some(route) = &self.reserved2_route {
             let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
@@ -1563,9 +1437,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     ) -> Result<ChatTurnOutcome, String> {
         self.owner_interaction_closed = false;
         self.chat_failure_defers = None;
-        if !self.context.is_isolated() {
-            return Err("chat 模式只在选定运行环境中运行".to_string());
-        }
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.owner_qq = crate::chat::owner_qq(cfg);
         self.note_turn("chat", inbound);
@@ -1682,9 +1553,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     async fn turn_adapter(&mut self, key: &str, mode: &str) -> Result<(
         crate::turn_engine::Adapter, Option<crate::engine_switch::TurnGates>, Option<serde_json::Value>,
     ), TurnAdmissionError> {
-        if !self.context.is_isolated() {
-            return Ok((crate::turn_engine::Adapter::Dsh, None, None));
-        }
         let release = crate::release::turn_guard(&self.context).await?;
         let gate = crate::engine_switch::turn_gate(&self.context, key).await?;
         if self.reserved2_route.as_ref().is_some_and(|route| {
@@ -2397,129 +2265,6 @@ mod tests {
 
     static DSH_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct SessionStoreFixtureRoot(std::path::PathBuf);
-
-    impl SessionStoreFixtureRoot {
-        fn new(label: &str) -> Self {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock follows UNIX epoch")
-                .as_nanos();
-            let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
-                "her-ticket04-session-store-{label}-{}-{stamp}",
-                std::process::id()
-            )));
-            std::fs::create_dir(&root).expect("unique synthetic session root");
-            let fixture = Self(root);
-            std::fs::create_dir(fixture.0.join("data")).unwrap();
-            fixture
-        }
-
-        fn session_file(&self) -> std::path::PathBuf {
-            self.0.join("data/sessions.json")
-        }
-    }
-
-    impl Drop for SessionStoreFixtureRoot {
-        fn drop(&mut self) {
-            let Ok(temp_root) = std::fs::canonicalize(std::env::temp_dir()) else {
-                return;
-            };
-            let Ok(root) = std::fs::canonicalize(&self.0) else {
-                return;
-            };
-            if root.parent() != Some(temp_root.as_path())
-                || !root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("her-ticket04-session-store-"))
-            {
-                return;
-            }
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn legacy_session_store_wrappers_load_and_save_only_scoped_ab_paths() {
-        let root_a = SessionStoreFixtureRoot::new("a");
-        let root_b = SessionStoreFixtureRoot::new("b");
-        let path_a = root_a.session_file();
-        let path_b = root_b.session_file();
-        let bytes_a = br#"{
-            "workspace_id":"workspace-a",
-            "sessions":{"group:70001":{"sessionId":"sid-a","workspaceId":"session-workspace-a"}}
-        }"#
-        .to_vec();
-        let bytes_b = br#"{
-            "workspace_id":"workspace-b",
-            "sessions":{"private:90002":{"sessionId":"sid-b","workspaceId":"session-workspace-b"}}
-        }"#
-        .to_vec();
-        std::fs::write(&path_a, &bytes_a).unwrap();
-        std::fs::write(&path_b, &bytes_b).unwrap();
-
-        let mut store_a = legacy_session_file_scope::with_path(path_a.clone(), SessionStore::load);
-        assert_eq!(store_a.workspace_id, "workspace-a");
-        assert_eq!(store_a.sessions.len(), 1);
-        assert_eq!(store_a.sessions["group:70001"].session_id, "sid-a");
-        assert!(!store_a.sessions.contains_key("private:90002"));
-        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a);
-        assert_eq!(std::fs::read(&path_b).unwrap(), bytes_b);
-
-        store_a.workspace_id = "workspace-a-updated".to_string();
-        store_a.sessions.insert(
-            "private:70002".to_string(),
-            SessionRef {
-                session_id: "sid-a-extra".to_string(),
-                workspace_id: "session-workspace-a-extra".to_string(),
-            },
-        );
-        legacy_session_file_scope::with_path(path_a.clone(), || store_a.save()).unwrap();
-        let bytes_a_after_save = std::fs::read(&path_a).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes_a_after_save).unwrap(),
-            json!({
-                "workspace_id": "workspace-a-updated",
-                "sessions": {
-                    "group:70001": { "sessionId": "sid-a", "workspaceId": "session-workspace-a" },
-                    "private:70002": { "sessionId": "sid-a-extra", "workspaceId": "session-workspace-a-extra" }
-                }
-            })
-        );
-        assert_eq!(std::fs::read(&path_b).unwrap(), bytes_b);
-
-        let mut store_b = legacy_session_file_scope::with_path(path_b.clone(), SessionStore::load);
-        assert_eq!(store_b.workspace_id, "workspace-b");
-        assert_eq!(store_b.sessions.len(), 1);
-        assert_eq!(store_b.sessions["private:90002"].session_id, "sid-b");
-        assert!(!store_b.sessions.contains_key("group:70001"));
-        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a_after_save);
-        assert_eq!(std::fs::read(&path_b).unwrap(), bytes_b);
-
-        store_b.workspace_id = "workspace-b-updated".to_string();
-        store_b.sessions.insert(
-            "group:90003".to_string(),
-            SessionRef {
-                session_id: "sid-b-extra".to_string(),
-                workspace_id: "session-workspace-b-extra".to_string(),
-            },
-        );
-        legacy_session_file_scope::with_path(path_b.clone(), || store_b.save()).unwrap();
-        let bytes_b_after_save = std::fs::read(&path_b).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes_b_after_save).unwrap(),
-            json!({
-                "workspace_id": "workspace-b-updated",
-                "sessions": {
-                    "private:90002": { "sessionId": "sid-b", "workspaceId": "session-workspace-b" },
-                    "group:90003": { "sessionId": "sid-b-extra", "workspaceId": "session-workspace-b-extra" }
-                }
-            })
-        );
-        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a_after_save);
-    }
-
     struct RestoreDshHome(Option<std::ffi::OsString>);
 
     impl RestoreDshHome {
@@ -2873,7 +2618,7 @@ mod tests {
     #[test]
     fn missing_candidate_session_store_is_a_noncreating_empty_store() {
         let (root, context) = isolated_fixture("missing-session");
-        let store = SessionStore::load_for_runtime(&context).unwrap();
+        let store = SessionStore::load(&context).unwrap();
         assert!(store.sessions.is_empty());
         assert!(store.workspace_id.is_empty());
         assert!(!root.join("data/sessions.json").exists());
@@ -3001,7 +2746,7 @@ mod tests {
         assert_eq!(std::fs::read(selected_credentials_path(&ambient_root)).unwrap(), ambient_original);
         assert_eq!(old_encoded, URL_SAFE_NO_PAD.encode([0x11; 32]));
         let canonical_root_a = std::fs::canonicalize(&root_a).unwrap();
-        assert_eq!(context_a.runtime_root(), Some(canonical_root_a.as_path()));
+        assert_eq!(context_a.runtime_root(), canonical_root_a.as_path());
 
         drop(pipeline_a);
         drop(pipeline_b);
@@ -3198,7 +2943,7 @@ mod tests {
         assert_eq!(again.lock().unwrap().retries("group:42"), 2);
     }
 
-    /// Ticket 25 review 11: without a ledger turn (a legacy context) an error of `session/prompt` is not a refusal unless
+    /// Ticket 25 review 11: without a ledger turn, an error of `session/prompt` is not a refusal unless
     /// DSH said so: a timeout or a dropped connection leaves the outcome unknown, is checked with DSH and never fails over.
     #[test]
     fn ticket25_a_transport_error_without_a_ledger_turn_is_checked_not_assumed_refused() {

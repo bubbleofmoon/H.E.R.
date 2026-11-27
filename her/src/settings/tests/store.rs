@@ -340,13 +340,7 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
 }
 
 #[test]
-fn settings_routes_refuse_agents_legacy_contexts_and_oversized_bodies() {
-    let legacy = RuntimeContext::legacy();
-    let applied = crate::settings::apply(&legacy, QUIET_KEY, &json!(4500), "administrator", "console");
-    assert_eq!(applied.err(), Some((503, "settings require a selected runtime".to_string())));
-    let document = json!({"socialV2": {"reply": {"wakeQuietMs": 9000}}});
-    assert_eq!(crate::settings::overlay(&legacy, document.clone()), document, "a legacy context has no store");
-
+fn settings_routes_refuse_agents_and_oversized_bodies() {
     let (root, context) = settings_fixture("settings refusals");
     let request = json!({"setting": QUIET_KEY, "value": 4500});
     let (status, body) = agent_request(&context, "POST", "/api/settings/set", Some(&request), "fixture-agent-token");

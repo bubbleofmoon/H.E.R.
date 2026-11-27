@@ -285,10 +285,9 @@ impl Journal {
         let path = context
             .resolve_path(RuntimeArea::Data, DB_NAME, PathIntent::WriteFile)
             .map_err(|e| format!("入站数据库路径不可用：{e}"))?;
-        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
-        if context.is_isolated() {
-            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let conn = Connection::open_with_flags(&path, flags)
             .map_err(|e| format!("打不开入站数据库：{e}"))?;
         Self::init(conn)
@@ -1041,21 +1040,6 @@ pub fn backfill_window(
         format!("stopped after {MAX_HISTORY_PAGES} pages before reaching the window start"),
         recovered,
     ))
-}
-
-/// 唤醒已触发：该会话等待中的事件转为 `processing`，之后由主循环在回合结束时标为 `handled`。
-pub async fn start_processing(
-    journal: &SharedJournal,
-    awaiting: &mut std::collections::HashMap<String, Vec<String>>,
-    in_flight: &mut Vec<String>,
-    conversation: &str,
-    now: i64,
-) -> Result<(), String> {
-    if let Some(keys) = awaiting.remove(conversation) {
-        journal.mark_processing(keys.clone(), now).await?;
-        in_flight.extend(keys);
-    }
-    Ok(())
 }
 
 /// 每次（重）连接后立即调用（快，仅写库）：以上次存活时刻为起点，为每个允许会话记录缺口。

@@ -20,13 +20,11 @@ fn config_stamp(context: &RuntimeContext) -> StartStamp {
 
 /// Remember the start stamp (JS `cfgStamp` baseline taken at start).
 pub(super) fn note_config_start(context: &RuntimeContext) {
-    if context.is_isolated() {
-        let stamps = CONFIG_START_STAMP.get_or_init(Default::default);
-        if let Ok(mut stamps) = stamps.lock() {
-            stamps
-                .entry(context.config_file().to_path_buf())
-                .or_insert_with(|| config_stamp(context));
-        }
+    let stamps = CONFIG_START_STAMP.get_or_init(Default::default);
+    if let Ok(mut stamps) = stamps.lock() {
+        stamps
+            .entry(context.config_file().to_path_buf())
+            .or_insert_with(|| config_stamp(context));
     }
 }
 
@@ -115,9 +113,6 @@ fn state_dir_command(dir: &str) -> String {
 }
 
 pub(super) fn harden_selected_state_dir(context: &RuntimeContext) {
-    if !context.is_isolated() {
-        return;
-    }
     let dir = match state_dir(context) {
         Ok(dir) => dir,
         Err(error) => {

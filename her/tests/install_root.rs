@@ -593,7 +593,7 @@ fn development_guard_normalizes_paths_and_keeps_siblings_separate() {
 }
 
 #[test]
-fn installed_and_legacy_supervisors_can_own_their_selected_runtime() {
+fn installed_and_development_supervisors_can_own_their_selected_runtime() {
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
     struct Reap(Child);
@@ -623,10 +623,10 @@ fn installed_and_legacy_supervisors_can_own_their_selected_runtime() {
             install.join("runtime"),
         ),
         (
-            "legacy",
+            "development",
             PathBuf::from(env!("CARGO_BIN_EXE_her")),
             PathBuf::from(env!("CARGO_BIN_EXE_her-cli")),
-            fixture.0.join("legacy-runtime"),
+            fixture.0.join("development-runtime"),
         ),
     ] {
         for dir in ["config", "data", "resources"] {
@@ -779,9 +779,6 @@ fn affected_native_script_checks_use_disposable_roots() {
 #[test]
 fn default_production_root_is_the_one_production_folder() {
     assert_eq!(install_root::DEFAULT_INSTALL_ROOT, if cfg!(windows) { "C:/qqbot" } else { "/qqbot" });
-    assert_eq!(crate::legacy_path!(), "C:/qqbot");
-    assert_eq!(crate::legacy_path!("qq-bridge/config.json"), "C:/qqbot/qq-bridge/config.json");
-    assert_eq!(crate::legacy_path!(windows "qq-bridge\\state"), "C:\\qqbot\\qq-bridge\\state");
 }
 
 #[test]
@@ -831,7 +828,7 @@ fn installed_runtime_backups_stay_inside_the_root() {
     // An absolute destination is the administrator's explicit choice and stays supported.
     let external = fixture.0.join("share");
     assert_eq!(install.backup_destination(&runtime, &external).unwrap(), external);
-    // A runtime outside the root (today's fixed layout) keeps runtime-relative backups, `..` included.
+    // A runtime outside the root (a development or standalone runtime) keeps runtime-relative backups, `..` included.
     let outside = fixture.0.join("qqbot-rust/runtime");
     assert_eq!(install.backup_destination(&outside, Path::new("backups")).unwrap(), outside.join("backups"));
     assert_eq!(install.backup_destination(&outside, Path::new("../b")).unwrap(), fixture.0.join("qqbot-rust/b"));
@@ -855,7 +852,7 @@ fn production_path_literals(text: &str) -> Vec<usize> {
         if has_layout_marker(line) { continue; }
         let mut spelled = line.to_ascii_lowercase().replace('\\', "/");
         while spelled.contains("//") { spelled = spelled.replace("//", "/"); }
-        if ["c:/qqbot", "qqbot-rust", "join(\".dsh\")", "/.dsh\"", "\".dsh/", "\".dsh\""]
+        if ["c:/qqbot", "qqbot-rust", "legacy_path!", "join(\".dsh\")", "/.dsh\"", "\".dsh/", "\".dsh\""]
             .iter()
             .any(|n| spelled.contains(n))
         {
@@ -904,7 +901,7 @@ fn production_path_scanner_flags_unmarked_spellings_and_skips_marked_ones() {
         r#"let p = PathBuf::from("D:/people/alice/.dsh");"#,
     ]
     .join("\n");
-    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 15, 16]);
+    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16]);
 }
 
 #[test]

@@ -119,7 +119,7 @@ fn record_message(url: &str) -> Value {
 
 /// Set the notice clock of `context`'s runtime (the test stand-in for the notice limiter's time).
 fn notice_clock(context: &RuntimeContext, ms: i64) {
-    NOTICE_CLOCK.lock().unwrap().insert(context.runtime_root().unwrap().to_path_buf(), ms);
+    NOTICE_CLOCK.lock().unwrap().insert(context.runtime_root().to_path_buf(), ms);
 }
 
 /// A SILK record of about `bytes` bytes in 32 KB packets (1500 of them fit one minute).
@@ -157,14 +157,14 @@ fn slow_reading_engine() -> String {
 
 /// The owner notices admitted for `context`'s runtime.
 fn notices(context: &RuntimeContext) -> Vec<String> {
-    let root = context.runtime_root().unwrap().to_path_buf();
+    let root = context.runtime_root().to_path_buf();
     NOTICES.lock().unwrap().iter().filter(|(r, ..)| *r == root).map(|(_, _, text, _)| text.clone()).collect()
 }
 
 /// The run-record lines of `context` naming `event`.
 fn records(context: &RuntimeContext, event: &str) -> Vec<Value> {
     crate::recovery_log::flush(context);
-    let text = std::fs::read_to_string(context.runtime_root().unwrap().join("data/run-record.jsonl")).unwrap_or_default();
+    let text = std::fs::read_to_string(context.runtime_root().join("data/run-record.jsonl")).unwrap_or_default();
     text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).filter(|record| record["event"] == event).collect()
 }
 
@@ -412,7 +412,7 @@ fn helper_failures_are_classified_and_bounded_by_the_deadline() {
     DOWNLOAD_FIXTURES.lock().unwrap().insert(url.to_string(), big_silk(48 << 20));
     let helper = HttpTranscriber::new(&slow_reading_engine()).unwrap();
     let limits = Limits { max_bytes: 64 << 20, max_seconds: 60 };
-    let slot = context.runtime_root().unwrap().to_path_buf();
+    let slot = context.runtime_root().to_path_buf();
     let permit = Running::claim(&slot).expect("the slot is free");
     let started = Instant::now();
     let deadline = started + Duration::from_millis(600);
@@ -549,7 +549,7 @@ async fn a_silent_helper_times_out_pauses_for_a_minute_and_its_recovery_is_told(
     let second = for_message(&context, &cfg, "group:777002", "group:777002|message:2", &message(2)).await;
     let asked = silent.requests.lock().unwrap().len();
     // The minute has passed (the pause ended a millisecond ago) and the helper answers again.
-    health().lock().unwrap().get_mut(context.runtime_root().unwrap()).unwrap().cool_until =
+    health().lock().unwrap().get_mut(context.runtime_root()).unwrap().cool_until =
         Instant::now().checked_sub(Duration::from_millis(1));
     let answering = fake_engine(Some(ok_reply(r#"{"text":"好了"}"#)));
     let cfg = json!({"voiceTranscription": {"conversations": ["group:777002"], "helper": answering.origin}});
@@ -612,7 +612,7 @@ async fn a_download_that_uses_its_share_leaves_the_helper_time_and_one_that_over
     let overran = for_message(&context, &cfg, "group:777006", "group:777006|message:2", &record_message(overrun)).await;
     let asked = engine.requests.lock().unwrap().len();
     let told = notices(&context);
-    let state = health().lock().unwrap().get(context.runtime_root().unwrap()).map(|state| (state.down, state.told));
+    let state = health().lock().unwrap().get(context.runtime_root()).map(|state| (state.down, state.told));
     let failed = records(&context, "voice-transcription");
     let outages = records(&context, "voice-transcription-unavailable");
     std::fs::remove_dir_all(root).unwrap();
@@ -681,7 +681,7 @@ async fn a_second_voice_while_one_runs_keeps_the_label() {
     let cfg = context.load_config().unwrap();
     let url = "https://voice.fixture.test/busy";
     DOWNLOAD_FIXTURES.lock().unwrap().insert(url.to_string(), silk(5));
-    let held = Running::claim(context.runtime_root().unwrap()).expect("the test holds the runtime's one transcription");
+    let held = Running::claim(context.runtime_root()).expect("the test holds the runtime's one transcription");
     let result = for_message(&context, &cfg, "group:777004", "group:777004|message:1", &record_message(url)).await;
     drop(held);
     let asked = engine.requests.lock().unwrap().len();
@@ -702,7 +702,7 @@ async fn a_failed_download_keeps_the_label_and_is_no_helper_outage() {
     let result = for_message(&context, &cfg, "group:777005", "group:777005|message:1", &record_message(url)).await;
     let failed = records(&context, "voice-transcription");
     let told = notices(&context);
-    let cool_until = health().lock().unwrap().get(context.runtime_root().unwrap()).and_then(|state| state.cool_until);
+    let cool_until = health().lock().unwrap().get(context.runtime_root()).and_then(|state| state.cool_until);
     let leaked = files_holding(&root, b"secret-rkey");
     std::fs::remove_dir_all(root).unwrap();
     assert_eq!(result, None);

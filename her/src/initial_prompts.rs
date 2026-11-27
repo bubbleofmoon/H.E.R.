@@ -102,14 +102,10 @@ fn number(value: Option<&Value>) -> i64 {
 
 /// Reads the store. Never fails: a damaged file yields `writable == false`.
 pub fn load(context: &RuntimeContext) -> Store {
-    let raw = if context.is_isolated() {
-        match context.read_optional_text(RuntimeArea::Data, FILE) {
-            Ok(Some(text)) => Some(text),
-            Ok(None) => None,
-            Err(_) => return Store { entries: Vec::new(), writable: false },
-        }
-    } else {
-        context.read_text(RuntimeArea::Data, FILE).ok()
+    let raw = match context.read_optional_text(RuntimeArea::Data, FILE) {
+        Ok(Some(text)) => Some(text),
+        Ok(None) => None,
+        Err(_) => return Store { entries: Vec::new(), writable: false },
     };
     let Some(raw) = raw else { return Store { entries: Vec::new(), writable: true } };
     let body = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
@@ -162,7 +158,7 @@ pub fn set(context: &RuntimeContext, cfg: &Value, key: &str, raw_text: &str, now
     }
     let _gate = SAVE_GATE.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load(context);
-    let location = if context.is_isolated() { "data/initial-prompts.json" } else { "state/initial-prompts.json" };
+    let location = "data/initial-prompts.json";
     let prev = store.get(&canonical).cloned();
     if text.is_empty() {
         if !store.writable {

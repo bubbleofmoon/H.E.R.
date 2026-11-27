@@ -191,7 +191,7 @@ impl Prepared {
                 .map_err(|e| e.to_string())?;
             let raw = crate::backup::parse_archive_config(&bytes)?;
             let (config, _) = crate::backup::validate_archive_config(
-                context.runtime_root().ok_or("runtime root missing")?,
+                context.runtime_root(),
                 raw,
                 &verified.settings_overlay,
             )?;
@@ -305,9 +305,6 @@ const WRITER_RESTORE_GATE: &str = "locks/restore-writers.lock";
 const WRITER_RESTORE_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) fn writer_gate_shared(context: &RuntimeContext) -> Result<Option<File>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     let deadline = Instant::now() + WRITER_RESTORE_WAIT;
     loop {
         match context.open_shared_locked_file(RuntimeArea::Data, WRITER_RESTORE_GATE) {
@@ -480,9 +477,7 @@ impl Control for RealControl {
         let mut cmd =
             crate::subprocess::command_without_console(crate::subprocess::external_path(exe)?);
         cmd.args(["supervise", "--runtime-root"])
-            .arg(crate::subprocess::external_path(
-                context.runtime_root().ok_or("runtime root missing")?,
-            )?)
+            .arg(crate::subprocess::external_path(context.runtime_root())?)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log));
@@ -511,7 +506,7 @@ impl Control for RealControl {
         let permit = verifying_recovery(context);
         loop {
             let verdict = crate::health_check::check_restore_candidate(
-                context.runtime_root().ok_or("runtime root missing")?,
+                context.runtime_root(),
                 deadline.min(Instant::now() + Duration::from_secs(5)),
                 permit,
             );
@@ -621,8 +616,7 @@ const ROLLBACK_ARCHIVE: &str = "console-restore-recovery/rollback-archive";
 const DESTINATION_TOKEN: &str = "console-restore-recovery/destination-token";
 
 pub(crate) fn recovery_pending(context: &RuntimeContext) -> bool {
-    context.is_isolated()
-        && !matches!(context.read_protected_data_file(RECOVERY_INTENT, 4096), Ok(None))
+    !matches!(context.read_protected_data_file(RECOVERY_INTENT, 4096), Ok(None))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1329,7 +1323,7 @@ impl CliFixtureControl {
 #[cfg(feature = "parity-clock")]
 impl Control for CliFixtureControl {
     fn preflight(&mut self, context: &RuntimeContext) -> Result<(), String> {
-        crate::install_root::check_development_path(context.runtime_root().ok_or("runtime root missing")?)
+        crate::install_root::check_development_path(context.runtime_root())
     }
     fn stop(&mut self, _: &RuntimeContext, _: u64) -> Result<(), String> {
         Ok(())
@@ -1579,7 +1573,7 @@ fn queue_inner(
         } else {
             "her-cli"
         });
-    let root = context.runtime_root().ok_or("runtime root missing")?;
+    let root = context.runtime_root();
     let log = context.resolve_path(RuntimeArea::Data, "logs/restore.log", PathIntent::WriteFile)?;
     let output = fs::OpenOptions::new()
         .create(true)
@@ -1826,7 +1820,7 @@ mod tests {
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
             if self.leave_settings_sidecars {
-                let root = context.runtime_root().unwrap();
+                let root = context.runtime_root();
                 self.settings_sidecars_after_replace = Some(
                     ["-wal", "-shm", "-journal"]
                         .map(|suffix| root.join(format!("data/settings.db{suffix}")).exists()),
@@ -1849,7 +1843,6 @@ mod tests {
                     fs::write(
                         context
                             .runtime_root()
-                            .unwrap()
                             .join(format!("data/conversations.db{suffix}")),
                         b"stale conversation sidecar",
                     )
@@ -1861,7 +1854,6 @@ mod tests {
                     fs::write(
                         context
                             .runtime_root()
-                            .unwrap()
                             .join(format!("data/settings.db{suffix}")),
                         b"stale settings sidecar",
                     )
@@ -2659,7 +2651,7 @@ mod tests {
                             let release = RefCell::new(Some(release_tx));
                             let archive = crate::backup::create(&context, &|| {
                                 if release.borrow().is_some() {
-                                    let partial = match fs::read_dir(context.runtime_root().unwrap().join("backups")) {
+                                    let partial = match fs::read_dir(context.runtime_root().join("backups")) {
                                         Ok(entries) => entries.filter_map(Result::ok)
                                             .map(|e| e.path().join("conversations.db"))
                                             .filter_map(|p| fs::metadata(p).ok())

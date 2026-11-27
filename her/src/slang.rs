@@ -6,19 +6,13 @@
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
 
-/// 词库文件的默认位置（与 JS 的 `SLANG_FILE` 一致）。
-pub const SLANG_FILE: &str = crate::legacy_path!("qq-bridge/state/slang.json");
-
 /// Leaf store gate serializing selected-runtime `data/slang.json` reads and writes.
 /// Never wait, sleep, or acquire any other store lock while holding this gate.
-fn store_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
+fn store_gate(context: &RuntimeContext) -> Result<std::fs::File, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match context.open_locked_file(RuntimeArea::Data, "slang-store.lock") {
-            Ok(file) => return Ok(Some(file)),
+            Ok(file) => return Ok(file),
             Err(error)
                 if error == "runtime file is already locked"
                     && std::time::Instant::now() < deadline =>
@@ -37,49 +31,7 @@ pub enum MutateError<E> {
     Action(E),
 }
 
-#[cfg(test)]
-mod legacy_load_scope {
-    use super::RuntimeContext;
-    use std::cell::RefCell;
-    use std::sync::Arc;
-
-    std::thread_local! {
-        static CONTEXTS: RefCell<Vec<Arc<RuntimeContext>>> = RefCell::new(Vec::new());
-    }
-
-    struct ScopeGuard;
-
-    impl Drop for ScopeGuard {
-        fn drop(&mut self) {
-            CONTEXTS.with(|contexts| {
-                let popped = contexts.borrow_mut().pop();
-                debug_assert!(popped.is_some(), "legacy slang load scope stack underflow");
-            });
-        }
-    }
-
-    pub(super) fn current() -> Option<Arc<RuntimeContext>> {
-        CONTEXTS.with(|contexts| contexts.borrow().last().cloned())
-    }
-
-    pub(super) fn with_context<T>(context: RuntimeContext, action: impl FnOnce() -> T) -> T {
-        CONTEXTS.with(|contexts| contexts.borrow_mut().push(Arc::new(context)));
-        let _scope = ScopeGuard;
-        action()
-    }
-}
-
-/// 读词库：磁盘上是数组；历史上也出现过 `{entries: [...]}`，两种都认。
-pub fn load_entries() -> Vec<Value> {
-    #[cfg(test)]
-    if let Some(context) = legacy_load_scope::current() {
-        return load_entries_for_runtime(context.as_ref());
-    }
-    load_entries_for_runtime(&RuntimeContext::legacy())
-}
-
-/// Read slang entries from the selected runtime. Legacy callers retain their historical path via
-/// `RuntimeContext::legacy`; isolated callers can only read `data/slang.json` under their root.
+/// Read slang entries from the selected runtime (`data/slang.json`).
 pub fn load_entries_for_runtime(context: &RuntimeContext) -> Vec<Value> {
     let entries = match context
         .read_text(RuntimeArea::Data, "slang.json")
@@ -144,11 +96,6 @@ fn hash_optional_text(text: Option<&str>) -> String {
 }
 
 fn load_checked_and_hash(context: &RuntimeContext) -> Result<(Vec<Value>, String), String> {
-    if !context.is_isolated() {
-        let raw = context.read_text(RuntimeArea::Data, "slang.json").ok();
-        let hash = hash_optional_text(raw.as_deref());
-        return Ok((load_entries_for_runtime(context), hash));
-    }
     let Some(text) = context
         .read_optional_text(RuntimeArea::Data, "slang.json")
         .map_err(|error| format!("读取候选黑话库失败：{error}"))?
@@ -217,11 +164,6 @@ pub fn reconcile_if_hash(
         return Ok(true);
     }
     Ok(false)
-}
-
-/// 写词库：磁盘上是**数组**（与 JS 一致），先写临时文件再改名。
-pub fn save_entries(entries: &[Value]) -> Result<(), String> {
-    save_entries_for_runtime(&RuntimeContext::legacy(), entries)
 }
 
 /// Atomically replace the selected runtime's slang data file.
@@ -636,60 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_load_wrapper_reads_only_scoped_selected_root_and_preserves_both_files() {
-        let (root_a, context_a) = runtime_fixture("legacy-load-a");
-        let (root_b, context_b) = runtime_fixture("legacy-load-b");
-        let entries_a = vec![entry("a", "甲词", "A meaning", "confirmed", 2)];
-        let entries_b = vec![entry("b", "乙词", "B meaning", "candidate", 5)];
-        let bytes_a = serde_json::to_vec(&entries_a).unwrap();
-        let historical_b = json!({ "entries": entries_b });
-        let bytes_b = serde_json::to_vec(&historical_b).unwrap();
-        context_a
-            .write_atomic(RuntimeArea::Data, "slang.json", &bytes_a)
-            .unwrap();
-        context_b
-            .write_atomic(RuntimeArea::Data, "slang.json", &bytes_b)
-            .unwrap();
-
-        assert_eq!(
-            legacy_load_scope::with_context(context_a.clone(), load_entries),
-            entries_a
-        );
-        assert_eq!(
-            context_a
-                .read_file(RuntimeArea::Data, "slang.json")
-                .unwrap(),
-            bytes_a
-        );
-        assert_eq!(
-            context_b
-                .read_file(RuntimeArea::Data, "slang.json")
-                .unwrap(),
-            bytes_b
-        );
-
-        assert_eq!(
-            legacy_load_scope::with_context(context_b.clone(), load_entries),
-            entries_b
-        );
-        assert_eq!(
-            context_a
-                .read_file(RuntimeArea::Data, "slang.json")
-                .unwrap(),
-            bytes_a
-        );
-        assert_eq!(
-            context_b
-                .read_file(RuntimeArea::Data, "slang.json")
-                .unwrap(),
-            bytes_b
-        );
-
-        std::fs::remove_dir_all(root_a).unwrap();
-        std::fs::remove_dir_all(root_b).unwrap();
-    }
-
-    #[test]
     fn public_entry_never_leaks_evidence() {
         let e = entry("a", "集美", "姐妹", "confirmed", 2);
         let p = public_entry(&e);
@@ -867,7 +755,7 @@ mod tests {
     #[test]
     fn mutate_entries_serializes_concurrent_writers_and_skips_save_on_error_or_noop() {
         let (root, context) = runtime_fixture("mutate-locked");
-        let gate = store_gate(&context).unwrap().unwrap();
+        let gate = store_gate(&context).unwrap();
         let worker_ctx = context.clone();
         let worker = std::thread::spawn(move || {
             mutate_entries(&worker_ctx, |entries| {

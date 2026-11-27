@@ -120,9 +120,9 @@ struct Limits {
 
 impl Limits {
     fn current(context: &RuntimeContext, fallback: &Value) -> Self {
-        let fresh = context.is_isolated()
-            .then(|| context.load_config_document().ok())
-            .flatten()
+        let fresh = context
+            .load_config_document()
+            .ok()
             .filter(Value::is_object);
         Self::read(fresh.as_ref().unwrap_or(fallback))
     }
@@ -206,10 +206,7 @@ pub fn admin_key(kind: &str) -> String {
 }
 
 fn scope_of(context: &RuntimeContext) -> String {
-    context
-        .runtime_root()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "legacy".to_string())
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 /// `ownerQQ` as a positive account id; `None` when it is not configured (JS: the alert is only logged).

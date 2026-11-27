@@ -159,7 +159,7 @@ fn write_dependencies(root: &Path, onebot: &str, dsh: &str, model: &str) {
     crate::support::write_dependencies(root, dsh, model, onebot, None);
 }
 
-fn start_console(root: &Path, port: u16, via_legacy_args: bool) -> ChildGuard {
+fn start_console(root: &Path, port: u16, via_env_root: bool) -> ChildGuard {
     let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
     command
         .arg("--console-serve")
@@ -168,7 +168,7 @@ fn start_console(root: &Path, port: u16, via_legacy_args: bool) -> ChildGuard {
         .env_remove("HER_RUNTIME_ROOT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if via_legacy_args {
+    if via_env_root {
         command.env("HER_RUNTIME_ROOT", root);
     } else {
         command.arg("--runtime-root").arg(root);
@@ -393,17 +393,17 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
     onebot.wait_for_requests(1);
     stop(&mut child);
 
-    // The old public CLI shape remains usable when an operator selects a runtime root in the environment.
-    let (child, legacy_port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
+    // Selecting the runtime root via `HER_RUNTIME_ROOT` remains equivalent to `--runtime-root`.
+    let (child, env_port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
         start_console(&root, port, true).0.take().expect("spawned console")
     });
     let mut child = ChildGuard(Some(child));
-    let health = wait_for_health(&mut child, legacy_port).unwrap_or_else(|error| {
+    let health = wait_for_health(&mut child, env_port).unwrap_or_else(|error| {
         stop(&mut child);
         panic!("{error}");
     });
     assert_eq!(health["runtime"]["mode"], "isolated");
-    assert_status_reads_fixture(legacy_port);
+    assert_status_reads_fixture(env_port);
     onebot.wait_for_requests(2);
     stop(&mut child);
 

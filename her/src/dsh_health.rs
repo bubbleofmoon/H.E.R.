@@ -148,7 +148,7 @@ fn registry() -> &'static Mutex<HashMap<String, Health>> {
 }
 
 fn scope_of(context: &RuntimeContext) -> String {
-    context.runtime_root().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "legacy".to_string())
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 /// The DSH base URL of a selected runtime.
@@ -249,7 +249,7 @@ pub fn probe_login(context: &RuntimeContext, deadline: Option<std::time::Instant
     let Some(base) = dsh_base(context) else {
         return unchecked(Err("no DSH dependency configured".to_string()));
     };
-    let rpc = match crate::dsh::Rpc::connect_with_runtime(context, &base) {
+    let rpc = match crate::dsh::Rpc::connect(context, &base) {
         Ok(rpc) => rpc,
         Err(error) => return unchecked(Err(error)),
     };

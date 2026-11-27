@@ -12,14 +12,14 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
         source: "fixture", importance: 0.5,
     }).unwrap();
     let args = json!({"key":"group:101","token":"group-token","query":"deepseek-v4.1-flash"});
-    let valid = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap();
+    let valid = crate::mcp::call_tool("memory_search", &args, &context).unwrap();
     assert_eq!(valid, "1. [#1 推断·fact] deepseek-v4.1-flash v0.2.1");
     let block = crate::prompt::recall_block_with_runtime(&context, &context.load_config().unwrap(),
         &json!({"unread":[{"text":"deepseek-v4.1-flash v0.2.1"}]}), "group:101");
     assert!(block.contains("deepseek-v4.1-flash v0.2.1"), "dotted recall must inject: {block}");
     conn.execute_batch("CREATE TRIGGER fail_hits BEFORE UPDATE OF hits ON memory BEGIN SELECT RAISE(FAIL, 'private-query-token-path'); END;").unwrap();
     drop(conn);
-    let error = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap_err();
+    let error = crate::mcp::call_tool("memory_search", &args, &context).unwrap_err();
     assert!(error.contains("memory search failed"), "{error}");
     assert!(!error.contains("private-query-token-path"), "{error}");
     let (port, server) = start_http_fixture(context, 1);
@@ -94,7 +94,7 @@ fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
                 "JS omits undefined named values: {path}: {result}"
             );
         }
-        let text = crate::mcp::call_tool_with_context("settings_get", &named, &context).unwrap();
+        let text = crate::mcp::call_tool("settings_get", &named, &context).unwrap();
         let expected = defaults
             .get(path)
             .map(Value::to_string)
@@ -149,9 +149,9 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
         context
             .write_atomic(RuntimeArea::Config, "config.json", &bytes)
             .unwrap();
-        let result = crate::mcp::call_tool_with_context("settings_get", &args, &context).unwrap();
+        let result = crate::mcp::call_tool("settings_get", &args, &context).unwrap();
         assert_eq!(result, format!("sendDelayMs = {expected}"));
-        let all = crate::mcp::call_tool_with_context("settings_get", &all_args, &context).unwrap();
+        let all = crate::mcp::call_tool("settings_get", &all_args, &context).unwrap();
         assert!(all.lines().any(|line| line == result), "{all}");
         assert_eq!(
             std::fs::read(context.config_file()).unwrap(),
@@ -161,11 +161,11 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
     }
     let set_args = json!({"key":"private:7001","token":"owner-token","settingKey":"sendDelayMs","value":17});
     assert_eq!(
-        crate::mcp::call_tool_with_context("settings_set", &set_args, &context).unwrap(),
+        crate::mcp::call_tool("settings_set", &set_args, &context).unwrap(),
         "已改 sendDelayMs = 17。已立即生效"
     );
     assert_eq!(
-        crate::mcp::call_tool_with_context("settings_get", &args, &context).unwrap(),
+        crate::mcp::call_tool("settings_get", &args, &context).unwrap(),
         "sendDelayMs = 17"
     );
     assert_eq!(context.load_config().unwrap()["sendDelayMs"], 17);
@@ -195,13 +195,13 @@ fn ticket17_frozen_js_history_retrieval_and_acl_oracle_through_http() {
             args["key"] = json!("private:7001");
             args["token"] = json!("owner-token");
             args["action"] = json!("grant");
-            crate::mcp::call_tool_with_context("memory_acl", &args, &context).unwrap();
+            crate::mcp::call_tool("memory_acl", &args, &context).unwrap();
             grant = Some(args);
         }
         if expected["label"] == "revoked" {
             let mut args = grant.take().unwrap();
             args["action"] = json!("revoke");
-            crate::mcp::call_tool_with_context("memory_acl", &args, &context).unwrap();
+            crate::mcp::call_tool("memory_acl", &args, &context).unwrap();
         }
         let key = expected["readerKey"].as_str().unwrap();
         let token = match key {
@@ -270,7 +270,7 @@ fn ticket17_mcp_cannot_self_grant_or_delete_foreign_memory() {
     conn.execute("INSERT INTO memory(owner_type,owner_id,scope,kind,content,source,created_at) VALUES('session','private:202','private','fact','foreign-secret','fixture',1700000000000)", []).unwrap();
     let id = conn.last_insert_rowid();
     drop(conn);
-    let grant = crate::mcp::call_tool_with_context(
+    let grant = crate::mcp::call_tool(
         "memory_acl",
         &json!({"key":"group:101","token":"group-token","action":"grant","readType":"*","readId":"*"}),
         &context,
@@ -279,7 +279,7 @@ fn ticket17_mcp_cannot_self_grant_or_delete_foreign_memory() {
         grant.is_err(),
         "a group cannot grant itself access: {grant:?}"
     );
-    let forget = crate::mcp::call_tool_with_context(
+    let forget = crate::mcp::call_tool(
         "memory_forget",
         &json!({"key":"group:101","token":"group-token","id":id}),
         &context,
@@ -288,7 +288,7 @@ fn ticket17_mcp_cannot_self_grant_or_delete_foreign_memory() {
         forget.is_err(),
         "a group cannot delete another scope: {forget:?}"
     );
-    let settings = crate::mcp::call_tool_with_context(
+    let settings = crate::mcp::call_tool(
         "settings_get",
         &json!({"key":"group:101","token":"group-token","settingKey":"consoleToken"}),
         &context,
@@ -311,9 +311,9 @@ fn ticket17_new_database_and_failed_index_write_are_atomic() {
         )
         .unwrap();
     let args = json!({"key":"group:101","token":"group-token","content":"first-memory"});
-    crate::mcp::call_tool_with_context("memory_write", &args, &context).unwrap();
+    crate::mcp::call_tool("memory_write", &args, &context).unwrap();
     assert!(
-        crate::mcp::call_tool_with_context("memory_index", &args, &context)
+        crate::mcp::call_tool("memory_index", &args, &context)
             .unwrap()
             .contains("共 1 条")
     );
@@ -321,10 +321,10 @@ fn ticket17_new_database_and_failed_index_write_are_atomic() {
     conn.execute_batch("CREATE TRIGGER reject_index BEFORE INSERT ON memory_fts_content BEGIN SELECT RAISE(ABORT,'injected index failure'); END;").unwrap();
     let mut fail = args.clone();
     fail["content"] = json!("must-rollback");
-    assert!(crate::mcp::call_tool_with_context("memory_write", &fail, &context).is_err());
+    assert!(crate::mcp::call_tool("memory_write", &fail, &context).is_err());
     assert_eq!(fixture_memory_contents(&context), vec!["first-memory"]);
     conn.execute_batch("DROP TRIGGER reject_index;").unwrap();
-    assert!(crate::mcp::call_tool_with_context(
+    assert!(crate::mcp::call_tool(
         "memory_search",
         &json!({"key":"group:101","token":"group-token","query":"first"}),
         &context
@@ -353,7 +353,7 @@ fn ticket17_http_and_mcp_share_history_acl_settings_archive_and_revocation() {
         args.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        crate::mcp::call_tool_with_context(name, &args, &context)
+        crate::mcp::call_tool(name, &args, &context)
     };
     let (port, server) = start_http_fixture(context.clone(), 6);
     let before = call("memory_search", &group, json!({"query":""})).unwrap();
@@ -489,7 +489,7 @@ fn ticket17_concurrent_writes_deduplicate_and_waiting_token_is_rechecked() {
     drop(initialize_fixture_memory_database(&context));
     let workers: Vec<_> = (0..8).map(|i| {
         let ctx = context.clone();
-        std::thread::spawn(move || crate::mcp::call_tool_with_context("memory_write", &json!({"key":if i%2==0 {"group:101"} else {"group:202"},"token":if i%2==0 {"group-token"} else {"other-token"},"content":"same-content"}), &ctx).unwrap())
+        std::thread::spawn(move || crate::mcp::call_tool("memory_write", &json!({"key":if i%2==0 {"group:101"} else {"group:202"},"token":if i%2==0 {"group-token"} else {"other-token"},"content":"same-content"}), &ctx).unwrap())
     }).collect();
     for worker in workers {
         worker.join().unwrap();
@@ -502,7 +502,7 @@ fn ticket17_concurrent_writes_deduplicate_and_waiting_token_is_rechecked() {
     let held = acquire_social_state_gate(&context).unwrap();
     let ctx = context.clone();
     let worker = std::thread::spawn(move || {
-        crate::mcp::call_tool_with_context(
+        crate::mcp::call_tool(
             "memory_write",
             &json!({"key":"group:101","token":"group-token","content":"revoked-write"}),
             &ctx,

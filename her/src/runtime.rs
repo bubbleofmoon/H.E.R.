@@ -1,22 +1,18 @@
 //! Runtime path and dependency selection for the bridge.
 //!
-//! The legacy context preserves the existing production paths. An explicit runtime root confines
-//! console and MCP file access to a selected fixture tree. The path resolver is request-scoped:
-//! callers pass `&RuntimeContext` through every operation rather than keeping a mutable process
-//! global, which also makes two contexts safe to use concurrently in one process.
+//! An explicit runtime root confines console, live bridge, and MCP file access to a selected
+//! runtime tree. The path resolver is request-scoped: callers pass `&RuntimeContext` through every
+//! operation rather than keeping a mutable process global, which also makes two contexts safe to
+//! use concurrently in one process.
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use crate::guarded_file::{is_link, no_follow};
 
-const LEGACY_CONFIG: &str = crate::legacy_path!("qq-bridge/config.json");
-const LEGACY_DATA: &str = crate::legacy_path!("qq-bridge/state");
-const LEGACY_RESOURCES: &str = crate::legacy_path!("qq-bridge");
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
 #[cfg(test)]
@@ -71,12 +67,6 @@ pub struct ConfigStamp {
     pub modified: Option<std::time::SystemTime>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeMode {
-    Legacy,
-    Isolated,
-}
-
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct TestOneShots(
@@ -96,12 +86,10 @@ impl std::fmt::Debug for TestOneShots {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeContext {
-    mode: RuntimeMode,
-    runtime_root: Option<PathBuf>,
+    runtime_root: PathBuf,
     config_file: PathBuf,
     data_dir: PathBuf,
     resources_dir: PathBuf,
-    dsh_user_dir: Option<PathBuf>,
     console_port: Option<u16>,
     dependencies: BTreeMap<String, String>,
     config: Option<Value>,
@@ -175,26 +163,7 @@ pub(crate) fn parse_evidence_jsonl(text: &str, file: &str, damaged: &str) -> Res
 }
 
 impl RuntimeContext {
-    /// The legacy context is kept for callers which have not opted into a runtime root.
-    pub fn legacy() -> Self {
-        Self {
-            mode: RuntimeMode::Legacy,
-            runtime_root: None,
-            config_file: PathBuf::from(LEGACY_CONFIG),
-            data_dir: PathBuf::from(LEGACY_DATA),
-            resources_dir: PathBuf::from(LEGACY_RESOURCES),
-            dsh_user_dir: None,
-            console_port: None,
-            dependencies: BTreeMap::new(),
-            config: None,
-            browser_anchors: Default::default(),
-            console_authority: None,
-            #[cfg(test)]
-            test_one_shots: Default::default(),
-        }
-    }
-
-    /// Resolve the CLI/environment selection before any legacy command can read production paths.
+    /// Resolve the CLI/environment runtime selection; fails closed if no runtime root is selected.
     pub fn from_process_args(args: &[String]) -> Result<Self, &'static str> {
         let environment_root = std::env::var_os("HER_RUNTIME_ROOT").map(PathBuf::from);
         Self::from_process_args_with_environment(args, environment_root)
@@ -205,7 +174,7 @@ impl RuntimeContext {
         environment_root: Option<PathBuf>,
     ) -> Result<Self, &'static str> {
         if environment_root.is_none() && !args.iter().any(|arg| arg == "--runtime-root") {
-            return Ok(Self::legacy());
+            return Err("runtime root is required: pass --runtime-root <absolute path> or set HER_RUNTIME_ROOT");
         }
         let (root, port) = Self::parse_isolated_startup_args(args, environment_root)?;
         let context = if args.iter().any(|arg| arg == "--console-serve") {
@@ -335,9 +304,6 @@ impl RuntimeContext {
         };
         let data_dir = contained_path(&root, "data", true)?;
         let resources_dir = contained_path(&root, "resources", true)?;
-        // This directory is a selected fixture root, never inherited from DSH_HOME/USERPROFILE.
-        // It may be created lazily by an operation that explicitly writes a user-scoped fixture.
-        let dsh_user_dir = root.join("user/dsh");
         let dependencies_file = contained_path(&root, "dependencies.json", false)?;
         let config = if pending {
             None
@@ -420,12 +386,10 @@ impl RuntimeContext {
         }
 
         Ok(Self {
-            mode: RuntimeMode::Isolated,
-            runtime_root: Some(root.clone()),
+            runtime_root: root.clone(),
             config_file,
             data_dir,
             resources_dir,
-            dsh_user_dir: Some(dsh_user_dir),
             console_port: None,
             dependencies,
             config,
@@ -460,8 +424,8 @@ impl RuntimeContext {
         &self.resources_dir
     }
 
-    pub fn runtime_root(&self) -> Option<&Path> {
-        self.runtime_root.as_deref()
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
     }
 
     pub fn with_console_port(mut self, port: u16) -> Self {
@@ -476,8 +440,7 @@ impl RuntimeContext {
     /// Re-reads the selected runtime's configuration and dependency endpoints from its root while preserving
     /// request-scoped test overrides on this context.
     pub(crate) fn refreshed(&self) -> Result<Self, &'static str> {
-        let root = self.runtime_root().ok_or("runtime root is unavailable")?;
-        let mut next = Self::from_root(root)?;
+        let mut next = Self::from_root(self.runtime_root())?;
         next.console_port = self.console_port;
         #[cfg(test)]
         {
@@ -521,11 +484,6 @@ impl RuntimeContext {
         relative: &str,
         intent: PathIntent,
     ) -> Result<PathBuf, &'static str> {
-        let base = self.area_base(area)?;
-        if !self.is_isolated() {
-            return resolve_legacy_path(&base, relative, intent);
-        }
-        let root = self.runtime_root.as_deref().ok_or("runtime path is unavailable")?;
         let base_rel = match area {
             RuntimeArea::Config => "config",
             RuntimeArea::Data | RuntimeArea::Memory => "data",
@@ -534,12 +492,10 @@ impl RuntimeContext {
             RuntimeArea::DshWork => "dsh/work",
             RuntimeArea::Logs => "data",
         };
-        resolve_contained_path(root, base_rel, relative, intent).map_err(|_| "runtime path is unavailable")
+        resolve_contained_path(&self.runtime_root, base_rel, relative, intent).map_err(|_| "runtime path is unavailable")
     }
 
     pub(crate) fn resolve_path_detailed(&self, area: RuntimeArea, relative: &str, intent: PathIntent) -> Result<PathBuf, String> {
-        if !self.is_isolated() { return self.resolve_path(area, relative, intent).map_err(str::to_string); }
-        let root = self.runtime_root.as_deref().ok_or("runtime root is unavailable")?;
         let base = match area {
             RuntimeArea::Config => "config",
             RuntimeArea::Data | RuntimeArea::Memory | RuntimeArea::Logs => "data",
@@ -547,7 +503,7 @@ impl RuntimeContext {
             RuntimeArea::DshUser => "user/dsh",
             RuntimeArea::DshWork => "dsh/work",
         };
-        resolve_contained_path(root, base, relative, intent)
+        resolve_contained_path(&self.runtime_root, base, relative, intent)
     }
 
     fn resolve_read_path_once(
@@ -631,15 +587,12 @@ impl RuntimeContext {
 
     /// Read an optional selected-root text file. A missing leaf or parent is `Ok(None)`; an
     /// invalid parent, reparse point, non-file leaf, or failed read stays an error. This never
-    /// creates directories or consults an ambient or legacy location.
+    /// creates directories or consults an ambient location.
     pub fn read_optional_text(
         &self,
         area: RuntimeArea,
         relative: &str,
     ) -> Result<Option<String>, &'static str> {
-        if !self.is_isolated() {
-            return Err("optional runtime reads require an isolated context");
-        }
         self.read_bytes_retrying(area, relative, true)?
             .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid"))
             .transpose()
@@ -657,9 +610,6 @@ impl RuntimeContext {
         area: RuntimeArea,
         relative: &str,
     ) -> Result<Option<String>, String> {
-        if !self.is_isolated() {
-            return Err("optional runtime reads require an isolated context".to_string());
-        }
         let path = self
             .resolve_path(area, relative, PathIntent::ReadOptionalFile)
             .map_err(str::to_string)?;
@@ -685,9 +635,6 @@ impl RuntimeContext {
     /// The length of an optional selected-root file (`Ok(0)` when absent), with the guards of
     /// `read_optional_text`.
     pub fn optional_file_len(&self, area: RuntimeArea, relative: &str) -> Result<u64, &'static str> {
-        if !self.is_isolated() {
-            return Err("optional runtime reads require an isolated context");
-        }
         let path = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
         if self.resolve_path(area, relative, PathIntent::ReadOptionalFile)? != path {
             return Err("runtime path is unavailable");
@@ -708,9 +655,6 @@ impl RuntimeContext {
         relative: &str,
         offset: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, &'static str> {
-        if !self.is_isolated() {
-            return Err("optional runtime reads require an isolated context");
-        }
         self.read_optional_tail_io(area, relative, offset)
             .map_err(|_| "runtime path is unavailable")
     }
@@ -930,8 +874,7 @@ impl RuntimeContext {
     /// Callers must keep the returned handle alive for the ownership period and must not unlink
     /// or atomically replace this file. The OS releases the lock when its handle/process closes,
     /// so a crashed owner can be recovered by opening the same persistent file; marker validation
-    /// and updates must happen only while holding the returned handle. Legacy contexts are
-    /// rejected so this helper cannot silently select a user or production path. This uses
+    /// and updates must happen only while holding the returned handle. This uses
     /// `std::fs::File::try_lock` (stable since Rust 1.89):
     /// <https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock>
     pub fn open_locked_file(&self, area: RuntimeArea, relative: &str) -> Result<fs::File, String> {
@@ -953,9 +896,6 @@ impl RuntimeContext {
         relative: &str,
         shared: bool,
     ) -> Result<fs::File, String> {
-        if !self.is_isolated() {
-            return Err("runtime file locks require an isolated context".to_string());
-        }
         let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
             return Err("runtime path is unavailable".to_string());
@@ -1044,7 +984,7 @@ impl RuntimeContext {
         let authority_file = matches!((area, relative),
             (RuntimeArea::Config, "config.json") |
             (RuntimeArea::Data, crate::conversation_state::FILE | "mode.json" | "current-role.json"));
-        let _authority = if self.is_isolated() && authority_file && authority.is_none() {
+        let _authority = if authority_file && authority.is_none() {
             #[cfg(test)]
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
@@ -1178,17 +1118,14 @@ impl RuntimeContext {
     pub fn dependency_url(&self, name: &str) -> Option<&str> {
         self.dependencies.get(name).map(String::as_str)
     }
-    pub fn is_isolated(&self) -> bool {
-        self.mode == RuntimeMode::Isolated
-    }
 
     /// The console credential this runtime authorizes with (JS `startConsoleServer` and
-    /// `readConsoleToken`): the configured `consoleToken`, or, when it is empty in a selected
-    /// runtime, the generated token kept only in `data/console-token`. Used for console
-    /// authentication, the MCP and wake-snapshot clients and secret redaction; never written back.
+    /// `readConsoleToken`): the configured `consoleToken`, or the generated token kept only in
+    /// `data/console-token`. Used for console authentication, the MCP and wake-snapshot clients
+    /// and secret redaction; never written back.
     pub fn effective_console_token(&self, cfg: &Value) -> String {
         let configured = cfg.get("consoleToken").and_then(Value::as_str).map(str::trim).unwrap_or("");
-        if !configured.is_empty() || !self.is_isolated() {
+        if !configured.is_empty() {
             return configured.to_string();
         }
         self.read_optional_text(RuntimeArea::Data, "console-token")
@@ -1200,8 +1137,7 @@ impl RuntimeContext {
 
     /// The configuration before normalization: the stored `config/config.json` (a leading UTF-8 BOM accepted) with
     /// the settings overlay applied. Every reader of configuration values goes through this or `load_config`, which
-    /// normalizes it. Only the writers (they modify the stored file), the backup archive (it keeps the stored bytes)
-    /// and the no-root legacy paths read the file themselves.
+    /// normalizes it; only writers and backup archives read the stored file directly.
     pub fn load_config_document(&self) -> Result<Value, ConfigReadError> {
         Ok(self.overlay_config(self.read_config_document()?))
     }
@@ -1215,7 +1151,7 @@ impl RuntimeContext {
     }
 
     /// Applies the stored settings in `data/settings.db` over the parsed `config.json` (`settings::overlay`).
-    /// A legacy context and a runtime without a settings store read the file as it is.
+    /// A runtime without a settings store reads the file as it is.
     pub(crate) fn overlay_config(&self, file: Value) -> Value {
         apply_settings_overlay(crate::settings::overlay(self, file))
     }
@@ -1229,16 +1165,12 @@ impl RuntimeContext {
     }
 
     pub fn load_config(&self) -> Result<Value, &'static str> {
-        if self.is_isolated() {
-            let raw = match self.load_config_document() {
-                Ok(raw) => raw,
-                Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
-                Err(ConfigReadError::Unavailable(message)) => return Err(message),
-            };
-            return self.normalized_config(&raw);
-        }
-
-        Ok(self.load_config_document().unwrap_or_else(|_| json!({})))
+        let raw = match self.load_config_document() {
+            Ok(raw) => raw,
+            Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
+            Err(ConfigReadError::Unavailable(message)) => return Err(message),
+        };
+        self.normalized_config(&raw)
     }
 
     /// Loads a selected runtime's effective configuration for a durable repair that requires a successful store read.
@@ -1249,21 +1181,14 @@ impl RuntimeContext {
         })?;
         crate::settings::overlay_checked(self, &mut document)?;
         let document = apply_settings_overlay(document);
-        if self.is_isolated() {
-            self.normalized_config(&document).map_err(str::to_owned)
-        } else {
-            Ok(document)
-        }
+        self.normalized_config(&document).map_err(str::to_owned)
     }
 
     /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
     /// that file (an access change records the policy it writes before the write). The settings overlay is applied
-    /// first, as `load_config_document` does; a legacy context then uses the document as it is.
+    /// first, as `load_config_document` does.
     pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
         let document = self.overlay_config(raw.clone());
-        if !self.is_isolated() {
-            return Ok(document);
-        }
         self.normalized_config(&document)
     }
 
@@ -1278,9 +1203,6 @@ impl RuntimeContext {
     ) -> Result<Value, &'static str> {
         let mut document = self.overlay_config(raw.clone());
         crate::settings::place_changes(&mut document, changes);
-        if !self.is_isolated() {
-            return Ok(document);
-        }
         self.normalized_config(&document)
     }
 
@@ -1294,7 +1216,7 @@ impl RuntimeContext {
         let (mut config, _) = crate::config::canonical_config(raw)
             .map_err(|_| "runtime config is invalid")?;
         crate::settings::resolve_config(&mut config);
-        crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
+        crate::backup::Settings::from_config(self.runtime_root(), &config)
             .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
         // The live closed-agent process mirrors DSH's qq-mode owner override here so the
         // console and the turn worker enforce the same current administrator policy.
@@ -1318,9 +1240,6 @@ impl RuntimeContext {
     }
 
     pub fn health_metadata(&self) -> Value {
-        if !self.is_isolated() {
-            return Value::Null;
-        }
         let mut dependency_names: Vec<&str> = REQUIRED_DEPENDENCIES
             .iter()
             .copied()
@@ -1336,28 +1255,6 @@ impl RuntimeContext {
             "resourcesConfigured": self.resources_dir().is_dir(),
             "dependencyNames": dependency_names,
         })
-    }
-
-    fn area_base(&self, area: RuntimeArea) -> Result<PathBuf, &'static str> {
-        let base = match (self.mode, area) {
-            (RuntimeMode::Legacy, RuntimeArea::Config) => PathBuf::from(crate::legacy_path!("qq-bridge")),
-            (RuntimeMode::Legacy, RuntimeArea::Data) => PathBuf::from(LEGACY_DATA),
-            (RuntimeMode::Legacy, RuntimeArea::Resources) => PathBuf::from(LEGACY_RESOURCES),
-            (RuntimeMode::Legacy, RuntimeArea::DshUser) => match dsh_home() {
-                Some(home) => home,
-                None => return Err("runtime path is unavailable"),
-            },
-            (RuntimeMode::Legacy, RuntimeArea::DshWork) => return Err("runtime path is unavailable"),
-            (RuntimeMode::Legacy, RuntimeArea::Memory) => PathBuf::from(crate::legacy_path!("data")),
-            (RuntimeMode::Legacy, RuntimeArea::Logs) => PathBuf::from(crate::legacy_path!("logs")),
-            (RuntimeMode::Isolated, RuntimeArea::Config) => self.runtime_root.as_ref().unwrap().join("config"),
-            (RuntimeMode::Isolated, RuntimeArea::Data | RuntimeArea::Memory) => self.runtime_root.as_ref().unwrap().join("data"),
-            (RuntimeMode::Isolated, RuntimeArea::Resources) => self.resources_dir.clone(),
-            (RuntimeMode::Isolated, RuntimeArea::DshUser) => self.dsh_user_dir.clone().unwrap(),
-            (RuntimeMode::Isolated, RuntimeArea::DshWork) => self.runtime_root.as_ref().unwrap().join("dsh/work"),
-            (RuntimeMode::Isolated, RuntimeArea::Logs) => self.runtime_root.as_ref().unwrap().join("data"),
-        };
-        Ok(base)
     }
 }
 
@@ -1393,44 +1290,6 @@ pub(crate) fn with_config_overlay<T>(pointer: &str, value: Value, run: impl FnOn
     CONFIG_OVERLAY_TEST_VALUES.with(|values| values.borrow_mut().push((pointer.to_string(), value)));
     let _reset = Reset;
     run()
-}
-
-/// The DSH home comes only from an explicit `DSH_HOME` or `USERPROFILE`. There is no
-/// personal default: when neither is set, callers must fail instead of reading another home.
-pub(crate) fn dsh_home() -> Option<PathBuf> {
-    dsh_home_from(std::env::var_os("DSH_HOME"), std::env::var_os("USERPROFILE"))
-}
-
-fn dsh_home_from(dsh_home: Option<OsString>, user_profile: Option<OsString>) -> Option<PathBuf> {
-    dsh_home
-        .map(PathBuf::from)
-        .or_else(|| user_profile.map(crate::install_root::legacy_dsh_home))
-}
-
-fn resolve_legacy_path(base: &Path, relative: &str, intent: PathIntent) -> Result<PathBuf, &'static str> {
-    let components = validated_components(relative)?;
-    let mut path = base.to_path_buf();
-    for component in components {
-        path.push(component);
-    }
-    match intent {
-        PathIntent::ReadFile if !path.is_file() => Err("runtime path is unavailable"),
-        PathIntent::ReadDirectory if !path.is_dir() => Err("runtime path is unavailable"),
-        PathIntent::CreateDirectory => {
-            fs::create_dir_all(&path).map_err(|_| "runtime path is unavailable")?;
-            Ok(path)
-        }
-        PathIntent::WriteFile => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|_| "runtime path is unavailable")?;
-            }
-            if path.exists() && !path.is_file() {
-                return Err("runtime path is unavailable");
-            }
-            Ok(path)
-        }
-        _ => Ok(path),
-    }
 }
 
 fn validated_components(relative: &str) -> Result<Vec<&std::ffi::OsStr>, &'static str> {
@@ -2046,21 +1905,6 @@ pub(crate) mod tests {
         cleanup(&root);
     }
 
-    #[test]
-    fn dsh_home_never_defaults_to_a_personal_directory() {
-        // Explicit DSH_HOME and USERPROFILE stay the only sources for the DSH home.
-        assert_eq!(dsh_home_from(None, None), None);
-        assert_eq!(
-            dsh_home_from(Some(OsString::from("D:/dsh-home")), None),
-            Some(PathBuf::from("D:/dsh-home"))
-        );
-        assert_eq!(
-            dsh_home_from(None, Some(OsString::from("D:/people/alice"))),
-            Some(PathBuf::from("D:/people/alice").join(".dsh")) // layout-literal: expected value
-        );
-        assert_ne!(dsh_home_from(None, None), Some(PathBuf::from("D:/people/alice/.dsh"))); // layout-literal: expected value
-    }
-
     /// Ticket 24 decision B: an empty `consoleToken` falls back to the hardened `data/console-token`
     /// (JS `loadOrCreateConsoleToken`); with neither the runtime refuses to start.
     #[test]
@@ -2570,13 +2414,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn open_locked_file_requires_an_explicit_isolated_context() {
-        assert!(RuntimeContext::legacy()
-            .open_locked_file(RuntimeArea::Data, "locks/session-owner.json")
-            .is_err());
-    }
-
-    #[test]
     fn optional_onebot_websocket_preserves_three_key_roots_and_health_names() {
         let root = fixture_root("onebot-websocket-schema");
 
@@ -2982,7 +2819,7 @@ pub(crate) mod tests {
         assert_eq!(context.dependency_url("onebot"), Some("http://127.0.0.1:43103"));
         assert_eq!(context.dependency_url("onebot_ws"), Some("ws://127.0.0.1:43104"));
         let expected_root = fs::canonicalize(&root).unwrap();
-        assert_eq!(context.runtime_root(), Some(expected_root.as_path()));
+        assert_eq!(context.runtime_root(), expected_root.as_path());
 
         // The same selector accepts flags in either order and accepts a root from the environment.
         let mut reversed = vec![
@@ -2997,7 +2834,7 @@ pub(crate) mod tests {
         ];
         let reversed_context = RuntimeContext::from_process_args_with_environment(&reversed, None)
             .expect("argument order does not change the selected mode or root");
-        assert_eq!(reversed_context.runtime_root(), Some(expected_root.as_path()));
+        assert_eq!(reversed_context.runtime_root(), expected_root.as_path());
         assert_eq!(reversed_context.console_port(), Some(43157));
         let mut live_no_reconnect = reversed.clone();
         let live_flag = live_no_reconnect.iter().position(|arg| arg == "--live").unwrap();
@@ -3009,7 +2846,7 @@ pub(crate) mod tests {
         reversed.pop();
         let env_context = RuntimeContext::from_process_args_with_environment(&reversed, Some(root.clone()))
             .expect("HER_RUNTIME_ROOT selection supports the same isolated live arguments");
-        assert_eq!(env_context.runtime_root(), Some(expected_root.as_path()));
+        assert_eq!(env_context.runtime_root(), expected_root.as_path());
 
         for maximum in ["group:9223372036854775807", "private:9223372036854775807"] {
             let args = live_args(Some(&root), maximum, "43154");
@@ -3177,11 +3014,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn no_runtime_root_keeps_legacy_probe_arguments_accepted() {
-        let args = vec!["her.exe".to_string(), "--send-probe".to_string()];
-        let context = RuntimeContext::from_process_args_with_environment(&args, None)
-            .expect("no-root arguments continue to select the legacy context");
-        assert!(!context.is_isolated());
+    fn missing_runtime_root_is_refused() {
+        for args in [
+            vec!["her.exe".to_string()],
+            vec!["her.exe".into(), "--console-serve".into(), "--console-port".into(), "43160".into()],
+            vec!["her.exe".into(), "--mcp-serve".into(), "--console-port".into(), "43160".into()],
+            vec!["her.exe".into(), "--mcp-web-search-serve".into(), "--console-port".into(), "43160".into()],
+            vec!["her.exe".into(), "--mcp-host-serve".into(), "--console-port".into(), "43160".into()],
+            vec!["her.exe".into(), "--live".into(), "--live-groups".into(), "group:123".into(), "--console-port".into(), "43160".into()],
+            vec!["her.exe".into(), "--send-probe".into()],
+        ] {
+            let error = RuntimeContext::from_process_args_with_environment(&args, None).unwrap_err();
+            assert!(error.contains("--runtime-root"), "{args:?}: {error}");
+        }
     }
 
     #[test]

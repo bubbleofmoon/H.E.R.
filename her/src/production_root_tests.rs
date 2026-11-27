@@ -49,7 +49,7 @@ fn every_resolved_production_path_is_inside_the_selected_root() {
 
     // The bridge and the supervisor resolve every runtime area through the selected runtime.
     let context = RuntimeContext::from_root(&fixture.runtime).unwrap();
-    let runtime = context.runtime_root().unwrap();
+    let runtime = context.runtime_root();
     for (name, area) in [
         ("config", RuntimeArea::Config), ("data", RuntimeArea::Data), ("memory", RuntimeArea::Memory),
         ("logs", RuntimeArea::Logs), ("resources", RuntimeArea::Resources),
@@ -95,25 +95,4 @@ fn every_resolved_production_path_is_inside_the_selected_root() {
         let spelled = crate::subprocess::external_path(path).unwrap();
         assert!(task.arguments.contains(&spelled), "task arguments name the {name}: {}", task.arguments);
     }
-}
-
-#[test]
-fn fixed_path_layout_lies_inside_the_default_production_root() {
-    // ReadOptionalFile on the legacy context never touches the filesystem.
-    let root = Path::new(crate::legacy_path!());
-    let legacy = RuntimeContext::legacy();
-    let fixed = [
-        legacy.config_file(), legacy.data_dir(), legacy.resources_dir(),
-        Path::new(crate::memory::DB_PATH), Path::new(crate::ledger::LEDGER_FILE),
-        Path::new(crate::ledger::RUST_LEDGER_FILE), Path::new(crate::send_outbox::LEGACY_OUTBOX_FILE),
-        Path::new(crate::turn_ledger::LEGACY_LEDGER_FILE), Path::new(crate::slang::SLANG_FILE),
-        Path::new(crate::sticker::STICKER_FILE),
-    ];
-    for path in fixed { assert!(path.starts_with(root), "{} is outside {}", path.display(), root.display()); }
-    // The legacy DSH home stays in the profile until the owner's move; it is not checked here.
-    for area in [RuntimeArea::Config, RuntimeArea::Data, RuntimeArea::Resources, RuntimeArea::Memory, RuntimeArea::Logs] {
-        let path = legacy.resolve_path(area, "probe", PathIntent::ReadOptionalFile).unwrap();
-        assert!(path.starts_with(root), "{area:?} resolves outside {}", root.display());
-    }
-    if cfg!(windows) { assert_eq!(crate::install_root::DEFAULT_INSTALL_ROOT, crate::legacy_path!()); }
 }

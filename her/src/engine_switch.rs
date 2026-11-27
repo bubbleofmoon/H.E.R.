@@ -59,10 +59,9 @@ fn unsaved_retries() -> &'static Mutex<HashMap<PathBuf, Retry>> {
 }
 
 fn load_retry(context: &RuntimeContext, key: &str) -> Result<Option<Retry>, (u16, String)> {
-    if let Some(root) = context.runtime_root() {
-        if let Some(retry) = unsaved_retries().lock().unwrap_or_else(|p| p.into_inner()).get(&root.join(retry_path(key))).cloned() {
-            return Ok(Some(retry));
-        }
+    let root = context.runtime_root();
+    if let Some(retry) = unsaved_retries().lock().unwrap_or_else(|p| p.into_inner()).get(&root.join(retry_path(key))).cloned() {
+        return Ok(Some(retry));
     }
     read_retry(context, key)
 }
@@ -77,9 +76,8 @@ fn read_retry(context: &RuntimeContext, key: &str) -> Result<Option<Retry>, (u16
 }
 
 fn clear_retry(context: &RuntimeContext, key: &str) {
-    if let Some(root) = context.runtime_root() {
-        unsaved_retries().lock().unwrap_or_else(|p| p.into_inner()).remove(&root.join(retry_path(key)));
-    }
+    let root = context.runtime_root();
+    unsaved_retries().lock().unwrap_or_else(|p| p.into_inner()).remove(&root.join(retry_path(key)));
     if let Ok(Some(_)) = read_retry(context, key) {
         if context.remove_file(RuntimeArea::Data, &retry_path(key)).is_err() {
             crate::safe_println!("[chat] {key} engine switch retry state could not be cleared");
@@ -96,15 +94,14 @@ fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, mut retry: R
     let saved = serde_json::to_vec(&retry).ok().is_some_and(|bytes| {
         context.write_atomic(RuntimeArea::Data, &retry_path(key), &bytes).is_ok()
     });
-    if let Some(root) = context.runtime_root() {
-        let slot = root.join(retry_path(key));
-        let mut unsaved = unsaved_retries().lock().unwrap_or_else(|p| p.into_inner());
-        if saved {
-            unsaved.remove(&slot);
-        } else {
-            retry.notice_pending = offer_notice;
-            unsaved.insert(slot, retry);
-        }
+    let root = context.runtime_root();
+    let slot = root.join(retry_path(key));
+    let mut unsaved = unsaved_retries().lock().unwrap_or_else(|p| p.into_inner());
+    if saved {
+        unsaved.remove(&slot);
+    } else {
+        retry.notice_pending = offer_notice;
+        unsaved.insert(slot, retry);
     }
     if !saved {
         crate::safe_println!("[chat] {key} engine switch retry state could not be saved");

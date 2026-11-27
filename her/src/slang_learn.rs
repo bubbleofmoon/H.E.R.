@@ -1,6 +1,6 @@
 //! S1：黑话抽取（extract）的编排层。
 //!
-//! 这一层**不碰存储格式**：读写仍然走 `slang.rs` 的 `load_entries` / `save_entries` /
+//! 这一层**不碰存储格式**：读写仍然走 `slang.rs` 的 `load_entries_for_runtime` / `save_entries_for_runtime` /
 //! `normalize_entry`。这里只负责：
 //!   1. 每个会话的最近消息窗口（最多 80 条）；
 //!   2. 阈值 + 冷却判断；
@@ -28,8 +28,6 @@ use crate::backend;
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use crate::slang;
 
-/// 窗口文件（跨进程共享；主循环写、控制台读）。
-pub const WINDOWS_FILE: &str = crate::legacy_path!("qq-bridge/state/slang-windows.json");
 /// 窗口最多保留多少条（与 JS 一致）。
 pub const WINDOW_MAX: usize = 80;
 /// 送进提示词的单条消息最长字符数（JS 的 `truncateText(text, 200)`）。
@@ -113,15 +111,14 @@ struct WindowState {
 struct LearningInner {
     context: RuntimeContext,
     state: Mutex<WindowState>,
-    extract_lock: tokio::sync::Mutex<()>,
     sync_lock: Mutex<()>,
 }
 
 /// Per-runtime-root learning state so callers like `extract_now` stay isolated by `RuntimeContext`.
 fn runtime_inner(context: &RuntimeContext) -> Arc<LearningInner> {
-    static RUNTIMES: OnceLock<Mutex<HashMap<Option<PathBuf>, Arc<LearningInner>>>> =
+    static RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, Arc<LearningInner>>>> =
         OnceLock::new();
-    let key = context.runtime_root().map(std::path::Path::to_path_buf);
+    let key = context.runtime_root().to_path_buf();
     let mut map = RUNTIMES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -131,17 +128,16 @@ fn runtime_inner(context: &RuntimeContext) -> Arc<LearningInner> {
             Arc::new(LearningInner {
                 context: context.clone(),
                 state: Mutex::new(WindowState::default()),
-                extract_lock: tokio::sync::Mutex::new(()),
                 sync_lock: Mutex::new(()),
             })
         })
         .clone()
 }
 
-/// Runtime roots (`None`: the legacy runtime) whose startup catch-up this process already started. The first learning
+/// Runtime roots whose startup catch-up this process already started. The first learning
 /// value of a root claims it; every later value of that root, in any process object, starts nothing.
-fn catch_up_roots() -> &'static Mutex<std::collections::HashSet<Option<std::path::PathBuf>>> {
-    static ROOTS: OnceLock<Mutex<std::collections::HashSet<Option<std::path::PathBuf>>>> = OnceLock::new();
+fn catch_up_roots() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static ROOTS: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
     ROOTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
@@ -158,7 +154,6 @@ impl SlangLearning {
             inner: Arc::new(LearningInner {
                 context: context.clone(),
                 state: Mutex::new(WindowState::default()),
-                extract_lock: tokio::sync::Mutex::new(()),
                 sync_lock: Mutex::new(()),
             }),
         }
@@ -216,11 +211,6 @@ impl SlangLearning {
 
     /// Extract one due window on the calling (non-async) thread, like `run_auto_reserved`.
     fn extract_blocking(&self, key: &str) {
-        let _guard = if self.inner.context.is_isolated() {
-            None
-        } else {
-            Some(self.inner.extract_lock.blocking_lock())
-        };
         let cfg = match self.inner.context.load_config() {
             Ok(cfg) => cfg,
             Err(error) => {
@@ -245,7 +235,7 @@ impl SlangLearning {
     /// that is already due is extracted in turn; one whose extraction fails stays for its next trigger. Returns the
     /// thread's handle when this call started it.
     pub fn start_catch_up(&self) -> Option<std::thread::JoinHandle<()>> {
-        let root = self.inner.context.runtime_root().map(std::path::Path::to_path_buf);
+        let root = self.inner.context.runtime_root().to_path_buf();
         let claimed = catch_up_roots()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -291,11 +281,6 @@ impl SlangLearning {
     }
 
     async fn run_auto_reserved(&self, cfg: Value, key: String, ticket: Option<JobTicket>) {
-        let _guard = if self.inner.context.is_isolated() {
-            None
-        } else {
-            Some(self.inner.extract_lock.lock().await)
-        };
         let inner = self.inner.clone();
         let key_for_worker = key.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -332,20 +317,6 @@ impl SlangLearning {
             force,
         )
     }
-}
-
-fn state() -> &'static Mutex<WindowState> {
-    static STATE: OnceLock<Mutex<WindowState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(WindowState::default()))
-}
-
-/// 抽取任务串行化：同时只允许一个抽取/研究任务在跑。
-///
-/// 用 tokio 的 Mutex 而不是 std 的：自动抽取挂在 tokio 任务里，
-/// 等待锁时不能把 worker 线程堵住。
-pub fn extract_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn now_ms() -> i64 {
@@ -497,9 +468,6 @@ impl Drop for JobTicket {
 const MAX_PENDING_JOBS: usize = 16;
 
 fn reserve_job(context: &RuntimeContext) -> Result<Option<JobTicket>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let ns = SystemTime::now()
@@ -541,9 +509,6 @@ fn job_gate(
     context: &RuntimeContext,
     reserved: Option<JobTicket>,
 ) -> Result<Option<JobTicket>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     let mut ticket = match reserved {
         Some(ticket) => ticket,
         None => reserve_job(context)?.ok_or("黑话任务排队失败")?,
@@ -668,110 +633,66 @@ pub fn refusal_backoff_ms(attempts: u32, cooldown: i64) -> i64 {
 }
 
 fn read_windows_file(context: &RuntimeContext) -> Result<DiskWindows, String> {
-    let text = if context.is_isolated() {
-        context
-            .read_optional_text(RuntimeArea::Data, "slang-windows.json")
-            .map_err(|error| format!("读取候选黑话窗口失败：{error}"))?
-    } else {
-        context
-            .read_text(RuntimeArea::Data, "slang-windows.json")
-            .ok()
-    };
+    let text = context
+        .read_optional_text(RuntimeArea::Data, "slang-windows.json")
+        .map_err(|error| format!("读取候选黑话窗口失败：{error}"))?;
     let Some(text) = text else {
         return Ok(DiskWindows::default());
     };
-    let v = match serde_json::from_str::<Value>(&text) {
-        Ok(value) => value,
-        Err(error) if context.is_isolated() => {
-            return Err(format!("候选黑话窗口 JSON 损坏：{error}"));
-        }
-        Err(_) => return Ok(DiskWindows::default()),
-    };
-    if context.is_isolated() && !v.is_object() {
+    let v = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("候选黑话窗口 JSON 损坏：{error}"))?;
+    if !v.is_object() {
         return Err("候选黑话窗口结构损坏".to_string());
     }
     let mut out = DiskWindows::default();
     out.generation = match v.get("generation") {
-        Some(value) if context.is_isolated() => value
+        Some(value) => value
             .as_u64()
             .ok_or_else(|| "候选黑话窗口 generation 结构异常".to_string())?,
-        Some(value) => value.as_u64().unwrap_or(0),
         None => 0,
     };
-    if context.is_isolated() {
-        // Missing fields are accepted for older selected-root snapshots, but a present field
-        // with the wrong shape must not be treated as an empty window. The next feed would
-        // otherwise atomically overwrite the only copy of that malformed state.
-        if let Some(value) = v.get("windows") {
-            let map = value
-                .as_object()
-                .ok_or_else(|| "候选黑话窗口字段 windows 结构异常".to_string())?;
-            for (key, list) in map {
-                let rows = list
-                    .as_array()
-                    .ok_or_else(|| format!("候选黑话窗口会话 {key} 不是消息数组"))?;
-                let mut messages = Vec::with_capacity(rows.len());
-                for (index, row) in rows.iter().enumerate() {
-                    let message =
-                        serde_json::from_value::<SlangMsg>(row.clone()).map_err(|_| {
-                            format!("候选黑话窗口会话 {key} 第 {} 条消息结构异常", index + 1)
-                        })?;
-                    messages.push(message);
-                }
-                out.windows.insert(key.clone(), messages);
-            }
-        }
-        if let Some(value) = v.get("consumedAt") {
-            let map = value
-                .as_object()
-                .ok_or_else(|| "候选黑话窗口字段 consumedAt 结构异常".to_string())?;
-            for (key, timestamp) in map {
-                let timestamp = timestamp
-                    .as_i64()
-                    .ok_or_else(|| format!("候选黑话窗口会话 {key} 消费时间结构异常"))?;
-                out.consumed_at.insert(key.clone(), timestamp);
-            }
-        }
-        if let Some(value) = v.get("consumedBatches") {
-            out.consumed_batches = serde_json::from_value(value.clone())
-                .map_err(|_| "候选黑话窗口字段 consumedBatches 结构异常".to_string())?;
-        }
-        if let Some(value) = v.get("pendingCommit").filter(|val| !val.is_null()) {
-            out.pending_commit = Some(
-                serde_json::from_value(value.clone())
-                    .map_err(|_| "候选黑话窗口字段 pendingCommit 结构异常".to_string())?,
-            );
-        }
-        return Ok(out);
-    }
-
-    // Legacy parsing deliberately retains its historical best-effort behavior.
-    if let Some(map) = v.get("windows").and_then(|w| w.as_object()) {
+    // Missing fields are accepted for older selected-root snapshots, but a present field
+    // with the wrong shape must not be treated as an empty window. The next feed would
+    // otherwise atomically overwrite the only copy of that malformed state.
+    if let Some(value) = v.get("windows") {
+        let map = value
+            .as_object()
+            .ok_or_else(|| "候选黑话窗口字段 windows 结构异常".to_string())?;
         for (key, list) in map {
-            let msgs: Vec<SlangMsg> = list
+            let rows = list
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|m| serde_json::from_value::<SlangMsg>(m.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            out.windows.insert(key.clone(), msgs);
+                .ok_or_else(|| format!("候选黑话窗口会话 {key} 不是消息数组"))?;
+            let mut messages = Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                let message =
+                    serde_json::from_value::<SlangMsg>(row.clone()).map_err(|_| {
+                        format!("候选黑话窗口会话 {key} 第 {} 条消息结构异常", index + 1)
+                    })?;
+                messages.push(message);
+            }
+            out.windows.insert(key.clone(), messages);
         }
     }
-    if let Some(map) = v.get("consumedAt").and_then(|c| c.as_object()) {
-        out.consumed_at = map
-            .iter()
-            .filter_map(|(key, value)| Some((key.clone(), value.as_i64()?)))
-            .collect();
+    if let Some(value) = v.get("consumedAt") {
+        let map = value
+            .as_object()
+            .ok_or_else(|| "候选黑话窗口字段 consumedAt 结构异常".to_string())?;
+        for (key, timestamp) in map {
+            let timestamp = timestamp
+                .as_i64()
+                .ok_or_else(|| format!("候选黑话窗口会话 {key} 消费时间结构异常"))?;
+            out.consumed_at.insert(key.clone(), timestamp);
+        }
     }
     if let Some(value) = v.get("consumedBatches") {
-        if let Ok(batches) = serde_json::from_value(value.clone()) {
-            out.consumed_batches = batches;
-        }
+        out.consumed_batches = serde_json::from_value(value.clone())
+            .map_err(|_| "候选黑话窗口字段 consumedBatches 结构异常".to_string())?;
     }
     if let Some(value) = v.get("pendingCommit").filter(|val| !val.is_null()) {
-        out.pending_commit = serde_json::from_value(value.clone()).ok();
+        out.pending_commit = Some(
+            serde_json::from_value(value.clone())
+                .map_err(|_| "候选黑话窗口字段 pendingCommit 结构异常".to_string())?,
+        );
     }
     Ok(out)
 }
@@ -818,13 +739,7 @@ fn write_windows_file(context: &RuntimeContext, state: &WindowState) -> Result<(
         .map_err(|error| format!("写黑话窗口失败：{error}"))
 }
 
-fn read_refusals_file(
-    context: &RuntimeContext,
-    memory: &HashMap<String, RefusalRecord>,
-) -> HashMap<String, RefusalRecord> {
-    if !context.is_isolated() {
-        return memory.clone();
-    }
+fn read_refusals_file(context: &RuntimeContext) -> HashMap<String, RefusalRecord> {
     let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, "slang-refusals.json")
     else {
         return HashMap::new();
@@ -836,9 +751,6 @@ fn write_refusals_file(
     context: &RuntimeContext,
     refusals: &HashMap<String, RefusalRecord>,
 ) -> Result<(), String> {
-    if !context.is_isolated() {
-        return Ok(());
-    }
     if refusals.is_empty() {
         let _ = context.remove_file(RuntimeArea::Data, "slang-refusals.json");
         return Ok(());
@@ -851,59 +763,17 @@ fn write_refusals_file(
 }
 
 /// 把磁盘上的窗口合并进内存，并按 `consumedAt` 剪掉已消费的消息。
-///
-/// 合并而不是覆盖：主循环可能比控制台多几条新消息，控制台也可能刚消费过一批。
 fn sync_with_disk(context: &RuntimeContext, state: &mut WindowState) -> Result<(), String> {
     let disk = read_windows_file(context)?;
-    if context.is_isolated() {
-        if state.generation != disk.generation {
-            state.cooldowns.clear();
-            state.refusals.clear();
-        }
-        state.generation = disk.generation;
-        state.windows = disk.windows;
-        state.consumed_at = disk.consumed_at;
-        state.consumed_batches = disk.consumed_batches;
-        state.pending_commit = disk.pending_commit;
-        return Ok(());
+    if state.generation != disk.generation {
+        state.cooldowns.clear();
+        state.refusals.clear();
     }
+    state.generation = disk.generation;
+    state.windows = disk.windows;
+    state.consumed_at = disk.consumed_at;
+    state.consumed_batches = disk.consumed_batches;
     state.pending_commit = disk.pending_commit;
-    for batch in disk.consumed_batches {
-        if !state.consumed_batches.contains(&batch) {
-            state.consumed_batches.push(batch);
-        }
-    }
-    if state.consumed_batches.len() > MAX_CONSUMED_BATCHES {
-        let drop = state.consumed_batches.len() - MAX_CONSUMED_BATCHES;
-        state.consumed_batches.drain(0..drop);
-    }
-    for (key, ts) in disk.consumed_at {
-        let slot = state.consumed_at.entry(key).or_insert(ts);
-        if ts > *slot {
-            *slot = ts;
-        }
-    }
-    for (key, msgs) in disk.windows {
-        let slot = state.windows.entry(key).or_default();
-        for m in msgs {
-            if !slot
-                .iter()
-                .any(|x| x.time == m.time && x.sender == m.sender && x.text == m.text)
-            {
-                slot.push(m);
-            }
-        }
-        slot.sort_by_key(|m| m.time);
-        if slot.len() > WINDOW_MAX {
-            let drop = slot.len() - WINDOW_MAX;
-            slot.drain(0..drop);
-        }
-    }
-    for (key, cutoff) in state.consumed_at.clone() {
-        if let Some(win) = state.windows.get_mut(&key) {
-            win.retain(|m| m.time > cutoff);
-        }
-    }
     Ok(())
 }
 
@@ -925,14 +795,11 @@ pub fn clear_windows(context: &RuntimeContext) -> Result<(), String> {
     Ok(())
 }
 
-fn lock_window_file(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
+fn lock_window_file(context: &RuntimeContext) -> Result<std::fs::File, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match context.open_locked_file(RuntimeArea::Data, "slang-windows.lock") {
-            Ok(file) => return Ok(Some(file)),
+            Ok(file) => return Ok(file),
             Err(error)
                 if error == "runtime file is already locked"
                     && std::time::Instant::now() < deadline =>
@@ -942,11 +809,6 @@ fn lock_window_file(context: &RuntimeContext) -> Result<Option<std::fs::File>, S
             Err(error) => return Err(error),
         }
     }
-}
-
-/// 主循环入口：喂一条消息。返回 false 表示这条消息不值得学（命令/空文本）。
-pub fn feed_window(key: &str, sender: &str, text: &str) -> bool {
-    feed_window_with_runtime(&RuntimeContext::legacy(), state(), key, sender, text).unwrap_or(false)
 }
 
 fn feed_window_with_runtime(
@@ -963,18 +825,16 @@ fn feed_window_with_runtime(
         sender: clip_chars(sender, 80),
         text: clip_chars(text, MESSAGE_TEXT_MAX),
         time: now_ms(),
-        window_id: context.is_isolated().then(new_window_id),
+        window_id: Some(new_window_id()),
     };
     let mut st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
     let _file_lock = lock_window_file(context)?;
     sync_with_disk(context, &mut st)?;
-    let before_write = context.is_isolated().then(|| st.clone());
+    let before_write = st.clone();
     push_message(st.windows.entry(key.to_string()).or_default(), msg);
     if let Err(error) = write_windows_file(context, &st) {
-        if let Some(before) = before_write {
-            *st = before;
-            return Err(error);
-        }
+        *st = before_write;
+        return Err(error);
     }
     Ok(true)
 }
@@ -1024,20 +884,8 @@ fn remove_batch_from_window(
     state: &mut WindowState,
     key: &str,
     batch: &[SlangMsg],
-    isolated: bool,
 ) {
     let previous_cutoff = state.consumed_at.get(key).copied().unwrap_or(0);
-    if !isolated {
-        let through = batch.last().map(|m| m.time).unwrap_or(0);
-        let slot = state.consumed_at.entry(key.to_string()).or_insert(through);
-        if through > *slot {
-            *slot = through;
-        }
-        if let Some(win) = state.windows.get_mut(key) {
-            win.retain(|m| m.time > through);
-        }
-        return;
-    }
     if let Some(window) = state.windows.get_mut(key) {
         for captured in batch {
             if let Some(index) = window.iter().position(|message| message == captured) {
@@ -1072,7 +920,7 @@ fn consume_batch_with_runtime(
     let _file_lock = lock_window_file(context)?;
     sync_with_disk(context, &mut st)?;
     let before_write = st.clone();
-    remove_batch_from_window(&mut st, key, batch, context.is_isolated());
+    remove_batch_from_window(&mut st, key, batch);
     record_consumed_signature(&mut st, key, &sig);
     if st
         .pending_commit
@@ -1082,12 +930,10 @@ fn consume_batch_with_runtime(
         st.pending_commit = None;
     }
     if let Err(error) = write_windows_file(context, &st) {
-        if context.is_isolated() {
-            *st = before_write;
-        }
+        *st = before_write;
         return Err(error);
     }
-    let mut refusals = read_refusals_file(context, &st.refusals);
+    let mut refusals = read_refusals_file(context);
     if refusals.remove(key).is_some() {
         let _ = write_refusals_file(context, &refusals);
     }
@@ -1121,9 +967,7 @@ fn stage_pending_commit(
     let before_write = st.clone();
     st.pending_commit = Some(pending);
     if let Err(error) = write_windows_file(context, &st) {
-        if context.is_isolated() {
-            *st = before_write;
-        }
+        *st = before_write;
         return Err(error);
     }
     Ok(())
@@ -1168,9 +1012,9 @@ fn refusal_blocked(
     signature: &str,
     now: i64,
 ) -> Result<bool, String> {
-    let st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
+    let _st = state.lock().map_err(|_| "黑话窗口状态锁失败".to_string())?;
     let _file_lock = lock_window_file(context)?;
-    let refusals = read_refusals_file(context, &st.refusals);
+    let refusals = read_refusals_file(context);
     let Some(record) = refusals.get(key) else {
         return Ok(false);
     };
@@ -1195,7 +1039,7 @@ fn record_refusal_backoff(
     let Ok(_file_lock) = lock_window_file(context) else {
         return;
     };
-    let mut refusals = read_refusals_file(context, &st.refusals);
+    let mut refusals = read_refusals_file(context);
     let attempts = match refusals.get(key) {
         Some(prev) if prev.signature == signature => prev.attempts.saturating_add(1),
         _ => 1,
@@ -1221,14 +1065,6 @@ pub fn should_trigger(
     cooldown: i64,
 ) -> bool {
     enabled && pending >= min.max(1) && now.saturating_sub(last_at) >= cooldown
-}
-
-/// 自动触发：三个条件都满足时才返回 true，并**当场记下冷却时间**。
-///
-/// 先记冷却再跑，而不是跑完再记 —— 否则第一次抽取还没结束时，
-/// 下一条消息又会把它排队，串行锁只能保证不同时跑，挡不住连续跑两轮。
-pub fn maybe_trigger(cfg: &Value, key: &str) -> bool {
-    maybe_trigger_with_runtime(&RuntimeContext::legacy(), state(), cfg, key).unwrap_or(false)
 }
 
 fn maybe_trigger_with_runtime(
@@ -1816,18 +1652,13 @@ fn research_results(raw: &str) -> Vec<Value> {
 
 fn research_with_runtime(
     context: &RuntimeContext,
-    cfg: &Value,
+    _cfg: &Value,
     ids: &[String],
     ticket: Option<JobTicket>,
 ) -> Result<(), String> {
     let _job = job_gate(context, ticket)?;
-    let current_cfg;
-    let cfg = if context.is_isolated() {
-        current_cfg = context.load_config().map_err(str::to_string)?;
-        &current_cfg
-    } else {
-        cfg
-    };
+    let current_cfg = context.load_config().map_err(str::to_string)?;
+    let cfg = &current_cfg;
     if !enabled(cfg) {
         return Ok(());
     }
@@ -2026,27 +1857,10 @@ fn summary_error(key: &str, messages: usize, error: String) -> Value {
     })
 }
 
-/// 同步抽取（控制台端点直接调；自动任务在 spawn_blocking 里调）。
-///
-/// `limit` 只影响送进模型的消息条数（取最近的 N 条），不影响阈值。
-/// 后端回复格式坏了时用格式修复提示词重问一次；第二次仍坏才**消费掉这批消息**
-/// （避免同一批脏输出每 5 分钟被重试一次）。合法的空数组是成功的「没学到」。
-pub fn extract_once(cfg: &Value, key: &str, limit: Option<usize>) -> Value {
-    extract_once_with_runtime(
-        &RuntimeContext::legacy(),
-        state(),
-        cfg,
-        key,
-        limit,
-        None,
-        true,
-    )
-}
-
 fn extract_once_with_runtime(
     context: &RuntimeContext,
     window_state: &Mutex<WindowState>,
-    cfg: &Value,
+    _cfg: &Value,
     key: &str,
     limit: Option<usize>,
     ticket: Option<JobTicket>,
@@ -2056,16 +1870,11 @@ fn extract_once_with_runtime(
         Ok(gate) => gate,
         Err(error) => return summary_error(key, 0, error),
     };
-    let current_cfg;
-    let cfg = if context.is_isolated() {
-        current_cfg = match context.load_config() {
-            Ok(config) => config,
-            Err(error) => return summary_error(key, 0, error.to_string()),
-        };
-        &current_cfg
-    } else {
-        cfg
+    let current_cfg = match context.load_config() {
+        Ok(config) => config,
+        Err(error) => return summary_error(key, 0, error.to_string()),
     };
+    let cfg = &current_cfg;
     if !enabled(cfg) {
         return summary_error(key, 0, "群聊黑话搜集功能现处于关闭态（配置开关为 false）".to_string());
     }
@@ -2296,14 +2105,6 @@ fn extract_once_with_runtime(
         "backend": backend_id,
         "parsed": items.len(),
     })
-}
-
-/// 自动抽取（tokio 任务）：串行锁 + spawn_blocking，绝不占着主循环的线程。
-pub async fn run_auto(cfg: Value, key: String) {
-    let _guard = extract_lock().lock().await;
-    let k = key.clone();
-    let out = tokio::task::spawn_blocking(move || extract_once(&cfg, &k, None)).await;
-    report_auto_result(out, &key);
 }
 
 fn report_auto_result(out: Result<Value, tokio::task::JoinError>, key: &str) {
@@ -3050,14 +2851,8 @@ mod tests {
         let (_selected_guard, selected_context) =
             auto_learning_fixture_root("selected 中文 space", &probes);
         let (decoy_guard, decoy_context) = auto_learning_fixture_root("decoy", &probes);
-        let selected_root = selected_context
-            .runtime_root()
-            .expect("selected synthetic root")
-            .to_path_buf();
-        let decoy_root = decoy_context
-            .runtime_root()
-            .expect("decoy synthetic root")
-            .to_path_buf();
+        let selected_root = selected_context.runtime_root().to_path_buf();
+        let decoy_root = decoy_context.runtime_root().to_path_buf();
         let key = "group:ticket04-learning";
         let inbound_text = "1 selected-learning-marker 奸消息 [引用 奸人：奸原话] [图片] [CQ:at,qq=123]";
 
@@ -3863,7 +3658,7 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="[^"]*selected-send
                 "attempt {attempt} must enter backoff immediately"
             );
             // Simulate backoff time elapsing for retries below the cap; never clear attempts.
-            let mut refusals = read_refusals_file(&context, &HashMap::new());
+            let mut refusals = read_refusals_file(&context);
             let rec = refusals.get_mut("group:retry").unwrap();
             assert_eq!(rec.signature, sig1);
             assert_eq!(rec.attempts, attempt);

@@ -121,9 +121,6 @@ pub(crate) fn current_with_clock(
     max_pixels: u64,
     fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Option<Normalized> {
-    if !context.is_isolated() {
-        return None;
-    }
     let _gate = gate(context)?;
     let uin = own_uin(context)?;
     let now_ms = now_ms();

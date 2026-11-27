@@ -432,7 +432,7 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     let wanted = config.provider.clone();
     let cache_key = json!([
         answer_key(&wanted, q, &config),
-        context.runtime_root().map(|root| root.as_os_str().to_string_lossy()),
+        context.runtime_root().as_os_str().to_string_lossy(),
         secret_endpoint(&search_base_url(&config)),
         crate::settings::secret_revision(context, &crate::settings::WEB_SEARCH_API_KEY),
     ]).to_string();
@@ -539,7 +539,12 @@ mod tests {
 
     #[test]
     fn ticket219_core_search_keeps_its_explicit_environment_fallback() {
-        let context = RuntimeContext::legacy();
+        let fixture = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(format!("her-aux-search-219-{}", std::process::id())),
+            &json!({"consoleToken": "fixture-aux-search-token"}),
+            &json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
         let config = load_search_config(&json!({"webSearch": {"apiKeyEnv": "HER_FIXTURE_SEARCH_KEY"}}));
         let key = resolve_api_key(&context, &config, "https://search.example.test/v1", |name| {
             assert_eq!(name, "HER_FIXTURE_SEARCH_KEY");

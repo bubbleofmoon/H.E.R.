@@ -219,7 +219,7 @@ fn empty_protected(counts: &Counts, key: &str, cfg: &Value) -> Vec<Layer> {
 /// Alert the owner when a protected layer injected nothing, once per conversation, session, epoch, generation and
 /// layer in this process; returns the layers whose alert was attempted now.
 pub fn alert_empty(context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str, generation: u64, counts: &Counts) -> Vec<Layer> {
-    let scope = context.runtime_root().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let scope = context.runtime_root().to_string_lossy().into_owned();
     alert_empty_with(&scope, cfg, key, sid, epoch, generation, counts, &|text, dedupe| crate::admin_alert::notify_memory(context, cfg, text, dedupe))
 }
 

@@ -420,10 +420,7 @@ impl RouteMemory {
 
 /// The runtime a memory belongs to: the selected root, as the DSH chain keeps its failover state (`pipeline.rs`).
 pub(crate) fn scope_of(context: &RuntimeContext) -> String {
-    context
-        .runtime_root()
-        .map(|root| root.to_string_lossy().to_string())
-        .unwrap_or_default()
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 /// Runs `with` on the route memory of runtime `scope`, shared by every turn of this process. Nothing is durable: a
@@ -569,9 +566,6 @@ impl ModelRoute {
     /// `for_conversation`); without a valid one the turn fails as not configured.
     #[cfg(test)]
     pub fn from_runtime(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Err("harness requires a selected runtime".into());
-        }
         let chain = chain(cfg)?;
         Self::for_specs(context, chain.clone(), chain)
     }
@@ -580,9 +574,6 @@ impl ModelRoute {
     /// route, else `harness.firstRoute`), then the other routes in configured order (`conversation_order`); the
     /// configured order when the selection names no route of the chain.
     pub fn for_conversation(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Err("harness requires a selected runtime".into());
-        }
         let chain = chain(cfg)?;
         let order = conversation_order(&chain, selected(context, cfg, conversation).as_deref());
         Self::for_specs(context, order, chain)
@@ -600,9 +591,6 @@ impl ModelRoute {
         order: Vec<RouteSpec>,
         configured: Vec<RouteSpec>,
     ) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Err("harness requires a selected runtime".into());
-        }
         if order.is_empty() {
             return Err(MODEL_NOT_CONFIGURED.into());
         }

@@ -46,15 +46,11 @@ pub(super) fn admit_in_scope(
     };
     let records =
         read_records(context).map_err(|_| (503, "send guard outbox is unavailable".into()))?;
-    let turns = if context.is_isolated() {
-        crate::turn_ledger::fold(
-            &crate::turn_ledger::read_records(context)
-                .map_err(|_| (503, "send guard turn ledger is unavailable".into()))?,
-        )
-        .0
-    } else {
-        Vec::new()
-    };
+    let turns = crate::turn_ledger::fold(
+        &crate::turn_ledger::read_records(context)
+            .map_err(|_| (503, "send guard turn ledger is unavailable".into()))?,
+    )
+    .0;
     let current = turns
         .iter()
         .rposition(|t| scope.ends_with(&format!(":{}", t.id)) && t.key == key);

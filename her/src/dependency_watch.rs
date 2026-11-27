@@ -124,7 +124,7 @@ pub async fn adopt_heal(
     http_token: &mut Option<String>,
     cfg_raw: &mut Value,
 ) -> bool {
-    if !context.is_isolated() || !throttle.allow(crate::parity_clock::now_ms()) {
+    if !throttle.allow(crate::parity_clock::now_ms()) {
         return false;
     }
     let base = match context.dependency_url("onebot") {

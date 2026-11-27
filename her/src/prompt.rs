@@ -30,14 +30,6 @@ fn read_data_json(context: &RuntimeContext, relative: &str) -> Option<Value> {
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
 }
 
-/// 这个会话用哪个角色卡（对应 JS 的 roleForSession）。
-///
-/// 优先级：sessions 显式 > roleGroups 组 > default > 全局 current-role.json。
-/// 显式写 null / "" 表示「这个会话明确不要角色卡」，不再往下回落。
-pub fn role_for_session(key: &str) -> Option<String> {
-    role_for_session_with_runtime(&RuntimeContext::legacy(), key)
-}
-
 pub fn role_for_session_with_runtime(context: &RuntimeContext, key: &str) -> Option<String> {
     // Role cards are retired in companion modes; identity comes from the persona library there.
     if crate::persona::applies(context) {
@@ -96,10 +88,6 @@ pub fn role_for_session_with_runtime(context: &RuntimeContext, key: &str) -> Opt
 }
 
 /// 角色行（对应 JS 的 roleLine）。没配角色卡时返回空串。
-pub fn role_line(key: &str) -> String {
-    role_line_with_runtime(&RuntimeContext::legacy(), key)
-}
-
 pub fn role_line_with_runtime(context: &RuntimeContext, key: &str) -> String {
     match role_for_session_with_runtime(context, key) {
         Some(name) => format!("【当前角色】{name}（如需查阅当前启用的完整角色卡正文内容，请调用提示词查询接口 qq_get_prompt 读取）\n\n"),
@@ -114,7 +102,7 @@ pub(crate) fn identity_core(context: &RuntimeContext, cfg: &Value, key: &str) ->
     crate::persona::core_block(context, key, role_inject_limit(cfg))
 }
 
-/// Chat and first-generation prompts: the persona core, else the role card (closed-agent, legacy).
+/// Chat and first-generation prompts: the persona core, else the role card (closed-agent).
 pub fn identity_hint_v1(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
     let core = identity_core(context, cfg, key);
     if core.is_empty() { role_hint_v1(context, cfg, key) } else { core.trim_end().to_string() }
@@ -233,10 +221,6 @@ fn v2_card_lines(raw: &str) -> String {
 }
 
 /// Operator-configured initial prompt, injected only on the first bootstrap wake so it is not repeated every turn.
-pub fn initial_prompt_line(cfg: &Value, key: &str, reason: &str) -> String {
-    initial_prompt_line_with_runtime(&RuntimeContext::legacy(), cfg, key, reason)
-}
-
 pub fn initial_prompt_line_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
@@ -287,10 +271,6 @@ fn recommendation_line(cfg: &Value, group: &str, label: &str) -> String {
     format!("【{label}】{hint}\n\n")
 }
 
-pub fn sticker_line(cfg: &Value) -> String {
-    sticker_line_with_runtime(&RuntimeContext::legacy(), cfg)
-}
-
 pub fn sticker_line_with_runtime(context: &RuntimeContext, cfg: &Value) -> String {
     let delivery = crate::model_view::with_blacklist(context, cfg);
     let (enabled, include, _total, sticker_context, _strategy) =
@@ -318,10 +298,6 @@ pub fn sticker_line_with_runtime(context: &RuntimeContext, cfg: &Value) -> Strin
 
 /// 表情相关的四件东西，供 `/api/socialV2/prompt` 结构化输出用：
 /// `(enabled, includeInPrompt, total, context, strategy)`。
-pub fn sticker_parts(cfg: &Value) -> (bool, bool, usize, String, String) {
-    sticker_parts_with_runtime(&RuntimeContext::legacy(), cfg)
-}
-
 pub fn sticker_parts_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
@@ -636,10 +612,6 @@ fn state_with_runtime_recent(
 }
 
 /// Recall section (`buildRecallBlockV2`), querying with the message being answered.
-pub fn recall_block(cfg: &Value, st: &Value, key: &str) -> String {
-    recall_block_with_runtime(&RuntimeContext::legacy(), cfg, st, key)
-}
-
 /// The recall the next DSH wake would deliver (the console preview): memories the conversation's
 /// session generation already carries (`briefing_delivery::WakePlan::held`) are left out, as in the wake. Rendering reads memory without
 /// counting search hits: a hit is counted by `record_recall_hits` once the prompt carrying the recall
@@ -1097,15 +1069,8 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: i64) -> String {
 
 /// 回合没设置唤醒时的提醒 prompt（对应 JS 的 buildWakeReminderPromptV2）。
 ///
-/// 目前只有单测在用，等 actor 的「回合收尾检查」接上就删掉这行 allow。
-#[allow(dead_code)]
-///
 /// 这个 prompt 存在的唯一目的：防止 AI 忘了收尾，导致会话进入「永眠」——
 /// 既没有下一次唤醒配置，也没有有限潜水定时器，就再也不会被叫醒。
-pub fn build_reminder(key: &str, self_name: &str, self_qq: &str) -> String {
-    build_reminder_with_runtime(&RuntimeContext::legacy(), key, self_name, self_qq)
-}
-
 pub fn build_reminder_with_runtime(
     context: &RuntimeContext,
     key: &str,
@@ -1253,13 +1218,10 @@ fn build_inner(
     out
 }
 
+#[cfg(test)]
 /// Self-contained prompt builder for CLI/text-only backends without MCP tool calls.
 /// Inlines recent context, status, and identity so the model outputs only the final message text
 /// for Rust to deliver directly.
-pub fn build_text_only(key: &str, recent: &[String], self_name: &str, self_qq: &str) -> String {
-    build_text_only_with_runtime(&RuntimeContext::legacy(), key, recent, self_name, self_qq)
-}
-
 pub fn build_text_only_with_runtime(
     context: &RuntimeContext,
     key: &str,

@@ -63,11 +63,6 @@ pub(crate) fn handle_http_tx(
     capability: ConsoleCapability,
     browser_acl: Option<BrowserAcl>,
 ) -> Result<crate::config_tx::CommitOutcome<Value>, crate::config_tx::CommitError> {
-    let capability = if context.is_isolated() {
-        capability
-    } else {
-        configured_header(&req.headers, cfg)
-    };
     let mut config_diff = None;
     match handle_inner(
         action,
@@ -87,6 +82,7 @@ pub(crate) fn handle_http_tx(
     }
 }
 
+#[cfg(test)]
 fn configured_header(headers: &HashMap<String, String>, cfg: &Value) -> ConsoleCapability {
     let expected = cfg["consoleToken"].as_str().unwrap_or("").trim();
     if let Some(value) = headers.get("x-console-token").map(|value| value.trim()) {
@@ -122,7 +118,7 @@ fn handle_inner(
     headers: &HashMap<String, String>,
     query: &HashMap<String, String>,
     body: &str,
-    cfg: &Value,
+    _cfg: &Value,
     context: &RuntimeContext,
     capability: ConsoleCapability,
     browser_acl: Option<BrowserAcl>,
@@ -130,31 +126,22 @@ fn handle_inner(
 ) -> Result<Value, (u16, String)> {
     // Block/defer unstopped memory.db and chat-tool settings.db/config.json writers during an
     // active restore before acquiring the social/configuration gate.
-    let _restore_gate =
-        if context.is_isolated() && (browser_acl.is_some() || action != "settings-get") {
-            Some(crate::restore::writer_gate_shared(context).map_err(|error| (503, error))?)
-        } else {
-            None
-        };
+    let _restore_gate = if browser_acl.is_some() || action != "settings-get" {
+        Some(crate::restore::writer_gate_shared(context).map_err(|error| (503, error))?)
+    } else {
+        None
+    };
     // Serialize with session reset/token rotation, and re-read configuration after waiting.
     // SQLite writers and ACL revocation below share this gate with MCP calls.
-    let _gate = if context.is_isolated() {
-        Some(crate::conversation_state::acquire(context)?)
-    } else {
-        None
-    };
-    let fresh_cfg = if context.is_isolated() {
-        Some(context.load_config().map_err(|e| {
-            if action == "settings-set" && e == "runtime config is invalid" {
-                (400, "selected runtime config is invalid".to_string())
-            } else {
-                (503, e.to_string())
-            }
-        })?)
-    } else {
-        None
-    };
-    let cfg = fresh_cfg.as_ref().unwrap_or(cfg);
+    let _gate = crate::conversation_state::acquire(context)?;
+    let fresh_cfg = context.load_config().map_err(|e| {
+        if action == "settings-set" && e == "runtime config is invalid" {
+            (400, "selected runtime config is invalid".to_string())
+        } else {
+            (503, e.to_string())
+        }
+    })?;
+    let cfg = &fresh_cfg;
     if let Some(browser_acl) = browser_acl {
         let (action, fields) = match browser_acl {
             BrowserAcl::List => (None, Value::Null),
@@ -167,12 +154,7 @@ fn handle_inner(
     for (k, v) in query {
         merged.insert(k.clone(), json!(v));
     }
-    let parsed_body = if context.is_isolated() {
-        Some(crate::console::parse_object_body(body)?)
-    } else {
-        serde_json::from_str::<Value>(body).ok()
-    };
-    if let Some(Value::Object(o)) = parsed_body {
+    if let Value::Object(o) = crate::console::parse_object_body(body)? {
         for (k, v) in o {
             merged.insert(k, v);
         }
@@ -223,7 +205,7 @@ fn handle_inner(
             &b,
             cfg,
             context,
-            _gate.as_ref(),
+            Some(&_gate),
         ) {
             Ok(outcome) => {
                 *config_diff = outcome.config_diff;

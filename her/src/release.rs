@@ -492,7 +492,7 @@ fn approval_installation(context: &RuntimeContext) -> Result<InstallRoot, String
     let root = installation()?;
     let runtime =
         fs::canonicalize(root.root().join("runtime")).map_err(|_| "install runtime unavailable")?;
-    if context.runtime_root() != Some(runtime.as_path()) {
+    if context.runtime_root() != runtime.as_path() {
         return Err("update approval requires the install runtime".into());
     }
     Ok(root)
@@ -678,9 +678,6 @@ fn approve_with_gates(
 /// A turn holds shared ownership until its complete pipeline (including final sends) returns.
 /// Auto admission holds exclusive ownership through staging; the helper owns retirement/judgment.
 pub async fn turn_guard(context: &RuntimeContext) -> Result<Option<fs::File>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     loop {
         match context
             .open_shared_locked_file(crate::runtime::RuntimeArea::Data, "locks/turn-update.lock")
@@ -1089,13 +1086,11 @@ fn own_release_tag() -> Result<String, String> {
         .ok_or_else(|| "installed supervisor tag unavailable".to_string())
 }
 
-/// Installed runtimes check by default; legacy/development runtimes opt in with an update block.
+/// Installed runtimes check by default; development/external runtimes opt in with an update block.
 /// The worker discovers releases and consumes explicit approvals independently of task scheduling.
 pub fn start(context: RuntimeContext) {
     let installed = InstallRoot::configured().ok().is_some_and(|install| {
-        context
-            .runtime_root()
-            .is_some_and(|root| install.protects(root).unwrap_or(false))
+        install.protects(context.runtime_root()).unwrap_or(false)
     });
     std::thread::spawn(move || {
         let mut last_error = None;
@@ -1107,9 +1102,7 @@ pub fn start(context: RuntimeContext) {
                 if installed {
                     let root = InstallRoot::configured()?;
                     let install_runtime = fs::canonicalize(root.root().join("runtime")).ok();
-                    let is_runtime = context
-                        .runtime_root()
-                        .is_some_and(|path| install_runtime.as_deref() == Some(path));
+                    let is_runtime = install_runtime.as_deref() == Some(context.runtime_root());
                     if is_runtime
                         && health_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
                     {
@@ -1363,11 +1356,9 @@ fn handover_with_policy_gate(
     };
     let root = installation()?;
     if context.runtime_root()
-        != Some(
-            fs::canonicalize(root.root().join("runtime"))
-                .map_err(|_| "install runtime unavailable")?
-                .as_path(),
-        )
+        != fs::canonicalize(root.root().join("runtime"))
+            .map_err(|_| "install runtime unavailable")?
+            .as_path()
     {
         return Err("handover requires the install runtime".into());
     }

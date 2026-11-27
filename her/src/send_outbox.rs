@@ -28,8 +28,6 @@ pub(crate) use crate::conversation_state::token_epoch_matches;
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
-/// Rust-owned legacy outbox; written only by this process (same pattern as the Rust token ledger).
-pub const LEGACY_OUTBOX_FILE: &str = crate::legacy_path!("state/send-outbox-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_OUTBOX_FILE: &str = "send-outbox.jsonl";
 
@@ -46,37 +44,25 @@ pub fn read_records_waiting(context: &RuntimeContext) -> Result<Vec<Value>, Stri
 }
 
 fn read_records_in(context: &RuntimeContext, wait: bool) -> Result<Vec<Value>, String> {
-    let text = if context.is_isolated() {
-        let text = if wait {
-            context.read_optional_text_waiting(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)?
-        } else {
-            context
-                .read_optional_text(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)
-                .map_err(str::to_string)?
-        };
-        text.unwrap_or_default()
+    let text = if wait {
+        context.read_optional_text_waiting(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)?
     } else {
-        match std::fs::read_to_string(LEGACY_OUTBOX_FILE) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(format!("读取发送账本失败：{error}")),
-        }
+        context
+            .read_optional_text(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)
+            .map_err(str::to_string)?
     };
+    let text = text.unwrap_or_default();
     crate::runtime::parse_evidence_jsonl(&text, ISOLATED_OUTBOX_FILE, "发送账本行损坏")
 }
 
 /// Append one record. A failure means the caller must not perform the network action it guards.
 pub fn append_record(context: &RuntimeContext, record: &Value) -> Result<(), String> {
-    if context.is_isolated() {
-        let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化发送账本失败：{e}"))?;
-        line.push(b'\n');
-        context.append_bytes_durable(RuntimeArea::Data, ISOLATED_OUTBOX_FILE, &line)?;
-        // Best-effort history copy after the guarded record is durable; it never fails a send.
-        crate::history_log::record_send(context, record);
-        Ok(())
-    } else {
-        crate::ledger::append_record_to(LEGACY_OUTBOX_FILE, record)
-    }
+    let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化发送账本失败：{e}"))?;
+    line.push(b'\n');
+    context.append_bytes_durable(RuntimeArea::Data, ISOLATED_OUTBOX_FILE, &line)?;
+    // Best-effort history copy after the guarded record is durable; it never fails a send.
+    crate::history_log::record_send(context, record);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

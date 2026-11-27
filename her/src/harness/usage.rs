@@ -152,9 +152,6 @@ pub(crate) fn record_attempt(
     usage: Option<&Usage>,
     attempt_id: Option<&str>,
 ) {
-    if !context.is_isolated() {
-        return;
-    }
     let safe_route = redact_field(context, route);
     let safe_model = redact_field(context, model);
     let row = row_for_attempt(
@@ -186,9 +183,6 @@ pub(crate) fn record_attempt(
 /// at startup so usage from a response that ended just before a crash is captured once without
 /// double-counting already-recorded facts (even across ledger compaction or reset).
 pub(crate) fn reconcile_startup(context: &RuntimeContext) -> Result<usize, String> {
-    if !context.is_isolated() {
-        return Ok(0);
-    }
     let after_seq = crate::ledger::LedgerStorage::read_reconcile_seq(context)?;
     let completed = super::store::completed_attempts_after(context, after_seq)?;
     if completed.is_empty() {

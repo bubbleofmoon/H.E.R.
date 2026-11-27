@@ -1,7 +1,6 @@
 """Observe the MCP/curl/digest chains independently of supervisor startup readiness."""
 import argparse
 import json
-import os
 from pathlib import Path
 import shutil
 import socket
@@ -54,8 +53,7 @@ try:
         time.sleep(.05)
     command = [shutil.which('node'), str(repo / 'scripts/lifecycle-extra-chains.mjs'), str(local_candidate), str(runtime), str(root), str(support), port, '--fake-console']
     (evidence / 'command.json').write_text(json.dumps(command))
-    code = fixture.run(command, 'chains', timeout=90,
-                       env=dict(os.environ, MEMORY_DB_PATH=str(root / 'digest-runtime/data/memory.db')))
+    code = fixture.run(command, 'chains', timeout=90)
     assert code == 0, ('chains exit', code, (evidence / 'chains.stderr.log').read_text())
     (root / 'done').write_text('done')
     assert observer.wait(timeout=15) == 0, 'native window observation failed'

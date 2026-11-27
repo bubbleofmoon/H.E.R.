@@ -1,4 +1,4 @@
-//! Local chat history log (#58). When config `history.enabled` is true (isolated runtimes only),
+//! Local chat history log (#58). When config `history.enabled` is true,
 //! ingress appends every message frame before self filtering, the allow list and mode dispatch,
 //! and the guarded send boundary (`send_outbox::append_record`) appends each intent part and
 //! confirmation after the outbox record is durable. Records use schema v1 from
@@ -14,14 +14,11 @@ use crate::runtime::{ConfigStamp, RuntimeArea, RuntimeContext};
 
 pub const DIR: &str = "history";
 
-/// Whether `history.enabled` is the boolean true in an isolated runtime. The configuration is read only when its
+/// Whether `history.enabled` is the boolean true in the runtime. The configuration is read only when its
 /// stamp (`RuntimeContext::config_stamp`) changes, so a disabled log costs one stat per frame.
 pub fn enabled(context: &RuntimeContext) -> bool {
     type FlagCache = HashMap<String, (ConfigStamp, bool)>;
     static CACHE: Mutex<Option<FlagCache>> = Mutex::new(None);
-    if !context.is_isolated() {
-        return false;
-    }
     let Ok(identity) = context.config_stamp() else { return false };
     let scope = scope_key(context);
     let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -37,7 +34,7 @@ pub fn enabled(context: &RuntimeContext) -> bool {
 }
 
 fn scope_key(context: &RuntimeContext) -> String {
-    context.runtime_root().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 fn read_flag(context: &RuntimeContext) -> bool {
@@ -515,11 +512,6 @@ mod tests {
             record_inbound(&sandbox.context, &group_frame(71, 1001, "非布尔").to_string());
             assert!(history_lines(&sandbox.root).is_empty(), "history.enabled must be the boolean true, not {value}");
         }
-    }
-
-    #[test]
-    fn a_legacy_runtime_never_turns_the_log_on() {
-        assert!(!enabled(&RuntimeContext::legacy()));
     }
 
     #[test]
