@@ -951,6 +951,7 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
             let outcome = model_step(
                 self.client,
                 ctx.route,
+                ctx.credentials,
                 delivered,
                 offered,
                 max_tokens,
@@ -1141,6 +1142,7 @@ fn charge_of(end: &StreamEnd) -> Result<u32, &'static str> {
 async fn model_step(
     client: &Client,
     route: &routes::Route,
+    credentials: &[String],
     messages: Vec<ChatMessage>,
     tools: Vec<genai::chat::Tool>,
     max_tokens: u32,
@@ -1188,7 +1190,7 @@ async fn model_step(
             Some(&options),
         )
         .await
-        .map_err(model_error)?;
+        .map_err(|error| model_error(error, credentials))?;
     let mut cancel = routes::Cancellation::from_watch(cancelled.clone());
     let mut end = None;
     loop {
@@ -1206,7 +1208,7 @@ async fn model_step(
             Ok(_) => {}
             // A refusal already seen is the answer's failure, whatever the stream does after it.
             Err(_) if refused.load(Ordering::SeqCst) => break,
-            Err(error) => return Err(model_error(error)),
+            Err(error) => return Err(model_error(error, credentials)),
         }
     }
     if refused.load(Ordering::SeqCst) {
@@ -1244,8 +1246,8 @@ async fn model_step(
     Ok(end)
 }
 
-fn model_error(error: genai::Error) -> ModelFailure {
-    let (miss, reason) = routes::classify_genai_error(&error);
+fn model_error(error: genai::Error, credentials: &[String]) -> ModelFailure {
+    let (miss, reason) = routes::classify_genai_error(&error, credentials);
     match miss {
         routes::Miss::Dropped => ModelFailure::Dropped(reason),
         routes::Miss::RateLimited { wait } => ModelFailure::RateLimited { reason, wait },

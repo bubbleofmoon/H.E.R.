@@ -1595,6 +1595,7 @@ dependencies = [
  "minisign",
  "minisign-verify",
  "regex",
+ "reqwest",
  "roxmltree",
  "rpassword",
  "rusqlite",

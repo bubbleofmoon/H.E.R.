@@ -34,6 +34,7 @@ release-test-keys = []
 [dependencies]
 her-memory = { path = "../her-memory" }
 genai = "=0.7.3"
+reqwest = { version = "=0.13.5", default-features = false }
 jiff = { version = "=0.2.39", features = ["tzdb-bundle-always"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"

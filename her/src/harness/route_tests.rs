@@ -44,7 +44,15 @@ fn refusal() -> String {
 
 /// A failed response with `headers` (each ending in CRLF).
 fn status(code: u16, headers: &str) -> String {
-    let body = json!({"error":{"message":"fixture failure","type":"fixture"}}).to_string();
+    status_with_code(code, headers, None)
+}
+
+fn status_with_code(code: u16, headers: &str, error_code: Option<&str>) -> String {
+    let mut err = json!({"message":"fixture failure","type":"fixture"});
+    if let Some(error_code) = error_code {
+        err["code"] = json!(error_code);
+    }
+    let body = json!({"error":err}).to_string();
     format!(
         "HTTP/1.1 {code} Fixture\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -62,24 +70,7 @@ fn send_call(id: &str) -> String {
 }
 
 async fn read_body(socket: &mut tokio::net::TcpStream) -> Value {
-    let mut bytes = Vec::new();
-    loop {
-        let mut chunk = [0; 4096];
-        let count = socket.read(&mut chunk).await.unwrap();
-        assert_ne!(count, 0, "truncated fixture request");
-        bytes.extend_from_slice(&chunk[..count]);
-        if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-            let length = String::from_utf8_lossy(&bytes[..split])
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                .unwrap_or(0);
-            if bytes.len() >= split + 4 + length {
-                return serde_json::from_slice(&bytes[split + 4..split + 4 + length]).unwrap_or(Value::Null);
-            }
-        }
-    }
+    read_http_request(socket).await.2
 }
 
 /// Answers one request per connection with `responses`, in order, and returns each request body.
@@ -913,5 +904,154 @@ async fn model_route_a_conversations_own_route_starts_its_next_turn_and_a_reset_
     let second = serve(rig.model.clone(), vec![text("from a")]);
     assert_eq!(ended(&mut rig.admit("own-route-2")).await, Ok("from a".to_string()));
     assert_eq!(models(&second.await.unwrap()), ["model-a"], "the configured order from the next turn");
+    rig.no_more_requests().await;
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, String, Value) {
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let count = socket.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0, "truncated fixture request");
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&bytes[..split]).into_owned();
+            let length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            if bytes.len() >= split + 4 + length {
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                let auth = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim().to_string())
+                    .unwrap_or_default();
+                let body = serde_json::from_slice(&bytes[split + 4..split + 4 + length]).unwrap_or(Value::Null);
+                return (request_line, auth, body);
+            }
+        }
+    }
+}
+
+fn non_streaming_json(answer: &str) -> String {
+    let body = json!({
+        "id": "fake-oneshot",
+        "object": "chat.completion",
+        "model": "fake",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": answer},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_endpoint_preserves_explicit_path_prefix_for_turns_and_one_shot() {
+    let mut rig = rig("explicit-path-prefix", json!({"model": "model-a"}), None).await;
+    let port = rig.model.local_addr().unwrap().port();
+    let prefixed = format!("http://127.0.0.1:{port}/compatible-mode/v1");
+    std::fs::write(
+        rig.root.join("dependencies.json"),
+        json!({
+            "dsh": format!("http://127.0.0.1:{port}"),
+            "model": prefixed,
+            "onebot": format!("http://127.0.0.1:{port}"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    rig.context = RuntimeContext::from_root(&rig.root).unwrap();
+
+    let redirect_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect_url = format!("http://{}/v1/chat/completions", redirect_target.local_addr().unwrap());
+    let redirect_response = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+
+    let listener = rig.model.clone();
+    let responses = vec![
+        text("streamed ok"),
+        non_streaming_json("digest ok"),
+        status_with_code(500, "", Some("secret_synthetic-model-key-7")),
+        status_with_code(500, "", Some("secret_synthetic-model-key-7")),
+        redirect_response,
+    ];
+    let server = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for response in responses {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .expect("the fixture received no request")
+                .unwrap();
+            captured.push(read_http_request(&mut socket).await);
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        }
+        captured
+    });
+
+    assert_eq!(ended(&mut rig.admit("prefixed-stream")).await, Ok("streamed ok".to_string()));
+    let ctx_ok = rig.context.clone();
+    let cfg_ok = rig.cfg.clone();
+    let one_shot_ok = tokio::task::spawn_blocking(move || {
+        crate::harness::one_shot::digest_model(&ctx_ok, &cfg_ok)
+            .unwrap()
+            .complete("", "ping")
+    })
+    .await
+    .unwrap();
+    assert_eq!(one_shot_ok, Ok("digest ok".to_string()));
+    let ctx_err = rig.context.clone();
+    let cfg_err = rig.cfg.clone();
+    let one_shot_err = tokio::task::spawn_blocking(move || {
+        crate::harness::one_shot::digest_model(&ctx_err, &cfg_err)
+            .unwrap()
+            .complete_failure("", "ping-fail")
+    })
+    .await
+    .unwrap();
+    let err = one_shot_err.expect_err("500 must fail");
+    assert_eq!(err.class, "backend");
+    assert!(!format!("{err:?}").contains("synthetic-model-key-7"));
+
+    let mut stream_err_turn = rig.admit("prefixed-stream-err");
+    let stream_err = ended(&mut stream_err_turn).await.expect_err("500 stream must fail");
+    assert!(!stream_err.contains("synthetic-model-key-7"));
+    for failure in stream_err_turn.route_failures() {
+        assert!(!failure.summary.contains("synthetic-model-key-7"));
+    }
+    for reason in rig.records("route-failed") {
+        assert!(!reason.contains("synthetic-model-key-7"));
+    }
+
+    let mut redirect_turn = rig.admit("prefixed-redirect");
+    assert!(ended(&mut redirect_turn).await.is_err(), "307 redirect must fail without following");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), redirect_target.accept())
+            .await
+            .is_err(),
+        "model client must never follow HTTP redirects"
+    );
+
+    let captured = server.await.unwrap();
+    assert_eq!(captured.len(), 5);
+    for (request_line, auth, _body) in &captured {
+        assert!(
+            request_line.starts_with("POST /compatible-mode/v1/chat/completions "),
+            "unexpected request path: {request_line}"
+        );
+        assert_eq!(auth, "Bearer synthetic-model-key-7");
+    }
     rig.no_more_requests().await;
 }
