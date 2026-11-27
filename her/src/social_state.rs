@@ -1568,10 +1568,10 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
     cfg: &Value,
     key: &str,
     wake_claim: Option<&Value>,
-    max_wake_at: Option<i64>,
+    max_confirmed_at: Option<i64>,
+    max_live_wake_at: Option<i64>,
 ) -> Result<(), String> {
     if !inbound_admitted(cfg, key)
-        || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
         || mode_checked(context).map_err(String::from)? != "reserved2"
     {
         return Ok(());
@@ -1587,17 +1587,11 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             };
             let original = wake.clone();
             let previous = wake_claim.and_then(|claim| claim.get("previous"));
-            let claim_at = wake_claim.and_then(|claim| claim.get("at")).and_then(Value::as_i64);
-            let same_wake = if let Some(at) = claim_at {
-                wake["lastWakeAt"].as_i64() == Some(at)
-            } else if let Some(cutoff) = max_wake_at {
-                wake["lastWakeAt"].as_i64().is_none_or(|last| last <= cutoff)
-            } else {
-                true
-            };
+            let same_wake = max_live_wake_at
+                .is_none_or(|cutoff| wake["lastWakeAt"].as_i64().is_none_or(|at| at <= cutoff));
             let same_config = if let Some(prev) = previous {
                 prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]
-            } else if let Some(cutoff) = max_wake_at {
+            } else if let Some(cutoff) = max_confirmed_at {
                 wake["confirmedAt"].as_i64().is_none_or(|at| at <= cutoff)
             } else {
                 true
@@ -3816,36 +3810,37 @@ mod tests {
         })
         .unwrap();
         let future_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": future}}});
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim), None, None).unwrap();
         assert_eq!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
             future,
             "still-future deadline from wake_claim must be restored"
         );
 
-        // Consumed past deadline draws a new default sleep when the same wake still owns wakeConfig.
+        // Consumed past deadline draws a new default sleep even when a crashed provisional lastWakeAt <= cutoff exists.
         update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(12);
             doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
             Ok(())
         })
         .unwrap();
         let past_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
         let before = now_ms();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
         let rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
             .as_str()
             .and_then(crate::wake::parse_iso_ms)
-            .expect("past deadline must re-arm a new sleepUntil");
+            .expect("past deadline must re-arm a new sleepUntil across provisional claim");
         assert!(rearmed >= before + 60_000);
 
-        // Newer wake claim (lastWakeAt changed) on the same confirmedAt must never be overwritten.
+        // Newer live wake (lastWakeAt > cutoff) on the same confirmedAt must never be overwritten.
         update_raw(&context, |doc| {
             doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(20);
             doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
         assert!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
             "newer live wake must keep its consumed sleepUntil untouched by older claim"
@@ -3863,7 +3858,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None, None).unwrap();
         let kept = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
         assert_eq!(kept["confirmedAt"], 9);
         assert_eq!(kept["infinite"], true);
@@ -3881,13 +3876,13 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None, None).unwrap();
         let kept_finite = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
         assert_eq!(kept_finite["confirmedAt"], 10);
         assert_eq!(kept_finite["infinite"], false);
         assert!(kept_finite["sleepUntil"].is_null());
 
-        // Globally paused documents still re-arm consumed finite deadlines so unpausing resumes scheduling.
+        // Globally paused documents and socialV2.enabled=false restarts still re-arm consumed finite deadlines.
         update_raw(&context, |doc| {
             doc["paused"] = json!(true);
             doc["conversations"]["group:42"]["wakeConfig"]["confirmedAt"] = json!(2);
@@ -3896,12 +3891,14 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        let mut disabled_cfg = cfg.clone();
+        disabled_cfg["socialV2"]["enabled"] = json!(false);
         let before_paused = now_ms();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &disabled_cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
         let paused_rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
             .as_str()
             .and_then(crate::wake::parse_iso_ms)
-            .expect("global pause must still re-arm consumed finite sleepUntil");
+            .expect("global pause and disabled socialV2 restart must still re-arm consumed finite sleepUntil");
         assert!(paused_rearmed >= before_paused + 60_000);
 
         // Unclaimed turn (wake_claim = None) must not overwrite a newer config whose confirmedAt > cutoff.
@@ -3918,7 +3915,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", None, Some(150)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", None, Some(150), Some(150)).unwrap();
         assert!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
             "unclaimed turn must keep newer config (confirmedAt > begun_at) untouched"

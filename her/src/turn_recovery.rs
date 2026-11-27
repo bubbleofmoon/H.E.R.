@@ -619,6 +619,7 @@ fn rearm_reserved2_if_needed(
     context: &RuntimeContext,
     cfg: &Value,
     turn: &Turn,
+    live_cutoff: Option<i64>,
 ) -> Result<(), String> {
     if turn.backend == "harness" && (turn.reserved2 || turn.wake_claim.is_some()) {
         crate::social_state::rearm_interrupted_reserved2_wake(
@@ -627,6 +628,7 @@ fn rearm_reserved2_if_needed(
             &turn.key,
             turn.wake_claim.as_ref(),
             Some(turn.begun_at),
+            Some(live_cutoff.unwrap_or_else(now)),
         )?;
     }
     Ok(())
@@ -635,6 +637,18 @@ fn rearm_reserved2_if_needed(
 /// Apply one verdict. The ledger record comes first and is the commit point: if it cannot be
 /// written nothing is settled or queued for replay (fail closed), and the next pass retries.
 fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, verdict: &Verdict, facts: Option<&TurnFacts>) {
+    apply_at(context, cfg, journal, turn, verdict, facts, None);
+}
+
+fn apply_at(
+    context: &RuntimeContext,
+    cfg: &Value,
+    journal: &Journal,
+    turn: &Turn,
+    verdict: &Verdict,
+    facts: Option<&TurnFacts>,
+    live_cutoff: Option<i64>,
+) {
     // A DSH probe can finish after the owner or expiry resolved this turn. Serialize the
     // commit and its hand-back with resolutions; a stale verdict must never replay it.
     let current = resolution_gate(context).and_then(|gate| {
@@ -673,7 +687,7 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
         ) {
             return;
         }
-        if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
+        if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
             return;
         }
         if commit(recorder.end_reconciled(outcome, ledger_reason)) {
@@ -733,7 +747,7 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
                 ) {
                     return;
                 }
-            } else if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
+            } else if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
                 return;
             }
             let _ = recorder.verified("not-executed", why);
@@ -751,7 +765,7 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
             // Re-arm any consumed wake deadline BEFORE committing `abandoned` so a transient rearm
             // failure keeps the turn open (even without a SQLite row) for recovery to retry, and
             // commit `abandoned` before closing SQLite so a mid-close crash never flips to Cancelled.
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
+            if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
                 return;
             }
             if commit(recorder.end_reconciled("abandoned", why)) {
@@ -892,7 +906,19 @@ impl Pass<'_> {
         preserve_finalization_claim(turn, decided)
     }
 
+    #[cfg(test)]
     async fn reconcile(&self, journal: &Journal, turn: &Turn, turns: &[Turn], outbox: &Result<Vec<Value>, String>) {
+        self.reconcile_at(journal, turn, turns, outbox, None).await;
+    }
+
+    async fn reconcile_at(
+        &self,
+        journal: &Journal,
+        turn: &Turn,
+        turns: &[Turn],
+        outbox: &Result<Vec<Value>, String>,
+        live_cutoff: Option<i64>,
+    ) {
         // Intent can survive a crash before the cancelling handler revokes authority.
         // Revoke before any probe/wait, without claiming that the work has ended.
         if turn.notes.iter().any(|note| note["verdict"] == "cancel-requested") {
@@ -909,7 +935,7 @@ impl Pass<'_> {
         let sends = self.sends_of(turn, turns, outbox);
         if turn.backend == "harness" {
             let verdict = self.reconcile_harness(turn, &sends);
-            apply(self.context, self.cfg, journal, turn, &verdict, None);
+            apply_at(self.context, self.cfg, journal, turn, &verdict, None, live_cutoff);
             return;
         }
         let check = validity(self.context, self.cfg, turn);
@@ -1293,6 +1319,7 @@ fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &
                 &turn.key,
                 turn.wake_claim.as_ref(),
                 Some(turn.begun_at),
+                Some(cutoff),
             ) {
                 crate::safe_println!("[recovery] startup terminal sleep rearm failed for {}: {error}", turn.key);
                 ok = false;
@@ -1375,7 +1402,7 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                         }
                     }
                     last_try.insert(turn.id.clone(), now());
-                    pass.reconcile(&journal, turn, &turns, &outbox).await;
+                    pass.reconcile_at(&journal, turn, &turns, &outbox, Some(started_at)).await;
                 }
                 pass.resolutions(&journal, &turns, &records);
                 pass.release_held(&journal, &turns, &records);
@@ -2191,23 +2218,63 @@ mod tests {
         assert_eq!(paused.state, State::Paused);
         assert_eq!(paused.pause_reason, "send-unresolved");
 
-        // An already-closed historical abandoned turn without wake_claim must not re-arm a live wake's timer.
-        fx_abandoned.cfg["allow"] = json!({"groups": [1]});
-        crate::conversation_state::ConversationState::for_runtime(&fx_abandoned.context)
+        // An already-closed historical unclaimed abandoned turn must not re-arm a live wake's timer.
+        let fx_unclaimed_abandoned = setup_submitted_harness_turn("her-297-unclaimed-aband-", "reserved2", true, None, false);
+        turn_ledger::Recorder::attach(&fx_unclaimed_abandoned.context, &fx_unclaimed_abandoned.turn_id, "group:1")
+            .end_reconciled("abandoned", "revoked")
+            .unwrap();
+        fx_unclaimed_abandoned.store.finish(&fx_unclaimed_abandoned.turn_id, &crate::harness::Status::Cancelled, None).unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&fx_unclaimed_abandoned.context)
             .update("group:1", |conv| {
                 let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
                 wc["lastWakeAt"] = json!(crate::turn_ledger::now_ms() + 100_000);
+                wc["confirmedAt"] = json!(crate::turn_ledger::now_ms() + 100_000);
                 wc["sleepUntil"] = Value::Null;
                 wc["infinite"] = json!(false);
                 conv.set_field("wakeConfig", wc);
                 Ok(())
             })
             .unwrap();
-        let turns = fold(&turn_ledger::read_records(&fx_abandoned.context).unwrap()).0;
-        Pass { context: &fx_abandoned.context, cfg: &fx_abandoned.cfg }.finished(&fx_abandoned.journal, &turns);
+        let unclaimed_turns = fold(&turn_ledger::read_records(&fx_unclaimed_abandoned.context).unwrap()).0;
+        assert!(unclaimed_turns[0].wake_claim.is_none());
+        Pass { context: &fx_unclaimed_abandoned.context, cfg: &fx_unclaimed_abandoned.cfg }
+            .finished(&fx_unclaimed_abandoned.journal, &unclaimed_turns);
         assert!(
-            fx_abandoned.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].is_null(),
-            "historical closed abandoned turn must not overwrite live wake timer"
+            fx_unclaimed_abandoned.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].is_null(),
+            "historical unclaimed closed abandoned turn must not overwrite live wake timer"
+        );
+
+        // Provisional claim (lastWakeAt bumped before cutoff without a ledger turn) still allows startup repair,
+        // and socialV2.enabled=false at restart still re-arms consumed finite deadlines.
+        let mut fx_prov = setup_submitted_harness_turn("her-297-provisional-", "reserved2", true, None, true);
+        fx_prov.cfg["socialV2"]["enabled"] = json!(false);
+        fx_prov.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
+        turn_ledger::Recorder::attach(&fx_prov.context, &fx_prov.turn_id, "group:1")
+            .wake_claim(&obs_claim)
+            .unwrap();
+        turn_ledger::Recorder::attach(&fx_prov.context, &fx_prov.turn_id, "group:1")
+            .end("completed", "ok")
+            .unwrap();
+        let startup_cutoff = crate::turn_ledger::now_ms() + 500;
+        crate::conversation_state::ConversationState::for_runtime(&fx_prov.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["lastWakeAt"] = json!(startup_cutoff - 10);
+                wc["confirmedAt"] = json!(1);
+                wc["sleepUntil"] = Value::Null;
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        let prov_turns = fold(&turn_ledger::read_records(&fx_prov.context).unwrap()).0;
+        assert!(rearm_startup_terminal_sleeps(&fx_prov.context, &fx_prov.cfg, &prov_turns, startup_cutoff));
+        assert!(
+            fx_prov.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "provisional claim before startup cutoff and socialV2.enabled=false must still re-arm finite sleepUntil"
         );
 
         // Non-harness (DSH) reserved2 turns are unaffected by harness re-arming during `apply`.
@@ -2216,7 +2283,7 @@ mod tests {
         dsh_turn.reserved2 = true;
         dsh_turn.wake_claim = Some(obs_claim.clone());
         std::fs::write(fx_abandoned._root.0.join("data/mode.json"), "{broken").unwrap();
-        assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &dsh_turn).is_ok());
+        assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &dsh_turn, None).is_ok());
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch
