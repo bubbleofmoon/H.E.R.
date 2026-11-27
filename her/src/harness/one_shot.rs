@@ -904,10 +904,28 @@ mod tests {
         let (root, context) = capture::runtime("one-shot-redact", &url);
         capture::arm(&context, "harness");
         let route_id = format!("route-{secret}");
-        let model_name = format!("fake-chat-{secret}");
+        let bad_spec = RouteSpec {
+            id: route_id.clone(),
+            model: format!("fake-chat-{secret}"),
+            effort: None,
+            max_output_tokens: 321,
+            retry_429: false,
+        };
+        assert!(
+            RouteWalk::single_route(
+                &context,
+                Job::Digest,
+                "internal:digest",
+                bad_spec,
+                Duration::from_secs(5),
+                321,
+            )
+            .is_err(),
+            "one-shot route with credential in model must fail closed"
+        );
         let spec = RouteSpec {
             id: route_id,
-            model: model_name,
+            model: "fake-chat".to_string(),
             effort: None,
             max_output_tokens: 321,
             retry_429: false,
@@ -932,7 +950,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(
             (rows[0]["route"].as_str(), rows[0]["model"].as_str()),
-            (Some("route-[REDACTED]"), Some("fake-chat-[REDACTED]")),
+            (Some("route-[REDACTED]"), Some("fake-chat")),
             "{}",
             rows[0]
         );
@@ -942,7 +960,7 @@ mod tests {
         );
         let record =
             capture::settled(&context).expect("the armed capture took the one-shot request");
-        assert_eq!(record["request"]["model"], "fake-chat-[REDACTED]", "{record}");
+        assert_eq!(record["request"]["model"], "fake-chat", "{record}");
     }
 
     struct MockOneShot(Mutex<VecDeque<Result<String, ModelError>>>);

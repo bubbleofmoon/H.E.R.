@@ -434,9 +434,8 @@ fn digest_walk_the_digest_model_setting_is_one_route_without_failover_or_route_h
 
 #[test]
 fn digest_walk_records_name_routes_without_the_credential() {
-    let model_a = format!("m-{SECRET}");
-    let relay = Relay::start(vec![(model_a.as_str(), at_once(Kind::Status(500, ""))), ("model-b", at_once(Kind::Answer("[]")))]);
-    let extra = json!({"harness": {"routes": [{"id": format!("r-{SECRET}"), "model": model_a}, {"id": "b", "model": "model-b"}]}});
+    let relay = Relay::start(vec![("model-a", at_once(Kind::Status(500, ""))), ("model-b", at_once(Kind::Answer("[]")))]);
+    let extra = json!({"harness": {"routes": [{"id": format!("r-{SECRET}"), "model": "model-a"}, {"id": "b", "model": "model-b"}]}});
     let fixture = Fixture::new("credential", &relay, extra);
     assert_eq!(fixture.walk(Duration::from_secs(10)).complete("system", "input"), Ok("[]".to_string()));
     let failovers = fixture.records("failover-step");
@@ -448,11 +447,19 @@ fn digest_walk_records_name_routes_without_the_credential() {
         .unwrap_or_default();
     assert!(!ledger.is_empty() && !ledger.contains(SECRET), "the ledger never keeps the credential");
 
-    // Also verify answering digest route itself redacts route id & model in the ledger row.
-    let model_c = format!("c-{SECRET}");
-    let relay_ans = Relay::start(vec![(model_c.as_str(), at_once(Kind::Answer("[]")))]);
+    // Also verify answering digest route itself redacts route id in the ledger row,
+    // while refusing any route whose model carries the credential.
+    let bad_cfg = json!({"harness": {"routes": [{"id": "bad", "model": format!("c-{SECRET}")}]}});
+    let bad_walk = Walk { routes: routes::chain(&bad_cfg).unwrap(), chain: true };
+    assert!(
+        RouteWalk::new(&fixture.context, Job::Digest, usage::DIGEST_KEY, bad_walk, Duration::from_secs(10), 64)
+            .is_err(),
+        "digest walk must refuse a route whose model contains a credential"
+    );
+
+    let relay_ans = Relay::start(vec![("model-c", at_once(Kind::Answer("[]")))]);
     let extra_ans = json!({
-        "harness": {"routes": [{"id": format!("id-{SECRET}"), "model": model_c}]}
+        "harness": {"routes": [{"id": format!("id-{SECRET}"), "model": "model-c"}]}
     });
     let fixture_ans = Fixture::new("credential-ans", &relay_ans, extra_ans);
     assert_eq!(
@@ -463,7 +470,7 @@ fn digest_walk_records_name_routes_without_the_credential() {
         std::fs::read_to_string(fixture_ans.root.join("data/token-usage-rust.jsonl")).unwrap();
     let row: Value = serde_json::from_str(ans_ledger.lines().next().unwrap()).unwrap();
     assert_eq!(row["route"], "id-[REDACTED]");
-    assert_eq!(row["model"], "c-[REDACTED]");
+    assert_eq!(row["model"], "model-c");
 }
 
 #[test]
