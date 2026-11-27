@@ -493,7 +493,7 @@ async fn hf135_notice_survives_unreadable_store_repair_and_process_restart() {
 }
 
 async fn wait_for_notice(context: &RuntimeContext, text: &str) {
-    let path = context.runtime_root().unwrap().join("owner-notices");
+    let path = context.runtime_root().join("owner-notices");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if std::fs::read_to_string(&path)

@@ -16,9 +16,8 @@ use crate::social_state::{
     self, begin_access_change, canonical_key, config_write_error, default_stopper,
     finish_access_change, finish_access_change_with, finish_pending_before_change,
     finish_pending_before_change_with, forget_access_change, js_id_list, js_string, js_string_or,
-    legacy_write_json_atomic, live_restart, normalize_owner, normalized_id, policy_list,
-    raw_config_for_write, raw_config_object, reconcile_default_wake_configs, SessionStopper,
-    SocialError, StopTracker, LEGACY_CONFIG_PATH,
+    live_restart, normalize_owner, normalized_id, policy_list, raw_config_for_write,
+    raw_config_object, reconcile_default_wake_configs, SessionStopper, SocialError, StopTracker,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -140,21 +139,7 @@ fn read_config_before(context: &RuntimeContext) -> Result<String, CommitError> {
         })
 }
 
-fn legacy_read_config_object() -> Result<Value, (u16, String)> {
-    let text = std::fs::read_to_string(LEGACY_CONFIG_PATH)
-        .map_err(|_| (500, "读不到 config.json".to_string()))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|_| (500, "config.json 不是合法 JSON，已拒绝写入".to_string()))?;
-    if !value.is_object() {
-        return Err((500, "config.json 不是合法 JSON，已拒绝写入".to_string()));
-    }
-    Ok(value)
-}
-
 fn read_raw_for_edit(context: &RuntimeContext, base: ConfigBase) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return legacy_read_config_object();
-    }
     match base {
         ConfigBase::Canonical => raw_config_for_write(context).map_err(SocialError::into_http),
         ConfigBase::RawObject => {
@@ -178,20 +163,14 @@ pub(crate) fn write_selected_config_text(
 ) -> Result<ConfigDiff, String> {
     let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|_| "runtime config is invalid".to_string())?;
-    let kept = if context.is_isolated() {
-        let current = context
-            .read_optional_text(RuntimeArea::Config, "config.json")
-            .ok()
-            .flatten()
-            .and_then(|raw| {
-                serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok()
-            })
-            .unwrap_or(Value::Null);
-        crate::settings::keep_file_members(&current, &mut doc)
-            .map_err(crate::settings::direct_change_error)?
-    } else {
-        false
-    };
+    let current = context
+        .read_optional_text(RuntimeArea::Config, "config.json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or(Value::Null);
+    let kept = crate::settings::keep_file_members(&current, &mut doc)
+        .map_err(crate::settings::direct_change_error)?;
     let mirrored = crate::settings::mirror_into(context, &mut doc)?;
     let backup = doc.get("backup").is_some();
     if backup {
@@ -218,10 +197,6 @@ pub(crate) fn write_config_json(
     context: &RuntimeContext,
     value: &Value,
 ) -> Result<Option<ConfigDiff>, String> {
-    if !context.is_isolated() {
-        legacy_write_json_atomic(LEGACY_CONFIG_PATH, value)?;
-        return Ok(None);
-    }
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
     write_selected_config_text(context, &text).map(Some)
 }
@@ -230,7 +205,7 @@ fn write_config_social_error(
     context: &RuntimeContext,
     value: &Value,
 ) -> Result<Option<ConfigDiff>, SocialError> {
-    write_config_json(context, value).map_err(|e| config_write_error(context, e))
+    write_config_json(context, value).map_err(|_| config_write_error())
 }
 
 pub(crate) fn commit_config_edit<T>(
@@ -242,7 +217,7 @@ pub(crate) fn commit_config_edit<T>(
     let mut cfg = read_raw_for_edit(context, base)?;
     let value = edit(&mut cfg)?;
     let config_diff = write_config_json(context, &cfg).map_err(|error| match base {
-        ConfigBase::Canonical => CommitError::from(config_write_error(context, error)),
+        ConfigBase::Canonical => CommitError::from(config_write_error()),
         ConfigBase::RawObject => CommitError::plain(500, error),
     })?;
     Ok(CommitOutcome { value, config_diff })
@@ -267,11 +242,7 @@ pub(crate) fn commit_page_config<T>(
     prepare: impl FnOnce(&RuntimeContext) -> Result<PageConfigWrite<T>, (u16, String)>,
 ) -> Result<CommitOutcome<T>, CommitError> {
     let _gate = acquire_config_gate(context)?;
-    let pre_store_before = if context.is_isolated() {
-        Some(read_config_before(context)?)
-    } else {
-        None
-    };
+    let pre_store_before = read_config_before(context)?;
     let mut plan = prepare(context)?;
     let changes =
         crate::settings::console_changes(context, &plan.base_for_changes, &plan.carried)?;
@@ -279,24 +250,24 @@ pub(crate) fn commit_page_config<T>(
         changes.iter().map(|(setting, _)| *setting).collect();
     crate::settings::check_confirmation(plan.confirm, &changed)?;
     let has_changes = !changes.is_empty();
-    if has_changes && plan.check_canonical_before_store && context.is_isolated() {
+    if has_changes && plan.check_canonical_before_store {
         raw_config_for_write(context)?;
     }
     crate::settings::apply_changes(context, changes, "administrator", "console")?;
-    if context.is_isolated() && (has_changes || plan.keep_stored_always) {
+    if has_changes || plan.keep_stored_always {
         let latest = raw_config_object(context)?;
         crate::settings::keep_registry_values(&latest, &mut plan.file)
             .map_err(|key| CommitError::from((plan.keep_error_fmt)(key)))?;
     }
     let mut config_diff = write_config_json(context, &plan.file).map_err(|error| {
         if plan.isolated_write_error_503 {
-            CommitError::from(config_write_error(context, error))
+            CommitError::from(config_write_error())
         } else {
             CommitError::plain(500, error)
         }
     })?;
-    if let (Some(diff), Some(before)) = (&mut config_diff, pre_store_before) {
-        diff.before = before;
+    if let Some(diff) = &mut config_diff {
+        diff.before = pre_store_before;
     }
     if let Some(before_wake) = &plan.prior_wake {
         reconcile_default_wake_configs(context, Some(before_wake)).map_err(|err| {
@@ -350,9 +321,6 @@ pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(
 }
 
 pub(crate) fn finish_startup_write_back(context: &RuntimeContext) {
-    if !context.is_isolated() {
-        return;
-    }
     if crate::settings::has_stored_values(context) {
         let result = acquire_config_gate(context)
             .and_then(|_gate| crate::settings::write_back(context).map_err(|e| (503, e)));
@@ -380,9 +348,6 @@ pub(crate) fn persist_snowluma_endpoint(
     ws_url: Option<&str>,
     http_url: Option<&str>,
 ) -> Result<Vec<&'static str>, String> {
-    if !context.is_isolated() {
-        return Err("token self-heal writes only a selected runtime's config".to_string());
-    }
     let _gate = acquire_config_gate(context).map_err(|(_, message)| message)?;
     let mut doc = raw_config_for_write(context).map_err(|e| e.message().to_string())?;
     let mut changed: Vec<&'static str> = Vec::new();
@@ -619,11 +584,7 @@ pub(crate) fn commit_whitelist_with(
     finish_pending_before_change_with(&repair, &interaction, tracker, stopper)?;
     let (before, after, file, pending, config_diff) = {
         let _gate = acquire_gate(context)?;
-        let pre_store_before = if context.is_isolated() {
-            Some(read_config_before(context)?)
-        } else {
-            None
-        };
+        let pre_store_before = read_config_before(context)?;
         let effective_before = context
             .load_config()
             .map_err(|e| SocialError::Unavailable(e.to_string()))?;
@@ -660,7 +621,7 @@ pub(crate) fn commit_whitelist_with(
             object.insert("ownerQQ".into(), normalize_owner(Some(value))?);
         }
         let mut changes = crate::settings::console_changes(context, &unchanged, &file)?;
-        if context.is_isolated() && body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() {
+        if body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() {
             let owner = crate::settings::find("ownerQQ").expect("the registry holds the owner");
             if !owner
                 .read(&crate::settings::overlay(context, unchanged.clone()))
@@ -697,8 +658,8 @@ pub(crate) fn commit_whitelist_with(
             if stored { &Value::Null } else { &unchanged },
             &pending,
         )?;
-        if let (Some(diff), Some(before_text)) = (&mut diff, pre_store_before) {
-            diff.before = before_text;
+        if let Some(diff) = &mut diff {
+            diff.before = pre_store_before;
         }
         let shown = context
             .load_config_document()
@@ -799,11 +760,7 @@ pub(crate) fn commit_conversation_scope_with(
     finish_pending_before_change_with(context, &interaction, tracker, stopper)?;
     let (before, after, changed, pending, mirror_error, config_diff) = {
         let _gate = acquire_gate(context)?;
-        let pre_store_before = if context.is_isolated() {
-            Some(read_config_before(context)?)
-        } else {
-            None
-        };
+        let pre_store_before = read_config_before(context)?;
         let effective_before = context
             .load_config()
             .map_err(|e| SocialError::Unavailable(e.to_string()))?;
@@ -910,8 +867,8 @@ pub(crate) fn commit_conversation_scope_with(
                     if stored { &Value::Null } else { &unchanged },
                     &pending,
                 )?;
-                if let (Some(diff), Some(before_text)) = (&mut diff, pre_store_before) {
-                    diff.before = before_text;
+                if let Some(diff) = &mut diff {
+                    diff.before = pre_store_before;
                 }
                 diff
             } else {
@@ -1030,8 +987,6 @@ pub(crate) fn change_conversation_scope_waiting_with(
 thread_local! {
     static ISOLATED_UNDO_WRITE_FAIL: std::cell::RefCell<Option<(String, String)>> =
         const { std::cell::RefCell::new(None) };
-    static LEGACY_UNDO_WRITE_FAIL: std::cell::RefCell<Option<(String, String)>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1089,35 +1044,6 @@ fn write_undo_targets<T>(
         written.push(target);
     }
     Ok(restored)
-}
-
-struct PreparedLegacyUndo {
-    file: String,
-    old: String,
-    snapshot: Option<Vec<u8>>,
-}
-
-fn write_legacy_undo_file(file: &str, text: &str) -> Result<(), String> {
-    #[cfg(test)]
-    if let Some(error) = take_undo_write_error(&LEGACY_UNDO_WRITE_FAIL, file) {
-        return Err(error);
-    }
-    std::fs::write(file, text).map_err(|e| e.to_string())
-}
-
-fn write_legacy_undo_targets(
-    prepared: Vec<PreparedLegacyUndo>,
-) -> Result<Vec<String>, CommitError> {
-    write_undo_targets(
-        prepared,
-        |target| &target.file,
-        |target| write_legacy_undo_file(&target.file, &target.old),
-        |prev| match prev.snapshot.as_deref() {
-            Some(bytes) => std::fs::write(&prev.file, bytes).map_err(|e| e.to_string()),
-            None => std::fs::remove_file(&prev.file).map_err(|e| e.to_string()),
-        },
-    )
-    .map_err(|failure| CommitError::plain(500, failure.message))
 }
 
 struct PreparedIsolatedUndo {
@@ -1184,75 +1110,7 @@ pub(crate) fn commit_audit_undo(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    if context.is_isolated() {
-        return commit_isolated_audit_undo(context, id, &entry, confirm, files);
-    }
-    // Phase 1: validate all inputs and snapshot pre-undo contents before writing any file.
-    let mut prepared = Vec::with_capacity(files.len());
-    let mut wake_before: Option<Value> = None;
-    for f in &files {
-        let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let backup = f.get("backup").and_then(|v| v.as_str()).unwrap_or("");
-        if !crate::console::AUDIT_FILES.contains(&file) {
-            return Err(CommitError::plain(
-                400,
-                format!("拒绝恢复未声明的文件：{file}"),
-            ));
-        }
-        if prepared
-            .iter()
-            .any(|existing: &PreparedLegacyUndo| existing.file == file)
-        {
-            return Err(CommitError::plain(
-                400,
-                format!("审计记录包含重复的目标文件：{file}"),
-            ));
-        }
-        if !crate::console::audit_backup_allowed_for(context, backup) {
-            return Err(CommitError::plain(
-                400,
-                format!("拒绝恢复 audit-blobs 之外的文件：{backup}"),
-            ));
-        }
-        let old = std::fs::read_to_string(backup)
-            .map_err(|e| CommitError::plain(500, format!("读备份失败 {backup}: {e}")))?;
-        let backup_cfg: Value = serde_json::from_str(&old).map_err(|_| {
-            CommitError::plain(500, format!("备份内容不是合法 JSON，拒绝写入：{backup}"))
-        })?;
-        if file == LEGACY_CONFIG_PATH {
-            let before = context
-                .load_config_requiring_settings()
-                .map_err(|error| CommitError::plain(503, error))?;
-            if before["socialV2"]["wake"] != backup_cfg["socialV2"]["wake"] {
-                wake_before = Some(before);
-            }
-        }
-        let snapshot = match std::fs::read(file) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(CommitError::plain(
-                    503,
-                    format!("读取目标文件失败 {file}: {err}"),
-                ));
-            }
-        };
-        prepared.push(PreparedLegacyUndo {
-            file: file.to_string(),
-            old,
-            snapshot,
-        });
-    }
-    // Phase 2: write all prepared files with rollback on failure, then reconcile wake plans.
-    let restored = write_legacy_undo_targets(prepared)?;
-    if let Some(before) = wake_before {
-        reconcile_default_wake_configs(context, Some(&before))
-            .map_err(CommitError::from_social)?;
-    }
-    Ok(CommitOutcome {
-        value: json!({ "ok": true, "id": id, "restored": restored }),
-        config_diff: None,
-    })
+    commit_isolated_audit_undo(context, id, &entry, confirm, files)
 }
 
 fn validate_isolated_audit_backups(
@@ -1289,7 +1147,7 @@ fn validate_isolated_audit_backups(
                 format!("审计记录包含重复的目标文件：{file}"),
             ));
         }
-        if !crate::console::audit_backup_allowed_for(context, backup) {
+        if !crate::console::audit_backup_allowed(context, backup) {
             return Err(CommitError::plain(
                 400,
                 format!("拒绝恢复 audit-blobs 之外的文件：{backup}"),
@@ -1726,14 +1584,9 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
 }
 
 fn write_setting_path(context: &RuntimeContext, path: &str, value: &Value) -> Result<(), String> {
-    let mut file = read_raw_for_edit(context, ConfigBase::RawObject).map_err(|(_, e)| {
-        if context.is_isolated() {
-            "selected runtime config is unavailable".to_string()
-        } else {
-            e
-        }
-    })?;
-    if context.is_isolated() && !file.is_object() {
+    let mut file = read_raw_for_edit(context, ConfigBase::RawObject)
+        .map_err(|_| "selected runtime config is unavailable".to_string())?;
+    if !file.is_object() {
         return Err("selected runtime config is invalid".to_string());
     }
     let parts: Vec<&str> = path.split('.').collect();
@@ -1782,7 +1635,7 @@ pub(crate) fn settings_action(
             }
             let mut writable: Vec<String> =
                 SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
-            for setting in crate::settings::chat_registry().filter(|_| context.is_isolated()) {
+            for setting in crate::settings::chat_registry() {
                 let name = setting.chat_name();
                 all.insert(name.clone(), redact_setting(&name, setting.read(cfg)));
                 writable.push(name);
@@ -1797,9 +1650,7 @@ pub(crate) fn settings_action(
         if setting_is_secret(&path) {
             return Err((403, SETTINGS_READ_REFUSED.to_string()));
         }
-        if let Some(setting) =
-            crate::settings::chat_setting(&path).filter(|_| context.is_isolated())
-        {
+        if let Some(setting) = crate::settings::chat_setting(&path) {
             let value = redact_setting(&path, setting.read(cfg));
             return Ok(json!({"ok": true, "key": path, "writable": true, "value": value}));
         }
@@ -1822,8 +1673,7 @@ pub(crate) fn settings_action(
         .unwrap_or("")
         .trim()
         .to_string();
-    if let Some(setting) = crate::settings::chat_setting(&path)
-        .filter(|_| context.is_isolated() && !setting_is_secret(&path))
+    if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| !setting_is_secret(&path))
     {
         let value = b.get("value").cloned().unwrap_or(Value::Null);
         let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat")
@@ -1880,12 +1730,12 @@ pub(crate) fn commit_chat_settings(
     context: &RuntimeContext,
     held_gate: Option<&Gate>,
 ) -> Result<CommitOutcome<Value>, CommitError> {
-    let _local_gate = if held_gate.is_none() && context.is_isolated() && action == "settings-set" {
+    let _local_gate = if held_gate.is_none() && action == "settings-set" {
         acquire_config_gate(context)?
     } else {
         None
     };
-    let before_text = (context.is_isolated() && action == "settings-set")
+    let before_text = (action == "settings-set")
         .then(|| read_config_before(context))
         .transpose()?;
     let mut reply = settings_action(action, b, cfg, context)?;
@@ -2157,7 +2007,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_chat_settings_reconciles_wake_plans_and_legacy_guards_secrets() {
+    fn commit_chat_settings_reconciles_wake_plans_and_guards_secrets() {
         let (_root, context) = fixture(
             "chat-wake-sync",
             json!({
@@ -2204,11 +2054,10 @@ mod tests {
             4500
         );
 
-        let legacy = RuntimeContext::legacy();
         for secret in ["webSearch.apiKey", "cliModel.apiKey", "security.outboundGuard"] {
             assert!(setting_is_secret(secret), "{secret}");
             assert_eq!(
-                settings_action("settings-get", &json!({"settingKey": secret}), &cfg, &legacy)
+                settings_action("settings-get", &json!({"settingKey": secret}), &cfg, &context)
                     .unwrap_err()
                     .0,
                 403
@@ -2335,7 +2184,6 @@ mod tests {
     impl Drop for UndoWriteFailGuard {
         fn drop(&mut self) {
             ISOLATED_UNDO_WRITE_FAIL.with(|slot| *slot.borrow_mut() = None);
-            LEGACY_UNDO_WRITE_FAIL.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
@@ -2684,85 +2532,6 @@ mod tests {
                 ["triggers"]["poke"],
             true,
             "wake reconciliation runs after all files are written"
-        );
-    }
-
-    #[test]
-    fn write_legacy_undo_targets_rolls_back_earlier_files_on_failure() {
-        let _guard = UndoWriteFailGuard;
-        let dir = TestDir::new("legacy-undo-rb");
-        let first_path = dir.0.join("first.json");
-        let second_path = dir.0.join("second.json");
-        let first_key = first_path.to_string_lossy().to_string();
-        let second_key = second_path.to_string_lossy().to_string();
-
-        std::fs::write(&first_path, r#"{"state":"before"}"#).unwrap();
-        LEGACY_UNDO_WRITE_FAIL.with(|slot| {
-            *slot.borrow_mut() = Some((second_key.clone(), "disk full".into()));
-        });
-        let err = write_legacy_undo_targets(vec![
-            PreparedLegacyUndo {
-                file: first_key.clone(),
-                old: r#"{"state":"restored"}"#.into(),
-                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
-            },
-            PreparedLegacyUndo {
-                file: second_key.clone(),
-                old: r#"{"role":"restored"}"#.into(),
-                snapshot: None,
-            },
-        ])
-        .unwrap_err();
-        assert_eq!(err.status, 500);
-        assert_eq!(
-            std::fs::read_to_string(&first_path).unwrap(),
-            r#"{"state":"before"}"#,
-            "legacy rollback must restore pre-undo bytes of earlier written file"
-        );
-        assert!(!second_path.exists());
-
-        // When an earlier file did not exist before undo, rollback removes it.
-        LEGACY_UNDO_WRITE_FAIL.with(|slot| {
-            *slot.borrow_mut() = Some((first_key.clone(), "disk full".into()));
-        });
-        let err = write_legacy_undo_targets(vec![
-            PreparedLegacyUndo {
-                file: second_key.clone(),
-                old: r#"{"role":"restored"}"#.into(),
-                snapshot: None,
-            },
-            PreparedLegacyUndo {
-                file: first_key.clone(),
-                old: r#"{"state":"restored"}"#.into(),
-                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
-            },
-        ])
-        .unwrap_err();
-        assert_eq!(err.status, 500);
-        assert!(!second_path.exists());
-
-        // Happy path restores both files.
-        let restored = write_legacy_undo_targets(vec![
-            PreparedLegacyUndo {
-                file: first_key.clone(),
-                old: r#"{"state":"restored"}"#.into(),
-                snapshot: Some(br#"{"state":"before"}"#.to_vec()),
-            },
-            PreparedLegacyUndo {
-                file: second_key.clone(),
-                old: r#"{"role":"restored"}"#.into(),
-                snapshot: None,
-            },
-        ])
-        .unwrap();
-        assert_eq!(restored, vec![first_key, second_key]);
-        assert_eq!(
-            std::fs::read_to_string(&first_path).unwrap(),
-            r#"{"state":"restored"}"#
-        );
-        assert_eq!(
-            std::fs::read_to_string(&second_path).unwrap(),
-            r#"{"role":"restored"}"#
         );
     }
 }

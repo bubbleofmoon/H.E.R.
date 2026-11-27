@@ -16,8 +16,6 @@ pub(crate) use fixture::{
     install as install_fixture_embeddings, install_loader as install_fixture_embedding_loader,
 };
 
-pub const DB_PATH: &str = crate::legacy_path!("data/memory.db");
-
 struct RuntimeModelResources(RuntimeContext);
 
 impl her_memory::ModelResources for RuntimeModelResources {
@@ -58,37 +56,27 @@ pub fn recall(
     her_memory::recall(reader, text, semantic, limit, exclude)
 }
 
-/// A selected root always owns its database. Legacy MCP/console calls honor an explicit
-/// Rust override, then the frozen JS override, before using the deployment default.
+/// A selected runtime always owns its database under its memory directory.
 pub fn db_path_for_runtime(context: &RuntimeContext) -> Result<PathBuf, String> {
-    if context.is_isolated() {
-        context
-            .resolve_path(RuntimeArea::Memory, "memory.db", PathIntent::WriteFile)
-            .map_err(str::to_string)
-    } else {
-        Ok(std::env::var_os("HER_MEMORY_DB")
-            .or_else(|| std::env::var_os("MEMORY_DB_PATH").filter(|p| !p.is_empty()))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DB_PATH)))
-    }
+    context
+        .resolve_path(RuntimeArea::Memory, "memory.db", PathIntent::WriteFile)
+        .map_err(str::to_string)
 }
 
 fn validated_db_path_for_runtime(context: &RuntimeContext) -> Result<PathBuf, String> {
     let path = db_path_for_runtime(context)?;
-    if context.is_isolated() {
-        // SQLite opens its own sidecars outside Rust's filesystem wrappers. Validate every
-        // existing leaf immediately before opening, then ask SQLite not to follow a reparse
-        // point at the database itself. The runtime directory remains a trusted local root;
-        // this preflight does not pin Windows directory handles against a concurrent replacer.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            context
-                .resolve_path(
-                    RuntimeArea::Memory,
-                    &format!("memory.db{suffix}"),
-                    PathIntent::WriteFile,
-                )
-                .map_err(|_| "selected memory database is unavailable".to_string())?;
-        }
+    // SQLite opens its own sidecars outside Rust's filesystem wrappers. Validate every
+    // existing leaf immediately before opening, then ask SQLite not to follow a reparse
+    // point at the database itself. The runtime directory remains a trusted local root;
+    // this preflight does not pin Windows directory handles against a concurrent replacer.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        context
+            .resolve_path(
+                RuntimeArea::Memory,
+                &format!("memory.db{suffix}"),
+                PathIntent::WriteFile,
+            )
+            .map_err(|_| "selected memory database is unavailable".to_string())?;
     }
     Ok(path)
 }
@@ -105,8 +93,6 @@ pub fn open_read_only_for_runtime(context: &RuntimeContext) -> Result<Connection
 }
 
 /// Open the selected runtime's memory database without imposing caller-specific PRAGMA policy.
-/// Console, MCP, and other callers share path selection while retaining their existing connection
-/// settings and legacy override contract.
 pub fn open_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
     let _restore_gate = crate::restore::writer_gate_shared(context)?;
     open_for_runtime_unlocked(context)
@@ -114,17 +100,13 @@ pub fn open_for_runtime(context: &RuntimeContext) -> Result<Connection, String> 
 
 fn open_for_runtime_unlocked(context: &RuntimeContext) -> Result<Connection, String> {
     let path = validated_db_path_for_runtime(context)?;
-    if context.is_isolated() {
-        Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|_| "cannot open selected memory database".to_string())
-    } else {
-        Connection::open(&path).map_err(|e| format!("cannot open memory database: {e}"))
-    }
+    Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| "cannot open selected memory database".to_string())
 }
 
 /// Open the selected runtime's database at the current memory schema version.
@@ -205,13 +187,13 @@ mod fixture {
     }
 
     fn install_model(context: &RuntimeContext, model: DenseModel) -> FixtureEncoder {
-        let path = context.runtime_root().unwrap().to_owned();
+        let path = context.runtime_root().to_owned();
         assert!(RUNNERS.lock().unwrap().insert(path.clone(), model).is_none());
         FixtureEncoder(path)
     }
 
     pub(super) fn model(context: &RuntimeContext) -> Option<DenseModel> {
-        RUNNERS.lock().unwrap().get(context.runtime_root()?).cloned()
+        RUNNERS.lock().unwrap().get(context.runtime_root()).cloned()
     }
 }
 
@@ -252,57 +234,6 @@ mod tests {
         assert!(diagnostic.contains("memory recall hit count failed"), "missing diagnostic: {diagnostic}");
         assert!(!diagnostic.contains("private-query-token-path"), "payload leaked: {diagnostic}");
         assert!(!diagnostic.contains("ticket03-memory-fixture"), "path leaked: {diagnostic}");
-    }
-
-    #[test]
-    fn ticket17_legacy_memory_override_is_used_without_opening_default() {
-        const PROBE: &str = "TICKET17_MEMORY_OVERRIDE_PROBE";
-        if let Some(path) = std::env::var_os(PROBE) {
-            let context = RuntimeContext::legacy();
-            // Assert routing before opening: even the red run cannot touch production.
-            assert_eq!(db_path_for_runtime(&context).unwrap(), PathBuf::from(&path));
-            let conn = open_ready_for_runtime(&context).unwrap();
-            conn.execute("INSERT INTO memory(owner_type,owner_id,scope,kind,content,source,created_at) VALUES('session','group:17','group','fact','override marker','test',1)", []).unwrap();
-            assert_eq!(
-                std::fs::canonicalize(
-                    conn.query_row("PRAGMA database_list", [], |r| r.get::<_, String>(2))
-                        .unwrap()
-                )
-                .unwrap(),
-                std::fs::canonicalize(path).unwrap()
-            );
-            return;
-        }
-        let (root, _) = isolated_fixture();
-        let path = std::fs::canonicalize(&root.0).unwrap().join("override.db");
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-        let output = command
-            .args([
-                "--exact",
-                "memory::tests::ticket17_legacy_memory_override_is_used_without_opening_default",
-                "--nocapture",
-            ])
-            .env(PROBE, &path)
-            .env("HER_MEMORY_DB", &path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT content FROM memory", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            "override marker"
-        );
     }
 
     #[test]

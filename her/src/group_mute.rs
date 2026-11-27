@@ -3,7 +3,7 @@
 //! mute episode and none for a lift. State lives in `data/group-mutes.json` (keys `group:<id>`)
 //! under `locks/group-mutes.lock`; it never reads or writes `social-v2.json`, so it cannot create
 //! conversation records. Personal and whole-group restrictions are stored apart and the effective
-//! mute is derived. Reads fail open (a refused send relearns it); legacy contexts are never muted.
+//! mute is derived. Reads fail open (a refused send relearns it).
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,7 +84,7 @@ pub fn active(context: &RuntimeContext, key: &str) -> Option<Mute> {
 }
 
 pub(crate) fn active_at(context: &RuntimeContext, key: &str, now: i64) -> Option<Mute> {
-    if !context.is_isolated() || !key.starts_with("group:") { return None; }
+    if !key.starts_with("group:") { return None; }
     effective(&read(context).ok()?["groups"][key], now)
 }
 
@@ -126,7 +126,7 @@ pub fn change_from_notice(sub_type: &str, duration: Option<&Value>, now: i64) ->
 /// Apply one change under the gate. Returns the episode revision whose owner notice this call claimed.
 /// A transient read error refuses the change (`Err`); only an invalid file is replaced.
 pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, operator: Option<i64>, now: i64) -> Result<Option<i64>, String> {
-    if !context.is_isolated() || !key.starts_with("group:") { return Ok(None); }
+    if !key.starts_with("group:") { return Ok(None); }
     let _gate = gate(context)?;
     let text = context.read_optional_text(RuntimeArea::Data, FILE).map_err(|e| format!("group-mutes read: {e}"))?;
     let mut store = match text {
@@ -249,7 +249,6 @@ pub(crate) fn seq_of(context: &RuntimeContext, key: &str) -> i64 {
 
 /// Groups whose mute has no known end.
 pub fn unknown_end_groups(context: &RuntimeContext, now: i64) -> Vec<i64> {
-    if !context.is_isolated() { return Vec::new(); }
     let Ok(store) = read(context) else { return Vec::new() };
     store["groups"].as_object().into_iter().flatten()
         .filter(|(_, e)| effective(e, now).is_some_and(|m| m.until.is_none()))
@@ -283,7 +282,7 @@ impl Drop for Running {
 /// Queue a gateway refresh of these groups on one background worker. Requests made while a worker
 /// runs are picked up by that worker (it keeps the connection details it started with).
 pub fn spawn_refresh(context: RuntimeContext, http_base: String, token: String, self_id: i64, groups: Vec<(i64, Option<i64>)>) {
-    if groups.is_empty() || self_id <= 0 || !context.is_isolated() { return; }
+    if groups.is_empty() || self_id <= 0 { return; }
     {
         let mut pending = PENDING.lock().unwrap_or_else(|p| p.into_inner());
         for (gid, operator) in groups {

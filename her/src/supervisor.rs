@@ -344,7 +344,7 @@ pub(crate) fn task_api_with_clock(
     cfg: &Value,
     clock: Arc<dyn Clock>,
 ) -> Result<crate::console_tasks::TasksApi, String> {
-    let root = context.runtime_root().ok_or("tasks require a selected runtime root")?.to_path_buf();
+    let root = context.runtime_root().to_path_buf();
     let store_dir = context.resolve_path(RuntimeArea::Data, "tasks", PathIntent::CreateDirectory)
         .map_err(str::to_string)?;
     let redact_context = context.clone();
@@ -611,7 +611,7 @@ impl RealEffects {
 
 impl RealEffects {
     fn launch_console(&self, port: u16) -> Result<std::process::Child, String> {
-        let root = self.context.runtime_root().ok_or("runtime root unavailable")?;
+        let root = self.context.runtime_root();
         self.launch(&["--runtime-root".into(), root.to_string_lossy().into_owned(), "--console-port".into(),
             port.to_string(), "--console-serve".into()], "rbridge-console")
     }
@@ -682,7 +682,7 @@ impl Effects for RealEffects {
         let cfg = self.context.load_config().map_err(str::to_string)?;
         let target = watchdog::live_target_from_config(&cfg)?;
         if target.groups != groups { return Err("configured groups changed before startup".into()); }
-        let root = self.context.runtime_root().ok_or("runtime root unavailable")?;
+        let root = self.context.runtime_root();
         self.spawn(&["--runtime-root".into(), root.to_string_lossy().into_owned(), "--console-port".into(), target.console_port.to_string(), "--live".into(), "--live-groups".into(), groups.join(",")], "rbridge-live", |pid| {
             let OwnerObservation::Verified(owner) = lifecycle::verify_owner(
                 &mut LiveLifecycle,
@@ -932,7 +932,7 @@ mod tests {
                 assert!(!path.starts_with(r"\\?\"), "task {} leaked {path}", task.id.as_str());
             }
         }
-        let block = crate::dsh_mcp_config::apply("", root.join("her.exe").to_str().unwrap(), Some((root.to_str().unwrap(), 12345))).unwrap();
+        let block = crate::dsh_mcp_config::apply("", root.join("her.exe").to_str().unwrap(), (root.to_str().unwrap(), 12345)).unwrap();
         assert!(!block.contains(r"\\?\"), "generated MCP config leaks verbatim paths");
         assert_eq!(crate::subprocess::external_path(r"\\?\UNC\server\share\dir").unwrap(), r"\\server\share\dir");
         for unsupported in [r"\\?\GLOBALROOT\Device\HarddiskVolume1", r"\\?\C:\dir.\file", r"\\?\C:\NUL.txt", r"\\?\C:\file:stream", r"\\?\UNC\server"] {

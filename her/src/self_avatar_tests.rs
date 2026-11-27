@@ -225,7 +225,6 @@ fn self_avatar_needs_her_own_valid_uin_and_a_selected_runtime() {
     let (root, context) = fixture_runtime("206 avatar no identity", "fixture-self-avatar-console-token");
     assert!(current_with(&context, T0, PIXELS, &mut fetch).is_none());
     assert!(!root.0.join("data").join(CACHE_FILE).exists());
-    assert!(current_with(&RuntimeContext::legacy(), T0, PIXELS, &mut fetch).is_none(), "the fixed-path mode keeps the portrait");
     assert_eq!(calls.get(), 0);
     // Positive control: her own valid uin in a selected runtime fetches once and stores the avatar.
     let (valid_root, valid) = with_identity("206 avatar identity valid", json!({"userId": "10001"}));

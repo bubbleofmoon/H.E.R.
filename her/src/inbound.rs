@@ -285,10 +285,9 @@ impl Journal {
         let path = context
             .resolve_path(RuntimeArea::Data, DB_NAME, PathIntent::WriteFile)
             .map_err(|e| format!("入站数据库路径不可用：{e}"))?;
-        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
-        if context.is_isolated() {
-            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let conn = Connection::open_with_flags(&path, flags)
             .map_err(|e| format!("打不开入站数据库：{e}"))?;
         Self::init(conn)

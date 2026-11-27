@@ -664,7 +664,7 @@ pub(crate) fn default_dependency_directory(
     install: &crate::install_root::InstallRoot,
     context: &RuntimeContext,
 ) -> Result<PathBuf, String> {
-    let runtime = context.runtime_root().ok_or("runtime root unavailable")?;
+    let runtime = context.runtime_root();
     if std::fs::canonicalize(install.root().join("runtime")).ok().as_deref() != Some(runtime) {
         return Err("dependencies.directory is not configured for the dependency install".into());
     }
@@ -2022,10 +2022,7 @@ fn deliver_notice(
     }
     let ob = crate::console::media_onebot(context, cfg)?;
     let key = notice["key"].as_str().ok_or("invalid outage notice")?;
-    let scope = context
-        .runtime_root()
-        .ok_or("outage notice requires selected runtime")?
-        .to_string_lossy();
+    let scope = context.runtime_root().to_string_lossy();
     if !crate::admin_alert::admit_notice(
         context,
         cfg,
@@ -2389,9 +2386,7 @@ mod os {
     }
     pub fn launch_gate(context: &RuntimeContext) -> Result<Gate, String> {
         use sha2::{Digest, Sha256};
-        let root = crate::subprocess::external_path(
-            context.runtime_root().ok_or("runtime root unavailable")?,
-        )?
+        let root = crate::subprocess::external_path(context.runtime_root())?
         .replace('/', "\\")
         .to_lowercase();
         let hash = format!("{:x}", Sha256::digest(root.as_bytes())).to_uppercase();

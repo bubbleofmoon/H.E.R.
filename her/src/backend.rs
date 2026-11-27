@@ -81,10 +81,6 @@ pub struct CliBackend {
 }
 
 impl CliBackend {
-    pub fn from_config(id: &str, v: &Value) -> Result<Self, BackendError> {
-        Self::from_config_with_runtime(&RuntimeContext::legacy(), id, v)
-    }
-
     pub fn from_config_with_runtime(
         context: &RuntimeContext,
         id: &str,
@@ -154,10 +150,8 @@ impl Backend for CliBackend {
         let exe = resolve_command(&self.cmd).ok_or_else(|| {
             BackendError::Unavailable(format!("命令 {} 不在 PATH 里", self.cmd))
         })?;
-        if self.context.is_isolated() {
-            validate_isolated_cli_settings(&self.context, &self.args, &self.env)
-                .map_err(BackendError::Config)?;
-        }
+        validate_isolated_cli_settings(&self.context, &self.args, &self.env)
+            .map_err(BackendError::Config)?;
         // 输出走**临时文件**而不是管道：管道有两个坑 ——
         // ① 缓冲区写满会阻塞子进程；② `wait_with_output` 没有超时，
         //    CLI 后端是 agent（会自己跑工具循环），实测长提示词下能跑 19 分钟。
@@ -170,22 +164,14 @@ impl Backend for CliBackend {
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         );
-        let (out_path, err_path) = if self.context.is_isolated() {
-            let out = self
-                .context
-                .resolve_path(RuntimeArea::Logs, &format!("logs/cli-{stamp}.out"), PathIntent::WriteFile)
-                .map_err(|e| BackendError::Failed(e.into()))?;
-            let err = self
-                .context
-                .resolve_path(RuntimeArea::Logs, &format!("logs/cli-{stamp}.err"), PathIntent::WriteFile)
-                .map_err(|e| BackendError::Failed(e.into()))?;
-            (out, err)
-        } else {
-            (
-                std::path::PathBuf::from(format!("{}/logs/cli-{stamp}.out", crate::legacy_path!())),
-                std::path::PathBuf::from(format!("{}/logs/cli-{stamp}.err", crate::legacy_path!())),
-            )
-        };
+        let out_path = self
+            .context
+            .resolve_path(RuntimeArea::Logs, &format!("logs/cli-{stamp}.out"), PathIntent::WriteFile)
+            .map_err(|e| BackendError::Failed(e.into()))?;
+        let err_path = self
+            .context
+            .resolve_path(RuntimeArea::Logs, &format!("logs/cli-{stamp}.err"), PathIntent::WriteFile)
+            .map_err(|e| BackendError::Failed(e.into()))?;
         let mut output_files = CliOutputFiles::new(&self.context, out_path, err_path)?;
         let out_file = output_files.open_stdout()?;
         let err_file = output_files.open_stderr()?;
@@ -194,9 +180,7 @@ impl Backend for CliBackend {
             .stdin(std::process::Stdio::piped())
             .stdout(out_file)
             .stderr(err_file);
-        if self.context.is_isolated() {
-            configure_isolated_cli_environment(&mut cmd, &self.context)?;
-        }
+        configure_isolated_cli_environment(&mut cmd, &self.context)?;
         // Pass session key and token via environment so CLI backends need not guess them.
         for (k, v) in session_env_for_runtime(&self.context, &req.key) {
             cmd.env(k, v);
@@ -209,7 +193,7 @@ impl Backend for CliBackend {
             .env("NO_COLOR", "1")
             .env("CI", "1");
         for (k, v) in &self.env {
-            if self.context.is_isolated() && isolated_environment_key(k) {
+            if isolated_environment_key(k) {
                 return Err(BackendError::Config(format!(
                     "isolated backend {} cannot override selected runtime environment variable {k}",
                     self.id
@@ -218,11 +202,7 @@ impl Backend for CliBackend {
             cmd.env(k, v);
         }
         let credentials = configure_cli_model(&mut cmd, &self.context)?;
-        let status = if self.context.is_isolated() {
-            run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?
-        } else {
-            run_legacy_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?
-        };
+        let status = run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?;
         // 进程已退出，从临时文件读结果
         let (stdout_text, stderr_text) = output_files.read_texts()?;
         let clean = |text: &str| {
@@ -464,55 +444,6 @@ pub fn plain_output_failure(answer: &str) -> Option<crate::model_failure::Failur
     diagnostic.is_match(answer).then(|| Failure::classify("", answer))
 }
 
-fn run_legacy_cli(
-    mut command: Command,
-    prompt: &str,
-    timeout_s: u64,
-    command_name: &str,
-) -> Result<ExitStatus, BackendError> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| BackendError::Failed(format!("启动 {command_name} 失败：{error}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        if let Err(error) = stdin.write_all(prompt.as_bytes()) {
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BackendError::Failed(format!(
-                "写入 {command_name} 标准输入失败：{error}"
-            )));
-        }
-        // Legacy CLI clients keep the original synchronous stdin contract.
-        drop(stdin);
-    }
-
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_s.max(5).min(3600));
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BackendError::Failed(format!(
-                    "{command_name} 超时（{timeout_s}s）已强杀"
-                )));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BackendError::Failed(format!(
-                    "等待 {command_name} 失败：{error}"
-                )));
-            }
-        }
-    }
-}
-
 const ISOLATED_CLI_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn join_cli_writer<'scope>(
@@ -686,7 +617,6 @@ fn run_isolated_cli(
 /// prompts or model output from surviving a failed CLI attempt.
 struct CliOutputFiles {
     context: RuntimeContext,
-    isolated: bool,
     stdout: PathBuf,
     stderr: PathBuf,
     stdout_created: bool,
@@ -697,7 +627,6 @@ impl CliOutputFiles {
     fn new(context: &RuntimeContext, stdout: PathBuf, stderr: PathBuf) -> Result<Self, BackendError> {
         Ok(Self {
             context: context.clone(),
-            isolated: context.is_isolated(),
             stdout,
             stderr,
             stdout_created: false,
@@ -718,45 +647,32 @@ impl CliOutputFiles {
     }
 
     fn open_capture(&self, path: &std::path::Path) -> Result<Stdio, BackendError> {
-        if self.isolated {
-            let relative = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-                BackendError::Failed("runtime CLI capture path is unavailable".into())
-            })?;
-            let relative = format!("logs/{relative}");
-            let checked = self
-                .context
-                .resolve_path(RuntimeArea::Logs, &relative, PathIntent::WriteFile)
-                .map_err(|error| BackendError::Failed(error.into()))?;
-            if checked != path {
-                return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
-            }
-            crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
-                .map(Stdio::from)
-                .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
-        } else {
-            std::fs::File::create(path)
-                .map(Stdio::from)
-                .map_err(|error| BackendError::Failed(format!("创建临时输出文件失败 {}: {error}", path.display())))
+        let relative = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+            BackendError::Failed("runtime CLI capture path is unavailable".into())
+        })?;
+        let relative = format!("logs/{relative}");
+        let checked = self
+            .context
+            .resolve_path(RuntimeArea::Logs, &relative, PathIntent::WriteFile)
+            .map_err(|error| BackendError::Failed(error.into()))?;
+        if checked != path {
+            return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
         }
+        crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
+            .map(Stdio::from)
+            .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
     }
 
     fn read_texts(&self) -> Result<(String, String), BackendError> {
-        if self.isolated {
-            let read = |path: &PathBuf| {
-                let relative = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-                    BackendError::Failed("runtime CLI capture path is unavailable".into())
-                })?;
-                self.context
-                    .read_text(RuntimeArea::Logs, &format!("logs/{relative}"))
-                    .map_err(|error| BackendError::Failed(error.into()))
-            };
-            Ok((read(&self.stdout)?, read(&self.stderr)?))
-        } else {
-            Ok((
-                std::fs::read_to_string(&self.stdout).unwrap_or_default(),
-                std::fs::read_to_string(&self.stderr).unwrap_or_default(),
-            ))
-        }
+        let read = |path: &PathBuf| {
+            let relative = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                BackendError::Failed("runtime CLI capture path is unavailable".into())
+            })?;
+            self.context
+                .read_text(RuntimeArea::Logs, &format!("logs/{relative}"))
+                .map_err(|error| BackendError::Failed(error.into()))
+        };
+        Ok((read(&self.stdout)?, read(&self.stderr)?))
     }
 }
 
@@ -769,12 +685,8 @@ impl Drop for CliOutputFiles {
             if !created {
                 continue;
             }
-            if self.isolated {
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    let _ = self.context.remove_file(RuntimeArea::Logs, &format!("logs/{name}"));
-                }
-            } else {
-                let _ = std::fs::remove_file(path);
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                let _ = self.context.remove_file(RuntimeArea::Logs, &format!("logs/{name}"));
             }
         }
     }
@@ -821,7 +733,7 @@ fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
 }
 
 fn path_is_within_runtime(context: &RuntimeContext, value: &str) -> bool {
-    let Some(root) = context.runtime_root() else { return false };
+    let root = context.runtime_root();
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return false;
@@ -958,10 +870,8 @@ fn configure_isolated_cli_environment(
         .env("XDG_DATA_HOME", ordinary(&xdg_data)?)
         .env("TEMP", ordinary(&temp)?)
         .env("TMP", ordinary(&temp)?)
-        .current_dir(ordinary(&cwd)?);
-    if let Some(root) = context.runtime_root() {
-        command.env("HER_RUNTIME_ROOT", crate::subprocess::external_path(root).map_err(BackendError::Config)?);
-    }
+        .current_dir(ordinary(&cwd)?)
+        .env("HER_RUNTIME_ROOT", crate::subprocess::external_path(context.runtime_root()).map_err(BackendError::Config)?);
     Ok(())
 }
 
@@ -1007,9 +917,6 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
 }
 
 fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
-    if !context.is_isolated() {
-        return Ok(Vec::new());
-    }
     let model_url = context.dependency_url("model")
         .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
     command.env("ANTHROPIC_BASE_URL", model_url)
@@ -1038,16 +945,6 @@ fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Resul
 ///
 /// 和 `cli_fallback` 的区别：那个按配置顺序挨个试，这个只要一个 id。
 /// 找不到 / 不可用 / 跑失败都回 Err，调用方据此回落到 DSH 候选链。
-pub fn cli_fallback_by_id(
-    cfg: &Value,
-    id: &str,
-    key: &str,
-    prompt: &str,
-    timeout_s: u64,
-) -> Result<(String, String), String> {
-    cli_fallback_by_id_with_runtime(&RuntimeContext::legacy(), cfg, id, key, prompt, timeout_s)
-}
-
 pub fn cli_fallback_by_id_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
@@ -1084,10 +981,6 @@ pub fn cli_fallback_by_id_with_runtime(
 /// 为什么要从文件读而不是让模型传：CLI 后端的模型不知道会话身份（它没有桥接的上下文），
 /// 实测让它传 token 会得到「未授权」。这里从 social-v2.json 取，随调用注入。
 /// 读不到就返回空表 —— 不报错：没有会话的后端（如 probe）本来就不需要。
-pub fn session_env(key: &str) -> Vec<(String, String)> {
-    session_env_for_runtime(&RuntimeContext::legacy(), key)
-}
-
 pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(String, String)> {
     if key.trim().is_empty() {
         return Vec::new();
@@ -1162,10 +1055,6 @@ impl Registry {
     ///   "backends": {"default": "dsh", "list": [{"id": "...", "kind": "cli", "cmd": "..."}]}
     ///   "backends": [{"id": "...", ...}]
     /// 没配时回落到单元素 ["dsh"]。
-    pub fn from_config(cfg: &Value) -> Result<Self, BackendError> {
-        Self::from_config_with_runtime(&RuntimeContext::legacy(), cfg)
-    }
-
     pub fn from_config_with_runtime(
         context: &RuntimeContext,
         cfg: &Value,
@@ -1253,15 +1142,6 @@ impl Backend for DshBackend {
 /// **同步**函数，故意不写成 async：`Backend::ask` 本来就是"等子进程跑完"，
 /// 但这条路径本来就是"DSH 全挂了"的兜底，阻塞一小会儿比给整个 Registry
 /// 加 Send 约束划算。正常回合走不到这里。
-pub fn cli_fallback(
-    cfg: &Value,
-    key: &str,
-    prompt: &str,
-    timeout_s: u64,
-) -> Result<(String, String), String> {
-    cli_fallback_with_runtime(&RuntimeContext::legacy(), cfg, key, prompt, timeout_s)
-}
-
 pub fn cli_fallback_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
@@ -1492,16 +1372,29 @@ mod tests {
         }
     }
 
+    fn backend_test_context(tag: &str) -> (crate::runtime::tests::FixtureRoot, RuntimeContext) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(format!("her-backend-{tag}-{}-{id}", std::process::id())),
+            &json!({"consoleToken": "fixture-backend-console-token"}),
+            &json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        (root, context)
+    }
+
     #[test]
     fn agy_configuration_requests_json_without_changing_other_clients() {
+        let (_root, context) = backend_test_context("agy");
         for args in [json!([]), json!(["--output-format","text"]), json!(["--output-format=stream-json","--model","fixture"])] {
             let value = json!({"cmd":"agy","args":args});
-            let backend = CliBackend::from_config_with_runtime(&RuntimeContext::legacy(), "agy-test", &value).unwrap();
+            let backend = CliBackend::from_config_with_runtime(&context, "agy-test", &value).unwrap();
             assert_eq!(&backend.args[backend.args.len()-2..], &["--output-format", "json"]);
             assert_eq!(backend.args.iter().filter(|a| a.starts_with("--output-format")).count(), 1);
         }
         let value = json!({"cmd":"other","args":["--output-format","text"]});
-        let backend = CliBackend::from_config_with_runtime(&RuntimeContext::legacy(), "other", &value).unwrap();
+        let backend = CliBackend::from_config_with_runtime(&context, "other", &value).unwrap();
         assert_eq!(backend.args, vec!["--output-format", "text"]);
     }
 
@@ -1509,46 +1402,51 @@ mod tests {
 
     #[test]
     fn registry_defaults_to_dsh() {
+        let (_root, context) = backend_test_context("default-dsh");
         let cfg = json!({});
-        let reg = Registry::from_config(&cfg).unwrap();
+        let reg = Registry::from_config_with_runtime(&context, &cfg).unwrap();
         assert_eq!(reg.ids(), vec!["dsh".to_string()]);
     }
 
     #[test]
     fn registry_parses_object_and_array_forms() {
+        let (_root, context) = backend_test_context("obj-arr");
         let obj = json!({"backends": {"default": "oc", "list": [
             {"id": "oc", "kind": "cli", "cmd": "opencode", "args": ["run"]},
             {"id": "dsh", "kind": "dsh", "model": "deepseek-flash"}
         ]}});
-        let reg = Registry::from_config(&obj).unwrap();
+        let reg = Registry::from_config_with_runtime(&context, &obj).unwrap();
         assert_eq!(reg.ids(), vec!["oc".to_string(), "dsh".to_string()]);
 
         let arr = json!({"backends": [{"id": "a", "kind": "cli", "cmd": "x"}]});
-        assert_eq!(Registry::from_config(&arr).unwrap().ids(), vec!["a".to_string()]);
+        assert_eq!(Registry::from_config_with_runtime(&context, &arr).unwrap().ids(), vec!["a".to_string()]);
     }
 
     #[test]
     fn unknown_kind_is_config_error_and_not_retryable() {
+        let (_root, context) = backend_test_context("unknown-kind");
         let cfg = json!({"backends": [{"id": "x", "kind": "quantum"}]});
-        let err = Registry::from_config(&cfg).err().expect("应该报配置错");
+        let err = Registry::from_config_with_runtime(&context, &cfg).err().expect("应该报配置错");
         assert!(!err.retryable(), "配置错不该被 failover 吞掉");
     }
 
     #[test]
     fn cli_backend_requires_cmd() {
+        let (_root, context) = backend_test_context("requires-cmd");
         let cfg = json!({"backends": [{"id": "x", "kind": "cli"}]});
-        let err = Registry::from_config(&cfg).err().expect("应该报缺少 cmd");
+        let err = Registry::from_config_with_runtime(&context, &cfg).err().expect("应该报缺少 cmd");
         assert!(err.message().contains("缺少 cmd"));
     }
 
     #[test]
     fn missing_command_is_unavailable_but_retryable() {
+        let (_root, context) = backend_test_context("missing-cmd");
         let b = CliBackend {
             id: "nope".into(),
             cmd: "definitely-not-a-real-command-xyz".into(),
             args: vec![],
             env: vec![],
-            context: RuntimeContext::legacy(),
+            context,
         };
         assert!(!b.available());
         let err = b.ask(&BackendRequest { key: "k".into(), prompt: "hi".into(), timeout_s: 5 }).unwrap_err();
@@ -1558,14 +1456,15 @@ mod tests {
 
     #[test]
     fn dsh_failed_fallback_runs_no_cli_backend_unless_enabled() {
+        let (_root, context) = backend_test_context("failover-fallback");
         // The backend's command does not exist, so nothing can run; the error shows whether the backend was consulted.
         let mut cfg = json!({"backends": {"list": [{"id": "oc", "kind": "cli", "cmd": "definitely-not-a-real-command-xyz"}]}});
-        let off = cli_fallback_with_runtime(&RuntimeContext::legacy(), &cfg, "group:1", "hi", 10).unwrap_err();
+        let off = cli_fallback_with_runtime(&context, &cfg, "group:1", "hi", 10).unwrap_err();
         assert!(off.contains("failoverFallback") && !off.contains("oc"), "off by default, backend not consulted: {off}");
         cfg["backends"]["failoverFallback"] = json!(false);
-        assert!(cli_fallback_with_runtime(&RuntimeContext::legacy(), &cfg, "group:1", "hi", 10).unwrap_err().contains("failoverFallback"));
+        assert!(cli_fallback_with_runtime(&context, &cfg, "group:1", "hi", 10).unwrap_err().contains("failoverFallback"));
         cfg["backends"]["failoverFallback"] = json!(true);
-        let on = cli_fallback_with_runtime(&RuntimeContext::legacy(), &cfg, "group:1", "hi", 10).unwrap_err();
+        let on = cli_fallback_with_runtime(&context, &cfg, "group:1", "hi", 10).unwrap_err();
         assert!(!on.contains("failoverFallback") && on.contains("oc"), "enabled: the configured backend is consulted: {on}");
     }
 
@@ -1634,7 +1533,7 @@ mod tests {
         )
         .unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
-        let selected_root = context.runtime_root().unwrap().to_path_buf();
+        let selected_root = context.runtime_root().to_path_buf();
         crate::settings::apply(
             &context, crate::settings::CLI_MODEL_API_KEY.key, &serde_json::json!("fixture-selected-api-key"),
             "administrator", "console",

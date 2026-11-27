@@ -319,17 +319,7 @@ fn settings_undo_cut_off_before_its_audit_row_changes_nothing() {
 }
 
 #[test]
-fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input() {
-    let legacy = RuntimeContext::legacy();
-    for (method, path, body) in [
-        ("GET", "/api/settings/history", ""),
-        ("POST", "/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#),
-        ("POST", "/api/settings/undo", r#"{"entry":1}"#),
-    ] {
-        let (status, reply) = direct_route(&legacy, method, path, body);
-        assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
-    }
-
+fn settings_history_undo_and_reset_refuse_agents_and_bad_input() {
     let (root, context) = settings_fixture("settings undo bad input");
     let (status, body) = post(&context, "/api/settings/undo", json!({"entry": 1}));
     assert_eq!(status, 404, "{body}");

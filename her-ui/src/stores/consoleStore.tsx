@@ -422,7 +422,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       }
       await refreshLiveData();
     } catch {
-      // Legacy non-isolated runtimes do not expose /api/auth/status; load live data when bearer token exists.
+      // Load live data when a desktop bearer token is already available.
       if (readDesktopBearer()) {
         await refreshLiveData();
       }

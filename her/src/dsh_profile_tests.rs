@@ -555,7 +555,7 @@ fn guard179_admit_refuses_and_alerts_once_per_gap_and_clears_on_fix() {
     write_compliant(&context);
     assert_eq!(admit(&context), Ok(()));
     assert!(alerts(&context).is_empty());
-    let alert_file = context.runtime_root().unwrap().join("data").join(ALERT_FILE);
+    let alert_file = context.runtime_root().join("data").join(ALERT_FILE);
     edit_preset(&context, |text| text.replacen(PWSH_ON.0, PWSH_ON.1, 1));
     let error = admit(&context).unwrap_err();
     assert_eq!(error, format!("{REFUSAL_PREFIX}local-tools:preset1"));
@@ -586,7 +586,7 @@ fn guard179_a_refused_owner_notice_is_offered_again() {
     let (_root, context) = fixture("notice");
     force(&context);
     write_compliant(&context);
-    let alert_file = context.runtime_root().unwrap().join("data").join(ALERT_FILE);
+    let alert_file = context.runtime_root().join("data").join(ALERT_FILE);
     refuse_notices(&context, true);
     edit_preset(&context, |text| text.replacen(PWSH_ON.0, PWSH_ON.1, 1));
     assert!(admit(&context).is_err());
@@ -633,7 +633,7 @@ fn guard179_the_rpc_refuses_a_prompt_while_a_row_is_missing() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+    let rpc = crate::dsh::Rpc::connect(&context, &base).unwrap();
     let prompt = json!({"sessionId": "s", "mode": "queue", "content": []});
     let error = rpc.call("session/prompt", prompt.clone()).unwrap_err();
     assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("preset-bundle"), "{error}");
@@ -710,7 +710,7 @@ fn guard179_the_rpc_asks_the_guard_again_before_a_401_repeat() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let server = fake_401_breaking_the_preset(listener, home(&context).join(PRESET_FILE));
-        let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+        let rpc = crate::dsh::Rpc::connect(&context, &base).unwrap();
         let prompt = json!({"sessionId": "s", "mode": "queue", "content": []});
         let result = if bounded {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -737,7 +737,7 @@ fn guard179_the_rpc_guards_session_create_like_a_prompt() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let server = fake_401_breaking_the_preset(listener, home(&context).join(PRESET_FILE));
-        let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+        let rpc = crate::dsh::Rpc::connect(&context, &base).unwrap();
         let result = if bounded {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             rpc.call_with_cancellation("session/create", create.clone(), deadline, &|| false)
@@ -755,7 +755,7 @@ fn guard179_the_rpc_guards_session_create_like_a_prompt() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+    let rpc = crate::dsh::Rpc::connect(&context, &base).unwrap();
     let error = rpc.call("session/create", create.clone()).unwrap_err();
     assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("preset-bundle"), "{error}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -817,7 +817,7 @@ fn guard179_linked_profile_and_preset_files_are_refused() {
     let (_root, context) = fixture("linked");
     write_compliant(&context);
     for (index, relative) in [PROFILE_FILE, PRESET_FILE].into_iter().enumerate() {
-        let outside = context.runtime_root().unwrap().join(format!("outside-{index}.yml"));
+        let outside = context.runtime_root().join(format!("outside-{index}.yml"));
         let path = home(&context).join(relative);
         std::fs::copy(&path, &outside).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -831,7 +831,7 @@ fn guard179_linked_profile_and_preset_files_are_refused() {
 #[test]
 fn guard179_the_check_command_reports_ok_or_the_problems() {
     let (_root, context) = fixture("cli");
-    let root = context.runtime_root().unwrap().to_string_lossy().into_owned();
+    let root = context.runtime_root().to_string_lossy().into_owned();
     let args = |command: &str| vec![command.to_string(), "--runtime-root".to_string(), root.clone()];
     assert_eq!(run_cli(&args("check")), 1, "nothing is in place yet");
     write_compliant(&context);

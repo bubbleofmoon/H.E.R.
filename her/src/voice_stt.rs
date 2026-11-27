@@ -607,7 +607,7 @@ pub(crate) static NOTICE_CLOCK: Mutex<std::collections::BTreeMap<PathBuf, i64>> 
 /// clock.
 #[cfg(test)]
 fn tell_owner(context: &RuntimeContext, _cfg: &Value, text: &str, key: &str) -> bool {
-    let root = context.runtime_root().map(Path::to_path_buf).unwrap_or_default();
+    let root = context.runtime_root().to_path_buf();
     let now = NOTICE_CLOCK.lock().unwrap_or_else(|p| p.into_inner()).get(&root).copied().unwrap_or(0);
     let mut told = NOTICES.lock().unwrap_or_else(|p| p.into_inner());
     if told.iter().any(|(r, k, _, at)| *r == root && k == key && now - at < 60_000) {
@@ -621,7 +621,7 @@ fn tell_owner(context: &RuntimeContext, _cfg: &Value, text: &str, key: &str) -> 
 /// The outage notice goes out on a helper failure until one is admitted (`Health::told`), so a refused one is tried
 /// again on the next failure; the recovery notice goes out only for an outage the owner heard of.
 fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
-    let Some(root) = context.runtime_root().map(Path::to_path_buf) else { return };
+    let root = context.runtime_root().to_path_buf();
     let (was_down, was_told, down, told) = {
         let mut all = health().lock().unwrap_or_else(|p| p.into_inner());
         let state = all.entry(root.clone()).or_default();
@@ -691,7 +691,7 @@ pub(crate) async fn for_message(
     inbound_key: &str,
     message: &Value,
 ) -> Option<String> {
-    let root = context.runtime_root().filter(|_| context.is_isolated())?.to_path_buf();
+    let root = context.runtime_root().to_path_buf();
     let settings = Settings::from_config(cfg);
     if !settings.applies_to(key) {
         return None;

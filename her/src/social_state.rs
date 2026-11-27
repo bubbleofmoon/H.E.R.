@@ -22,10 +22,6 @@ pub(crate) const END_TURN: &str =
     "end this turn now: produce your final answer and make no further tool calls";
 pub(crate) const PENDING_REVOCATIONS: &str = "access-revocations-pending.json";
 
-pub(crate) const LEGACY_CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const LEGACY_MODE_PATH: &str = crate::legacy_path!("qq-bridge/state/mode.json");
-const LEGACY_ROLE_STATE_FILE: &str = crate::legacy_path!("qq-bridge/state/current-role.json");
-const LEGACY_SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
 const LIVE_RESTART_REASON: &str = "the live process serves the --live-groups list it was started with; the supervisor's watchdog restarts it with rollout.rustGroups on its next run (every two minutes), or run the watchdog task now (Schedule page, POST /api/tasks/watchdog/run)";
 const ADMIN_WAKE_QUEUE: usize = 20;
 
@@ -297,37 +293,8 @@ fn rand01() -> f64 {
     ((nanos ^ (nanos >> 17)) % 1_000_000) as f64 / 1_000_000.0
 }
 
-fn legacy_read_json(path: &str) -> Option<Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-}
-
-pub(crate) fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
-    if error.class().starts_with("temp/") {
-        format!("写临时文件失败：{error}")
-    } else {
-        format!("改名失败：{error}")
-    }
-}
-
-static LEGACY_JSON_WRITE_GATE: Mutex<()> = Mutex::new(());
-
-pub(crate) fn legacy_write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
-    let _gate = LEGACY_JSON_WRITE_GATE
-        .lock()
-        .map_err(|_| "JSON write gate is poisoned".to_string())?;
-    let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
-    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes())
-        .map_err(legacy_write_error)
-}
-
-pub(crate) fn config_write_error(context: &RuntimeContext, error: String) -> SocialError {
-    if context.is_isolated() {
-        SocialError::Unavailable("runtime config is unavailable".to_string())
-    } else {
-        SocialError::Storage(error)
-    }
+pub(crate) fn config_write_error() -> SocialError {
+    SocialError::Unavailable("runtime config is unavailable".to_string())
 }
 
 pub(crate) fn acquire_gate(context: &RuntimeContext) -> Result<Gate, SocialError> {
@@ -784,12 +751,6 @@ pub(crate) fn mode(context: &RuntimeContext) -> String {
 
 /// Active mode, failing explicitly when the selected runtime's `mode.json` is unreadable or invalid.
 pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialError> {
-    if !context.is_isolated() {
-        return Ok(legacy_read_json(LEGACY_MODE_PATH)
-            .and_then(|v| v.get("mode").and_then(Value::as_str).map(str::to_string))
-            .map(|s| normalize_mode(&s).map(str::to_string).unwrap_or(s))
-            .unwrap_or_else(|| "reserved2".to_string()));
-    }
     let text = context
         .read_optional_text(RuntimeArea::Data, "mode.json")
         .map_err(|_| SocialError::Storage("runtime mode is unavailable".to_string()))?;
@@ -832,45 +793,11 @@ pub(crate) fn set_mode_with(
     sync_dsh: bool,
     stopper: &dyn SessionStopper,
 ) -> Result<Value, SocialError> {
-    let Some(normalized) = normalize_mode(raw_mode.trim()) else {
+    if normalize_mode(raw_mode.trim()).is_none() {
         return Err(SocialError::BadInput(
             "无效的运行模式：mode 仅允许设为 chat、reserved、reserved2 或 closed-agent 之一（若传入 simulation 则等效于二代模式）"
                 .to_string(),
         ));
-    };
-    if !context.is_isolated() {
-        let existing = legacy_read_json(LEGACY_MODE_PATH).unwrap_or_else(|| json!({}));
-        let preset_str = match preset {
-            Some(v) => match v {
-                Value::Null => String::new(),
-                Value::Bool(b) => b.to_string(),
-                Value::Number(n) => n.to_string(),
-                Value::String(s) => s.clone(),
-                _ => String::new(),
-            },
-            None => existing
-                .get("closedAgentPreset")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        };
-        let next = json!({ "mode": normalized, "closedAgentPreset": preset_str });
-        legacy_write_json_atomic(LEGACY_MODE_PATH, &next).map_err(SocialError::Storage)?;
-        let dsh_synced = if sync_dsh {
-            write_legacy_mode_to_dsh(normalized).is_ok()
-        } else {
-            false
-        };
-        if sync_dsh && !dsh_synced {
-            crate::safe_println!("[console] 模式未能写穿 DSH，当前仅落本地配置；下轮 DSH 同步可能还原");
-        }
-        crate::safe_println!("[console] 模式已设置为 {normalized}");
-        return Ok(json!({
-            "ok": true,
-            "mode": normalized,
-            "closedAgentPreset": preset_str,
-            "dshSynced": dsh_synced,
-        }));
     }
     let _interaction_gate = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
     set_mode_isolated_locked(context, raw_mode, preset, sync_dsh, stopper)
@@ -984,34 +911,6 @@ pub(crate) fn set_mode_isolated_locked(
     }))
 }
 
-fn write_legacy_mode_to_dsh(mode_name: &str) -> Result<(), String> {
-    let cfg = legacy_read_json(LEGACY_CONFIG_PATH).unwrap_or_else(|| json!({}));
-    let base = cfg
-        .get("dsh")
-        .and_then(|d| d.get("baseUrl"))
-        .and_then(Value::as_str)
-        .unwrap_or("http://127.0.0.1:3080");
-    let rpc = crate::dsh::Rpc::connect(base)?;
-    let v = match rpc.call(
-        "settings.update",
-        json!({ "ns": "qq-mode", "patch": { "mode": mode_name } }),
-    ) {
-        Ok(v) => v,
-        Err(e) if e.contains("401") => {
-            std::thread::sleep(Duration::from_millis(120));
-            rpc.call(
-                "settings.update",
-                json!({ "ns": "qq-mode", "patch": { "mode": mode_name } }),
-            )?
-        }
-        Err(e) => return Err(e),
-    };
-    if v.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err("settings.update 返回 ok=false".to_string());
-    }
-    Ok(())
-}
-
 /// Apply a DSH mode read only if no console mode write raced the settings request.
 pub(crate) fn apply_dsh_mode(
     context: &RuntimeContext,
@@ -1098,9 +997,6 @@ fn default_role_state() -> Value {
 }
 
 pub(crate) fn role_state(context: &RuntimeContext) -> Result<Value, SocialError> {
-    if !context.is_isolated() {
-        return Ok(legacy_read_json(LEGACY_ROLE_STATE_FILE).unwrap_or_else(default_role_state));
-    }
     let Some(text) = context
         .read_optional_text(RuntimeArea::Data, "current-role.json")
         .map_err(|_| SocialError::Unavailable("runtime role state is unavailable".to_string()))?
@@ -1123,10 +1019,6 @@ pub(crate) fn write_role_state(
     role_mode: &str,
 ) -> Result<(), SocialError> {
     let value = json!({ "role": role, "mode": role_mode });
-    if !context.is_isolated() {
-        return legacy_write_json_atomic(LEGACY_ROLE_STATE_FILE, &value)
-            .map_err(SocialError::Storage);
-    }
     let text = serde_json::to_string_pretty(&value)
         .map_err(|e| SocialError::Storage(format!("序列化失败：{e}")))?;
     context
@@ -1560,31 +1452,6 @@ pub(crate) fn rearm_observation_sleep(
 }
 
 // ── Conversation lifecycle, wake bookkeeping & resets ────────────────────────────────────────────
-
-pub(crate) fn begin_legacy_wait_turn(
-    context: &RuntimeContext,
-    key: &str,
-) -> Result<(), SocialError> {
-    ConversationState::for_runtime(context)
-        .update(key, |conv| {
-            conv.set_field("waitTurnId", json!(crate::turn_ledger::mint_id("wait-")));
-            Ok(())
-        })
-        .map_err(SocialError::from_http)
-}
-
-pub(crate) fn set_legacy_wait_deadline(
-    context: &RuntimeContext,
-    key: &str,
-    deadline: i64,
-) -> Result<(), SocialError> {
-    ConversationState::for_runtime(context)
-        .update(key, |conv| {
-            conv.set_field("waitTurnDeadlineAt", json!(deadline));
-            Ok(())
-        })
-        .map_err(SocialError::from_http)
-}
 
 pub(crate) fn record_reserved2_incoming(
     context: &RuntimeContext,
@@ -2164,38 +2031,6 @@ pub(crate) fn reset_conversation_with(
     key: &str,
     stopper: &dyn SessionStopper,
 ) -> Result<Value, SocialError> {
-    if !context.is_isolated() {
-        let mut store = legacy_read_json(LEGACY_SESSIONS_FILE).unwrap_or_else(|| json!({}));
-        let sessions = store.get("sessions").cloned().unwrap_or_else(|| json!({}));
-        if key.is_empty() || sessions.get(key).is_none() {
-            return Err(SocialError::NotFound("会话不存在".to_string()));
-        }
-        let old_session = match sessions.get(key) {
-            None | Some(Value::Null) => String::new(),
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Number(n)) => n.to_string(),
-            Some(Value::Bool(b)) => b.to_string(),
-            Some(other) => other.to_string(),
-        };
-        if let Some(obj) = store.get_mut("sessions").and_then(Value::as_object_mut) {
-            obj.remove(key);
-        }
-        if let Some(obj) = store.get_mut("sessionPolicies").and_then(Value::as_object_mut) {
-            obj.remove(key);
-        }
-        legacy_write_json_atomic(LEGACY_SESSIONS_FILE, &store).map_err(SocialError::Storage)?;
-        ConversationState::for_runtime(&RuntimeContext::legacy())
-            .update_document(|doc| {
-                doc.remove_conversation(key);
-                Ok(())
-            })
-            .map_err(SocialError::from_http)?;
-        crate::safe_println!(
-            "[console] 已清理会话上下文 {key}（原会话 {old_session}；未触发 DSH 停止或归档）"
-        );
-        return Ok(json!({ "ok": true, "key": key, "archived": old_session }));
-    }
-
     let _interaction_gate = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
     let sessions_text = context
         .read_optional_text(RuntimeArea::Data, "sessions.json")
@@ -2980,9 +2815,6 @@ pub(crate) fn begin_access_change(
     after: &Value,
     why: &str,
 ) -> Result<Option<String>, SocialError> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     let mut pending = pending_revocations(context).map_err(SocialError::Unavailable)?;
     let id = crate::turn_ledger::mint_id("revoke-");
     pending.push(json!({
@@ -3052,25 +2884,21 @@ pub(crate) fn finish_access_change_with(
             hook(context.config_file());
         }
     }
-    let (revoked, mut failures) = if !context.is_isolated() {
-        (Vec::new(), Vec::new())
-    } else {
-        let current_mode = mode(context);
-        reconcile_policies(
-            context,
-            &ReconcileRequest {
-                before,
-                after,
-                mode: &current_mode,
-                why,
-                dsh_cfg: after,
-                entry: pending.as_deref(),
-                targets: &[],
-            },
-            tracker,
-            stopper,
-        )
-    };
+    let current_mode = mode(context);
+    let (revoked, mut failures) = reconcile_policies(
+        context,
+        &ReconcileRequest {
+            before,
+            after,
+            mode: &current_mode,
+            why,
+            dsh_cfg: after,
+            entry: pending.as_deref(),
+            targets: &[],
+        },
+        tracker,
+        stopper,
+    );
     if failures.is_empty() {
         if let Err(error) = forget_access_change(context, &pending) {
             failures.push(format!(
@@ -3087,9 +2915,6 @@ fn finish_pending_revocations_locked(
     tracker: &Arc<StopTracker>,
     stopper: &Arc<dyn SessionStopper>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
-    if !context.is_isolated() {
-        return Ok((Vec::new(), Vec::new()));
-    }
     let mut pending = pending_revocations(context)?;
     if pending.is_empty() && recorded_stops(context)?.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -3196,9 +3021,8 @@ pub(crate) fn finish_pending_revocations_with(
     tracker: &Arc<StopTracker>,
     stopper: &Arc<dyn SessionStopper>,
 ) -> Result<(Vec<String>, Vec<String>), SocialError> {
-    if !context.is_isolated()
-        || (pending_revocations(context).is_ok_and(|pending| pending.is_empty())
-            && recorded_stops(context).is_ok_and(|stops| stops.is_empty()))
+    if pending_revocations(context).is_ok_and(|pending| pending.is_empty())
+        && recorded_stops(context).is_ok_and(|stops| stops.is_empty())
     {
         return Ok((Vec::new(), Vec::new()));
     }

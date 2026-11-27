@@ -58,7 +58,7 @@ fn settings_get_reads_only_writable_settings_and_never_a_secret() {
     }
     // A writable setting still reads, alone and in the full list.
     assert_eq!(memory_tool_action(&context, "settings-get", &args("sendDelayMs")).unwrap()["value"], 321);
-    let all = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
+    let all = crate::mcp::call_tool("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
     assert!(all.contains("sendDelayMs = 321") && !all.contains("fixture-"), "{all}");
     // A refused write does not name the key either.
     let refused = crate::mcp::call_prepared("settings_set", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": "dsh.model", "value": "x"}), &context).to_string();
@@ -177,9 +177,9 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     surfaces.push(("auxiliary tool list".into(), Value::Array(crate::aux_mcp::tool_list()).to_string()));
 
     // The generated DSH MCP block: the server names and serve flags DSH can render into tool names.
-    let block = crate::dsh_mcp_config::render_block("/opt/her/her-cli", None);
+    let block = crate::dsh_mcp_config::render_block("/opt/her/her-cli", ("/opt/her/runtime", 3101));
     let named: Vec<&str> = block.lines().map(str::trim_start)
-        .filter(|line| line.starts_with("serverName:") || line.starts_with("- '--")).collect();
+        .filter(|line| line.starts_with("serverName:") || line.starts_with("- '--mcp-")).collect();
     assert_eq!(named.len(), 6, "three server names and three serve flags:\n{block}");
     surfaces.push(("MCP server names and serve flags".into(), named.join("\n")));
 
@@ -200,7 +200,7 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
         .unwrap_err();
     assert_eq!(image_error.0, 404, "{image_error:?}");
     surfaces.push(("self image error".into(), image_error.1));
-    let settings = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
+    let settings = crate::mcp::call_tool("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
     assert!(settings.contains("禁止在聊天中更改"), "{settings}");
     surfaces.push(("settings_get result".into(), settings));
     for setting in ["socialV2.send.burstEnabled", "dsh.model", "relay.credentials.0"] {

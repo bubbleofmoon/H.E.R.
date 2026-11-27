@@ -291,7 +291,7 @@ impl Hub {
             .context
             .dependency_url("dsh")
             .ok_or("runtime DSH dependency is unavailable")?;
-        crate::dsh::Rpc::connect_with_runtime(&self.context, base)
+        crate::dsh::Rpc::connect(&self.context, base)
     }
 
     fn refresh_owner(&self) {

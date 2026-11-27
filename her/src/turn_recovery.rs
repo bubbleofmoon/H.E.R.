@@ -268,7 +268,7 @@ pub async fn owner_command(
     raw: &str,
     replayed: bool,
 ) -> Result<bool, String> {
-    if !context.is_isolated() || ev.post_type != "message" || ev.message_type != "private" {
+    if ev.post_type != "message" || ev.message_type != "private" {
         return Ok(false);
     }
     let (plain, _, _) = crate::plain_text(&ev.message, ev.self_id.unwrap_or(0));
@@ -784,7 +784,7 @@ impl Pass<'_> {
         } else {
             let session = turn.attempts.last().map(|a| a.session_id.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| turn.session_id.clone());
             let rpc_ids: Vec<String> = turn.attempts.iter().map(|a| a.rpc_id.clone()).collect();
-            match dsh_base(self.context).and_then(|base| Rpc::connect_with_runtime(self.context, &base)) {
+            match dsh_base(self.context).and_then(|base| Rpc::connect(self.context, &base)) {
                 Ok(rpc) => {
                     let (probe, harvest) = crate::dsh::probe_prompt_harvest(&rpc, &session, &rpc_ids).await;
                     record_harvest(self.context, &turn.key, &session, &harvest);
@@ -828,7 +828,7 @@ impl Pass<'_> {
         tokio::spawn(async move {
             let session = turn.attempts.last().map(|a| a.session_id.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| turn.session_id.clone());
             let rpc_ids: Vec<String> = turn.attempts.iter().map(|a| a.rpc_id.clone()).collect();
-            let outcome = match dsh_base(&context).and_then(|base| Rpc::connect_with_runtime(&context, &base)) {
+            let outcome = match dsh_base(&context).and_then(|base| Rpc::connect(&context, &base)) {
                 Ok(rpc) => crate::dsh::wait_prompt_outcome(&rpc, &session, &rpc_ids, Duration::from_secs(wait_secs(&cfg)))
                     .await
                     .map(|(probe, harvest)| {
@@ -1091,7 +1091,7 @@ fn startup_turns(records: &[Value], cutoff: i64) -> HashSet<String> {
 /// Start the recovery task once per process. Only a selected runtime has the ledger.
 pub fn spawn(context: RuntimeContext) {
     static STARTED: OnceLock<()> = OnceLock::new();
-    if !context.is_isolated() || STARTED.set(()).is_err() {
+    if STARTED.set(()).is_err() {
         return;
     }
     // An unreadable ledger must not read as "nothing was open": the loop takes the startup set from the

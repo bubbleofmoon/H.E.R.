@@ -43,8 +43,7 @@ if not args.baseline:
     command.extend(['-DigestSupportRoot', str(Path(args.support).resolve())])
 (evidence / 'command.json').write_text(json.dumps(command), encoding='utf-8')
 try:
-    code = fixture.run(command, 'fixture', timeout=args.timeout,
-                       env=dict(os.environ, MEMORY_DB_PATH=str(root / 'digest-runtime/data/memory.db')))
+    code = fixture.run(command, 'fixture', timeout=args.timeout)
     assert code == 0, ('fixture exit', code, (evidence / 'fixture.stderr.log').read_text(encoding='utf-8'))
     principal = json.loads((root / 'task-principal.json').read_text(encoding='utf-8-sig'))
     assert principal['callerElevated'] == caller_elevated and principal['readBeforeTrigger'], principal

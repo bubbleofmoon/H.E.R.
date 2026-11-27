@@ -26,9 +26,6 @@ pub enum Engine {
 
 impl Engine {
     pub fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str, mode: &str) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Ok(Self::Dsh);
-        }
         if cfg.get("conversationEngines").is_some() {
             crate::config_tx::import_engine_choices(context)?;
         }

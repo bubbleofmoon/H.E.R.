@@ -4,9 +4,6 @@
 
 use serde_json::{Value, json};
 use crate::runtime::{RuntimeArea, RuntimeContext};
-use std::path::Path;
-
-pub const STICKER_FILE: &str = crate::legacy_path!("qq-bridge/state/stickers.json");
 
 fn now_ms() -> i64 {
     crate::parity_clock::now_ms() as i64
@@ -370,54 +367,10 @@ pub fn merge(existing: &[Value], fetched: &[Value], complete: bool) -> Vec<Value
 /// 读取本地表情库。返回 `Ok(None)` 表示文件不存在，`Err` 表示文件存在但读不动/读坏了。
 ///
 /// 这个区分是故意的：读坏了绝不能当成空库——否则下一次合并会把它覆盖成空。
-#[cfg(test)]
-mod legacy_load_scope {
-    use super::RuntimeContext;
-    use std::cell::RefCell;
-    use std::sync::Arc;
-
-    std::thread_local! {
-        static CONTEXTS: RefCell<Vec<Arc<RuntimeContext>>> = RefCell::new(Vec::new());
-    }
-
-    struct ScopeGuard;
-
-    impl Drop for ScopeGuard {
-        fn drop(&mut self) {
-            CONTEXTS.with(|contexts| {
-                let popped = contexts.borrow_mut().pop();
-                debug_assert!(popped.is_some(), "legacy load scope stack underflow");
-            });
-        }
-    }
-
-    pub(super) fn current() -> Option<Arc<RuntimeContext>> {
-        CONTEXTS.with(|contexts| contexts.borrow().last().cloned())
-    }
-
-    pub(super) fn with_context<T>(context: RuntimeContext, action: impl FnOnce() -> T) -> T {
-        CONTEXTS.with(|contexts| contexts.borrow_mut().push(Arc::new(context)));
-        let _scope = ScopeGuard;
-        action()
-    }
-}
-
-pub fn load() -> Result<Option<Vec<Value>>, String> {
-    #[cfg(test)]
-    if let Some(context) = legacy_load_scope::current() {
-        return load_for_runtime(context.as_ref());
-    }
-    load_for_runtime(&RuntimeContext::legacy())
-}
-
 pub fn load_for_runtime(context: &RuntimeContext) -> Result<Option<Vec<Value>>, String> {
-    let text = if context.is_isolated() {
-        context
-            .read_optional_text(RuntimeArea::Data, "stickers.json")
-            .map_err(|error| format!("读表情库失败：{error}"))?
-    } else {
-        read_legacy_sticker_text(Path::new(STICKER_FILE))?
-    };
+    let text = context
+        .read_optional_text(RuntimeArea::Data, "stickers.json")
+        .map_err(|error| format!("读表情库失败：{error}"))?;
     let Some(text) = text else {
         return Ok(None);
     };
@@ -431,18 +384,6 @@ fn parse_sticker_text(text: &str) -> Result<Vec<Value>, String> {
         Value::Array(a) => Ok(a),
         other => Err(format!("表情库结构异常（顶层是 {}）", if other.is_object() { "对象" } else { "非数组" })),
     }
-}
-
-fn read_legacy_sticker_text(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("读表情库失败：{error}")),
-    }
-}
-
-pub fn save(entries: &[Value]) -> Result<(), String> {
-    save_for_runtime(&RuntimeContext::legacy(), entries)
 }
 
 pub fn save_for_runtime(context: &RuntimeContext, entries: &[Value]) -> Result<(), String> {
@@ -461,17 +402,12 @@ pub enum StoreUpdate<T> {
 
 /// Read the freshest selected sticker array, apply an in-memory update, and persist it while
 /// holding the selected-root gate. The callback must remain synchronous and must not perform
-/// network or other external I/O. Legacy callers retain their original path and do not acquire
-/// an isolated-runtime gate.
+/// network or other external I/O.
 pub fn mutate_for_runtime<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut Vec<Value>) -> Result<StoreUpdate<T>, String>,
 ) -> Result<T, String> {
-    let _gate = if context.is_isolated() {
-        Some(acquire_sticker_mutation_gate(context)?)
-    } else {
-        None
-    };
+    let _gate = acquire_sticker_mutation_gate(context)?;
     let mut entries = load_for_runtime(context)?.unwrap_or_default();
     match update(&mut entries)? {
         StoreUpdate::Changed(result) => {
@@ -519,43 +455,22 @@ pub fn enabled(cfg: &Value) -> bool {
     crate::settings::STICKERS_ENABLED.switch(cfg)
 }
 
-/// 同步一次。返回 (拉到的条数, 合并后的条数)。
-pub fn sync(onebot: &crate::onebot::OneBot, cfg: &Value) -> Result<(usize, usize), String> {
-    sync_for_runtime(&RuntimeContext::legacy(), onebot, cfg)
-}
-
 /// Build the OneBot client from the selected runtime and synchronize its selected sticker store.
-/// Isolated callers must use this entry point so the HTTP endpoint can never be inherited from
-/// candidate config or silently fall back to the legacy local gateway. `sync` and
-/// `sync_for_runtime` remain available for compatibility with callers that already supply a
-/// client explicitly.
 pub fn sync_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
 ) -> Result<(usize, usize), String> {
-    let http_url = if context.is_isolated() {
-        context
-            .dependency_url("onebot")
-            .ok_or_else(|| "runtime OneBot dependency is unavailable".to_string())?
-            .to_string()
-    } else {
-        cfg.get("snowluma")
-            .and_then(|value| value.get("httpUrl"))
-            .and_then(Value::as_str)
-            .unwrap_or("http://127.0.0.1:3000")
-            .to_string()
-    };
+    let http_url = context
+        .dependency_url("onebot")
+        .ok_or_else(|| "runtime OneBot dependency is unavailable".to_string())?
+        .to_string();
     let token = cfg
         .get("snowluma")
         .and_then(|value| value.get("accessToken"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let onebot = if context.is_isolated() {
-        crate::onebot::OneBot::try_new_url(&http_url, token)?
-    } else {
-        crate::onebot::OneBot::new(&http_url, token)
-    };
+    let onebot = crate::onebot::OneBot::try_new_url(&http_url, token)?;
     sync_for_runtime(context, &onebot, cfg)
 }
 
@@ -639,7 +554,7 @@ mod tests {
         label: &str,
         endpoint: &str,
         token: &str,
-        legacy_http_url: &str,
+        decoy_http_url: &str,
     ) -> (StickerRuntimeRoot, RuntimeContext) {
         static NEXT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
@@ -654,7 +569,7 @@ mod tests {
         std::fs::create_dir_all(root.0.join("resources")).unwrap();
         let config = json!({
             "consoleToken": "fixture-console-token-abcdefghij",
-            "snowluma": { "httpUrl": legacy_http_url, "accessToken": token },
+            "snowluma": { "httpUrl": decoy_http_url, "accessToken": token },
             "socialV2": { "sticker": { "enabled": true, "maxListCount": 20 } }
         });
         std::fs::write(
@@ -676,49 +591,6 @@ mod tests {
         .unwrap();
         let context = RuntimeContext::from_root(&root.0).expect("synthetic sticker runtime");
         (root, context)
-    }
-
-    #[test]
-    fn legacy_load_wrapper_reads_only_scoped_selected_root_and_preserves_both_files() {
-        let (root_a, context_a) = sticker_runtime_root(
-            "legacy load selected A 中文 space",
-            "http://127.0.0.1:49111",
-            "legacy-load-a-fixture-token",
-            "http://127.0.0.1:1",
-        );
-        let (root_b, context_b) = sticker_runtime_root(
-            "legacy load decoy B 中文 space",
-            "http://127.0.0.1:49112",
-            "legacy-load-b-fixture-token",
-            "http://127.0.0.1:1",
-        );
-        let path_a = root_a.0.join("data/stickers.json");
-        let path_b = root_b.0.join("data/stickers.json");
-        let entries_a = vec![entry("selected-a", 3, "A local note")];
-        let bytes_a = serde_json::to_vec(&entries_a).unwrap();
-        let bytes_b_invalid = b"{ decoy B must not be read by A }";
-        std::fs::write(&path_a, &bytes_a).unwrap();
-        std::fs::write(&path_b, bytes_b_invalid).unwrap();
-
-        let loaded_a = super::legacy_load_scope::with_context(context_a, load)
-            .expect("selected A should load despite malformed decoy B")
-            .expect("selected A exists");
-        assert_eq!(loaded_a, entries_a);
-        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a);
-        assert_eq!(std::fs::read(&path_b).unwrap(), bytes_b_invalid);
-
-        let bytes_a_invalid = b"{ decoy A must not be read by B }";
-        let entries_b = vec![entry("selected-b", 9, "B local note")];
-        let bytes_b = serde_json::to_vec(&entries_b).unwrap();
-        std::fs::write(&path_a, bytes_a_invalid).unwrap();
-        std::fs::write(&path_b, &bytes_b).unwrap();
-
-        let loaded_b = super::legacy_load_scope::with_context(context_b, load)
-            .expect("selected B should load despite malformed decoy A")
-            .expect("selected B exists");
-        assert_eq!(loaded_b, entries_b);
-        assert_eq!(std::fs::read(&path_a).unwrap(), bytes_a_invalid);
-        assert_eq!(std::fs::read(&path_b).unwrap(), bytes_b);
     }
 
     struct FakeOnebot {
@@ -1174,23 +1046,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sticker_loader_contract_is_testable_without_touching_production_files() {
-        let path = crate::install_root::development_root(std::env::temp_dir().join(format!(
-            "her-sticker-legacy-fixture-{}-{}",
-            std::process::id(),
-            now_ms()
-        )));
-        assert_eq!(read_legacy_sticker_text(&path).unwrap(), None);
-        std::fs::write(&path, r#"[{"id":"fixture-sticker"}]"#).unwrap();
-        let source = read_legacy_sticker_text(&path).unwrap().unwrap();
-        assert_eq!(parse_sticker_text(&source).unwrap()[0]["id"], "fixture-sticker");
-        std::fs::write(&path, "not-json").unwrap();
-        let corrupt = read_legacy_sticker_text(&path).unwrap().unwrap();
-        assert!(parse_sticker_text(&corrupt).unwrap_err().contains("JSON 损坏"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn normalize_requires_id() {
         assert!(normalize(&json!({"url":"x"})).is_none());
         let n = normalize(&json!({"emoji_id":"e1","md5":"ab"})).unwrap();
@@ -1339,25 +1194,23 @@ mod tests {
             "http://127.0.0.1:1",
         );
         let path = root.0.join("data/stickers.json");
-        super::legacy_load_scope::with_context(context, || {
-            assert_eq!(load().unwrap(), None, "a missing store is distinct from an empty one");
-            std::fs::write(&path, b"[]").unwrap();
-            assert_eq!(load().unwrap(), Some(vec![]));
+        assert_eq!(load_for_runtime(&context).unwrap(), None, "a missing store is distinct from an empty one");
+        std::fs::write(&path, b"[]").unwrap();
+        assert_eq!(load_for_runtime(&context).unwrap(), Some(vec![]));
 
-            let entries = vec![entry("fixture", 2, "preserve local note")];
-            let valid = serde_json::to_vec(&entries).unwrap();
-            std::fs::write(&path, &valid).unwrap();
-            assert_eq!(load().unwrap(), Some(entries));
-            assert_eq!(std::fs::read(&path).unwrap(), valid);
+        let entries = vec![entry("fixture", 2, "preserve local note")];
+        let valid = serde_json::to_vec(&entries).unwrap();
+        std::fs::write(&path, &valid).unwrap();
+        assert_eq!(load_for_runtime(&context).unwrap(), Some(entries));
+        assert_eq!(std::fs::read(&path).unwrap(), valid);
 
-            for (bytes, error) in [
-                (b"not-json".as_slice(), "JSON 损坏"),
-                (b"{}".as_slice(), "结构异常"),
-            ] {
-                std::fs::write(&path, bytes).unwrap();
-                assert!(load().unwrap_err().contains(error));
-                assert_eq!(std::fs::read(&path).unwrap(), bytes, "a broken store is never overwritten");
-            }
-        });
+        for (bytes, error) in [
+            (b"not-json".as_slice(), "JSON 损坏"),
+            (b"{}".as_slice(), "结构异常"),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(load_for_runtime(&context).unwrap_err().contains(error));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "a broken store is never overwritten");
+        }
     }
 }

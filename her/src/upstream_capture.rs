@@ -149,7 +149,7 @@ fn offer_at(
     request: impl FnOnce() -> Value,
     persist: Persist,
 ) -> Option<std::thread::JoinHandle<bool>> {
-    if !context.is_isolated() || !matches!(present(context, ARMED_FILE), Ok(true)) {
+    if !matches!(present(context, ARMED_FILE), Ok(true)) {
         return None;
     }
     let key = context.data_dir().to_path_buf();

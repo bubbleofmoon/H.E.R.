@@ -20,4 +20,4 @@ The repository keeps only what the Rust bridge, its build, tests, CI and agent w
 
 Keep files used by the Rust runtime, build, tests, CI or agent workflow. The `her-memory/` library and benchmark runner follow the same source retention rules as the bridge. Memory databases, production data and the production install stay protected.
 
-Active launchers stay until #12/#20 replace them, and DSH support stays until #78 retires it (ADR 0006).
+Active launchers stay until #12/#20 replace them, and DSH support stays until #13 retires it (ADR 0006).

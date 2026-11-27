@@ -24,7 +24,8 @@ fn yaml_single_quote(text: &str) -> String {
 }
 
 /// The managed block for `exe` (LF line endings, ends with a newline).
-pub fn render_block(exe: &str, runtime: Option<(&str, u16)>) -> String {
+pub fn render_block(exe: &str, runtime: (&str, u16)) -> String {
+    let (root, port) = runtime;
     let mut out = format!("{BEGIN}\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n");
     for (id, server_name, arg, timeout) in SERVERS {
         out.push_str("- insert:\n");
@@ -36,10 +37,8 @@ pub fn render_block(exe: &str, runtime: Option<(&str, u16)>) -> String {
         out.push_str(&format!("        command: {}\n", yaml_single_quote(exe)));
         out.push_str("        args:\n");
         out.push_str(&format!("          - {}\n", yaml_single_quote(arg)));
-        if let Some((root, port)) = runtime {
-            for argument in ["--runtime-root", root, "--console-port", &port.to_string()] {
-                out.push_str(&format!("          - {}\n", yaml_single_quote(argument)));
-            }
+        for argument in ["--runtime-root", root, "--console-port", &port.to_string()] {
+            out.push_str(&format!("          - {}\n", yaml_single_quote(argument)));
         }
         if let Some(ms) = timeout {
             // qq_wait_for_messages may wait ten minutes; DSH's default 60 s would cut the call short.
@@ -59,10 +58,10 @@ fn managed_id_outside(line: &str) -> bool {
 }
 
 /// The patch file text after installing the block for `exe` into `existing`.
-pub fn apply(existing: &str, exe: &str, runtime: Option<(&str, u16)>) -> Result<String, String> {
+pub fn apply(existing: &str, exe: &str, runtime: (&str, u16)) -> Result<String, String> {
     let exe = crate::subprocess::external_path(exe)?;
-    let root = runtime.map(|(root, _)| crate::subprocess::external_path(root)).transpose()?;
-    let runtime = runtime.map(|(_, port)| (root.as_deref().unwrap(), port));
+    let root = crate::subprocess::external_path(runtime.0)?;
+    let runtime = (root.as_str(), runtime.1);
     let text = existing.strip_prefix('\u{feff}').unwrap_or(existing);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let marker = |line: &str, which: &str| line.trim_end_matches(['\r', '\n']) == which;
@@ -129,7 +128,7 @@ fn backup(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `her dsh-mcp-config --patch-file <file> [--bridge-exe <path>] [--runtime-root <absolute root> --console-port <port>] [--check]`. Exit 0: installed / unchanged
+/// `her dsh-mcp-config --patch-file <file> [--bridge-exe <path>] --runtime-root <absolute root> --console-port <port> [--check]`. Exit 0: installed / unchanged
 /// (`--check`: already current); 1: `--check` and the file differs; 2: refused or failed.
 pub fn run_cli(args: &[String]) -> i32 {
     let mut patch_file: Option<&str> = None;
@@ -162,28 +161,36 @@ pub fn run_cli(args: &[String]) -> i32 {
                 i += 1;
             }
             other => {
-                eprintln!("dsh-mcp-config: unsupported argument {other:?}; usage: dsh-mcp-config --patch-file <cordis.patch.yml> [--bridge-exe <path>] [--runtime-root <absolute root> --console-port <port>] [--check]");
+                eprintln!("dsh-mcp-config: unsupported argument {other:?}; usage: dsh-mcp-config --patch-file <cordis.patch.yml> [--bridge-exe <path>] --runtime-root <absolute root> --console-port <port> [--check]");
                 return 2;
             }
         }
         i += 1;
     }
+    let Some(patch_file) = patch_file else {
+        eprintln!("dsh-mcp-config: --patch-file is required");
+        return 2;
+    };
+    let file = Path::new(patch_file);
+    if let Err(error) = crate::install_root::check_development_path(file) {
+        eprintln!("dsh-mcp-config: {error}");
+        return 2;
+    }
     let runtime = match (runtime_root, console_port) {
-        (None, None) => None,
         (Some(root), Some(port))
             if Path::new(root).is_absolute() && !root.contains(['\r', '\n']) =>
         {
-            Some((root, port))
+            (root, port)
         }
         _ => {
             eprintln!("dsh-mcp-config: runtime selection requires an absolute --runtime-root and a non-zero --console-port together");
             return 2;
         }
     };
-    let Some(patch_file) = patch_file else {
-        eprintln!("dsh-mcp-config: --patch-file is required");
+    if let Err(error) = crate::install_root::check_development_path(Path::new(runtime.0)) {
+        eprintln!("dsh-mcp-config: {error}");
         return 2;
-    };
+    }
     let exe = match exe.or_else(|| std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned())) {
         Some(exe) if !exe.trim().is_empty() => exe,
         _ => {
@@ -191,17 +198,6 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let file = Path::new(patch_file);
-    let guard = || -> Result<(), String> {
-        crate::install_root::check_development_path(file)?;
-        if let Some((root, _)) = runtime {
-            crate::install_root::check_development_path(Path::new(root))?;
-        }
-        Ok(())
-    };
-    if let Err(error) = guard() {
-        eprintln!("dsh-mcp-config: {error}"); return 2;
-    }
     let existing = match std::fs::read(file) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => Some(text),

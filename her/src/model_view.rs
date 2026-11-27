@@ -66,7 +66,7 @@ std::thread_local! {
 #[cfg(test)]
 fn forget_process_states(context: &crate::runtime::RuntimeContext) {
     if let Some(states) = PROCESS_STATES.get() {
-        states.lock().unwrap_or_else(|p| p.into_inner()).remove(context.runtime_root().unwrap());
+        states.lock().unwrap_or_else(|p| p.into_inner()).remove(context.runtime_root());
     }
 }
 
@@ -110,15 +110,13 @@ fn process_state_transition(context: &crate::runtime::RuntimeContext, state: &'s
     let mut states = PROCESS_STATES
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock().unwrap_or_else(|p| p.into_inner());
-    let scope = context.runtime_root().unwrap().to_path_buf();
+    let scope = context.runtime_root().to_path_buf();
     states.insert(scope, state) != Some(state) && state != "ready"
 }
 
 /// A delivery-only overlay. Never save this value back to config.json.
 pub fn with_blacklist(context: &crate::runtime::RuntimeContext, cfg: &Value) -> Value {
     use std::collections::HashSet;
-    // The retired legacy layout has no selected config directory.
-    if !context.is_isolated() { return cfg.clone(); }
     let (state, file_items) = read_blacklist(context);
     // The process record is updated on every read, so a fallback never compares against a stale state.
     let process_warn = process_state_transition(context, state);

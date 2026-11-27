@@ -51,9 +51,9 @@ impl RecordIo for ContextIo {
     }
 }
 
-/// A context that has a run record: a selected (isolated) root.
-pub fn enabled(context: &RuntimeContext) -> bool {
-    context.is_isolated() && context.runtime_root().is_some()
+/// Every runtime context now selects a runtime root and records runs.
+pub fn enabled(_context: &RuntimeContext) -> bool {
+    true
 }
 
 fn writers() -> &'static Mutex<Vec<(PathBuf, Arc<RunRecordWriter>)>> {
@@ -71,7 +71,7 @@ pub fn writer(context: &RuntimeContext) -> Option<Arc<RunRecordWriter>> {
     if !enabled(context) {
         return None;
     }
-    let root = context.runtime_root()?.to_path_buf();
+    let root = context.runtime_root().to_path_buf();
     let mut all = writers().lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, w)) = all.iter().find(|(r, _)| *r == root) {
         return Some(w.clone());
@@ -93,7 +93,7 @@ pub fn bind_default(context: &RuntimeContext) {
     *default_context().lock().unwrap_or_else(|p| p.into_inner()) = Some(context.clone());
 }
 
-/// Record one event for `context`. Best effort: a missing record (legacy context) is a no-op, a failed write is printed.
+/// Record one event for `context`. Best effort: a failed write is printed.
 pub fn record(context: &RuntimeContext, trigger: Trigger, component: Component, event: &str, outcome: Outcome, reason: &str) {
     let Some(w) = writer(context) else { return };
     if let Err(error) = w.record(&RecordInput { run_id: None, trigger, component, event, outcome, reason }) {
@@ -166,13 +166,5 @@ mod tests {
         assert_eq!(page.records[0].event, "recovered", "newest first");
         assert!(!file.contains("SECRET-VALUE-1234") && !file.contains("secret\\\\place"), "credential and path must not be stored: {file}");
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn a_legacy_context_has_no_record_and_writes_nothing() {
-        let legacy = RuntimeContext::legacy();
-        assert!(!enabled(&legacy));
-        record(&legacy, Trigger::Startup, Component::Process, "x", Outcome::Ok, "x");
-        assert!(page(&legacy, &Query::default()).unwrap().records.is_empty());
     }
 }

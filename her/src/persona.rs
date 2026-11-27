@@ -631,7 +631,7 @@ pub(crate) fn failure_line(context: &RuntimeContext, key: &str) -> Option<String
 
 /// Companion modes (chat, reserved, reserved2) use personas; closed-agent keeps role cards.
 pub(crate) fn applies(context: &RuntimeContext) -> bool {
-    context.is_isolated() && crate::social_state::mode(context) != "closed-agent"
+    crate::social_state::mode(context) != "closed-agent"
 }
 
 /// `【人设】<name>\n<core>\n\n` for the conversation's persona (override, else default), or empty.

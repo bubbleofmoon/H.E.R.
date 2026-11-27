@@ -165,10 +165,8 @@ fn from_gateway(
     if !path.starts_with(home) {
         return None;
     }
-    if let Some(root) = context.runtime_root() {
-        if !path.starts_with(std::fs::canonicalize(root).ok()?) {
-            return None;
-        }
+    if !path.starts_with(std::fs::canonicalize(context.runtime_root()).ok()?) {
+        return None;
     }
     accepted(read_image_path(&path, limits.bytes).ok()?, limits)
 }

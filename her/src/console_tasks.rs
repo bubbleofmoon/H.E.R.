@@ -363,19 +363,29 @@ mod tests {
         api: TasksApi,
         held: Arc<Held>,
         dir: std::path::PathBuf,
+        context: crate::runtime::RuntimeContext,
     }
 
     impl Fixture {
         fn new(name: &str) -> Self {
             let dir = crate::install_root::development_root(std::env::temp_dir().join(format!("her-console-tasks-{name}-{}-{}", std::process::id(), crate::parity_clock::now_ms())));
-            std::fs::create_dir_all(&dir).unwrap();
+            for sub in ["config", "data", "resources", "user/dsh", "tasks", "lifecycle"] {
+                std::fs::create_dir_all(dir.join(sub)).unwrap();
+            }
+            std::fs::write(dir.join("config/config.json"), "{}").unwrap();
+            std::fs::write(
+                dir.join("dependencies.json"),
+                r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+            )
+            .unwrap();
+            let context = crate::runtime::RuntimeContext::from_root(&dir).unwrap();
             let clock = Arc::new(ManualClock::new(1_793_289_600_000));
             let store = Arc::new(TaskStore::open(dir.join("tasks"), StoreLimits::default(), credential_redactor(vec![])).unwrap());
             let held = Arc::new(Held { open: Mutex::new(false), cv: Condvar::new() });
             let dispatcher = Dispatcher::new(store, Arc::new(HeldExecutor(held.clone())), clock.clone());
             let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.enabled_by_default, crate::local_time::beijing_tariff_zone(), clock.now_ms())));
             let api = TasksApi { dispatcher, scheduler, desired: DesiredStore::new(dir.join("lifecycle")) };
-            Self { api, held, dir }
+            Self { api, held, dir, context }
         }
 
         fn release(&self) {
@@ -385,8 +395,7 @@ mod tests {
 
         fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: &str) -> (u16, Value) {
             let query: HashMap<String, String> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            let context = crate::runtime::RuntimeContext::legacy();
-            let response = route(crate::console_front::AdminCaller::new(&context), &self.api, &TaskRequest { method, path, query: &query, body }).expect("a task route");
+            let response = route(crate::console_front::AdminCaller::new(&self.context), &self.api, &TaskRequest { method, path, query: &query, body }).expect("a task route");
             assert_eq!(response.content_type, JSON_TYPE);
             (response.status, serde_json::from_str(&response.body).unwrap())
         }
@@ -419,9 +428,8 @@ mod tests {
     fn non_task_paths_are_left_to_the_console() {
         let f = Fixture::new("passthrough");
         let query = HashMap::new();
-        let context = crate::runtime::RuntimeContext::legacy();
         for path in ["/api/status", "/api/tasksx", "/task", "/"] {
-            assert!(route(crate::console_front::AdminCaller::new(&context), &f.api, &TaskRequest { method: "GET", path, query: &query, body: "" }).is_none(), "{path}");
+            assert!(route(crate::console_front::AdminCaller::new(&f.context), &f.api, &TaskRequest { method: "GET", path, query: &query, body: "" }).is_none(), "{path}");
         }
     }
 

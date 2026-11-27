@@ -20,7 +20,6 @@ pub(crate) enum KeyPreflight {
     SessionKeyDeferAgentHeader,
     SessionKeyDeferMemoryAgent,
     SessionKeyDeferAlways,
-    SessionKeyDeferIsolated,
     SessionKeyOrClosedOwnerReset,
 }
 
@@ -504,12 +503,12 @@ const EXACT_ROUTES: &[(&str, &str, RoutePolicy)] = &[
     (
         "POST",
         "/api/socialV2/wake",
-        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferIsolated),
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAlways),
     ),
     (
         "POST",
         "/api/authorize/read",
-        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferIsolated),
+        RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAlways),
     ),
     // Remaining SessionKey routes.
     (
@@ -923,7 +922,7 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
     }) {
         return Some(RoutePolicy::console_or_agent(KeyPreflight::None));
     }
-    // Method-agnostic legacy/isolated agent-denial surfaces (closed in isolated HTTP allowlist).
+    // Method-agnostic agent-denial surfaces (closed in HTTP allowlist).
     if path == "/api/stickers" || path.starts_with("/api/stickers/") {
         return Some(
             RoutePolicy::console_or_agent(KeyPreflight::SessionKeyDeferAgentHeader)
@@ -969,9 +968,8 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
     None
 }
 
-pub(crate) fn supports_request(context: &RuntimeContext, method: &str, path: &str) -> bool {
-    !context.is_isolated()
-        || route_policy(method, path).is_some_and(|policy| policy.isolated_supported)
+pub(crate) fn supports_request(_context: &RuntimeContext, method: &str, path: &str) -> bool {
+    route_policy(method, path).is_some_and(|policy| policy.isolated_supported)
 }
 
 pub(crate) fn is_bounded_json_request(method: &str, path: &str) -> bool {
@@ -1138,13 +1136,6 @@ pub(super) enum BrowserCookie {
         port: u16,
         digest: [u8; 32],
     },
-    LegacyPage {
-        port: u16,
-        mac: [u8; 32],
-    },
-    LegacyPageDelete {
-        port: u16,
-    },
 }
 
 impl BrowserCookie {
@@ -1161,13 +1152,6 @@ impl BrowserCookie {
                 "her_browser_{port}_{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
                 URL_SAFE_NO_PAD.encode(digest)
             ),
-            Self::LegacyPage { port, mac } => format!(
-                "her_legacy_{port}={}; HttpOnly; SameSite=Strict; Path=/",
-                URL_SAFE_NO_PAD.encode(mac)
-            ),
-            Self::LegacyPageDelete { port } => {
-                format!("her_legacy_{port}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
-            }
         }
     }
 }
@@ -1641,7 +1625,7 @@ fn auth_status_route(
         .get("consoleToken")
         .and_then(Value::as_str)
         .is_some_and(|token| !token.trim().is_empty());
-    let token_file = if configured_token || !context.is_isolated() {
+    let token_file = if configured_token {
         "config/config.json"
     } else {
         "data/console-token"
@@ -1960,7 +1944,7 @@ fn handle_auth_route(
     port: u16,
     admission: &FrontAdmission,
 ) -> Option<ConsoleResponse> {
-    if !context.is_isolated() || !req.path.starts_with("/api/auth/") {
+    if !req.path.starts_with("/api/auth/") {
         return None;
     }
     let err = |status: u16, message: &str| {
@@ -2024,12 +2008,6 @@ fn desktop_sign_in(
     }
     if req.method != "POST" {
         return reply(405, json!({"ok":false,"error":"method not allowed"}));
-    }
-    if !context.is_isolated() {
-        return reply(
-            403,
-            json!({"ok":false,"error":"desktop sign-in requires a selected runtime"}),
-        );
     }
     if let Err((status, error)) = crate::console_auth::ensure_credentials_ready(context) {
         return reply(status, json!({"ok":false,"error":error}));
@@ -2100,7 +2078,6 @@ pub(crate) fn enforce_key_preflight(
         KeyPreflight::SessionKeyDeferAgentHeader => has_agent_header,
         KeyPreflight::SessionKeyDeferMemoryAgent => memory_agent_call(req),
         KeyPreflight::SessionKeyDeferAlways => true,
-        KeyPreflight::SessionKeyDeferIsolated => context.is_isolated(),
     };
     if defer {
         return None;
@@ -2113,7 +2090,6 @@ pub(crate) fn enforce_key_preflight(
     if has_credential {
         if let Some(key) = request_session_key(req) {
             let closed_owner_reset = preflight == KeyPreflight::SessionKeyOrClosedOwnerReset
-                && context.is_isolated()
                 && crate::social_state::mode(context) == "closed-agent"
                 && crate::chat::is_owner_key(cfg, &key);
             if !crate::social_state::key_in_allowlist(cfg, &key) && !closed_owner_reset {
@@ -2231,68 +2207,13 @@ fn ui_asset_response(asset: &'static crate::console_ui::EmbeddedAsset) -> Consol
     response
 }
 
-fn legacy_page_cookie_mac(expected_token: &str, port: u16) -> Option<[u8; 32]> {
-    if expected_token.is_empty() {
-        return None;
-    }
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"her-legacy-ui:");
-    hasher.update(port.to_le_bytes());
-    hasher.update(b":");
-    hasher.update(expected_token.as_bytes());
-    Some(hasher.finalize().into())
-}
-
-fn legacy_page_cookie_matches(req: &Request, expected_token: &str, port: u16) -> bool {
-    let Some(mac) = legacy_page_cookie_mac(expected_token, port) else {
-        return false;
-    };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let expected = URL_SAFE_NO_PAD.encode(mac);
-    let name = format!("her_legacy_{port}");
-    req.headers.get("cookie").is_some_and(|raw| {
-        raw.split(';').any(|pair| {
-            let Some((k, v)) = pair.trim().split_once('=') else {
-                return false;
-            };
-            k.trim() == name && credential_eq(&expected, v.trim())
-        })
-    })
-}
-
-fn percent_encode_query_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(*byte as char);
-        } else {
-            out.push_str(&format!("%{:02X}", byte));
-        }
-    }
-    out
-}
-
-fn ui_page_response(
-    req: &Request,
-    renewal: Option<BrowserCookie>,
-    preserve_token: bool,
-) -> Option<ConsoleResponse> {
+fn ui_page_response(req: &Request, renewal: Option<BrowserCookie>) -> Option<ConsoleResponse> {
     if req.method != "GET" {
         return None;
     }
     if let Some(target) = crate::console_ui::legacy_redirect(&req.path) {
-        let redirect_target = if preserve_token {
-            if let Some(tok) = req.query.get("token") {
-                format!("{target}?token={}", percent_encode_query_value(tok))
-            } else {
-                target.to_string()
-            }
-        } else {
-            target.to_string()
-        };
         let mut response = ConsoleResponse::from((302, String::new(), String::new()));
-        response.redirect = Some(ConsoleRedirect::Path(redirect_target));
+        response.redirect = Some(ConsoleRedirect::Path(target.to_string()));
         response.cookies = renewal.into_iter().collect();
         return Some(response);
     }
@@ -2374,9 +2295,7 @@ pub(crate) fn handle_http_request(
     };
     let mut admitted_context = context.clone().with_console_port(port);
     let public = is_public_probe(&req.method, &req.path);
-    if !public
-        && (context.is_isolated() || (req.method == "GET" && req.path.starts_with("/assets/")))
-    {
+    if !public {
         if let Some((status, value)) = host_denial(req, port) {
             return json_reply(status, value);
         }
@@ -2397,7 +2316,7 @@ pub(crate) fn handle_http_request(
             None => json_reply(404, json!({"ok": false, "error": "not found"})),
         };
     }
-    if context.is_isolated() && !public {
+    if !public {
         let mut isolated_admission = match admit_selected_request(req, context, port) {
             Ok(admission) => admission,
             Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
@@ -2461,7 +2380,7 @@ pub(crate) fn handle_http_request(
                     json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
                 );
             }
-            if let Some(response) = ui_page_response(req, admission_state.renewal.take(), false) {
+            if let Some(response) = ui_page_response(req, admission_state.renewal.take()) {
                 return response;
             }
         }
@@ -2486,65 +2405,6 @@ pub(crate) fn handle_http_request(
             CallerKind::Unauthenticated
         }
     };
-    if admission.is_none() && crate::console_ui::is_ui_page_request(&req.method, &req.path) {
-        if agent_marker {
-            return json_reply(
-                403,
-                json!({
-                    "ok": false,
-                    "error": "console UI routes are restricted to administrators",
-                }),
-            );
-        }
-        let expected = console_token(cfg);
-        let explicit_token = presented_console_token(req).is_some();
-        let cookie_ok = !explicit_token && legacy_page_cookie_matches(req, &expected, port);
-        if !(matches!(kind, CallerKind::Administrator) || cookie_ok) {
-            return json_reply(
-                401,
-                json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
-            );
-        }
-        let session_cookie = if matches!(kind, CallerKind::Administrator) {
-            legacy_page_cookie_mac(&expected, port)
-                .map(|mac| BrowserCookie::LegacyPage { port, mac })
-        } else {
-            None
-        };
-        if let Some(response) = ui_page_response(req, session_cookie, explicit_token) {
-            return response;
-        }
-    }
-    if admission.is_none() && req.method == "POST" && req.path == "/api/auth/logout" {
-        if agent_marker {
-            return json_reply(
-                403,
-                json!({
-                    "ok": false,
-                    "error": "console UI routes are restricted to administrators",
-                }),
-            );
-        }
-        if let Some((status, err)) = cross_site_denial(req, port) {
-            return json_reply(status, err);
-        }
-        let expected = console_token(cfg);
-        let explicit_token = presented_console_token(req).is_some();
-        let cookie_ok = !explicit_token && legacy_page_cookie_matches(req, &expected, port);
-        if matches!(kind, CallerKind::Administrator) || cookie_ok {
-            let mut response = ConsoleResponse::from((
-                200,
-                "application/json; charset=utf-8".to_string(),
-                json!({"ok": true}).to_string(),
-            ));
-            response.cookies = vec![BrowserCookie::LegacyPageDelete { port }];
-            return response;
-        }
-        return json_reply(
-            401,
-            json!({"ok": false, "error": "未通过鉴权：缺少有效控制台访问令牌"}),
-        );
-    }
     let administrator = admitted_context.console_authority.is_some()
         && matches!(kind, CallerKind::Administrator)
         && !matches!(
@@ -2557,7 +2417,7 @@ pub(crate) fn handle_http_request(
     let audit = (req.method != "GET"
         && req.path.starts_with("/api/")
         && !crate::console::inspector::is_route(&req.path))
-        || (admitted_context.is_isolated() && task_log_read);
+        || task_log_read;
     let before = if audit && !task_log_read {
         match audit_snapshot(&admitted_context) {
             Ok(snapshot) => snapshot,
@@ -2639,14 +2499,12 @@ pub(crate) fn handle_http_request(
                 req.method,
                 req.path
             );
-            if audit_context.is_isolated() {
-                if let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&body) {
-                    reply.insert(
-                        "audit".into(),
-                        json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}),
-                    );
-                    body = Value::Object(reply).to_string();
-                }
+            if let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&body) {
+                reply.insert(
+                    "audit".into(),
+                    json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}),
+                );
+                body = Value::Object(reply).to_string();
             }
         }
     }
@@ -2776,13 +2634,6 @@ mod tests {
                 "isolated route unexpectedly allowed {method} {path}"
             );
         }
-        let legacy = RuntimeContext::legacy();
-        assert!(supports_request(
-            &legacy,
-            "GET",
-            "/api/socialV2/send-message"
-        ));
-        assert!(supports_request(&legacy, "POST", "/api/socialV2/send-poke"));
     }
 
     #[test]
@@ -2899,13 +2750,6 @@ mod tests {
                 "unexpectedly opened {method} {path}"
             );
         }
-        let legacy = RuntimeContext::legacy();
-        assert!(supports_request(&legacy, "POST", "/api/stickers/note"));
-        assert!(supports_request(
-            &legacy,
-            "POST",
-            "/api/socialV2/sticker-list"
-        ));
     }
 
     #[test]
@@ -3055,9 +2899,6 @@ mod tests {
                 "unexpectedly opened {method} {path}"
             );
         }
-        let legacy = RuntimeContext::legacy();
-        assert!(supports_request(&legacy, "POST", "/api/tokens/reset"));
-        assert!(supports_request(&legacy, "GET", "/api/pending"));
     }
 
     #[test]
@@ -3630,141 +3471,68 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ui_index_and_assets_carry_strict_csp() {
-        let port = 32123;
-        let cfg = json!({ "consoleToken": "legacy-test-token" });
-        let context = RuntimeContext::legacy();
-        for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
-            let mut query_req = make_page_req(&host, "/", &[]);
-            query_req.query.insert("token".into(), "legacy-test-token".into());
-            let index_res = handle_http_request(None, &query_req, &cfg, &context, port);
-            assert_eq!(index_res.status, 200, "{host}");
-            assert_eq!(index_res.csp, Some(crate::console_ui::STRICT_CSP));
-            assert!(index_res.raw_body.is_some());
-            assert_eq!(index_res.cookies.len(), 1);
-            let cookie_pair = index_res.cookies[0]
-                .header()
-                .split(';')
-                .next()
-                .unwrap()
-                .to_string();
+    fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
+        let (_root, context) = super::super::tests::fixture_runtime(
+            "stale legacy cookie rejected",
+            "fixture-front-token",
+        );
+        let port = 3999;
+        let canonical = crate::console_auth::canonical_host(port);
+        let cfg = context.load_config().unwrap();
+        let legacy_cookie = format!("her_legacy_{port}=stale-cookie-value");
 
-            let reload_res = handle_http_request(
+        let protected = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/settings",
+                &[("cookie", legacy_cookie.as_str())],
+            ),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(protected.status, 401);
+
+        let origin = format!("http://{canonical}");
+        let mut protected_post = make_page_req(
+            &canonical,
+            "/api/settings",
+            &[
+                ("origin", origin.as_str()),
+                ("content-type", "application/json"),
+                ("cookie", legacy_cookie.as_str()),
+            ],
+        );
+        protected_post.method = "POST".into();
+        let post_res = handle_http_request(None, &protected_post, &cfg, &context, port);
+        assert_eq!(post_res.status, 401);
+
+        let status_res = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/auth/status",
+                &[("cookie", legacy_cookie.as_str())],
+            ),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(status_res.status, 200);
+        let status_body: serde_json::Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(status_body["authenticated"], false);
+
+        for (probe, expected_status) in [("/api/health", 200), ("/favicon.ico", 204)] {
+            let ok = handle_http_request(
                 None,
-                &make_page_req(&host, "/conversations", &[("cookie", &cookie_pair)]),
+                &make_page_req(&canonical, probe, &[]),
                 &cfg,
                 &context,
                 port,
             );
-            assert_eq!(reload_res.status, 200, "{host}");
-            assert!(reload_res.raw_body.is_some());
-
-            let api_with_cookie_only = handle_http_request(
-                None,
-                &make_page_req(&host, "/api/settings", &[("cookie", &cookie_pair)]),
-                &cfg,
-                &context,
-                port,
-            );
-            assert_eq!(api_with_cookie_only.status, 401, "{host}");
-
-            let api_with_bearer = handle_http_request(
-                None,
-                &make_page_req(
-                    &host,
-                    "/api/settings",
-                    &[("x-console-token", "legacy-test-token")],
-                ),
-                &cfg,
-                &context,
-                port,
-            );
-            assert_ne!(api_with_bearer.status, 401, "{host}");
-
-            let mut tasks_redirect = make_page_req(&host, "/tasks", &[]);
-            tasks_redirect
-                .query
-                .insert("token".into(), "legacy-test-token".into());
-            let redirect_res = handle_http_request(None, &tasks_redirect, &cfg, &context, port);
-            assert_eq!(redirect_res.status, 302, "{host}");
-            assert!(matches!(
-                redirect_res.redirect,
-                Some(ConsoleRedirect::Path(ref p)) if p == "/schedule?token=legacy-test-token"
-            ));
-            assert_eq!(redirect_res.cookies.len(), 1);
-
-            for headers in [
-                vec![],
-                vec![("x-console-token", "wrong-token")],
-                vec![
-                    ("cookie", cookie_pair.as_str()),
-                    ("x-console-token", "wrong-token"),
-                ],
-            ] {
-                let unauth = handle_http_request(
-                    None,
-                    &make_page_req(&host, "/", &headers),
-                    &cfg,
-                    &context,
-                    port,
-                );
-                assert_eq!(unauth.status, 401, "{host}");
-            }
-
-            let mut logout_req = make_page_req(
-                &host,
-                "/api/auth/logout",
-                &[
-                    ("content-type", "application/json"),
-                    ("cookie", cookie_pair.as_str()),
-                ],
-            );
-            logout_req.method = "POST".into();
-            let logout_res = handle_http_request(None, &logout_req, &cfg, &context, port);
-            assert_eq!(logout_res.status, 200, "{host}");
-            assert_eq!(logout_res.cookies.len(), 1);
-            assert!(logout_res.cookies[0].header().contains("Max-Age=0"));
-
-            let mut logout_bad_tok = make_page_req(
-                &host,
-                "/api/auth/logout",
-                &[
-                    ("content-type", "application/json"),
-                    ("cookie", cookie_pair.as_str()),
-                    ("x-console-token", "wrong-token"),
-                ],
-            );
-            logout_bad_tok.method = "POST".into();
-            let logout_bad_res = handle_http_request(None, &logout_bad_tok, &cfg, &context, port);
-            assert_eq!(logout_bad_res.status, 401, "{host}");
+            assert_eq!(ok.status, expected_status, "{probe}: {}", ok.body);
         }
-
-        let agent_denied = handle_http_request(
-            None,
-            &make_page_req(&format!("127.0.0.1:{port}"), "/", &[("x-agent-token", "agent-token")]),
-            &cfg,
-            &context,
-            port,
-        );
-        assert_eq!(agent_denied.status, 403);
-
-        let bad_host_asset = handle_http_request(
-            None,
-            &make_page_req(&format!("evil.example:{port}"), "/assets/nonexistent.js", &[]),
-            &cfg,
-            &context,
-            port,
-        );
-        assert_eq!(bad_host_asset.status, 403);
-
-        let missing_asset = handle_http_request(
-            None,
-            &make_page_req(&format!("127.0.0.1:{port}"), "/assets/nonexistent.js", &[]),
-            &cfg,
-            &context,
-            port,
-        );
-        assert_eq!(missing_asset.status, 404);
     }
 
     #[test]

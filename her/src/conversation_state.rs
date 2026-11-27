@@ -10,12 +10,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub(crate) const FILE: &str = "social-v2.json";
 pub(crate) const RESERVED_FILE: &str = "social-v1.json";
-const LEGACY_FILE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 
 const CONVERSATIONS: &str = "conversations";
 const AGENT_TOKEN: &str = "agentToken";
@@ -31,8 +29,7 @@ pub(crate) const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
 /// 2. Per-request unique `locks/observation-wait-*.lock` (`WaitLease::live` in `console.rs`,
 ///    acquired before `WaitLease::publish` enters `update_document`; unique per wait generation
 ///    so no writer blocks on it, and `observation_wait_turn` only performs a non-blocking probe)
-/// 3. `SOCIAL_STATE_GATE` (`locks/social-v2.lock`, or [`LEGACY_GATE`] for non-isolated runtimes;
-///    mutually exclusive because `open_locked_file` refuses legacy contexts)
+/// 3. `SOCIAL_STATE_GATE` (`locks/social-v2.lock`)
 /// 4. Selected store/coordination locks and in-process leaf mutexes: `locks/authority.lock`,
 ///    `locks/settings-store.lock`, `locks/sessions.lock`, `locks/personas.lock`,
 ///    `locks/social-v1.lock`, `locks/schedule.lock`, `wait_leases()` (inspected only as a non-I/O
@@ -46,11 +43,6 @@ pub(crate) const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
 /// cleanup on reset). Nothing acquires an outer lock, sleeps, waits on channels, or performs
 /// network/gateway I/O while holding `SOCIAL_STATE_GATE`.
 pub(crate) const SOCIAL_STATE_GATE_WAIT: Duration = Duration::from_secs(5);
-/// In-process social gate for legacy (non-isolated) runtimes. Holds the exact same lock rank as
-/// [`SOCIAL_STATE_GATE`] (preceding leaf mutexes like `wait_leases()` and receipt stores, never
-/// combined with `SOCIAL_STATE_GATE` or outer locks, and performing only legacy file atomic
-/// replace under the mutex).
-static LEGACY_GATE: Mutex<()> = Mutex::new(());
 
 fn is_reserved_typed_field(name: &str) -> bool {
     matches!(name, AGENT_TOKEN | UNREAD | IMPRESSIONS | MODEL_SEEN_SEQS)
@@ -783,13 +775,7 @@ impl<'a> ConversationState<'a> {
 
     pub(crate) fn read_document(&self) -> Result<SocialDocument, Failure> {
         let value = read_console_document(self.context)?;
-        SocialDocument::from_value(value).or_else(|err| {
-            if self.context.is_isolated() {
-                Err(err)
-            } else {
-                Ok(SocialDocument::empty())
-            }
-        })
+        SocialDocument::from_value(value)
     }
 
     /// Read `social-v2.json` tolerantly, returning an empty `SocialDocument` when the file is absent.
@@ -848,7 +834,7 @@ impl<'a> ConversationState<'a> {
         key: &str,
         f: impl FnOnce(&mut Conversation) -> Result<T, Failure>,
     ) -> Result<Option<T>, Failure> {
-        let _gate = acquire_for_update(self.context)?;
+        let _gate = acquire(self.context)?;
         let value = read_console_document(self.context)?;
         let mut doc = SocialDocument::from_value(value)?;
         let Some(mut conv) = doc.conversation(key) else {
@@ -866,7 +852,7 @@ impl<'a> ConversationState<'a> {
         &self,
         f: impl FnOnce(&mut SocialDocument) -> Result<T, Failure>,
     ) -> Result<T, Failure> {
-        let _gate = acquire_for_update(self.context)?;
+        let _gate = acquire(self.context)?;
         let value = read_console_document(self.context)?;
         let mut doc = SocialDocument::from_value(value)?;
         let result = f(&mut doc)?;
@@ -880,7 +866,7 @@ impl<'a> ConversationState<'a> {
 // Token/generation helpers backed by ConversationState
 // ---------------------------------------------------------------------------
 
-/// Read the active token using the console's selected and legacy read policies.
+/// Read the active token using the console's read policy.
 pub(crate) fn read_agent_token(
     context: &RuntimeContext,
     key: &str,
@@ -1108,19 +1094,15 @@ pub(crate) fn update_reserved_document<T>(
 }
 
 // ---------------------------------------------------------------------------
-// Document I/O, startup validation, gate & legacy compatibility
+// Document I/O, startup validation, and gate
 // ---------------------------------------------------------------------------
 
 fn read_text(context: &RuntimeContext) -> Result<String, String> {
-    let bytes = if context.is_isolated() {
-        let path = context.resolve_path_detailed(RuntimeArea::Data, FILE, PathIntent::ReadFile)?;
-        if context.resolve_path_detailed(RuntimeArea::Data, FILE, PathIntent::ReadFile)? != path {
-            return Err("path changed class=leaf".into());
-        }
-        fs::read(path).map_err(|e| runtime_io_error("leaf/read", &e))?
-    } else {
-        fs::read(LEGACY_FILE).map_err(|e| runtime_io_error("leaf/read", &e))?
-    };
+    let path = context.resolve_path_detailed(RuntimeArea::Data, FILE, PathIntent::ReadFile)?;
+    if context.resolve_path_detailed(RuntimeArea::Data, FILE, PathIntent::ReadFile)? != path {
+        return Err("path changed class=leaf".into());
+    }
+    let bytes = fs::read(path).map_err(|e| runtime_io_error("leaf/read", &e))?;
     String::from_utf8(bytes).map_err(|_| "kind=InvalidData class=encoding".to_string())
 }
 
@@ -1165,23 +1147,11 @@ fn empty_document() -> Value {
     json!({ CONVERSATIONS: {} })
 }
 
-fn read_legacy_document() -> Value {
-    read_text(&RuntimeContext::legacy())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(empty_document)
-}
-
 pub(crate) fn read_console_document(context: &RuntimeContext) -> Result<Value, Failure> {
-    let mut state = if context.is_isolated() {
-        let state = read_document(context).map_err(|e| (500, format!("social-state/read: {e}")))?;
-        if !state.is_object() {
-            return Err((500, "runtime data is invalid".to_string()));
-        }
-        state
-    } else {
-        read_legacy_document()
-    };
+    let mut state = read_document(context).map_err(|e| (500, format!("social-state/read: {e}")))?;
+    if !state.is_object() {
+        return Err((500, "runtime data is invalid".to_string()));
+    }
     strip_receipts(&mut state);
     Ok(state)
 }
@@ -1195,14 +1165,6 @@ pub(crate) fn strip_receipts(state: &mut Value) {
     }
 }
 
-fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
-    if error.class().starts_with("temp/") {
-        format!("写临时文件失败：{error}")
-    } else {
-        format!("改名失败：{error}")
-    }
-}
-
 pub(crate) fn write_console_document(
     context: &RuntimeContext,
     state: &Value,
@@ -1210,23 +1172,12 @@ pub(crate) fn write_console_document(
     let mut state = state.clone();
     strip_receipts(&mut state);
     let text = serde_json::to_string_pretty(&state).map_err(|e| format!("序列化失败：{e}"))?;
-    if context.is_isolated() {
-        context.write_atomic(RuntimeArea::Data, FILE, text.as_bytes())
-    } else {
-        crate::guarded_file::write_atomic(Path::new(LEGACY_FILE), text.as_bytes())
-            .map_err(legacy_write_error)
-    }
+    context.write_atomic(RuntimeArea::Data, FILE, text.as_bytes())
 }
 
-enum Lock {
-    Selected { _file: File },
-    Legacy { _guard: MutexGuard<'static, ()> },
-}
-
-/// Social gate guard for one runtime root (`locks/social-v2.lock` in isolated runtimes, an
-/// in-process mutex in legacy mode).
+/// Social gate guard for one runtime root (`locks/social-v2.lock`).
 pub(crate) struct Gate {
-    _lock: Lock,
+    _file: File,
 }
 
 impl std::fmt::Debug for Gate {
@@ -1268,39 +1219,15 @@ fn acquire_social_state_lock(context: &RuntimeContext) -> Result<File, Failure> 
     Ok(file)
 }
 
-/// Acquire the selected runtime's social gate (`locks/social-v2.lock`). Fails closed on legacy
-/// contexts (matching `open_locked_file`).
+/// Acquire the selected runtime's social gate (`locks/social-v2.lock`).
 pub(crate) fn acquire(context: &RuntimeContext) -> Result<Gate, Failure> {
     let file = acquire_social_state_lock(context)?;
-    Ok(Gate {
-        _lock: Lock::Selected { _file: file },
-    })
+    Ok(Gate { _file: file })
 }
 
-/// Acquire the social gate when operating on an isolated runtime; returns `Ok(None)` in legacy mode.
+/// Acquire the social gate for the selected runtime.
 pub(crate) fn acquire_config_gate(context: &RuntimeContext) -> Result<Option<Gate>, Failure> {
-    if context.is_isolated() {
-        acquire(context).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
-fn acquire_legacy_gate() -> Gate {
-    let guard = LEGACY_GATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Gate {
-        _lock: Lock::Legacy { _guard: guard },
-    }
-}
-
-fn acquire_for_update(context: &RuntimeContext) -> Result<Gate, Failure> {
-    if context.is_isolated() {
-        acquire(context)
-    } else {
-        Ok(acquire_legacy_gate())
-    }
+    acquire(context).map(Some)
 }
 
 /// Raw document read-modify-write under the social gate for callers migrating remaining
@@ -1310,15 +1237,11 @@ pub(crate) fn update_raw<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut Value) -> Result<T, Failure>,
 ) -> Result<T, Failure> {
-    let _gate = acquire_for_update(context)?;
+    let _gate = acquire(context)?;
     let mut state = read_console_document(context)?;
     let result = update(&mut state)?;
-    let result_write = write_console_document(context, &state);
-    if context.is_isolated() {
-        result_write.map_err(|error| (500, format!("social-state/write: {error}")))?;
-    } else {
-        result_write.map_err(|error| (500, error))?;
-    }
+    write_console_document(context, &state)
+        .map_err(|error| (500, format!("social-state/write: {error}")))?;
     Ok(result)
 }
 
@@ -1327,9 +1250,6 @@ pub(crate) fn update_selected_raw<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut Value) -> Result<T, Failure>,
 ) -> Result<(Value, T), Failure> {
-    if !context.is_isolated() {
-        return Err((500, "selected runtime is required".to_string()));
-    }
     let _gate = acquire(context)?;
     let mut state = read_console_document(context)?;
     let result = update(&mut state)?;

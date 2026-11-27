@@ -77,9 +77,6 @@ pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value)
 /// is not configured or invalid gives `error` and no routes; `healthError` and `storeError` say why route health or
 /// stored values cannot be read. Route ids and models are shown with credentials redacted.
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, "settings require a selected runtime".to_string()));
-    }
     let cfg = context.load_config().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
     let shown = route_redactor(context);
     let mut reply = json!({"ok": true, "setting": CONVERSATION_ROUTE.key});

@@ -18,8 +18,6 @@ use serde_json::{json, Value};
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
-/// Rust-owned legacy ledger (same pattern as the send outbox).
-pub const LEGACY_LEDGER_FILE: &str = crate::legacy_path!("state/turn-ledger-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_LEDGER_FILE: &str = "turn-ledger.jsonl";
 
@@ -47,51 +45,21 @@ fn read_records_in(context: &RuntimeContext, wait: bool) -> Result<Vec<Value>, S
     #[cfg(test)]
     crate::runtime::append_io_test_hook("turn-read-all")
         .map_err(|error| format!("读取回合账本失败：{error}"))?;
-    let text = if context.is_isolated() {
-        let text = if wait {
-            context.read_optional_text_waiting(RuntimeArea::Data, ISOLATED_LEDGER_FILE)?
-        } else {
-            context
-                .read_optional_text(RuntimeArea::Data, ISOLATED_LEDGER_FILE)
-                .map_err(str::to_string)?
-        };
-        text.unwrap_or_default()
+    let text = if wait {
+        context.read_optional_text_waiting(RuntimeArea::Data, ISOLATED_LEDGER_FILE)?
     } else {
-        match std::fs::read_to_string(LEGACY_LEDGER_FILE) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(format!("读取回合账本失败：{error}")),
-        }
+        context
+            .read_optional_text(RuntimeArea::Data, ISOLATED_LEDGER_FILE)
+            .map_err(str::to_string)?
     };
+    let text = text.unwrap_or_default();
     crate::runtime::parse_evidence_jsonl(&text, ISOLATED_LEDGER_FILE, "回合账本行损坏")
 }
 
 /// The ledger's length in bytes (0 before it exists). A turn captures it before writing `begun`,
 /// so its end can fold only the records appended since then (`fold_turn_since`).
 pub fn ledger_len(context: &RuntimeContext) -> Result<u64, String> {
-    if context.is_isolated() {
-        return context.optional_file_len(RuntimeArea::Data, ISOLATED_LEDGER_FILE).map_err(str::to_string);
-    }
-    match std::fs::metadata(LEGACY_LEDGER_FILE) {
-        Ok(metadata) => Ok(metadata.len()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(format!("读取回合账本失败：{error}")),
-    }
-}
-
-fn read_legacy_tail(from: u64) -> std::io::Result<Option<(u64, Vec<u8>)>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(LEGACY_LEDGER_FILE) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let len = file.metadata()?.len();
-    let start = if len < from { 0 } else { from };
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(Some((start, bytes)))
+    context.optional_file_len(RuntimeArea::Data, ISOLATED_LEDGER_FILE).map_err(str::to_string)
 }
 
 /// The records appended at or after byte `offset`, parsed like `read_records`. The cost follows
@@ -114,11 +82,7 @@ fn read_records_since_until(
     let tail = crate::runtime::append_io(deadline, || {
         #[cfg(test)]
         crate::runtime::append_io_test_hook("turn-read")?;
-        if context.is_isolated() {
-            context.read_optional_tail_io(RuntimeArea::Data, ISOLATED_LEDGER_FILE, from)
-        } else {
-            read_legacy_tail(from)
-        }
+        context.read_optional_tail_io(RuntimeArea::Data, ISOLATED_LEDGER_FILE, from)
     })
     .map_err(|error| crate::runtime::runtime_io_error("turn/read", &error))?;
     let Some((start, bytes)) = tail else { return Ok(Vec::new()) };
@@ -170,13 +134,9 @@ fn append_record_inner(context: &RuntimeContext, record: &Value, retry: bool) ->
 fn append_record_until(context: &RuntimeContext, record: &Value, deadline: Option<std::time::Instant>) -> Result<(), String> {
     let durable = matches!(record.get("k").and_then(Value::as_str), Some("ended" | "pause_notified" | "resolution_notified"));
     let durable = durable || (record["k"] == "verified" && matches!(record["verdict"].as_str(), Some("completion-observed" | "completion-rejected" | "cancel-requested" | "cancellation-ready")));
-    if context.is_isolated() {
-        let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化回合账本失败：{e}"))?;
-        line.push(b'\n');
-        context.append_turn_ledger_bytes(&line, durable, deadline)
-    } else {
-        crate::ledger::append_turn_record_to(LEGACY_LEDGER_FILE, record, durable, deadline)
-    }
+    let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化回合账本失败：{e}"))?;
+    line.push(b'\n');
+    context.append_turn_ledger_bytes(&line, durable, deadline)
 }
 
 /// Record that the administrator reset a conversation. Work queued before the reset must not run
@@ -686,7 +646,6 @@ impl Recorder {
     /// Serialize completion observation, cancellation intent and terminal settlement. Never
     /// hold this gate across RPC, usage/tool recording or token publication.
     fn finalization_gate(&self) -> Result<Option<std::fs::File>, String> {
-        if !self.context.is_isolated() { return Ok(None); }
         let deadline = std::time::Instant::now() + crate::runtime::APPEND_CONFLICT_WAIT;
         loop {
             match self.context.open_locked_file(RuntimeArea::Data, "locks/turn-ledger-finalize.lock") {
