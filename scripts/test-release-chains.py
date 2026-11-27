@@ -1,7 +1,6 @@
 """Observe the MCP/curl/digest chains independently of supervisor startup readiness."""
 import argparse
 import json
-import os
 from pathlib import Path
 import shutil
 import socket

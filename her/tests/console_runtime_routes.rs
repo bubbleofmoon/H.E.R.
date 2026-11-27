@@ -5405,3 +5405,57 @@ fn local_browser_auto_sign_in_over_loopback_tcp() {
         drop(console);
     }
 }
+
+#[test]
+fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
+    let fixture = BrowserFixture::new("stale-legacy-cookie");
+    let canonical = format!("her.localhost:{}", fixture.port);
+    let legacy_cookie = format!("her_legacy_{}=stale-cookie-value", fixture.port);
+    let origin = format!("http://{canonical}");
+    let _console = fixture.start();
+
+    let (protected_get, _) = raw_browser_http(
+        fixture.port,
+        "GET",
+        "/api/settings",
+        &canonical,
+        &[("Cookie", &legacy_cookie), ("Sec-Fetch-Site", "same-origin")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(protected_get.status, 401, "{}", protected_get.body);
+
+    let (protected_post, _) = raw_browser_http(
+        fixture.port,
+        "POST",
+        "/api/settings",
+        &canonical,
+        &[
+            ("Origin", &origin),
+            ("Content-Type", "application/json"),
+            ("Cookie", &legacy_cookie),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
+        "{}",
+    )
+    .unwrap();
+    assert_eq!(protected_post.status, 401, "{}", protected_post.body);
+
+    let (status_res, _) = raw_browser_http(
+        fixture.port,
+        "GET",
+        "/api/auth/status",
+        &canonical,
+        &[("Cookie", &legacy_cookie), ("Sec-Fetch-Site", "same-origin")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(status_res.status, 200, "{}", status_res.body);
+    let parsed: Value = serde_json::from_str(&status_res.body).unwrap();
+    assert_eq!(parsed["authenticated"], json!(false));
+
+    for (probe, expected_status) in [("/api/health", 200), ("/favicon.ico", 204)] {
+        let (ok, _) = raw_browser_http(fixture.port, "GET", probe, &canonical, &[], "").unwrap();
+        assert_eq!(ok.status, expected_status, "{probe}: {}", ok.body);
+    }
+}
