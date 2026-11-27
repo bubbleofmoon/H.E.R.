@@ -1572,6 +1572,26 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
     max_confirmed_at: Option<i64>,
     max_live_wake_at: Option<i64>,
 ) -> Result<(), String> {
+    rearm_interrupted_reserved2_wake_for_token(
+        context,
+        cfg,
+        key,
+        wake_claim,
+        max_confirmed_at,
+        max_live_wake_at,
+        None,
+    )
+}
+
+pub(crate) fn rearm_interrupted_reserved2_wake_for_token(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    wake_claim: Option<&Value>,
+    max_confirmed_at: Option<i64>,
+    max_live_wake_at: Option<i64>,
+    expected_token: Option<&str>,
+) -> Result<(), String> {
     if !inbound_admitted(cfg, key)
         || mode_checked(context).map_err(String::from)? != "reserved2"
     {
@@ -1583,6 +1603,11 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             let Some(mut conv) = doc.conversation(key) else {
                 return Ok(());
             };
+            if let Some(expected) = expected_token {
+                if !credential_eq(conv.token().unwrap_or(""), expected) {
+                    return Ok(());
+                }
+            }
             let Some(mut wake) = conv.field("wakeConfig").cloned().filter(Value::is_object) else {
                 return Ok(());
             };

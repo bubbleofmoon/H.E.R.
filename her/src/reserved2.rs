@@ -41,23 +41,28 @@ fn rearm_dropped_provisional_sleep(
     let records = crate::turn_ledger::read_records(context)?;
     let (turns, _) = crate::turn_ledger::fold(&records);
     let fallback = json!({ "at": at, "previous": previous });
-    let claim = turns
-        .iter()
-        .rev()
-        .find(|t| t.key == key)
-        .and_then(|t| t.wake_claim.as_ref())
-        .filter(|c| {
-            c["previous"]["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                && c["previous"]["wakeConfig"]["sleepUntil"].is_string()
-        })
-        .unwrap_or(&fallback);
-    social_state::rearm_interrupted_reserved2_wake(
+    let mut found_claim = None;
+    for t in turns.iter().rev().filter(|t| t.key == key) {
+        let Some(claim) = t.wake_claim.as_ref() else {
+            continue;
+        };
+        if claim["previous"]["wakeConfig"]["confirmedAt"] != previous["wakeConfig"]["confirmedAt"] {
+            break;
+        }
+        if claim["previous"]["wakeConfig"]["sleepUntil"].is_string() {
+            found_claim = Some(claim);
+            break;
+        }
+    }
+    let claim = found_claim.unwrap_or(&fallback);
+    social_state::rearm_interrupted_reserved2_wake_for_token(
         context,
         cfg,
         key,
         Some(claim),
         None,
         Some(at),
+        Some(expected_token),
     )
 }
 
@@ -1559,6 +1564,176 @@ mod tests {
                 "live driver must adopt re-armed sleep_until after retry succeeds"
             );
         }).await.expect("the transient token read error fixture must settle");
+    }
+
+    #[test]
+    fn ticket297_deferred_rearm_skips_rotated_token_under_write_lock() {
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-lock-token-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let key = "group:1";
+        let old_token = "tok-old-297";
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    key: {
+                        "agentToken": old_token,
+                        "wakeConfig": {
+                            "mode": "diving",
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "triggers": {"atMention": true},
+                            "confirmedAt": 2,
+                            "lastWakeAt": 100,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let previous = json!({
+            "wakeConfig": {
+                "confirmedAt": 2,
+                "infinite": false,
+                "sleepUntil": null
+            }
+        });
+
+        let hook_ctx = context.clone();
+        let mut rotated = false;
+        let _clear = ClearHook;
+        crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "turn-read-all" && !rotated {
+                    rotated = true;
+                    social_state::ensure_or_rotate(&hook_ctx, key, true).unwrap();
+                }
+                Ok(())
+            }));
+        });
+
+        rearm_dropped_provisional_sleep(&context, &cfg, key, 100, &previous, old_token).unwrap();
+
+        let state = context.read_social_state().unwrap();
+        assert_ne!(
+            state["conversations"][key]["agentToken"].as_str(),
+            Some(old_token),
+            "token must have rotated concurrently before write lock"
+        );
+        assert!(
+            state["conversations"][key]["wakeConfig"]["sleepUntil"].is_null(),
+            "rearm must validate expected_token under ConversationState write lock and skip rotated token"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket297_failed_presubmit_claim_preserves_earlier_future_deadline() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, _console) = harness_cap_fixture("harness-cap-multihop-claim", None).await;
+            let key = HARNESS_CAP_KEY;
+            let future_ms = crate::turn_ledger::now_ms() + 500_000;
+            let future_iso = crate::sticker::iso_at(future_ms);
+
+            // T1 consumed the future deadline and ended.
+            let rec1 = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "timeout",
+                "tok-epoch",
+                &[],
+            )
+            .unwrap();
+            rec1.wake_claim(&json!({
+                "at": 100,
+                "previous": {
+                    "wakeConfig": {
+                        "confirmedAt": 2,
+                        "sleepUntil": future_iso
+                    }
+                }
+            }))
+            .unwrap();
+            rec1.end_reconciled("failed", "harness-interrupted").unwrap();
+
+            // T2 was a newer failed pre-submit provisional wake with sleepUntil: null.
+            let rec2 = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "atMention",
+                "tok-epoch",
+                &[],
+            )
+            .unwrap();
+            rec2.wake_claim(&json!({
+                "at": 101,
+                "previous": {
+                    "wakeConfig": {
+                        "confirmedAt": 2,
+                        "sleepUntil": null
+                    }
+                }
+            }))
+            .unwrap();
+            rec2.end_reconciled("failed", "dispatch-failed").unwrap();
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            assert!(hub.active[key].previous["wakeConfig"]["sleepUntil"].is_null());
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                json!(future_iso),
+                "multi-hop wake_claim scan must skip T2 (sleepUntil: null) and preserve T1's still-future deadline"
+            );
+            assert_eq!(
+                hub.drivers[key].sched.wc.sleep_until.as_deref(),
+                Some(future_iso.as_str()),
+                "live driver must adopt the preserved multi-hop future deadline"
+            );
+        })
+        .await
+        .expect("the multi-hop claim fixture must settle");
     }
 
     async fn wait_for_harness_cap_wake(hub: &Hub) {

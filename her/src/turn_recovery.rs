@@ -1419,25 +1419,30 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                 };
                 let outbox = crate::send_outbox::read_records(&context);
                 let pass = Pass { context: &context, cfg: &cfg };
+                // Re-arm already-settled harness conversations before any slow DSH probe can block the pass.
+                rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
                 let mut reconciled = false;
-                for turn in &turns {
-                    let working = startup.contains(&turn.id)
-                        && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
-                    if !working {
-                        continue;
-                    }
-                    if active_turns().lock().unwrap_or_else(|p| p.into_inner()).contains(&turn.id) {
-                        continue;
-                    }
-                    if turn.state == State::Paused {
-                        let tried = last_try.get(&turn.id).copied().unwrap_or(0);
-                        if now() - tried < UNREACHABLE_RETRY_MS {
+                // Reconcile harness turns before DSH turns so an unreachable DSH probe cannot delay harness recovery.
+                for harness_only in [true, false] {
+                    for turn in turns.iter().filter(|t| (t.backend == "harness") == harness_only) {
+                        let working = startup.contains(&turn.id)
+                            && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
+                        if !working {
                             continue;
                         }
+                        if active_turns().lock().unwrap_or_else(|p| p.into_inner()).contains(&turn.id) {
+                            continue;
+                        }
+                        if turn.state == State::Paused {
+                            let tried = last_try.get(&turn.id).copied().unwrap_or(0);
+                            if now() - tried < UNREACHABLE_RETRY_MS {
+                                continue;
+                            }
+                        }
+                        last_try.insert(turn.id.clone(), now());
+                        pass.reconcile_at(&journal, turn, &turns, &outbox, Some(started_at)).await;
+                        reconciled = true;
                     }
-                    last_try.insert(turn.id.clone(), now());
-                    pass.reconcile_at(&journal, turn, &turns, &outbox, Some(started_at)).await;
-                    reconciled = true;
                 }
                 let (records, turns) = if reconciled {
                     let Ok(records) = turn_ledger::read_records(&context) else { continue };
@@ -1446,7 +1451,9 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                 } else {
                     (records, turns)
                 };
-                rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
+                if reconciled {
+                    rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
+                }
                 pass.resolutions(&journal, &turns, &records);
                 pass.release_held(&journal, &turns, &records);
                 pass.finished_with_cache(&journal, &turns, &mut abandoned_closed);
@@ -2513,6 +2520,178 @@ mod tests {
         assert!(
             state["conversations"]["group:2"]["wakeConfig"]["sleepUntil"].is_null(),
             "unrelated open startup turn group:2 must not be re-armed before settling"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket297_recovery_pass_sweeps_harness_before_dsh_probe() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dsh_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let follow_probed = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let follow_probed_srv = Arc::clone(&follow_probed);
+        let server = std::thread::spawn(move || {
+            let mut held_streams = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut first_line = String::new();
+                        let _ = reader.read_line(&mut first_line);
+                        let mut length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        if first_line.starts_with("POST ") {
+                            let mut body = vec![0; length];
+                            let _ = reader.read_exact(&mut body);
+                            let reply = r#"{"type":"server-response","ok":true,"payload":{"result":null}}"#;
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                                reply.len()
+                            );
+                        } else {
+                            follow_probed_srv.store(true, Ordering::Relaxed);
+                            held_streams.push(stream);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1, 2, 3]},
+            "harness": {"model": "fake-chat"},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-preloop-sweep-")),
+            &cfg,
+            &json!({"dsh": dsh_url, "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        std::fs::create_dir_all(root.0.join("user/dsh")).unwrap();
+        std::fs::write(
+            root.0.join("user/dsh/.credentials.yaml"),
+            "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let future_iso = crate::sticker::iso_at(now() + 300_000);
+        let wake_cfg = json!({
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": null,
+            "triggers": {"atMention": true},
+            "confirmedAt": 1,
+            "lastWakeAt": 10,
+            "wakeCount": 1
+        });
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {"agentToken": "tok-297-g1", "wakeTimes": [10], "wakeConfig": wake_cfg},
+                    "group:2": {"agentToken": "tok-297-g2", "wakeTimes": [10], "wakeConfig": wake_cfg},
+                    "group:3": {"agentToken": "tok-297-g3", "wakeTimes": [10], "wakeConfig": wake_cfg}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let _journal = Journal::open(&context).unwrap();
+
+        // Write the slow DSH turn FIRST in turns.jsonl so sequential order would block on it.
+        let rec2 = Recorder::begin_reserved2(
+            &context,
+            "group:2",
+            "dsh",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g2"),
+            &[],
+        )
+        .unwrap();
+        rec2.attempt("rpc-297-dsh", "sess-297-dsh").unwrap();
+
+        let rec1 = Recorder::begin_reserved2(
+            &context,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g1"),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "infinite": false, "sleepUntil": future_iso}
+            }
+        }))
+        .unwrap();
+        rec1.end("completed", "ok").unwrap();
+
+        let rec3 = Recorder::begin_reserved2(
+            &context,
+            "group:3",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g3"),
+            &[],
+        )
+        .unwrap();
+        rec3.wake_claim(&json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "infinite": false, "sleepUntil": future_iso}
+            }
+        }))
+        .unwrap();
+
+        let cutoff = now() + 500;
+        let startup = startup_turns(&turn_ledger::read_records(&context).unwrap(), cutoff);
+        assert!(startup.contains(&rec2.id));
+        assert!(startup.contains(&rec3.id));
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            recovery_loop(context.clone(), Some(startup), cutoff),
+        )
+        .await;
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+
+        let state = context.read_social_state().unwrap();
+        assert_eq!(
+            state["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "settled harness group:1 must re-arm before unrelated group:2 DSH probe blocks"
+        );
+        assert_eq!(
+            state["conversations"]["group:3"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "open harness group:3 must reconcile and re-arm before unrelated group:2 DSH probe blocks"
         );
     }
 
