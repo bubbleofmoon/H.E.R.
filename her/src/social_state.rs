@@ -1607,7 +1607,7 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             {
                 return Ok(());
             }
-            if wake["infinite"] == false && wake["sleepUntil"].is_null() {
+            if wake["infinite"] == false {
                 let restored_future = previous
                     .and_then(|prev| prev["wakeConfig"]["sleepUntil"].as_str())
                     .filter(|iso| crate::wake::parse_iso_ms(iso).is_some_and(|at| at > now));
@@ -1616,8 +1616,9 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
                 } else {
                     crate::wake::draw_default_sleep(&mut wake, cfg, now, rand01());
                 }
+            } else {
+                crate::wake::ensure_wakeable(&mut wake, cfg, now, rand01());
             }
-            crate::wake::ensure_wakeable(&mut wake, cfg, now, rand01());
             if wake != original {
                 conv.set_field("wakeConfig", wake);
                 doc.set_conversation(key, conv);
@@ -3939,11 +3940,90 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rollback_reserved2_wake(&context, "group:42", 10, &past_claim).unwrap();
+        rollback_reserved2_wake(&context, "group:42", 10, &past_claim["previous"]).unwrap();
+        let rolled_back = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert!(
+            rolled_back["lastWakeAt"].is_null(),
+            "rollback must run when confirmedAt and lastWakeAt match"
+        );
         assert_eq!(
-            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
+            rolled_back["sleepUntil"],
             future,
             "rollback must not overwrite an already-valid finite sleepUntil with an old deadline"
         );
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_zero_delay_finite_plan() {
+        let root = TestDir::new("rearm-zero-delay-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": {
+                "wake": {
+                    "sleepMinMs": 0,
+                    "sleepMaxMs": 0,
+                    "recommendedSleepMinMs": 0,
+                    "recommendedSleepMaxMs": 0,
+                    "recommendedDefaultInfinite": true
+                }
+            }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": false,
+                    "lastWakeAt": 10,
+                    "sleepUntil": null,
+                    "triggers": {
+                        "atMention": false,
+                        "nameMention": false,
+                        "speakerIds": [],
+                        "keywords": [],
+                        "question": false,
+                        "poke": false,
+                        "anyMessage": false,
+                        "probability": 0.0
+                    },
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
+        let before = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+        let after = now_ms();
+        let wc = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc["infinite"], false, "zero-delay finite plan must not flip to infinite: true");
+        let rearmed_iso = wc["sleepUntil"].as_str().expect("sleepUntil must be set");
+        let rearmed_ms = crate::wake::parse_iso_ms(rearmed_iso).expect("sleepUntil must parse as ISO");
+        assert!(
+            rearmed_ms >= before && rearmed_ms <= after && rearmed_iso == crate::sticker::iso_at(rearmed_ms),
+            "zero-delay bounds must re-arm sleepUntil to iso_at(now), got {rearmed_iso}"
+        );
+
+        // Unparseable sleepUntil with infinite=false is also re-armed rather than left invalid or flipped to infinite.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = json!("invalid-timestamp");
+            Ok(())
+        })
+        .unwrap();
+        let before_bad = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+        let after_bad = now_ms();
+        let wc_bad = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc_bad["infinite"], false);
+        let bad_rearmed_ms = wc_bad["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("unparseable sleepUntil must be replaced with valid iso_at(now)");
+        assert!(bad_rearmed_ms >= before_bad && bad_rearmed_ms <= after_bad);
     }
 }

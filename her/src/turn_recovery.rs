@@ -1322,7 +1322,7 @@ fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &
             && turn.backend == "harness"
             && matches!(
                 turn.state,
-                State::Completed | State::Failed | State::Cancelled | State::Abandoned
+                State::Completed | State::Failed | State::Cancelled | State::Abandoned | State::Resumed
             )
         {
             if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake(
@@ -2334,6 +2334,59 @@ mod tests {
         dsh_turn.wake_claim = Some(obs_claim.clone());
         std::fs::write(fx_abandoned._root.0.join("data/mode.json"), "{broken").unwrap();
         assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &dsh_turn, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ticket297_rearms_resumed_turn_after_live_wake_crash() {
+        let mut fx = setup_submitted_harness_turn("her-297-resumed-live-", "reserved2", true, None, true);
+        fx.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
+        let claim = json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "sleepUntil": "2000-01-01T00:00:00.000Z"}
+            }
+        });
+        turn_ledger::Recorder::attach(&fx.context, &fx.turn_id, "group:1")
+            .wake_claim(&claim)
+            .unwrap();
+
+        // Simulate a live reserved2 wake advancing lastWakeAt > live_cutoff before writing a ledger turn.
+        let live_cutoff = crate::turn_ledger::now_ms() + 500;
+        crate::conversation_state::ConversationState::for_runtime(&fx.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["lastWakeAt"] = json!(live_cutoff + 50);
+                wc["confirmedAt"] = json!(1);
+                wc["sleepUntil"] = Value::Null;
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&fx.context).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&fx.context);
+        Pass { context: &fx.context, cfg: &fx.cfg }
+            .reconcile_at(&fx.journal, &turns[0], &turns, &outbox, Some(live_cutoff))
+            .await;
+
+        let after_resume = fold(&turn_ledger::read_records(&fx.context).unwrap()).0;
+        assert_eq!(after_resume[0].state, State::Resumed);
+        assert!(
+            fx.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].is_null(),
+            "reconcile_at must leave the live wake's consumed sleepUntil untouched while live"
+        );
+
+        // Next process restarts after that live wake died before recording a ledger turn.
+        let next_cutoff = live_cutoff + 100;
+        assert!(rearm_startup_terminal_sleeps(&fx.context, &fx.cfg, &after_resume, next_cutoff));
+        assert!(
+            fx.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "next startup must re-arm stranded finite sleepUntil on State::Resumed turn"
+        );
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch
