@@ -748,16 +748,23 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
             }
         }
         Verdict::Abandon(why) => {
-            // Commit `abandoned` in the ledger before closing SQLite as `Cancelled`, so a crash
-            // in between never reclassifies the abandonment as `Cancelled` on retry.
+            // Commit `abandoned` in the ledger first, then re-arm any consumed wake deadline before
+            // closing SQLite so a crash or rearm error keeps the turn open for `finished()` to retry.
             if commit(recorder.end_reconciled("abandoned", why)) {
-                let _ = close_interrupted_harness(
-                    context,
-                    turn,
-                    &crate::harness::Status::Cancelled,
-                    Some("abandoned"),
-                );
-                let _ = rearm_reserved2_if_needed(context, cfg, turn);
+                if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
+                    return;
+                }
+                if !commit(
+                    close_interrupted_harness(
+                        context,
+                        turn,
+                        &crate::harness::Status::Cancelled,
+                        Some("abandoned"),
+                    )
+                    .map(|_| ()),
+                ) {
+                    return;
+                }
                 settle(journal, &turn.inbound, "handled");
                 log(&format!("已放弃：{why}"));
             }
@@ -1147,21 +1154,31 @@ impl Pass<'_> {
                 continue;
             }
             if turn.backend == "harness" && turn.state == State::Abandoned {
-                match close_interrupted_harness(
-                    self.context,
-                    turn,
-                    &crate::harness::Status::Cancelled,
-                    Some("abandoned"),
-                ) {
-                    Ok(closed) => {
+                match crate::harness::store::Store::open(self.context)
+                    .and_then(|store| store.status(&turn.id))
+                {
+                    Ok(Some(crate::harness::Status::Running)) => {
                         let has_newer_turn =
                             turns.iter().any(|t| t.key == turn.key && t.begun_at > turn.begun_at);
-                        if closed && !has_newer_turn {
-                            let _ = rearm_reserved2_if_needed(self.context, self.cfg, turn);
+                        if !has_newer_turn {
+                            if let Err(error) = rearm_reserved2_if_needed(self.context, self.cfg, turn) {
+                                crate::safe_println!("[recovery] 已放弃回合 {} 重设唤醒定时器失败：{error}", turn.id);
+                                continue;
+                            }
+                        }
+                        if let Err(error) = close_interrupted_harness(
+                            self.context,
+                            turn,
+                            &crate::harness::Status::Cancelled,
+                            Some("abandoned"),
+                        ) {
+                            crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
+                            continue;
                         }
                     }
+                    Ok(_) => {}
                     Err(error) => {
-                        crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
+                        crate::safe_println!("[recovery] 检查已放弃回合 {} 状态失败：{error}", turn.id);
                         continue;
                     }
                 }
@@ -1264,9 +1281,9 @@ pub fn spawn(context: RuntimeContext) {
     });
 }
 
-/// Re-arm interrupted `observationSleep` terminal wakes once per startup when the previous process
-/// committed `end_cancellation("completed", "observationSleep")` before the hub could re-arm `sleepUntil`.
-fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns: &[Turn], cutoff: i64) -> bool {
+/// Re-arm interrupted terminal `reserved2` harness wakes once per startup when the previous process
+/// committed a terminal outcome before the hub could schedule or re-arm the next wake deadline.
+fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &[Turn], cutoff: i64) -> bool {
     let mut latest_by_key: std::collections::HashMap<&str, &Turn> = Default::default();
     let mut keys_with_live_turn: std::collections::HashSet<&str> = Default::default();
     for turn in turns {
@@ -1283,8 +1300,10 @@ fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns
         }
         if (turn.reserved2 || turn.wake_claim.is_some())
             && turn.backend == "harness"
-            && turn.state == State::Completed
-            && turn.outcome_reason == "observationSleep"
+            && matches!(
+                turn.state,
+                State::Completed | State::Failed | State::Cancelled | State::Abandoned
+            )
         {
             if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake(
                 context,
@@ -1293,7 +1312,7 @@ fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns
                 turn.wake_claim.as_ref(),
                 Some(cutoff),
             ) {
-                crate::safe_println!("[recovery] observationSleep rearm failed for {}: {error}", turn.key);
+                crate::safe_println!("[recovery] startup terminal sleep rearm failed for {}: {error}", turn.key);
                 ok = false;
             }
         }
@@ -1304,7 +1323,7 @@ fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns
 async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<String>>, started_at: i64) {
     {
         let mut last_try: std::collections::HashMap<String, i64> = Default::default();
-        let mut obs_rearm_done = false;
+        let mut terminal_rearm_done = false;
         loop {
             if let (Ok(cfg), Ok(journal), Ok(records)) =
                 (context.load_config(), Journal::open(&context), turn_ledger::read_records(&context))
@@ -1317,8 +1336,8 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                     set
                 });
                 let (turns, _) = turn_ledger::fold(&records);
-                if !obs_rearm_done && rearm_startup_observation_sleeps(&context, &cfg, &turns, started_at) {
-                    obs_rearm_done = true;
+                if !terminal_rearm_done && rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at) {
+                    terminal_rearm_done = true;
                 }
                 let mut expiry_applied = false;
                 for turn in turns.iter().filter(|t| t.paused_at.is_some() && (t.state == State::Paused || t.notification_intent)) {
@@ -2081,20 +2100,72 @@ mod tests {
             })
             .unwrap();
         let turns = fold(&turn_ledger::read_records(&fx_obs.context).unwrap()).0;
-        assert!(rearm_startup_observation_sleeps(&fx_obs.context, &fx_obs.cfg, &turns, crate::turn_ledger::now_ms() + 1000));
+        assert!(rearm_startup_terminal_sleeps(&fx_obs.context, &fx_obs.cfg, &turns, crate::turn_ledger::now_ms() + 1000));
         let sleep_until = fx_obs.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
             .as_str()
             .and_then(crate::wake::parse_iso_ms);
         assert!(sleep_until.is_some(), "interrupted observationSleep must re-arm finite sleepUntil at startup");
 
-        // Retrying recovery after a mid-abandon crash closes the still-running SQLite turn via `finished()`.
+        // Ordinary `completed` (`ok`) before the hub schedules the next wake also re-arms at startup.
+        let mut fx_ok = setup_submitted_harness_turn("her-297-ok-rearm-", "reserved2", true, None, true);
+        fx_ok.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
+        turn_ledger::Recorder::attach(&fx_ok.context, &fx_ok.turn_id, "group:1")
+            .wake_claim(&obs_claim)
+            .unwrap();
+        turn_ledger::Recorder::attach(&fx_ok.context, &fx_ok.turn_id, "group:1")
+            .end("completed", "ok")
+            .unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&fx_ok.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["sleepUntil"] = Value::Null;
+                wc["confirmedAt"] = json!(1);
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        let ok_turns = fold(&turn_ledger::read_records(&fx_ok.context).unwrap()).0;
+        assert!(rearm_startup_terminal_sleeps(&fx_ok.context, &fx_ok.cfg, &ok_turns, crate::turn_ledger::now_ms() + 1000));
+        assert!(
+            fx_ok.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "ordinary completed reserved2 wake must re-arm finite sleepUntil at startup"
+        );
+
+        // Retrying recovery after a mid-abandon crash: when rearm fails (`mode.json` corrupt), SQLite stays Running
+        // so the next `finished()` pass retries both rearm and SQLite close cleanly.
         let mut fx_abandoned = setup_submitted_harness_turn("her-297-abandoned-sqlite-", "reserved2", true, None, true);
-        fx_abandoned.cfg["allow"] = json!({"groups": []});
+        fx_abandoned.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
         let abandoned_rec = turn_ledger::Recorder::attach(&fx_abandoned.context, &fx_abandoned.turn_id, "group:1");
+        abandoned_rec.wake_claim(&obs_claim).unwrap();
         abandoned_rec.end_reconciled("abandoned", "revoked before sqlite close").unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&fx_abandoned.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["sleepUntil"] = Value::Null;
+                wc["confirmedAt"] = json!(1);
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(fx_abandoned._root.0.join("data/mode.json"), "{broken").unwrap();
         let turns = fold(&turn_ledger::read_records(&fx_abandoned.context).unwrap()).0;
         Pass { context: &fx_abandoned.context, cfg: &fx_abandoned.cfg }.finished(&fx_abandoned.journal, &turns);
+        assert!(matches!(fx_abandoned.store.status(&fx_abandoned.turn_id).unwrap(), Some(crate::harness::Status::Running)));
+        std::fs::write(fx_abandoned._root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        Pass { context: &fx_abandoned.context, cfg: &fx_abandoned.cfg }.finished(&fx_abandoned.journal, &turns);
         assert!(matches!(fx_abandoned.store.status(&fx_abandoned.turn_id).unwrap(), Some(crate::harness::Status::Cancelled)));
+        assert!(
+            fx_abandoned.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "abandoned retry must re-arm consumed finite sleepUntil before closing SQLite"
+        );
 
         // Unreadable mode.json fails closed as send-unresolved instead of rolling back and resuming a claimed wake.
         let fx_bad_mode = setup_submitted_harness_turn("her-297-bad-mode-", "reserved2", true, None, true);

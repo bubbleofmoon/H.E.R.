@@ -1579,9 +1579,6 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
     let now = now_ms();
     ConversationState::for_runtime(context)
         .update_document(|doc| {
-            if doc.paused() {
-                return Ok(());
-            }
             let Some(mut conv) = doc.conversation(key) else {
                 return Ok(());
             };
@@ -3884,5 +3881,22 @@ mod tests {
         assert_eq!(kept_finite["confirmedAt"], 10);
         assert_eq!(kept_finite["infinite"], false);
         assert!(kept_finite["sleepUntil"].is_null());
+
+        // Globally paused documents still re-arm consumed finite deadlines so unpausing resumes scheduling.
+        update_raw(&context, |doc| {
+            doc["paused"] = json!(true);
+            doc["conversations"]["group:42"]["wakeConfig"]["confirmedAt"] = json!(2);
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(10);
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        let before_paused = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
+        let paused_rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("global pause must still re-arm consumed finite sleepUntil");
+        assert!(paused_rearmed >= before_paused + 60_000);
     }
 }
