@@ -118,7 +118,7 @@ const NOT_ADMITTED_ERROR: &str = "conversation is not admitted; admit it first";
 const ACCESS_SOURCE: &str = "access";
 
 /// One stored conversation value the registry accepts.
-struct Stored {
+pub(super) struct Stored {
     setting: &'static ConversationSetting,
     conversation: String,
     value: Value,
@@ -149,7 +149,7 @@ pub(crate) fn conversation_admitted(cfg: &Value, conversation: &str) -> bool {
 /// A row whose key the conversation registry does not have, whose conversation is not canonical, or whose value its
 /// setting does not keep (`Setting::storable` of its global setting: a valid value, or none where the default is none,
 /// which a reset stores) is skipped.
-fn read_values_checked(conn: &Connection) -> Result<Vec<Stored>, InspectError> {
+pub(super) fn read_values_checked(conn: &Connection) -> Result<Vec<Stored>, InspectError> {
     if schema_version_checked(conn)? < 2 {
         return Ok(Vec::new());
     }
@@ -518,18 +518,12 @@ pub(super) fn clear_unadmitted(conn: &Connection, context: &RuntimeContext) -> R
 /// stored value, sorted by key. Per conversation: whether it is admitted, and per setting the stored value (`null` when
 /// none) and `value`, the stored value or else the global setting's value on the loader's document. `storeError` says
 /// why stored values cannot be read.
-pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -> Result<Value, (u16, String)> {
-    let document = context.load_config_document().map_err(|_| (503, CONFIG_ERROR.to_string()))?;
-    let read = || -> Result<Vec<Stored>, String> {
-        read_store(context, |conn| match conn {
-            None => Ok(Vec::new()),
-            Some(conn) => read_values_checked(conn),
-        })
-    };
-    let (values, store_error) = match read() {
-        Ok(values) => (values, None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
+pub(super) fn build_view(
+    document: &Value,
+    values: &[Stored],
+    admitted: &[String],
+    store_error: Option<String>,
+) -> Value {
     let mut conversations: Vec<String> = admitted.iter().filter(|key| is_canonical(key)).cloned().collect();
     conversations.extend(values.iter().map(|stored| stored.conversation.clone()));
     conversations.sort();
@@ -558,7 +552,7 @@ pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -
                     .iter()
                     .find(|stored| stored.setting.key == setting.key && stored.conversation == *conversation)
                     .map(|stored| stored.value.clone());
-                let value = stored.clone().unwrap_or_else(|| setting.global.read(&document));
+                let value = stored.clone().unwrap_or_else(|| setting.global.read(document));
                 entries.insert(setting.key.to_string(), json!({"stored": stored, "value": value}));
             }
             json!({"conversation": conversation, "admitted": admitted.contains(conversation), "settings": entries})
@@ -568,5 +562,20 @@ pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -
     if let Some(error) = store_error {
         reply["storeError"] = json!(error);
     }
-    Ok(reply)
+    reply
+}
+
+pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -> Result<Value, (u16, String)> {
+    let document = context.load_config_document().map_err(|_| (503, CONFIG_ERROR.to_string()))?;
+    let read = || -> Result<Vec<Stored>, String> {
+        read_store(context, |conn| match conn {
+            None => Ok(Vec::new()),
+            Some(conn) => read_values_checked(conn),
+        })
+    };
+    let (values, store_error) = match read() {
+        Ok(values) => (values, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    Ok(build_view(&document, &values, admitted, store_error))
 }

@@ -98,6 +98,8 @@ export interface DetailedModelsResponse {
   ok?: boolean;
   setting?: string;
   firstRoute?: string | null;
+  effectiveModelEndpoint?: string | null;
+  effectiveModelEndpointSource?: string | null;
   error?: string | null;
   routes: DetailedModelRoute[];
   allFailed?: boolean;

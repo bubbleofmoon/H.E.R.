@@ -87,8 +87,14 @@ interface ConsoleContextValue {
   qqLoginState: string;
   triggerQqLoginWindow: () => void;
   settings: SettingItemView[];
+  settingsMutationSeq: number;
   conversations: ConversationStateSummary[];
-  saveSetting: (setting: string, value: unknown, confirm?: boolean) => Promise<void>;
+  saveSetting: (
+    setting: string,
+    value: unknown,
+    confirm?: boolean,
+    expectedEndpoint?: string,
+  ) => Promise<void>;
   resetSetting: (setting: string, confirm?: boolean) => Promise<void>;
   toasts: ToastItem[];
   pushToast: (message: string, tone?: ToastTone, undo?: { label: string; run: () => void }) => void;
@@ -164,6 +170,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [updateAvailable, setUpdateAvailable] = useState<string | null>(null);
   const [qqLoginState, setQqLoginState] = useState('unknown');
   const [settings, setSettings] = useState<SettingItemView[]>([]);
+  const [settingsMutationSeq, setSettingsMutationSeq] = useState(0);
   const [conversations, setConversations] = useState<ConversationStateSummary[]>([]);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
@@ -680,9 +687,15 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   );
 
   const saveSetting = useCallback(
-    async (setting: string, value: unknown, confirm = false) => {
-      const res = await saveSettingValue(setting, value, confirm);
+    async (
+      setting: string,
+      value: unknown,
+      confirm = false,
+      expectedEndpoint?: string,
+    ) => {
+      const res = await saveSettingValue(setting, value, confirm, expectedEndpoint);
       await refreshLiveData();
+      setSettingsMutationSeq((s) => s + 1);
       const mirrorErr = typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
       const wakeErr =
         typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
@@ -702,6 +715,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     async (setting: string, confirm = false) => {
       const res = await resetSettingValue(setting, confirm);
       await refreshLiveData();
+      setSettingsMutationSeq((s) => s + 1);
       const mirrorErr = typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
       const wakeErr =
         typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
@@ -751,6 +765,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
         qqLoginState,
         triggerQqLoginWindow,
         settings,
+        settingsMutationSeq,
         conversations,
         saveSetting,
         resetSetting,

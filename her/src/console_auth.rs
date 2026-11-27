@@ -3,7 +3,7 @@
 mod storage;
 
 pub(crate) use storage::{
-    administrator_password_is_set, admit_browser, archive_credentials, auth_status,
+    administrator_password_is_set_in, admit_browser, archive_credentials, auth_status,
     scrub_auth_snapshot, start_browser_clock, ArchivedCredentials, AuthStatusSnapshot,
     BrowserAdmission, BrowserSessionView, IssuedSession, SCHEMA_V3_ADDED, SCHEMA_V3_IMPLICIT,
 };

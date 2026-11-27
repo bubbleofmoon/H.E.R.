@@ -609,3 +609,83 @@ fn a_store_from_before_the_model_settings_is_read_and_extended() {
     );
     assert_eq!(next_turn_budgets(&context), (12, 32_768));
 }
+
+#[test]
+fn ticket443_harness_api_base_url_normalization_fallback_reset_and_undo() {
+    let (root, context) = model_fixture("ticket443 api base url");
+    let default_endpoint = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    let view = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(view["value"], Value::Null, "unset apiBaseUrl must report value=null: {view}");
+    assert_eq!(view["default"], Value::Null);
+    assert_eq!(view["stored"], Value::Null);
+    assert_eq!(view["kind"], json!({"type": "model endpoint", "maxChars": 2048}));
+    assert_eq!(
+        view["fallback"],
+        json!({"source": "dependencies.json", "value": default_endpoint}),
+        "unset apiBaseUrl must expose dependencies.json fallback: {view}"
+    );
+
+    let (status, models_view) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(status, 200, "{models_view}");
+    assert_eq!(models_view["effectiveModelEndpoint"], json!(default_endpoint));
+    assert_eq!(models_view["effectiveModelEndpointSource"], json!("dependencies.json"));
+
+    let (status, reply) = set_setting(&context, "harness.apiBaseUrl", json!("https://api.example.com/compatible-mode/v1/"));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["value"], json!("https://api.example.com/compatible-mode/v1"));
+
+    let (status, models_view) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(status, 200, "{models_view}");
+    assert_eq!(models_view["effectiveModelEndpoint"], json!("https://api.example.com/compatible-mode/v1"));
+    assert_eq!(models_view["effectiveModelEndpointSource"], json!("settings"));
+
+    let (status, reply) = set_setting(&context, "harness.apiBaseUrl", json!("http://127.0.0.1:8317/"));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["value"], json!("http://127.0.0.1:8317"));
+
+    let (status, reply) = set_setting(&context, "harness.apiBaseUrl", json!("https://api.example.com"));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["value"], json!("https://api.example.com"));
+
+    let long_url = format!("https://api.example.com/{}", "a".repeat(2040));
+    for invalid in [
+        json!(""),
+        json!(" https://api.example.com/v1"),
+        json!("https://api.example.com/v1 "),
+        json!("https://api.example.com/a b"),
+        json!("https://api.example.com\\v1"),
+        json!("https://user@api.example.com/v1"),
+        json!("https://api.example.com/v1?k=1"),
+        json!("https://api.example.com/v1#frag"),
+        json!("https://api.example.com/../v1"),
+        json!("https://api.example.com//v1"),
+        json!("https://api.example.com/%2fv1"),
+        json!("https://0.0.0.0/v1"),
+        json!("https://api.example.com:0/v1"),
+        json!("http://api.example.com/v1"),
+        json!(long_url),
+        Value::Null,
+        json!(123),
+    ] {
+        let (status, err_reply) = set_setting(&context, "harness.apiBaseUrl", invalid.clone());
+        assert_eq!(status, 400, "invalid url must be refused: {invalid} -> {err_reply}");
+    }
+
+    let (status, reset_reply) = post(&context, "/api/settings/reset", json!({"setting": "harness.apiBaseUrl"}));
+    assert_eq!(status, 200, "{reset_reply}");
+    assert_eq!(reset_reply["value"], Value::Null);
+    let after_reset = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(after_reset["value"], Value::Null);
+    assert_eq!(after_reset["fallback"], json!({"source": "dependencies.json", "value": default_endpoint}));
+    let (status, models_view) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(status, 200, "{models_view}");
+    assert_eq!(models_view["effectiveModelEndpoint"], json!(default_endpoint));
+    assert_eq!(models_view["effectiveModelEndpointSource"], json!("dependencies.json"));
+
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    let (status, undo_reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{undo_reply}");
+    assert_eq!(undo_reply["stored"], json!("https://api.example.com"));
+    assert_eq!(stored_config(&root)["harness"]["apiBaseUrl"], json!("https://api.example.com"));
+}

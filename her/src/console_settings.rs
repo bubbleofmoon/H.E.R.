@@ -59,16 +59,14 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
-            match (method, path) {
-                ("GET", "/api/settings" | "/api/settings/history") => {
-                    models::redact_route_settings(context, &mut value);
-                }
-                ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
-                    if value["setting"] == crate::settings::HARNESS_ROUTES.key =>
-                {
-                    models::redact_route_settings(context, &mut value);
-                }
-                _ => {}
+            if matches!(method, "POST")
+                && matches!(
+                    path,
+                    "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo"
+                )
+                && value["setting"] == crate::settings::HARNESS_ROUTES.key
+            {
+                models::redact_route_settings(context, &mut value);
             }
             (200, JSON_TYPE, value.to_string(), import_diff)
         }
@@ -151,13 +149,35 @@ fn access_change(
 
 fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     let context = caller.context();
-    let fields = body_fields(body, &["setting", "value", "confirm"])?;
+    let fields = body_fields(body, &["setting", "value", "confirm", "expectedEndpoint"])?;
     let setting = setting_field(&fields)?;
     let value = fields.get("value").ok_or((400, "value is required".to_string()))?;
+    let expected_endpoint = match fields.get("expectedEndpoint") {
+        None => None,
+        Some(Value::String(exp))
+            if setting == crate::settings::HARNESS_API_KEY.key
+                || setting == crate::settings::CLI_MODEL_API_KEY.key =>
+        {
+            Some(exp.as_str())
+        }
+        Some(Value::String(_)) => {
+            return Err((400, "expectedEndpoint is only valid for model endpoint credentials".to_string()));
+        }
+        Some(_) => {
+            return Err((400, "expectedEndpoint must be a string".to_string()));
+        }
+    };
     let found = crate::settings::find(setting);
     confirmed(&fields, found)?;
     let commit = || -> Result<Value, (u16, String)> {
-        let applied = crate::settings::apply(context, setting, value, "administrator", "console")?;
+        let applied = crate::settings::apply_checked_endpoint(
+            context,
+            setting,
+            value,
+            "administrator",
+            "console",
+            expected_endpoint,
+        )?;
         Ok(applied_reply(setting, applied))
     };
     if found.is_some_and(|found| found.access()) {

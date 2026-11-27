@@ -57,7 +57,7 @@ pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
-pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, HARNESS_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{REMINDER_CONVERSATION_CAP, REMINDER_HORIZON, REMINDER_REPEAT_FLOOR, REMINDER_TOTAL_CAP};
 pub(crate) use registry::{
     daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
@@ -72,11 +72,11 @@ pub(crate) use registry::{
     LAYER_CONVERSATION,
     LAYER_MATERIAL,
     chat_registry, chat_setting, conversation_registry, find, find_conversation, registry,
-    CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_CONTEXT_TOKENS,
-    HARNESS_FIRST_ROUTE, HARNESS_HISTORY_SHARE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
-    HARNESS_MODEL, INTERCEPT_NOTIFY, HARNESS_ROUTES, HARNESS_SUMMARIES, OUTBOUND_GUARD, OWNER,
-    REQUIRE_PASSWORD_LOCALLY, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK,
-    VOICE_ENABLED,
+    CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_API_BASE_URL,
+    HARNESS_CONTEXT_TOKENS, HARNESS_FIRST_ROUTE, HARNESS_HISTORY_SHARE, HARNESS_MAX_STEPS,
+    HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY, HARNESS_ROUTES, HARNESS_SUMMARIES,
+    OUTBOUND_GUARD, OWNER, REQUIRE_PASSWORD_LOCALLY, WEB_SEARCH_MODEL, tool_enabled,
+    tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
     VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
     COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
     STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL, ALERT_HOURLY_CAP, ALERT_KEY_WINDOW,
@@ -84,23 +84,30 @@ pub(crate) use registry::{
 };
 #[cfg(test)]
 pub(crate) use store::{
-    create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
-    NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
+    create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_SECOND_WAL_TRUNCATE,
+    FAIL_UNDO_LOOK, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
-    check_store_schema, complete_timing, console_changes, conversation_admitted, conversation_value,
-    conversation_view, direct_change_error, engine_choice, harness_credential,
-    has_endpoint_credentials, has_legacy_engine_choices, has_stored_setting, has_stored_values,
-    history, holds_any, import_engine_choices, inspect_store, keep_file_members,
-    keep_registry_values, last_good_text, migrate_store_v2, mirror_into, open_store_for_write,
-    overlay, overlay_checked, overlay_values, place_changes, preview, read_archive_values,
-    read_store, record_setting_change, registry_free, reset, reset_conversation, resolve_config,
-    resolve_live_batch, restore_gate, restore_switch_choice, schema_version_checked,
+    apply, apply_changes, apply_checked_endpoint, apply_conversation, apply_switch_choice,
+    archive_effective_model_endpoint, archive_known_secrets, archive_model_endpoint_override,
+    backup_source,
+    canonical_conversation, check_store_schema, classify_archive_model_endpoint_override,
+    complete_timing, console_changes,
+    conversation_admitted, conversation_value, conversation_view, direct_change_error,
+    engine_choice, harness_credential, has_endpoint_credentials, has_legacy_engine_choices,
+    has_stored_setting, has_stored_values, history, holds_any, import_engine_choices,
+    inspect_store, keep_file_members, keep_registry_values, last_good_text, migrate_store_v2,
+    mirror_into, models_snapshot, open_store_for_write, overlay, overlay_checked, overlay_values,
+    place_changes, preview, read_archive_scrubbed_hashes, read_archive_secrets,
+    read_archive_values, read_store,
+    record_setting_change, redact_route_array, registry_free, reset, reset_conversation,
+    resolve_config, resolve_live_batch, resolve_model_endpoint_and_key, restore_gate,
+    restore_switch_choice, schema_version_checked, scrub_archived_config_endpoint,
+    scrub_restored_settings_db,
     secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
     stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
-    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, STORAGE_ERROR,
-    STORE_SIDECARS,
+    Applied, Change, InspectError, ModelEndpointSnapshot, ModelEndpointSource, StoreInspection,
+    StoredEndpointOverride, CONVERSATION_ERROR, STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

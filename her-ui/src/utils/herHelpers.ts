@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { isSettingWriteLocked, saveSettingValue, SettingItemView } from '../api/client';
+import { isSettingWriteLocked, resetSettingValue, saveSettingValue, SettingItemView } from '../api/client';
 import { useConsole } from '../stores/consoleStore';
 import { formatErrorMessage } from './format';
 
@@ -7,6 +7,10 @@ export const INPUT_CLASS =
   'w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50';
 
 const SETTING_ZH_OVERRIDES: Record<string, { label: string; hint: string }> = {
+  'harness.apiBaseUrl': {
+    label: '模型接口地址（harness.apiBaseUrl）',
+    hint: 'OpenAI 兼容接口地址，支持回环 HTTP 或 HTTPS（保留显式路径前缀如 /compatible-mode/v1，仅裸域名自动补全 /v1）；留空或恢复默认将回退至 dependencies.json。修改此地址后，原端点绑定的密钥将失效，需重新输入。',
+  },
   'harness.model': {
     label: '默认会话模型（harness.model）',
     hint: '未设置 harness.routes 时回合引擎默认使用的中继模型 ID；每回合开始时读取。若两者均未设置则无法启动对话回合。',
@@ -45,7 +49,11 @@ const SETTING_ZH_OVERRIDES: Record<string, { label: string; hint: string }> = {
   },
   'cliModel.apiKey': {
     label: '中继模型服务 API 密钥',
-    hint: '中继或模型端点的调用凭据（8–4096 字节可打印 ASCII，不含空格）；仅显示已设置状态，不回显原文。',
+    hint: '与当前生效模型接口地址绑定的 CLI 调用凭据（8–4096 字节可打印 ASCII，不含空格）；仅显示已设置状态，不回显原文。更改模型接口地址后需重新输入。',
+  },
+  'harness.apiKey': {
+    label: '对话模型接口 API 密钥（harness.apiKey）',
+    hint: '仅写凭据（8–4096 字节可打印 ASCII，不含空格），与当前生效的模型接口地址绑定；当使用 dependencies.json 默认地址且未在设置库保存时，回退读取 config/harness-api-key。更改模型接口地址后需重新输入。',
   },
   'engine.default': {
     label: '默认回合执行引擎',
@@ -76,8 +84,25 @@ function containsRedactedMarker(value: unknown): boolean {
   return false;
 }
 
+export function normalizeEndpointDraftValue(
+  item: Pick<SettingItemView, 'key' | 'kind'> | undefined,
+  rawValue: unknown,
+): unknown {
+  if (
+    (item?.kind.type === 'model endpoint' || item?.key === MODEL_ENDPOINT_KEY) &&
+    typeof rawValue === 'string' &&
+    rawValue === ''
+  ) {
+    return null;
+  }
+  return rawValue;
+}
+
 export function parseSettingDraftForSave(item: SettingItemView | undefined, rawValue: unknown): unknown {
   if (!item) return rawValue;
+  if (item.kind.type === 'model endpoint' || item.key === MODEL_ENDPOINT_KEY) {
+    return normalizeEndpointDraftValue(item, rawValue);
+  }
   if (item.kind.type === 'route list') {
     let resolved: unknown = rawValue;
     if (typeof rawValue === 'string') {
@@ -111,8 +136,30 @@ export function parseSettingDraftForSave(item: SettingItemView | undefined, rawV
 export interface ExtraDirtySource {
   count: number;
   label: string;
-  onSave: () => Promise<void>;
+  prepareSave?: () => ((resolvedEndpoint?: string | null) => Promise<void>) | null;
+  onSave: (resolvedEndpoint?: string | null) => Promise<void>;
   onDiscard: () => void;
+}
+
+export const MODEL_ENDPOINT_KEY = 'harness.apiBaseUrl';
+export const MODEL_CREDENTIAL_KEYS = new Set(['harness.apiKey', 'cliModel.apiKey']);
+
+export function canonicalModelEndpoint(url: unknown): string | undefined {
+  if (typeof url !== 'string') return undefined;
+  const trimmed = url.replace(/\/+$/, '');
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function resolveActiveModelEndpoint(
+  items: SettingItemView[],
+  overrideEndpoint?: unknown,
+): string | undefined {
+  const endpointItem = items.find((s) => s.key === MODEL_ENDPOINT_KEY);
+  const fallback = canonicalModelEndpoint(endpointItem?.fallback?.value);
+  if (overrideEndpoint !== undefined) {
+    return canonicalModelEndpoint(overrideEndpoint) ?? fallback;
+  }
+  return canonicalModelEndpoint(endpointItem?.value) ?? fallback;
 }
 
 export function utf16Length(value: string): number {
@@ -162,16 +209,26 @@ export function settingValuesEqual(a: unknown, b: unknown): boolean {
 export function useSettingsDrafts(
   items: SettingItemView[],
   labelPrefix: string,
-  options: { manageDirtyBar?: boolean; extraDirty?: ExtraDirtySource | null } = {},
+  options: {
+    manageDirtyBar?: boolean;
+    extraDirty?: ExtraDirtySource | null;
+    onSettled?: (keys: string[]) => void | Promise<void>;
+    activeEndpoint?: string | null;
+  } = {},
 ) {
   const { resetSetting, openConfirm, pushToast, refreshLiveData, setDirtyEntry } = useConsole();
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
+  const [saving, setSaving] = useState(false);
   const mountedRef = useRef(true);
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  const activeEndpointRef = useRef(options.activeEndpoint);
+  activeEndpointRef.current = options.activeEndpoint;
   const draftRevRef = useRef<Record<string, number>>({});
   const manageDirtyBar = options.manageDirtyBar !== false;
   const extraDirty = options.extraDirty ?? null;
+  const onSettledRef = useRef(options.onSettled);
+  onSettledRef.current = options.onSettled;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -235,7 +292,8 @@ export function useSettingsDrafts(
         confirm: boolean;
         item?: SettingItemView;
       }[],
-    ): Promise<{ saved: number; failed: string[] }> => {
+      captured?: { initialEndpoint: string | null; defaultEndpoint: string | null },
+    ): Promise<{ saved: number; failed: string[]; resolvedEndpoint?: string | null }> => {
       if (snapshots.length === 0) {
         return { saved: 0, failed: [] };
       }
@@ -245,30 +303,101 @@ export function useSettingsDrafts(
         return { saved: 0, failed: [] };
       }
 
-      // Reserve every key's per-key write lock in api/client.ts synchronously on tick 0.
-      const outcomes = await Promise.all(
-        active.map(async ({ key, value, rev, confirm, item }) => {
-          try {
-            const parsedValue = parseSettingDraftForSave(item, value);
-            const res = await saveSettingValue(key, parsedValue, confirm);
-            const mirrorErr =
-              typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
-            const wakeErr =
-              typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
-                ? res.wakeRefreshError
-                : null;
-            const warn = [mirrorErr, wakeErr].filter(Boolean).join('；') || null;
-            return { key, rev, ok: true as const, warn };
-          } catch (err) {
-            return {
-              key,
-              rev,
+      const saveOne = async ({
+        key,
+        value,
+        rev,
+        confirm,
+        item,
+        expectedEndpoint,
+      }: {
+        key: string;
+        value: unknown;
+        rev: number;
+        confirm: boolean;
+        item?: SettingItemView;
+        expectedEndpoint?: string;
+      }) => {
+        try {
+          const parsedValue = parseSettingDraftForSave(item, value);
+          const isClearedEndpoint =
+            (item?.kind.type === 'model endpoint' || key === MODEL_ENDPOINT_KEY) &&
+            parsedValue === null;
+          const res = isClearedEndpoint
+            ? await resetSettingValue(key, confirm)
+            : await saveSettingValue(key, parsedValue, confirm, expectedEndpoint);
+          const mirrorErr =
+            typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
+          const wakeErr =
+            typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
+              ? res.wakeRefreshError
+              : null;
+          const warn = [mirrorErr, wakeErr].filter(Boolean).join('；') || null;
+          return { key, rev, ok: true as const, warn, value: res.value };
+        } catch (err) {
+          return {
+            key,
+            rev,
+            ok: false as const,
+            error: `${key}: ${formatErrorMessage(err, '保存失败')}`,
+          };
+        }
+      };
+
+      const endpointEntry = active.find((entry) => entry.key === MODEL_ENDPOINT_KEY);
+      const otherEntries = active.filter((entry) => entry.key !== MODEL_ENDPOINT_KEY);
+      const outcomes: Awaited<ReturnType<typeof saveOne>>[] = [];
+      const fallbackEndpoint: string | null = captured
+        ? captured.defaultEndpoint
+        : (resolveActiveModelEndpoint(itemsRef.current, null) ?? null);
+      let resolvedEndpoint: string | null = captured
+        ? captured.initialEndpoint
+        : (activeEndpointRef.current !== undefined
+            ? activeEndpointRef.current
+            : (resolveActiveModelEndpoint(itemsRef.current) ?? null));
+
+      if (endpointEntry) {
+        const epOutcome = await saveOne(endpointEntry);
+        outcomes.push(epOutcome);
+        if (!epOutcome.ok) {
+          pushToast(`部分${labelPrefix}保存失败：${epOutcome.error}`, 'danger');
+          return { saved: 0, failed: [epOutcome.error], resolvedEndpoint };
+        }
+        resolvedEndpoint =
+          epOutcome.value === null || epOutcome.value === undefined
+            ? fallbackEndpoint
+            : typeof epOutcome.value === 'string'
+              ? canonicalModelEndpoint(epOutcome.value) ?? epOutcome.value
+              : fallbackEndpoint;
+      }
+
+      const modelCredentialBlocked = !endpointEntry && !resolvedEndpoint;
+      const submittableOtherEntries = modelCredentialBlocked
+        ? otherEntries.filter((entry) => !MODEL_CREDENTIAL_KEYS.has(entry.key))
+        : otherEntries;
+      const blockedOutcomes = modelCredentialBlocked
+        ? otherEntries
+            .filter((entry) => MODEL_CREDENTIAL_KEYS.has(entry.key))
+            .map((entry) => ({
+              key: entry.key,
+              rev: entry.rev,
               ok: false as const,
-              error: `${key}: ${formatErrorMessage(err, '保存失败')}`,
-            };
-          }
-        }),
+              error: `${entry.key}: 当前模型接口地址不可用，请刷新后再保存密钥`,
+            }))
+        : [];
+
+      // Reserve every remaining key's per-key write lock in api/client.ts synchronously on tick 0.
+      const restOutcomes = await Promise.all(
+        submittableOtherEntries.map((entry) =>
+          saveOne({
+            ...entry,
+            expectedEndpoint: MODEL_CREDENTIAL_KEYS.has(entry.key)
+              ? (resolvedEndpoint ?? '')
+              : undefined,
+          }),
+        ),
       );
+      outcomes.push(...blockedOutcomes, ...restOutcomes);
 
       const failed: string[] = [];
       const warnings: string[] = [];
@@ -285,6 +414,7 @@ export function useSettingsDrafts(
 
       if (savedEntries.length > 0) {
         await refreshLiveData();
+        await onSettledRef.current?.(savedEntries.map((e) => e.key));
         if (mountedRef.current) {
           setDrafts((prev) => {
             let changed = false;
@@ -311,40 +441,70 @@ export function useSettingsDrafts(
         pushToast(`已保存 ${savedEntries.length} 项${labelPrefix}`, 'success');
       }
 
-      return { saved: savedEntries.length, failed };
+      return { saved: savedEntries.length, failed, resolvedEndpoint };
     },
     [refreshLiveData, pushToast, labelPrefix],
   );
 
-  const saveAll = useCallback(async (): Promise<{ saved: number; failed: string[] }> => {
-    if (dirtyKeys.length === 0) {
-      return { saved: 0, failed: [] };
-    }
-    const snapshots = dirtyKeys.map((key) => {
-      const item = itemsRef.current.find((s) => s.key === key);
-      return {
-        key,
-        value: drafts[key],
-        rev: draftRevRef.current[key] ?? 0,
-        confirm: Boolean(item?.confirm),
-        item,
-      };
-    });
-    const confirmKeys = snapshots.filter((s) => s.confirm).map((s) => s.key);
-    if (confirmKeys.length > 0) {
-      openConfirm({
-        title: `确认修改 ${confirmKeys.length} 项安全设置？`,
-        description: `待保存的受保护设置：${confirmKeys.join('、')}。\n确认后将立即生效，并在必要时重新评估访问权限。`,
-        confirmLabel: '确认保存',
-        danger: true,
-        onConfirm: async () => {
-          await executeSaveBatch(snapshots);
-        },
+  const saveAll = useCallback(
+    async (
+      afterExtraSave?: (resolvedEndpoint?: string | null) => Promise<void>,
+    ): Promise<{
+      saved: number;
+      failed: string[];
+      deferred?: boolean;
+      resolvedEndpoint?: string | null;
+    }> => {
+      if (dirtyKeys.length === 0) {
+        return { saved: 0, failed: [] };
+      }
+      const capturedEndpoint: string | null =
+        activeEndpointRef.current !== undefined
+          ? activeEndpointRef.current
+          : (resolveActiveModelEndpoint(itemsRef.current) ?? null);
+      const capturedDefaultEndpoint: string | null =
+        resolveActiveModelEndpoint(itemsRef.current, null) ?? null;
+      const snapshots = dirtyKeys.map((key) => {
+        const item = itemsRef.current.find((s) => s.key === key);
+        return {
+          key,
+          value: drafts[key],
+          rev: draftRevRef.current[key] ?? 0,
+          confirm: Boolean(item?.confirm),
+          item,
+        };
       });
-      return { saved: 0, failed: [] };
-    }
-    return executeSaveBatch(snapshots);
-  }, [dirtyKeys, drafts, executeSaveBatch, openConfirm]);
+      const confirmKeys = snapshots.filter((s) => s.confirm).map((s) => s.key);
+      if (confirmKeys.length > 0) {
+        openConfirm({
+          title: `确认修改 ${confirmKeys.length} 项安全设置？`,
+          description: `待保存的受保护设置：${confirmKeys.join('、')}。\n确认后将立即生效，并在必要时重新评估访问权限。`,
+          confirmLabel: '确认保存',
+          danger: true,
+          onConfirm: async () => {
+            if (mountedRef.current) setSaving(true);
+            try {
+              const batch = await executeSaveBatch(snapshots, {
+                initialEndpoint: capturedEndpoint,
+                defaultEndpoint: capturedDefaultEndpoint,
+              });
+              if (batch.failed.length === 0 && afterExtraSave) {
+                await afterExtraSave(batch.resolvedEndpoint);
+              }
+            } finally {
+              if (mountedRef.current) setSaving(false);
+            }
+          },
+        });
+        return { saved: 0, failed: [], deferred: true };
+      }
+      return executeSaveBatch(snapshots, {
+        initialEndpoint: capturedEndpoint,
+        defaultEndpoint: capturedDefaultEndpoint,
+      });
+    },
+    [dirtyKeys, drafts, executeSaveBatch, openConfirm],
+  );
 
   useEffect(() => {
     if (!manageDirtyBar) return;
@@ -361,11 +521,29 @@ export function useSettingsDrafts(
         count: totalCount,
         label,
         onSave: async () => {
-          if (dirtyKeys.length > 0) {
-            await saveAll();
+          const runExtra = extraDirty?.prepareSave
+            ? extraDirty.prepareSave()
+            : extraDirty && extraDirty.count > 0
+              ? extraDirty.onSave
+              : undefined;
+          if (extraDirty?.prepareSave && !runExtra) {
+            return;
           }
-          if (extraDirty && extraDirty.count > 0) {
-            await extraDirty.onSave();
+          if (mountedRef.current) setSaving(true);
+          try {
+            let resolvedEndpoint: string | null | undefined;
+            if (dirtyKeys.length > 0) {
+              const outcome = await saveAll(runExtra ?? undefined);
+              if (outcome.deferred || outcome.failed.length > 0) {
+                return;
+              }
+              resolvedEndpoint = outcome.resolvedEndpoint;
+            }
+            if (runExtra) {
+              await runExtra(resolvedEndpoint);
+            }
+          } finally {
+            if (mountedRef.current) setSaving(false);
           }
         },
         onDiscard: () => {
@@ -395,8 +573,10 @@ export function useSettingsDrafts(
             return;
           }
           const rev = draftRevRef.current[key] ?? 0;
+          if (mountedRef.current) setSaving(true);
           try {
             await resetSetting(key, needsConfirm);
+            await onSettledRef.current?.([key]);
             if (!mountedRef.current) return;
             setDrafts((prev) => {
               if (!(key in prev) || (draftRevRef.current[key] ?? 0) !== rev) {
@@ -408,6 +588,8 @@ export function useSettingsDrafts(
             });
           } catch (err) {
             pushToast(formatErrorMessage(err, `恢复 ${key} 默认值失败`), 'danger');
+          } finally {
+            if (mountedRef.current) setSaving(false);
           }
         },
       });
@@ -418,6 +600,7 @@ export function useSettingsDrafts(
   return {
     drafts,
     dirtyKeys,
+    saving,
     setDraft,
     clearDraft,
     discardAll,

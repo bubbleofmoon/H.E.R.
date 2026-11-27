@@ -7,7 +7,7 @@
 use super::route_health::{self, Seen};
 use super::usage;
 use crate::run_record::{Component, Outcome, Trigger};
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 use genai::{
     adapter::AdapterKind,
     chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, StopReason, Usage},
@@ -594,21 +594,25 @@ impl ModelRoute {
         if order.is_empty() {
             return Err(MODEL_NOT_CONFIGURED.into());
         }
-        let origin = context
-            .dependency_url("model")
-            .ok_or("harness model endpoint is unavailable")?;
-        let key = context
-            .read_text(RuntimeArea::Config, "harness-api-key")
-            .map_err(|_| "harness model credential is unavailable")?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err("harness model credential is empty".into());
-        }
-        let endpoint = crate::runtime::model_openai_endpoint(origin);
-        let mut credentials = crate::settings::stored_secrets(context)
+        let snapshot = crate::settings::resolve_model_endpoint_and_key(context)
             .map_err(|_| "stored model credentials are unavailable")?;
-        credentials.push(key.to_string());
-        credentials.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+        let origin = snapshot
+            .effective_endpoint
+            .as_deref()
+            .ok_or("harness model endpoint is unavailable")?;
+        let key = snapshot
+            .harness_api_key()
+            .ok_or("Set harness.apiKey in Settings for the current model endpoint.")?
+            .to_string();
+        let endpoint = crate::runtime::model_openai_endpoint(origin);
+        let credentials = snapshot.all_secrets;
+        if order.iter().any(|spec| {
+            credentials
+                .iter()
+                .any(|secret| !secret.is_empty() && spec.model.contains(secret))
+        }) {
+            return Err("harness route model contains a credential".into());
+        }
         let routes = order
             .into_iter()
             .map(|spec| Route {
@@ -2002,7 +2006,7 @@ mod tests {
     async fn scripted_executor_failover_sticky_memory_retry_cap_and_run_records() {
         let secret = "synthetic-secret-383";
         let cfg_routes = json!({"routes": [
-            {"id": format!("a-{secret}"), "model": format!("m-a-{secret}")},
+            {"id": format!("a-{secret}"), "model": "model-a"},
             {"id": "b", "model": "model-b", "reasoningEffort": "high", "maxOutputTokens": 900},
             {"id": "c", "model": "model-c"},
             {"id": "d", "model": "model-d"},
@@ -2031,7 +2035,7 @@ mod tests {
         let res = exec.next_answer(&mut step, &mut cancel).await.unwrap();
         assert_eq!(res.value, "ok-b");
         assert_eq!(step.calls.len(), 2);
-        assert_eq!((step.calls[0].route_id.as_str(), step.calls[0].model.as_str(), step.calls[0].attempt_index, step.calls[0].repeats), ("a-[REDACTED]", "m-a-[REDACTED]", 0, 0));
+        assert_eq!((step.calls[0].route_id.as_str(), step.calls[0].model.as_str(), step.calls[0].attempt_index, step.calls[0].repeats), ("a-[REDACTED]", "model-a", 0, 0));
         assert_eq!((step.calls[1].route_id.as_str(), step.calls[1].effort.as_deref(), step.calls[1].max_tokens, step.calls[1].attempt_index, step.calls[1].repeats), ("b", Some("high"), 900, 1, 1));
         assert_eq!(step.transitions, vec![Next::FailOver]);
         assert_eq!(step.failures.len(), 1);
