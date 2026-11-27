@@ -362,30 +362,28 @@ mod tests {
     struct Fixture {
         api: TasksApi,
         held: Arc<Held>,
-        dir: std::path::PathBuf,
+        _root: crate::runtime::tests::FixtureRoot,
         context: crate::runtime::RuntimeContext,
     }
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = crate::install_root::development_root(std::env::temp_dir().join(format!("her-console-tasks-{name}-{}-{}", std::process::id(), crate::parity_clock::now_ms())));
-            for sub in ["config", "data", "resources", "user/dsh", "tasks", "lifecycle"] {
-                std::fs::create_dir_all(dir.join(sub)).unwrap();
+            let root = crate::runtime::tests::runtime_fixture(
+                std::env::temp_dir().join(crate::turn_ledger::mint_id(&format!("her-console-tasks-{name}-"))),
+                &serde_json::json!({"consoleToken": "synthetic-console-tasks-token"}),
+                &serde_json::json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+            );
+            for sub in ["user/dsh", "tasks", "lifecycle"] {
+                std::fs::create_dir_all(root.0.join(sub)).unwrap();
             }
-            std::fs::write(dir.join("config/config.json"), "{}").unwrap();
-            std::fs::write(
-                dir.join("dependencies.json"),
-                r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
-            )
-            .unwrap();
-            let context = crate::runtime::RuntimeContext::from_root(&dir).unwrap();
+            let context = crate::runtime::RuntimeContext::from_root(&root.0).unwrap();
             let clock = Arc::new(ManualClock::new(1_793_289_600_000));
-            let store = Arc::new(TaskStore::open(dir.join("tasks"), StoreLimits::default(), credential_redactor(vec![])).unwrap());
+            let store = Arc::new(TaskStore::open(root.0.join("tasks"), StoreLimits::default(), credential_redactor(vec![])).unwrap());
             let held = Arc::new(Held { open: Mutex::new(false), cv: Condvar::new() });
             let dispatcher = Dispatcher::new(store, Arc::new(HeldExecutor(held.clone())), clock.clone());
             let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.enabled_by_default, crate::local_time::beijing_tariff_zone(), clock.now_ms())));
-            let api = TasksApi { dispatcher, scheduler, desired: DesiredStore::new(dir.join("lifecycle")) };
-            Self { api, held, dir, context }
+            let api = TasksApi { dispatcher, scheduler, desired: DesiredStore::new(root.0.join("lifecycle")) };
+            Self { api, held, _root: root, context }
         }
 
         fn release(&self) {
@@ -420,7 +418,6 @@ mod tests {
         fn drop(&mut self) {
             self.release();
             std::thread::sleep(Duration::from_millis(50));
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
