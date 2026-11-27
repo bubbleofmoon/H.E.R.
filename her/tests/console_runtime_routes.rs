@@ -5409,10 +5409,38 @@ fn local_browser_auto_sign_in_over_loopback_tcp() {
 #[test]
 fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
     let fixture = BrowserFixture::new("stale-legacy-cookie");
+    let config_path = fixture.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["security"]["requirePasswordLocally"] = json!(true);
+    fs::write(&config_path, config.to_string()).unwrap();
     let canonical = format!("her.localhost:{}", fixture.port);
-    let legacy_cookie = format!("her_legacy_{}=stale-cookie-value", fixture.port);
+    let legacy_cookie = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"her-legacy-ui:");
+        hasher.update(fixture.port.to_le_bytes());
+        hasher.update(b":");
+        hasher.update(BROWSER_MACHINE.as_bytes());
+        format!("her_legacy_{}={}", fixture.port, URL_SAFE_NO_PAD.encode(hasher.finalize()))
+    };
     let origin = format!("http://{canonical}");
     let _console = fixture.start();
+
+    let (page_res, page_headers) = raw_browser_http(
+        fixture.port,
+        "GET",
+        "/",
+        &canonical,
+        &[("Cookie", &legacy_cookie), ("Sec-Fetch-Site", "none")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(page_res.status, 200, "{}", page_res.body);
+    assert!(
+        !page_headers.contains("Set-Cookie:"),
+        "retired legacy cookie must not issue a browser session: {page_headers}"
+    );
 
     let (protected_get, _) = raw_browser_http(
         fixture.port,
