@@ -1559,6 +1559,57 @@ pub(crate) fn rearm_observation_sleep(
         .map_err(|(_, error)| error)
 }
 
+/// Ensure a reconciled `reserved2` conversation stays schedulable after an interrupted wake:
+/// if its finite `sleepUntil` was consumed before the crash and neither the model nor an operator
+/// wrote a newer configuration, restore a still-future deadline or draw a fresh default sleep;
+/// otherwise keep at least one active trigger or timer (`wake::ensure_wakeable`).
+pub(crate) fn rearm_interrupted_reserved2_wake(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    wake_claim: Option<&Value>,
+) -> Result<(), String> {
+    if !inbound_admitted(cfg, key)
+        || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
+        || mode(context) != "reserved2"
+    {
+        return Ok(());
+    }
+    let now = now_ms();
+    ConversationState::for_runtime(context)
+        .update_document(|doc| {
+            if doc.paused() {
+                return Ok(());
+            }
+            let Some(mut conv) = doc.conversation(key) else {
+                return Ok(());
+            };
+            let Some(mut wake) = conv.field("wakeConfig").cloned().filter(Value::is_object) else {
+                return Ok(());
+            };
+            let original = wake.clone();
+            if wake["infinite"] == false && wake["sleepUntil"].is_null() {
+                let previous = wake_claim.and_then(|claim| claim.get("previous"));
+                let restored_future = previous
+                    .filter(|prev| prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"])
+                    .and_then(|prev| prev["wakeConfig"]["sleepUntil"].as_str())
+                    .filter(|iso| crate::wake::parse_iso_ms(iso).is_some_and(|at| at > now));
+                if let Some(iso) = restored_future {
+                    wake["sleepUntil"] = json!(iso);
+                } else {
+                    crate::wake::draw_default_sleep(&mut wake, cfg, now, rand01());
+                }
+            }
+            crate::wake::ensure_wakeable(&mut wake, cfg, now, rand01());
+            if wake != original {
+                conv.set_field("wakeConfig", wake);
+                doc.set_conversation(key, conv);
+            }
+            Ok(())
+        })
+        .map_err(|(_, error)| error)
+}
+
 // ── Conversation lifecycle, wake bookkeeping & resets ────────────────────────────────────────────
 
 pub(crate) fn begin_legacy_wait_turn(
@@ -3713,5 +3764,72 @@ mod tests {
             turn,
             "wrong-token"
         ));
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_future_and_newer_configs() {
+        let root = TestDir::new("rearm-interrupted-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": { "wake": { "recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000 } }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        let future = crate::sticker::iso_at(now_ms() + 500_000);
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": false,
+                    "sleepUntil": null,
+                    "triggers": {"atMention": true},
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+        let future_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": future}}});
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim)).unwrap();
+        assert_eq!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
+            future,
+            "still-future deadline from wake_claim must be restored"
+        );
+
+        // Consumed past deadline draws a new default sleep.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        let past_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
+        let before = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        let rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("past deadline must re-arm a new sleepUntil");
+        assert!(rearmed >= before + 60_000);
+
+        // Newer model/operator config (infinite: true) is left untouched.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "active",
+                "infinite": true,
+                "sleepUntil": null,
+                "triggers": {"atMention": true, "anyMessage": true},
+                "confirmedAt": 9
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        let kept = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
+        assert_eq!(kept["confirmedAt"], 9);
+        assert_eq!(kept["infinite"], true);
+        assert!(kept["sleepUntil"].is_null());
     }
 }

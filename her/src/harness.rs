@@ -603,6 +603,21 @@ pub fn resolve_interrupted(context: &RuntimeContext, turn: &str) -> Result<(), S
     Ok(())
 }
 
+/// Settle a running interrupted turn in conversation storage according to its reconciled outcome.
+/// Already-final turns are left untouched so recovery remains idempotent across retries.
+pub(crate) fn resolve_interrupted_with(
+    context: &RuntimeContext,
+    turn: &str,
+    status: &Status,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let store = store::Store::open(context)?;
+    if matches!(store.status(turn)?, Some(Status::Running)) {
+        store.finish_with_reason(turn, status, None, reason)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tool_loop(
     context: &RuntimeContext,

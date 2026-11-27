@@ -4851,9 +4851,17 @@ fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
 #[test]
 fn ticket159_reserved2_restart_keeps_the_confirmed_tool_send_once() {
     let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_wake = release.clone();
     let model = FakeModel::script(vec![
         ModelReply::ToolCalls(vec![reserved2_send()]),
         ModelReply::Delayed { text:"private deliberation".into(), release },
+        ModelReply::ToolCalls(vec![
+            reserved2_call("send2", "qq_send_message", json!({
+                "key": GROUP_KEY, "token": "", "messages": ["after restart reply"]
+            })),
+            reserved2_sleep(),
+        ]),
+        ModelReply::Text("done".into()),
     ]);
     let mut rig = reserved2_fixture("ticket159-restart", &model, "harness");
     rig.start();
@@ -4863,16 +4871,93 @@ fn ticket159_reserved2_restart_keeps_the_confirmed_tool_send_once() {
         && reserved2_group_outbox(&rig).iter().any(|kind| kind == "confirmed")));
     assert_eq!(reserved2_group_ends(&rig), 0, "kill a live tool turn after the outbox confirmation");
     stop_bridge(&mut rig);
+    release_wake.store(true, std::sync::atomic::Ordering::SeqCst);
     rig.start();
-    assert!(wait_for(LONG, || rig.console("GET", "/api/turns", None).1["pausedCount"] == 1),
-        "the interrupted reserved2 wake must pause without DSH reconciliation");
-    let paused = rig.console("GET", "/api/turns", None).1;
-    assert_eq!(paused["paused"][0]["reason"], "harness-interrupted", "the interrupted wake must use harness recovery");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1),
+        "the interrupted harness reserved2 wake must reconcile on its own without pausing");
+    assert_eq!(rig.console("GET", "/api/turns", None).1["pausedCount"], 0,
+        "reconciled reserved2 wake must not leave a pause for the administrator");
     assert!(!wait_for(Duration::from_millis(1200), || lock(&model.requests).len() > 2),
-        "startup must not replay the interrupted wake after publishing its pause");
+        "startup must not replay the interrupted wake after reconciling it");
     assert_eq!(rig.texts_to(GROUP_KEY), ["simulation fixture reply"]);
     assert_eq!(reserved2_group_outbox(&rig).iter().filter(|kind| **kind == "confirmed").count(), 1);
     assert_eq!(lock(&model.requests).len(), 2, "startup must not rerun the wake or the send");
+
+    reserved2_push_mention(&rig, 15912, "wake after restart");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2),
+        "later wakes must run without administrator action");
+    assert_eq!(rig.texts_to(GROUP_KEY), ["simulation fixture reply", "after restart reply"]);
+    assert_eq!(reserved2_group_outbox(&rig).iter().filter(|kind| **kind == "confirmed").count(), 2);
+    assert!(rig.dsh.prompts().is_empty());
+}
+
+#[test]
+fn ticket297_reserved2_finite_sleep_schedules_next_wake_after_restart() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_wake = release.clone();
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![reserved2_send()]),
+        ModelReply::Delayed { text: "paused mid-wake".into(), release },
+        ModelReply::ToolCalls(vec![
+            reserved2_call("send2", "qq_send_message", json!({
+                "key": GROUP_KEY, "token": "", "messages": ["scheduled next wake"]
+            })),
+            reserved2_sleep(),
+        ]),
+        ModelReply::Text("second wake done".into()),
+    ]);
+    let mut rig = reserved2_fixture("ticket297-finite-sleep", &model, "harness");
+    let cfg_path = rig.root.join("config/config.json");
+    let mut cfg: Value = serde_json::from_slice(&fs::read(&cfg_path).unwrap()).unwrap();
+    cfg["socialV2"]["wake"]["recommendedSleepMinMs"] = json!(250);
+    cfg["socialV2"]["wake"]["recommendedSleepMaxMs"] = json!(250);
+    fs::write(&cfg_path, cfg.to_string()).unwrap();
+
+    let state_path = rig.root.join("data/social-v2.json");
+    let mut state = rig.data_json("social-v2.json");
+    state["conversations"][GROUP_KEY] = json!({
+        "bootstrapSent": true,
+        "wakeConfig": {
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": "2020-01-01T00:00:00.000Z",
+            "triggers": {
+                "atMention": true,
+                "nameMention": false,
+                "question": false,
+                "poke": false,
+                "anyMessage": false,
+                "probability": 0.0,
+                "keywords": [],
+                "speakerIds": []
+            },
+            "batchWindowMs": 1000,
+            "lastWakeAt": 0,
+            "wakeCount": 0,
+            "noActionCount": 0,
+            "confirmedAt": 1,
+            "confirmedBy": "set_wake_config"
+        }
+    });
+    fs::write(&state_path, state.to_string()).unwrap();
+
+    rig.start();
+    rig.wait_texts(GROUP_KEY, 1);
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 2
+        && reserved2_group_outbox(&rig).iter().any(|kind| kind == "confirmed")
+        && rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["wakeConfig"]["sleepUntil"].is_null()));
+    assert_eq!(reserved2_group_ends(&rig), 0, "kill during live finite-sleep wake after confirmation");
+    stop_bridge(&mut rig);
+    release_wake.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    rig.start();
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2),
+        "restarted bridge must reconcile the wake and schedule the next finite sleep without admin action");
+    assert_eq!(rig.console("GET", "/api/turns", None).1["pausedCount"], 0);
+    assert_eq!(rig.texts_to(GROUP_KEY), ["simulation fixture reply", "scheduled next wake"]);
+    assert_eq!(reserved2_group_outbox(&rig).iter().filter(|kind| **kind == "confirmed").count(), 2);
     assert!(rig.dsh.prompts().is_empty());
 }
 
