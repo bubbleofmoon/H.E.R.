@@ -1568,15 +1568,6 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
     cfg: &Value,
     key: &str,
     wake_claim: Option<&Value>,
-) -> Result<(), String> {
-    rearm_interrupted_reserved2_wake_before(context, cfg, key, wake_claim, None)
-}
-
-pub(crate) fn rearm_interrupted_reserved2_wake_before(
-    context: &RuntimeContext,
-    cfg: &Value,
-    key: &str,
-    wake_claim: Option<&Value>,
     max_wake_at: Option<i64>,
 ) -> Result<(), String> {
     if !inbound_admitted(cfg, key)
@@ -3823,7 +3814,7 @@ mod tests {
         })
         .unwrap();
         let future_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": future}}});
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim), None).unwrap();
         assert_eq!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
             future,
@@ -3838,7 +3829,7 @@ mod tests {
         .unwrap();
         let past_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
         let before = now_ms();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
         let rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
             .as_str()
             .and_then(crate::wake::parse_iso_ms)
@@ -3852,7 +3843,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
         assert!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
             "newer live wake must keep its consumed sleepUntil untouched by older claim"
@@ -3870,7 +3861,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
         let kept = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
         assert_eq!(kept["confirmedAt"], 9);
         assert_eq!(kept["infinite"], true);
@@ -3888,7 +3879,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None).unwrap();
         let kept_finite = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
         assert_eq!(kept_finite["confirmedAt"], 10);
         assert_eq!(kept_finite["infinite"], false);

@@ -608,11 +608,11 @@ fn close_interrupted_harness(
     turn: &Turn,
     status: &crate::harness::Status,
     reason: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if turn.backend == "harness" {
-        crate::harness::resolve_interrupted_with(context, &turn.id, status, reason)?;
+        return crate::harness::resolve_interrupted_with(context, &turn.id, status, reason);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn rearm_reserved2_if_needed(
@@ -620,12 +620,13 @@ fn rearm_reserved2_if_needed(
     cfg: &Value,
     turn: &Turn,
 ) -> Result<(), String> {
-    if turn.reserved2 || turn.wake_claim.is_some() {
+    if turn.backend == "harness" && (turn.reserved2 || turn.wake_claim.is_some()) {
         crate::social_state::rearm_interrupted_reserved2_wake(
             context,
             cfg,
             &turn.key,
             turn.wake_claim.as_ref(),
+            Some(turn.begun_at),
         )?;
     }
     Ok(())
@@ -667,7 +668,9 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
                             outcome: &str,
                             ledger_reason: &str,
                             message: String| {
-        if !commit(close_interrupted_harness(context, turn, &store_status, store_reason)) {
+        if !commit(
+            close_interrupted_harness(context, turn, &store_status, store_reason).map(|_| ()),
+        ) {
             return;
         }
         if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
@@ -705,12 +708,15 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
     }
     match &verdict {
         Verdict::Resume(why) => {
-            if !commit(close_interrupted_harness(
-                context,
-                turn,
-                &crate::harness::Status::Failed(why.clone()),
-                Some("interrupted"),
-            )) {
+            if !commit(
+                close_interrupted_harness(
+                    context,
+                    turn,
+                    &crate::harness::Status::Failed(why.clone()),
+                    Some("interrupted"),
+                )
+                .map(|_| ()),
+            ) {
                 return;
             }
             // A timer-only turn has no inbound event to hand back. Restore its durable deadline
@@ -1141,16 +1147,24 @@ impl Pass<'_> {
                 continue;
             }
             if turn.backend == "harness" && turn.state == State::Abandoned {
-                if let Err(error) = close_interrupted_harness(
+                match close_interrupted_harness(
                     self.context,
                     turn,
                     &crate::harness::Status::Cancelled,
                     Some("abandoned"),
                 ) {
-                    crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
-                    continue;
+                    Ok(closed) => {
+                        let has_newer_turn =
+                            turns.iter().any(|t| t.key == turn.key && t.begun_at > turn.begun_at);
+                        if closed && !has_newer_turn {
+                            let _ = rearm_reserved2_if_needed(self.context, self.cfg, turn);
+                        }
+                    }
+                    Err(error) => {
+                        crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
+                        continue;
+                    }
                 }
-                let _ = rearm_reserved2_if_needed(self.context, self.cfg, turn);
             }
             settle(journal, &turn.inbound, "handled");
         }
@@ -1272,7 +1286,7 @@ fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns
             && turn.state == State::Completed
             && turn.outcome_reason == "observationSleep"
         {
-            if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake_before(
+            if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake(
                 context,
                 cfg,
                 &turn.key,
@@ -2093,6 +2107,33 @@ mod tests {
         let paused = fold(&turn_ledger::read_records(&fx_bad_mode.context).unwrap()).0.remove(0);
         assert_eq!(paused.state, State::Paused);
         assert_eq!(paused.pause_reason, "send-unresolved");
+
+        // An already-closed historical abandoned turn without wake_claim must not re-arm a live wake's timer.
+        fx_abandoned.cfg["allow"] = json!({"groups": [1]});
+        crate::conversation_state::ConversationState::for_runtime(&fx_abandoned.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["lastWakeAt"] = json!(crate::turn_ledger::now_ms() + 100_000);
+                wc["sleepUntil"] = Value::Null;
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        let turns = fold(&turn_ledger::read_records(&fx_abandoned.context).unwrap()).0;
+        Pass { context: &fx_abandoned.context, cfg: &fx_abandoned.cfg }.finished(&fx_abandoned.journal, &turns);
+        assert!(
+            fx_abandoned.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].is_null(),
+            "historical closed abandoned turn must not overwrite live wake timer"
+        );
+
+        // Non-harness (DSH) reserved2 turns are unaffected by harness re-arming during `apply`.
+        let mut dsh_turn = turns[0].clone();
+        dsh_turn.backend = "dsh".into();
+        dsh_turn.reserved2 = true;
+        dsh_turn.wake_claim = Some(obs_claim.clone());
+        std::fs::write(fx_abandoned._root.0.join("data/mode.json"), "{broken").unwrap();
+        assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &dsh_turn).is_ok());
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch

@@ -610,12 +610,13 @@ pub(crate) fn resolve_interrupted_with(
     turn: &str,
     status: &Status,
     reason: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let store = store::Store::open(context)?;
     if matches!(store.status(turn)?, Some(Status::Running)) {
         store.finish_with_reason(turn, status, None, reason)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
