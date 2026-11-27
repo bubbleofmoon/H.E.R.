@@ -688,6 +688,7 @@ fn media_message_formats_are_real_mcp_images_with_metadata_and_order() {
         ("big.png", media_fixtures::still(image::ImageFormat::Png,4000,3000,false), 1, "image"),
         ("photo.jpg", media_fixtures::still(image::ImageFormat::Jpeg,1500,900,false), 1, "image"),
         ("anim.gif", media_fixtures::gif(37,40,30), 8, "sticker"),
+        ("long.gif", media_fixtures::gif(257,4,4), 8, "sticker"),
         ("anim.webp", media_fixtures::webp_animation(9), 8, "image"),
     ] {
         f.onebot.image(file, &bytes);
@@ -719,6 +720,9 @@ fn media_message_formats_are_real_mcp_images_with_metadata_and_order() {
                 assert!(img.get_pixel(0,0)[0].abs_diff(expected)<=4);
             }
         }
+        if file=="long.gif" {
+            assert!(text_of(&answer).contains("动图过长，已从前 256 帧中均匀抽取 8 帧"));
+        }
         assert_eq!(fs::read(f.root.path().join("data/social-v2.json")).unwrap(),before);
     }
 }
@@ -727,10 +731,10 @@ fn media_message_formats_are_real_mcp_images_with_metadata_and_order() {
 fn media_failures_limits_and_unsafe_references_keep_js_fallback_without_details() {
     let f = fixture("media-bad",json!({"media":{"maxCount":2,"maxBytes":1,"maxPixels":1}}));
     f.onebot.image("bad.gif",b"GIF89a damaged data................");
-    f.onebot.image("many.gif",&media_fixtures::gif(257,1,1));
+    f.onebot.image("overpixels.png",&media_fixtures::still(image::ImageFormat::Png,1200,1000,false));
     let list=json!([
         {"kind":"image","file":"bad.gif","url":"http://127.0.0.1:1/private?secret=hidden"},
-        {"kind":"sticker","file":"many.gif"},
+        {"kind":"sticker","file":"overpixels.png"},
         {"kind":"image","file":"not-requested.png"}
     ]);
     set_media(&f,"bad",list,false);

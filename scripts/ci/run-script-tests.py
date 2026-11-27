@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run every scripts/test-*.py that is not already a cargo test target, one result line each.
+"""Run every scripts/lifecycle/test-*.py that is not already a cargo test target, one result line each.
 
 Linux only: the scripts use fcntl, inotify, prctl, /bin/sh shims and a C compiler, and the four
 that exercise PowerShell entries drive them through pwsh. Run it after run-tests.py has built the
@@ -17,7 +17,7 @@ import time
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 root = Path(__file__).resolve().parents[2]
-scripts = root / 'scripts'
+scripts = root / 'scripts' / 'lifecycle'
 TIMEOUT = 300
 
 # (script, extra args after the executable, takes the executable). One entry per scenario.
@@ -74,6 +74,8 @@ for binary in (exe, cli):
 listed = {name for name, _, _ in RUN} | set(EXEMPT)
 on_disk = {path.name for path in scripts.glob('test-*.py')}
 problems = [f'{name}: in both RUN and EXEMPT' for name in sorted({name for name, _, _ in RUN} & set(EXEMPT))]
+problems += [f'{path.relative_to(root).as_posix()}: stray test-*.py outside scripts/lifecycle'
+             for path in sorted((root / 'scripts').glob('test-*.py'))]
 problems += [f'{name}: not in RUN or EXEMPT' for name in sorted(on_disk - listed)]
 problems += [f'{name}: listed but missing' for name in sorted(listed - on_disk)]
 if problems:

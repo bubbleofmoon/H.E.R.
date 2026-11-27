@@ -20,7 +20,7 @@ candidate, support, evidence = args.candidate, args.support, args.evidence
 tempfile.development_root(evidence)
 tempfile.gettempdir()  # Check redirected temp before even creating evidence.
 evidence.mkdir(parents=True, exist_ok=True)
-repo = Path(__file__).resolve().parent.parent
+repo = Path(__file__).resolve().parents[2]
 root = Path(tempfile.mkdtemp(prefix='relproof-chains-'))
 fixture = ReleaseFixture(root, evidence, timeout=args.timeout)
 observer = None
@@ -38,20 +38,20 @@ try:
     local_candidate = root / 'fake-curl/her.exe'
     shutil.copyfile(candidate, local_candidate)
     compile_script = root / 'compile.ps1'
-    compile_script.write_text("$ErrorActionPreference='Stop'\nAdd-Type -OutputType ConsoleApplication -OutputAssembly '" + str(root / 'fake-curl/curl.exe') + "' -Path '" + str(repo / 'scripts/lifecycle-curl-adapter.cs') + "'\n")
+    compile_script.write_text("$ErrorActionPreference='Stop'\nAdd-Type -OutputType ConsoleApplication -OutputAssembly '" + str(root / 'fake-curl/curl.exe') + "' -Path '" + str(repo / 'scripts/lifecycle/lifecycle-curl-adapter.cs') + "'\n")
     code = fixture.run(['powershell.exe', '-NoProfile', '-File', str(compile_script)], 'compile')
     assert code == 0, ('compile exit', code)
     observer_out = (root / 'observer.stdout.log').open('w')
     observer_err = (root / 'observer.stderr.log').open('w')
     observer = fixture.start(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
-                                 str(repo / 'scripts/lifecycle-window-observer.ps1'), '-FixtureRoot', str(root),
+                                 str(repo / 'scripts/lifecycle/lifecycle-window-observer.ps1'), '-FixtureRoot', str(root),
                                  '-Ready', str(root / 'ready'), '-Done', str(root / 'done'), '-Output', str(root / 'observer.json')],
                                 stdout=observer_out, stderr=observer_err)
     deadline = time.monotonic() + 15
     while not (root / 'ready').exists():
         assert observer.poll() is None and time.monotonic() < deadline, 'observer did not become ready'
         time.sleep(.05)
-    command = [shutil.which('node'), str(repo / 'scripts/lifecycle-extra-chains.mjs'), str(local_candidate), str(runtime), str(root), str(support), port, '--fake-console']
+    command = [shutil.which('node'), str(repo / 'scripts/lifecycle/lifecycle-extra-chains.mjs'), str(local_candidate), str(runtime), str(root), str(support), port, '--fake-console']
     (evidence / 'command.json').write_text(json.dumps(command))
     code = fixture.run(command, 'chains', timeout=90)
     assert code == 0, ('chains exit', code, (evidence / 'chains.stderr.log').read_text())

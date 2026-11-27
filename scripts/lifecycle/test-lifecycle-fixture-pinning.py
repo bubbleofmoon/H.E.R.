@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import fixture_paths as tempfile
 
-repo = Path(__file__).resolve().parent.parent
+repo = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix='ticket27-fixture-pin-') as tmp:
     harness = Path(tmp) / 'pinning.ps1'
     harness.write_text(r'''
@@ -42,7 +42,7 @@ if ([QQBotFixturePinnedProcess]::Stopped) { throw 'Fixture cleanup stopped a pro
 if (-not [QQBotFixturePinnedProcess]::Called) { throw 'Fixture cleanup did not try to pin the owner.' }
 Write-Output 'fixture cleanup refuses a reused owner PID'
 ''')
-    result = subprocess.run(['pwsh', '-NoProfile', '-File', str(harness), str(repo / 'scripts/test-lifecycle-fixture.ps1')],
+    result = subprocess.run(['pwsh', '-NoProfile', '-File', str(harness), str(repo / 'scripts/lifecycle/test-lifecycle-fixture.ps1')],
                             text=True, capture_output=True, timeout=30)
     print(result.stdout, end='')
     print(result.stderr, end='')

@@ -6167,20 +6167,47 @@ fn handle_sticker_image(
     let entry = entries[idx].clone();
     let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if url.is_empty() {
+        eprintln!(
+            "{}",
+            crate::media::format_failure_log("sticker", "sticker_missing_url")
+        );
         return Err((500, format!("读取表情图片出错：表情 {sticker_id} 没有图片地址")));
     }
     let limits = crate::media::Limits::from_config(cfg);
-    let _source = crate::media::admit_source()
-        .ok_or_else(|| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
-    let fetched = crate::safe_fetch::fetch_bytes(&url, limits.bytes)
-        .map_err(|_| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
-    if let Some((w, h)) = crate::media_normalize::image_dimensions(&fetched.bytes) {
+    let _source = crate::media::admit_source().ok_or_else(|| {
+        eprintln!(
+            "{}",
+            crate::media::format_failure_log("sticker", "source_gate_busy")
+        );
+        (500, "读取表情图片出错：（表情获取失败）".to_string())
+    })?;
+    let bytes = crate::media::fetch_url_bytes(&url, limits.bytes).map_err(|reason| {
+        eprintln!(
+            "{}",
+            crate::media::format_failure_log("sticker", &reason)
+        );
+        (500, "读取表情图片出错：（表情获取失败）".to_string())
+    })?;
+    if let Some((w, h)) = crate::media_normalize::image_dimensions(&bytes) {
         if w * h > limits.pixels {
+            eprintln!(
+                "{}",
+                crate::media::format_failure_log(
+                    "sticker",
+                    &format!("dimensions_exceeded(w={w},h={h},max_pixels={})", limits.pixels)
+                )
+            );
             return Err((400, format!("图片分辨率（{w}x{h}）超出上限，已拦截")));
         }
     }
-    let normalized = crate::media_normalize::normalize(&fetched.bytes, limits.pixels)
-        .map_err(|_| (500, "读取表情图片出错：（表情获取失败）".to_string()))?;
+    let normalized = crate::media_normalize::normalize_diagnosed(&bytes, limits.pixels)
+        .map_err(|e| {
+            eprintln!(
+                "{}",
+                crate::media::format_failure_log("sticker", &format!("normalize:{}", e.diagnostic()))
+            );
+            (500, "读取表情图片出错：（表情获取失败）".to_string())
+        })?;
     let images = crate::media::image_values(&normalized);
     Ok(json!({
         "ok": true,

@@ -1,14 +1,14 @@
 # Native Windows rehearsal of scripts\production-move.ps1 (#67) on a synthetic copy of the production layout.
 # Everything lives in a new folder under the temporary folder: an install root with a legacy SnowLuma folder, an old
 # runtime and release, a profile DSH home, an npx-style DSH package, a relay folder with its login folder, loopback
-# fakes (scripts\production-move-fake.mjs), two HER-Test-67-<guid> fixture tasks started through hidden VBS launchers
+# fakes (scripts\lifecycle\production-move-fake.mjs), two HER-Test-67-<guid> fixture tasks started through hidden VBS launchers
 # that wait (so their instances stay Running, as in production) and a file scheduler for the HER task. It names no
 # production path as a target and contacts no QQ, DSH, model or TTS service. Windows PowerShell 5.1; no elevation.
 # The install root's qq-bridge folder holds two DSH bundles the profile DSH home links to, as in production.
 # -NodePath names a node.exe to copy: the synthetic production runs only on a private copy inside the fixture (with an
 # npm stub beside it), so no production process ever matches its configured program; the copy goes with the fixture.
 # Ends with "PASS production move rehearsal" or exits 1.
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-production-move.ps1 -Candidate <folder with
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\lifecycle\test-production-move.ps1 -Candidate <folder with
 #     her.exe, her-cli.exe and herupdate.exe> -NodePath <node.exe to copy> -FixtureRoot <new folder under the temporary folder>
 [CmdletBinding()]
 param(
@@ -19,7 +19,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Run the rehearsal in Windows PowerShell 5.1.' }
-$moveScript = Join-Path $PSScriptRoot 'production-move.ps1'
+$moveScript = Join-Path $PSScriptRoot '..\production-move.ps1'
 $fake = Join-Path $PSScriptRoot 'production-move-fake.mjs'
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $Candidate = [IO.Path]::GetFullPath($Candidate).TrimEnd('\')

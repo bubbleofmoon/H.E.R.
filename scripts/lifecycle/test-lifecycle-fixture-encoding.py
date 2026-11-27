@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import fixture_paths as tempfile
 
-repo = Path(__file__).resolve().parent.parent
+repo = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix='ticket27-fixture-encoding-') as tmp:
     harness = Path(tmp) / 'encoding.ps1'
     harness.write_text(r'''
@@ -35,7 +35,7 @@ foreach ($name in @('config/config.json','dependencies.json','data/social-v2.jso
 Write-Output 'fixture runtime JSON is valid UTF-8 without a BOM'
 ''')
     result = subprocess.run(['pwsh', '-NoProfile', '-File', str(harness),
-                             str(repo / 'scripts/test-lifecycle-fixture.ps1'), tmp],
+                             str(repo / 'scripts/lifecycle/test-lifecycle-fixture.ps1'), tmp],
                             text=True, capture_output=True, timeout=30)
     print(result.stdout, end='')
     print(result.stderr, end='')
