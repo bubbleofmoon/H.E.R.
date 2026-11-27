@@ -4959,6 +4959,34 @@ fn ticket297_reserved2_finite_sleep_schedules_next_wake_after_restart() {
     assert_eq!(rig.texts_to(GROUP_KEY), ["simulation fixture reply", "scheduled next wake"]);
     assert_eq!(reserved2_group_outbox(&rig).iter().filter(|kind| **kind == "confirmed").count(), 2);
     assert!(rig.dsh.prompts().is_empty());
+
+    let records = rig.ledger();
+    let begun: Vec<_> = records
+        .iter()
+        .filter(|r| r["k"] == "begun" && r["key"] == GROUP_KEY)
+        .collect();
+    assert_eq!(begun.len(), 2, "expected 2 begun records for {GROUP_KEY}: {begun:?}");
+    let t1 = begun[0]["turn"].as_str().unwrap();
+    let t2 = begun[1]["turn"].as_str().unwrap();
+    assert!(
+        !records.iter().any(|r| r["k"] == "unknown" && matches!(r["turn"].as_str(), Some(id) if id == t1 || id == t2)),
+        "expected zero pause (unknown) records for {GROUP_KEY}"
+    );
+    let end1 = records.iter().find(|r| r["k"] == "ended" && r["turn"] == t1).unwrap();
+    assert_eq!(end1["outcome"], "failed", "interrupted turn with confirmed send must settle as failed, got {end1}");
+    let claim2 = records
+        .iter()
+        .find(|r| r["k"] == "wake_claim" && r["turn"] == t2)
+        .expect("second scheduled wake must record wake_claim");
+    let armed_sleep = claim2["claim"]["previous"]["wakeConfig"]["sleepUntil"]
+        .as_str()
+        .expect("second wake claim must hold the newly scheduled finite sleepUntil");
+    assert_ne!(
+        armed_sleep, "2020-01-01T00:00:00.000Z",
+        "startup recovery must arm the newly scheduled finite sleep instead of re-firing the original expired deadline"
+    );
+    let end2 = records.iter().find(|r| r["k"] == "ended" && r["turn"] == t2).unwrap();
+    assert_eq!(end2["outcome"], "completed", "second scheduled wake must complete, got {end2}");
 }
 
 #[test]

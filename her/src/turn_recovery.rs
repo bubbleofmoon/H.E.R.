@@ -785,7 +785,11 @@ fn apply_at(
             }
             // A timer-only turn has no inbound event to hand back. Restore its durable deadline
             // before closing recovery, so another crash at either boundary remains recoverable.
-            if let Some(claim) = &turn.wake_claim {
+            if let Some(claim) = turn
+                .wake_claim
+                .as_ref()
+                .filter(|_| !is_expired_timeout_before_admission(turn))
+            {
                 if !commit(
                     crate::social_state::rollback_reserved2_wake(
                         context,
@@ -853,6 +857,14 @@ fn apply_at(
             );
         }
         Verdict::Cancel(why) => {
+            if turn.notes.iter().any(|note| note["verdict"] == "expired-before-admission")
+                && !commit(
+                    crate::social_state::rotate_if_epoch(context, &turn.key, &turn.epochs)
+                        .map_err(String::from),
+                )
+            {
+                return;
+            }
             finalize_handled(
                 crate::harness::Status::Cancelled,
                 Some(why),
@@ -915,9 +927,13 @@ impl Pass<'_> {
         let (status, unsettled, has_tools) = match stored {
             Ok(Some(row)) => row,
             Ok(None) if is_reserved2 && matches!(sends, SendState::None) && turn.attempts.iter().all(|a| !a.accepted) => {
-                let decided = match validity(self.context, self.cfg, turn) {
-                    Ok(()) => Verdict::Resume("Harness reserved2 wake interrupted before admission; resuming".into()),
-                    Err(why) => Verdict::Abandon(format!("Harness reserved2 wake interrupted and no longer valid: {why}")),
+                let decided = if turn.notes.iter().any(|note| note["verdict"] == "expired-before-admission") {
+                    Verdict::Cancel("turnTimeout".into())
+                } else {
+                    match validity(self.context, self.cfg, turn) {
+                        Ok(()) => Verdict::Resume("Harness reserved2 wake interrupted before admission; resuming".into()),
+                        Err(why) => Verdict::Abandon(format!("Harness reserved2 wake interrupted and no longer valid: {why}")),
+                    }
                 };
                 return preserve_finalization_claim(turn, decided);
             }
@@ -3751,6 +3767,89 @@ mod tests {
             wc["sleepUntil"].is_null(),
             "startup rearm must skip timeout turn with expired-before-admission note even without sleepRetired, got {wc}"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket297_open_turn_with_expired_before_admission_cancels_without_reviving_timeout() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-open-exp-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let old_token = "tok-297-open-exp-before-revoke";
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let previous = json!({
+            "wakeConfig": {
+                "confirmedAt": 2,
+                "infinite": false,
+                "sleepUntil": due_iso,
+                "lastWakeAt": 0,
+                "wakeCount": 0
+            },
+            "lastWakeReason": ""
+        });
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": old_token,
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "sleepRetired": true,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let cfg = context.load_config().unwrap();
+        let journal = Journal::open(&context).unwrap();
+        let rec = Recorder::begin_reserved2(
+            &context,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch(old_token),
+            &[],
+        )
+        .unwrap();
+        rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+        rec.verified("expired-before-admission", "turnTimeout").unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, State::Begun);
+        assert!(turns[0].attempts.is_empty());
+        let outbox = crate::send_outbox::read_records(&context);
+        Pass { context: &context, cfg: &cfg }
+            .reconcile(&journal, &turns[0], &turns, &outbox)
+            .await;
+
+        let ended = fold(&turn_ledger::read_records(&context).unwrap()).0.remove(0);
+        assert_eq!(ended.state, State::Cancelled);
+        assert_eq!(ended.outcome_reason, "turnTimeout");
+        let conv = context.read_social_state().unwrap()["conversations"]["group:1"].clone();
+        assert!(
+            conv["wakeConfig"]["sleepUntil"].is_null(),
+            "open expired-before-admission timeout turn must keep sleepUntil null, got {}",
+            conv["wakeConfig"]
+        );
+        assert_eq!(conv["wakeConfig"]["sleepRetired"], json!(true));
+        assert_ne!(conv["agentToken"].as_str(), Some(old_token));
     }
 
     #[test]

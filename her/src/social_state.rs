@@ -1942,6 +1942,7 @@ fn rollback_reserved2_wake_inner(
                             wc["sleepRetired"] = json!(true);
                         } else if retire_token.is_none()
                             && wc["infinite"] != true
+                            && wc["sleepRetired"] != true
                             && wc["sleepUntil"]
                                 .as_str()
                                 .and_then(crate::wake::parse_iso_ms)
