@@ -1571,7 +1571,7 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
 ) -> Result<(), String> {
     if !inbound_admitted(cfg, key)
         || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
-        || mode(context) != "reserved2"
+        || mode_checked(context).map_err(String::from)? != "reserved2"
     {
         return Ok(());
     }
@@ -1588,6 +1588,12 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
                 return Ok(());
             };
             let original = wake.clone();
+            let previous = wake_claim.and_then(|claim| claim.get("previous"));
+            let same_config =
+                previous.is_none_or(|prev| prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]);
+            if !same_config {
+                return Ok(());
+            }
             if wake["infinite"] != true
                 && wake["sleepUntil"]
                     .as_str()
@@ -1597,9 +1603,7 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
                 return Ok(());
             }
             if wake["infinite"] == false && wake["sleepUntil"].is_null() {
-                let previous = wake_claim.and_then(|claim| claim.get("previous"));
                 let restored_future = previous
-                    .filter(|prev| prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"])
                     .and_then(|prev| prev["wakeConfig"]["sleepUntil"].as_str())
                     .filter(|iso| crate::wake::parse_iso_ms(iso).is_some_and(|at| at > now));
                 if let Some(iso) = restored_future {
@@ -3839,5 +3843,23 @@ mod tests {
         assert_eq!(kept["confirmedAt"], 9);
         assert_eq!(kept["infinite"], true);
         assert!(kept["sleepUntil"].is_null());
+
+        // Newer finite config with null sleepUntil (confirmedAt changed) is also left untouched.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "sleepUntil": null,
+                "triggers": {"atMention": true},
+                "confirmedAt": 10
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        let kept_finite = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
+        assert_eq!(kept_finite["confirmedAt"], 10);
+        assert_eq!(kept_finite["infinite"], false);
+        assert!(kept_finite["sleepUntil"].is_null());
     }
 }

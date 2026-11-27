@@ -662,6 +662,22 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
             }
         }
     };
+    let finalize_handled = |store_status: crate::harness::Status,
+                            store_reason: Option<&str>,
+                            outcome: &str,
+                            ledger_reason: &str,
+                            message: String| {
+        if !commit(close_interrupted_harness(context, turn, &store_status, store_reason)) {
+            return;
+        }
+        if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
+            return;
+        }
+        if commit(recorder.end_reconciled(outcome, ledger_reason)) {
+            settle(journal, &turn.inbound, "handled");
+            log(&message);
+        }
+    };
     if let Some(facts) = facts {
         let _ = recorder.tools(facts.tools.iter().map(|t| t.to_json()).collect());
         let _ = recorder.dsh_turn(&facts.rpc_id, facts.dsh_turn);
@@ -678,22 +694,12 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
                 return;
             }
             // A clean observation sleep is completed work owned by the cancellation claim.
-            let outcome = if reason == "observationSleep" { "completed" } else { "cancelled" };
-            let store_status = if reason == "observationSleep" {
-                crate::harness::Status::ObservationSleep
+            let (outcome, store_status) = if reason == "observationSleep" {
+                ("completed", crate::harness::Status::ObservationSleep)
             } else {
-                crate::harness::Status::Cancelled
+                ("cancelled", crate::harness::Status::Cancelled)
             };
-            if !commit(close_interrupted_harness(context, turn, &store_status, Some(reason))) {
-                return;
-            }
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
-                return;
-            }
-            if commit(recorder.end_reconciled(outcome, reason)) {
-                settle(journal, &turn.inbound, "handled");
-                log(&format!("已核实取消：{reason}"));
-            }
+            finalize_handled(store_status, Some(reason), outcome, reason, format!("已核实取消：{reason}"));
             return;
         }
     }
@@ -736,15 +742,16 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
             }
         }
         Verdict::Abandon(why) => {
-            if !commit(close_interrupted_harness(
-                context,
-                turn,
-                &crate::harness::Status::Cancelled,
-                Some("abandoned"),
-            )) {
-                return;
-            }
+            // Commit `abandoned` in the ledger before closing SQLite as `Cancelled`, so a crash
+            // in between never reclassifies the abandonment as `Cancelled` on retry.
             if commit(recorder.end_reconciled("abandoned", why)) {
+                let _ = close_interrupted_harness(
+                    context,
+                    turn,
+                    &crate::harness::Status::Cancelled,
+                    Some("abandoned"),
+                );
+                let _ = rearm_reserved2_if_needed(context, cfg, turn);
                 settle(journal, &turn.inbound, "handled");
                 log(&format!("已放弃：{why}"));
             }
@@ -753,52 +760,27 @@ fn apply(context: &RuntimeContext, cfg: &Value, journal: &Journal, turn: &Turn, 
             let store_status = if why == "observationSleep" {
                 crate::harness::Status::ObservationSleep
             } else {
-                crate::harness::Status::Cancelled
+                crate::harness::Status::Completed(String::new())
             };
-            if !commit(close_interrupted_harness(context, turn, &store_status, Some(why))) {
-                return;
-            }
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
-                return;
-            }
-            if commit(recorder.end_reconciled("completed", why)) {
-                settle(journal, &turn.inbound, "handled");
-                log(&format!("已核实完成，不重做：{why}"));
-            }
+            finalize_handled(store_status, Some(why), "completed", why, format!("已核实完成，不重做：{why}"));
         }
         Verdict::Fail(why) => {
-            if !commit(close_interrupted_harness(
-                context,
-                turn,
-                &crate::harness::Status::Failed(why.clone()),
+            finalize_handled(
+                crate::harness::Status::Failed(why.clone()),
                 Some("interrupted"),
-            )) {
-                return;
-            }
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
-                return;
-            }
-            if commit(recorder.end_reconciled("failed", why)) {
-                settle(journal, &turn.inbound, "handled");
-                log(&format!("已核实失败，不重做：{why}"));
-            }
+                "failed",
+                why,
+                format!("已核实失败，不重做：{why}"),
+            );
         }
         Verdict::Cancel(why) => {
-            if !commit(close_interrupted_harness(
-                context,
-                turn,
-                &crate::harness::Status::Cancelled,
+            finalize_handled(
+                crate::harness::Status::Cancelled,
                 Some(why),
-            )) {
-                return;
-            }
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn)) {
-                return;
-            }
-            if commit(recorder.end_reconciled("cancelled", why)) {
-                settle(journal, &turn.inbound, "handled");
-                log(&format!("已核实取消：{why}"));
-            }
+                "cancelled",
+                why,
+                format!("已核实取消：{why}"),
+            );
         }
         Verdict::Reattach | Verdict::Defer(_) => {}
         Verdict::Pause { reason, detail, rotate } => {
@@ -830,6 +812,67 @@ impl Pass<'_> {
         send_state(&turn_ledger::batches_of_turn(turn, next_begin, outbox))
     }
 
+    /// Reconcile an interrupted harness turn without DSH probing, failing closed on uncertain
+    /// outbox sends or unsettled conversation-store tool calls.
+    fn reconcile_harness(&self, turn: &Turn, sends: &SendState) -> Verdict {
+        if let SendState::Unresolved(detail) | SendState::Unreadable(detail) = sends {
+            return pause("send-unresolved", detail.clone(), true);
+        }
+        let stored = crate::harness::store::Store::open(self.context).and_then(|store| {
+            let Some(status) = store.status(&turn.id)? else {
+                return Ok(None);
+            };
+            let unsettled = store.has_unsettled_tools(&turn.id)?;
+            let has_tools = store.has_tool_runs(&turn.id)?;
+            Ok(Some((status, unsettled, has_tools)))
+        });
+        let is_reserved2 = turn.reserved2 || turn.wake_claim.is_some();
+        let (status, unsettled, has_tools) = match stored {
+            Ok(Some(row)) => row,
+            Ok(None) if is_reserved2 && matches!(sends, SendState::None) && turn.attempts.iter().all(|a| !a.accepted) => {
+                let decided = match validity(self.context, self.cfg, turn) {
+                    Ok(()) => Verdict::Resume("Harness reserved2 wake interrupted before admission; resuming".into()),
+                    Err(why) => Verdict::Abandon(format!("Harness reserved2 wake interrupted and no longer valid: {why}")),
+                };
+                return preserve_finalization_claim(turn, decided);
+            }
+            Ok(None) => return pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true),
+            Err(detail) => return pause("send-unresolved", detail, true),
+        };
+        if unsettled {
+            return pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true);
+        }
+        if let crate::harness::Status::Paused { reason, detail } = status {
+            return pause(&reason, detail, true);
+        }
+        if !is_reserved2 {
+            return pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true);
+        }
+        let decided = match status {
+            crate::harness::Status::Completed(_) => {
+                Verdict::Complete("Harness reserved2 wake completed before restart".into())
+            }
+            crate::harness::Status::ObservationSleep => {
+                Verdict::Complete("observationSleep".into())
+            }
+            crate::harness::Status::Cancelled => {
+                Verdict::Cancel("Harness reserved2 wake cancelled before restart".into())
+            }
+            crate::harness::Status::Running | crate::harness::Status::Failed(_) => {
+                if !has_tools && matches!(sends, SendState::None) {
+                    match validity(self.context, self.cfg, turn) {
+                        Ok(()) => Verdict::Resume("Harness reserved2 wake interrupted before tool calls or sends; resuming".into()),
+                        Err(why) => Verdict::Abandon(format!("Harness reserved2 wake interrupted and no longer valid: {why}")),
+                    }
+                } else {
+                    Verdict::Fail("Harness reserved2 wake interrupted after tool or send effects; keeping confirmed sends without replay".into())
+                }
+            }
+            crate::harness::Status::Paused { .. } => unreachable!(),
+        };
+        preserve_finalization_claim(turn, decided)
+    }
+
     async fn reconcile(&self, journal: &Journal, turn: &Turn, turns: &[Turn], outbox: &Result<Vec<Value>, String>) {
         // Intent can survive a crash before the cancelling handler revokes authority.
         // Revoke before any probe/wait, without claiming that the work has ended.
@@ -846,59 +889,7 @@ impl Pass<'_> {
         }
         let sends = self.sends_of(turn, turns, outbox);
         if turn.backend == "harness" {
-            // A tool intent can precede its outbox write (or affect something other
-            // than QQ). Preserve both sources of uncertainty without replay or DSH probes.
-            let is_reserved2 = turn.reserved2 || turn.wake_claim.is_some();
-            let verdict = match &sends {
-                SendState::Unresolved(detail) | SendState::Unreadable(detail) =>
-                    pause("send-unresolved", detail.clone(), true),
-                _ => {
-                    let stored = crate::harness::store::Store::open(self.context).and_then(|store| {
-                        let Some(status) = store.status(&turn.id)? else {
-                            return Ok(None);
-                        };
-                        let unsettled = store.has_unsettled_tools(&turn.id)?;
-                        let has_tools = store.has_tool_runs(&turn.id)?;
-                        Ok(Some((status, unsettled, has_tools)))
-                    });
-                    match stored {
-                        Ok(None) if is_reserved2 && turn.attempts.is_empty() && matches!(&sends, SendState::None) =>
-                            decide(turn, None, &sends, validity(self.context, self.cfg, turn)),
-                        Ok(None) => pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true),
-                        Ok(Some((_, true, _))) => pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true),
-                        Ok(Some((crate::harness::Status::Paused { reason, detail }, false, _))) =>
-                            pause(&reason, detail, true),
-                        Ok(Some((status, false, has_tools))) if is_reserved2 => {
-                            let valid = validity(self.context, self.cfg, turn);
-                            let decided = match status {
-                                crate::harness::Status::Completed(_) => {
-                                    Verdict::Complete("Harness reserved2 wake completed before restart".into())
-                                }
-                                crate::harness::Status::ObservationSleep => {
-                                    Verdict::Complete("observationSleep".into())
-                                }
-                                crate::harness::Status::Cancelled => {
-                                    Verdict::Cancel("Harness reserved2 wake cancelled before restart".into())
-                                }
-                                crate::harness::Status::Running | crate::harness::Status::Failed(_) => {
-                                    if !has_tools && matches!(&sends, SendState::None) {
-                                        match valid {
-                                            Ok(()) => Verdict::Resume("Harness reserved2 wake interrupted before tool calls or sends; resuming".into()),
-                                            Err(why) => Verdict::Abandon(format!("Harness reserved2 wake interrupted and no longer valid: {why}")),
-                                        }
-                                    } else {
-                                        Verdict::Fail("Harness reserved2 wake interrupted after tool or send effects; keeping confirmed sends without replay".into())
-                                    }
-                                }
-                                crate::harness::Status::Paused { .. } => unreachable!(),
-                            };
-                            preserve_finalization_claim(turn, decided)
-                        }
-                        Ok(Some((_, false, _))) => pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true),
-                        Err(detail) => pause("send-unresolved", detail, true),
-                    }
-                }
-            };
+            let verdict = self.reconcile_harness(turn, &sends);
             apply(self.context, self.cfg, journal, turn, &verdict, None);
             return;
         }
@@ -1242,9 +1233,35 @@ pub fn spawn(context: RuntimeContext) {
     });
 }
 
+/// Re-arm interrupted `observationSleep` terminal wakes once per startup when the previous process
+/// committed `end_cancellation("completed", "observationSleep")` before the hub could re-arm `sleepUntil`.
+fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns: &[Turn], cutoff: i64) -> bool {
+    let mut latest_by_key: std::collections::HashMap<&str, &Turn> = Default::default();
+    for turn in turns {
+        if turn.begun_at <= cutoff {
+            latest_by_key.insert(turn.key.as_str(), turn);
+        }
+    }
+    let mut ok = true;
+    for turn in latest_by_key.into_values() {
+        if (turn.reserved2 || turn.wake_claim.is_some())
+            && turn.backend == "harness"
+            && turn.state == State::Completed
+            && turn.outcome_reason == "observationSleep"
+        {
+            if let Err(error) = rearm_reserved2_if_needed(context, cfg, turn) {
+                crate::safe_println!("[recovery] observationSleep rearm failed for {}: {error}", turn.key);
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
 async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<String>>, started_at: i64) {
     {
         let mut last_try: std::collections::HashMap<String, i64> = Default::default();
+        let mut obs_rearm_done = false;
         loop {
             if let (Ok(cfg), Ok(journal), Ok(records)) =
                 (context.load_config(), Journal::open(&context), turn_ledger::read_records(&context))
@@ -1257,6 +1274,9 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                     set
                 });
                 let (turns, _) = turn_ledger::fold(&records);
+                if !obs_rearm_done && rearm_startup_observation_sleeps(&context, &cfg, &turns, started_at) {
+                    obs_rearm_done = true;
+                }
                 let mut expiry_applied = false;
                 for turn in turns.iter().filter(|t| t.paused_at.is_some() && (t.state == State::Paused || t.notification_intent)) {
                     let pause_ready = if turn.pause_notified {
@@ -1951,6 +1971,78 @@ mod tests {
         let recovered = fold(&turn_ledger::read_records(&fx_chat.context).unwrap()).0.remove(0);
         assert_eq!(recovered.state, State::Paused);
         assert_eq!(recovered.pause_reason, "harness-interrupted");
+    }
+
+    #[tokio::test]
+    async fn ticket297_covers_unaccepted_attempt_and_observation_sleep_crash_windows() {
+        // Crash between `attempt` (unaccepted) and `conversations.db` admission reconciles safely without pause.
+        let root_unaccepted = crate::install_root::development_root(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-unaccepted-")),
+        );
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root_unaccepted.join(dir)).unwrap();
+        }
+        std::fs::write(
+            root_unaccepted.join("config/config.json"),
+            r#"{"consoleToken":"synthetic-review-token","allow":{"groups":[1]}}"#,
+        )
+        .unwrap();
+        std::fs::write(root_unaccepted.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root_unaccepted.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        let tok = "fixture-unaccepted-tok";
+        let deadline = crate::sticker::iso_at(crate::turn_ledger::now_ms() + 600_000);
+        let prev = json!({"wakeConfig":{"confirmedAt":1,"infinite":false,"sleepUntil":deadline},"lastWakeReason":""});
+        std::fs::write(
+            root_unaccepted.join("data/social-v2.json"),
+            json!({"conversations":{"group:1":{"agentToken":tok,"wakeConfig":{"confirmedAt":1,"infinite":false,"lastWakeAt":10,"sleepUntil":null}}}}).to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&root_unaccepted).unwrap();
+        let cfg = ctx.load_config().unwrap();
+        let journal = Journal::open(&ctx).unwrap();
+        let rec = Recorder::begin_reserved2(&ctx, "group:1", "harness", "timeout", &crate::send_outbox::token_epoch(tok), &[]).unwrap();
+        rec.wake_claim(&json!({"at":10,"previous":prev})).unwrap();
+        rec.attempt(&format!("harness:{}", rec.id), "").unwrap();
+        let turns = fold(&turn_ledger::read_records(&ctx).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&ctx);
+        Pass { context: &ctx, cfg: &cfg }.reconcile(&journal, &turns[0], &turns, &outbox).await;
+        let recovered = fold(&turn_ledger::read_records(&ctx).unwrap()).0.remove(0);
+        assert_eq!(recovered.state, State::Resumed, "unaccepted attempt before store admission must resume");
+        assert_eq!(ctx.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"], deadline);
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&root_unaccepted);
+
+        // Crash right after `end_cancellation("completed", "observationSleep")` re-arms consumed deadline at startup.
+        let mut fx_obs = setup_submitted_harness_turn("her-297-obs-rearm-", "reserved2", true, None, true);
+        fx_obs.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
+        let past_deadline = "2000-01-01T00:00:00.000Z";
+        let obs_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 1, "sleepUntil": past_deadline}}});
+        turn_ledger::Recorder::attach(&fx_obs.context, &fx_obs.turn_id, "group:1")
+            .wake_claim(&obs_claim)
+            .unwrap();
+        turn_ledger::Recorder::attach(&fx_obs.context, &fx_obs.turn_id, "group:1")
+            .end_cancellation("completed", "observationSleep")
+            .unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&fx_obs.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["sleepUntil"] = Value::Null;
+                wc["confirmedAt"] = json!(1);
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        let turns = fold(&turn_ledger::read_records(&fx_obs.context).unwrap()).0;
+        assert!(rearm_startup_observation_sleeps(&fx_obs.context, &fx_obs.cfg, &turns, crate::turn_ledger::now_ms() + 1000));
+        let sleep_until = fx_obs.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms);
+        assert!(sleep_until.is_some(), "interrupted observationSleep must re-arm finite sleepUntil at startup");
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch
