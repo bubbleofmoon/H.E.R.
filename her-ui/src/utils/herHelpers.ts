@@ -136,8 +136,8 @@ export function parseSettingDraftForSave(item: SettingItemView | undefined, rawV
 export interface ExtraDirtySource {
   count: number;
   label: string;
-  prepareSave?: () => ((resolvedEndpoint?: string) => Promise<void>) | null;
-  onSave: (resolvedEndpoint?: string) => Promise<void>;
+  prepareSave?: () => ((resolvedEndpoint?: string | null) => Promise<void>) | null;
+  onSave: (resolvedEndpoint?: string | null) => Promise<void>;
   onDiscard: () => void;
 }
 
@@ -292,8 +292,8 @@ export function useSettingsDrafts(
         confirm: boolean;
         item?: SettingItemView;
       }[],
-      captured?: { initialEndpoint?: string; defaultEndpoint?: string },
-    ): Promise<{ saved: number; failed: string[]; resolvedEndpoint?: string }> => {
+      captured?: { initialEndpoint: string | null; defaultEndpoint: string | null },
+    ): Promise<{ saved: number; failed: string[]; resolvedEndpoint?: string | null }> => {
       if (snapshots.length === 0) {
         return { saved: 0, failed: [] };
       }
@@ -347,12 +347,14 @@ export function useSettingsDrafts(
       const endpointEntry = active.find((entry) => entry.key === MODEL_ENDPOINT_KEY);
       const otherEntries = active.filter((entry) => entry.key !== MODEL_ENDPOINT_KEY);
       const outcomes: Awaited<ReturnType<typeof saveOne>>[] = [];
-      const fallbackEndpoint = captured
+      const fallbackEndpoint: string | null = captured
         ? captured.defaultEndpoint
-        : resolveActiveModelEndpoint(itemsRef.current, null);
-      let resolvedEndpoint = captured
+        : (resolveActiveModelEndpoint(itemsRef.current, null) ?? null);
+      let resolvedEndpoint: string | null = captured
         ? captured.initialEndpoint
-        : resolveActiveModelEndpoint(itemsRef.current);
+        : (activeEndpointRef.current !== undefined
+            ? activeEndpointRef.current
+            : (resolveActiveModelEndpoint(itemsRef.current) ?? null));
 
       if (endpointEntry) {
         const epOutcome = await saveOne(endpointEntry);
@@ -369,16 +371,33 @@ export function useSettingsDrafts(
               : fallbackEndpoint;
       }
 
+      const modelCredentialBlocked = !endpointEntry && !resolvedEndpoint;
+      const submittableOtherEntries = modelCredentialBlocked
+        ? otherEntries.filter((entry) => !MODEL_CREDENTIAL_KEYS.has(entry.key))
+        : otherEntries;
+      const blockedOutcomes = modelCredentialBlocked
+        ? otherEntries
+            .filter((entry) => MODEL_CREDENTIAL_KEYS.has(entry.key))
+            .map((entry) => ({
+              key: entry.key,
+              rev: entry.rev,
+              ok: false as const,
+              error: `${entry.key}: 当前模型接口地址不可用，请刷新后再保存密钥`,
+            }))
+        : [];
+
       // Reserve every remaining key's per-key write lock in api/client.ts synchronously on tick 0.
       const restOutcomes = await Promise.all(
-        otherEntries.map((entry) =>
+        submittableOtherEntries.map((entry) =>
           saveOne({
             ...entry,
-            expectedEndpoint: MODEL_CREDENTIAL_KEYS.has(entry.key) ? resolvedEndpoint : undefined,
+            expectedEndpoint: MODEL_CREDENTIAL_KEYS.has(entry.key)
+              ? (resolvedEndpoint ?? '')
+              : undefined,
           }),
         ),
       );
-      outcomes.push(...restOutcomes);
+      outcomes.push(...blockedOutcomes, ...restOutcomes);
 
       const failed: string[] = [];
       const warnings: string[] = [];
@@ -429,19 +448,22 @@ export function useSettingsDrafts(
 
   const saveAll = useCallback(
     async (
-      afterExtraSave?: (resolvedEndpoint?: string) => Promise<void>,
+      afterExtraSave?: (resolvedEndpoint?: string | null) => Promise<void>,
     ): Promise<{
       saved: number;
       failed: string[];
       deferred?: boolean;
-      resolvedEndpoint?: string;
+      resolvedEndpoint?: string | null;
     }> => {
       if (dirtyKeys.length === 0) {
         return { saved: 0, failed: [] };
       }
-      const capturedEndpoint =
-        activeEndpointRef.current ?? resolveActiveModelEndpoint(itemsRef.current);
-      const capturedDefaultEndpoint = resolveActiveModelEndpoint(itemsRef.current, null);
+      const capturedEndpoint: string | null =
+        activeEndpointRef.current !== undefined
+          ? activeEndpointRef.current
+          : (resolveActiveModelEndpoint(itemsRef.current) ?? null);
+      const capturedDefaultEndpoint: string | null =
+        resolveActiveModelEndpoint(itemsRef.current, null) ?? null;
       const snapshots = dirtyKeys.map((key) => {
         const item = itemsRef.current.find((s) => s.key === key);
         return {
@@ -509,7 +531,7 @@ export function useSettingsDrafts(
           }
           if (mountedRef.current) setSaving(true);
           try {
-            let resolvedEndpoint: string | undefined;
+            let resolvedEndpoint: string | null | undefined;
             if (dirtyKeys.length > 0) {
               const outcome = await saveAll(runExtra ?? undefined);
               if (outcome.deferred || outcome.failed.length > 0) {

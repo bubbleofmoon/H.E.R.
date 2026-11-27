@@ -944,7 +944,7 @@ impl ModelEndpointSnapshot {
 pub(crate) enum StoredEndpointOverride {
     Reset,
     Suppressed,
-    Value { raw: String, canonical: String },
+    Value { raw_text: String, raw: String, canonical: String },
     Malformed { raw_text: String, parsed: Option<Value> },
 }
 
@@ -982,7 +982,19 @@ fn stored_model_endpoint_override(
             parsed: Some(parsed),
         }));
     };
-    Ok(Some(StoredEndpointOverride::Value { raw, canonical }))
+    Ok(Some(StoredEndpointOverride::Value { raw_text: text, raw, canonical }))
+}
+
+fn value_override_is_scrubbed(
+    raw_text: &str,
+    raw: &str,
+    canonical: &str,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> bool {
+    endpoint_value_is_scrubbed(raw_text, Some(known_secrets), Some(scrubbed_hashes))
+        || endpoint_value_is_scrubbed(raw, Some(known_secrets), Some(scrubbed_hashes))
+        || endpoint_value_is_scrubbed(canonical, Some(known_secrets), Some(scrubbed_hashes))
 }
 
 fn malformed_override_is_scrubbed(
@@ -1003,6 +1015,23 @@ fn classify_stored_endpoint_override(
     scrubbed_hashes: &[String],
 ) -> Result<Option<StoredEndpointOverride>, InspectError> {
     match stored {
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            if value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                known_secrets,
+                scrubbed_hashes,
+            ) {
+                Ok(Some(StoredEndpointOverride::Suppressed))
+            } else {
+                Ok(Some(StoredEndpointOverride::Value {
+                    raw_text,
+                    raw,
+                    canonical,
+                }))
+            }
+        }
         Some(StoredEndpointOverride::Malformed { raw_text, parsed }) => {
             if malformed_override_is_scrubbed(
                 &raw_text,
@@ -1164,13 +1193,14 @@ fn effective_endpoint_from_overrides(
     scrubbed_hashes: &[String],
 ) -> (Option<String>, Option<ModelEndpointSource>) {
     let override_ep = match stored_override {
-        Some(StoredEndpointOverride::Value { raw, canonical }) => {
-            (!endpoint_value_is_scrubbed(&raw, Some(known_secrets), Some(scrubbed_hashes))
-                && !endpoint_value_is_scrubbed(
-                    &canonical,
-                    Some(known_secrets),
-                    Some(scrubbed_hashes),
-                ))
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            (!value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                known_secrets,
+                scrubbed_hashes,
+            ))
             .then_some((canonical, ModelEndpointSource::Settings))
         }
         Some(
@@ -1232,13 +1262,14 @@ pub(crate) fn scrub_archived_config_endpoint(
     let known_secrets = archive_known_secrets(archive_secrets, host_disk_key);
     let stored_suppressed = match archive_stored_override {
         Some(StoredEndpointOverride::Suppressed) => true,
-        Some(StoredEndpointOverride::Value { raw, canonical }) => {
-            endpoint_value_is_scrubbed(raw, Some(&known_secrets), Some(archive_scrubbed_hashes))
-                || endpoint_value_is_scrubbed(
-                    canonical,
-                    Some(&known_secrets),
-                    Some(archive_scrubbed_hashes),
-                )
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            value_override_is_scrubbed(
+                raw_text,
+                raw,
+                canonical,
+                &known_secrets,
+                archive_scrubbed_hashes,
+            )
         }
         _ => false,
     };
@@ -1288,9 +1319,14 @@ fn resolve_model_endpoint_from_parts(
         Some(StoredEndpointOverride::Suppressed)
     ) || matches!(
         &stored_override,
-        Some(StoredEndpointOverride::Value { raw, canonical })
-            if endpoint_value_is_scrubbed(raw, Some(&all_secrets), Some(&scrubbed_hashes))
-                || endpoint_value_is_scrubbed(canonical, Some(&all_secrets), Some(&scrubbed_hashes))
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical })
+            if value_override_is_scrubbed(
+                raw_text,
+                raw,
+                canonical,
+                &all_secrets,
+                &scrubbed_hashes,
+            )
     );
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
     let (effective_endpoint, effective_source) = effective_endpoint_from_overrides(
@@ -1900,13 +1936,14 @@ fn read_endpoint_write_guard(
     let scrubbed_hashes = read_scrubbed_endpoint_hashes(conn)?;
     let endpoint_suppressed = match stored_model_endpoint_override(conn)? {
         Some(StoredEndpointOverride::Suppressed) => true,
-        Some(StoredEndpointOverride::Value { raw, canonical }) => {
-            endpoint_value_is_scrubbed(&raw, Some(&known_secrets), Some(&scrubbed_hashes))
-                || endpoint_value_is_scrubbed(
-                    &canonical,
-                    Some(&known_secrets),
-                    Some(&scrubbed_hashes),
-                )
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                &known_secrets,
+                &scrubbed_hashes,
+            )
         }
         Some(StoredEndpointOverride::Malformed { raw_text, parsed }) => {
             if malformed_override_is_scrubbed(
@@ -3195,15 +3232,13 @@ pub(crate) fn undo(
                 .map_err(|error| (503, error.into_message()))?;
             let has_clean_stored_endpoint = matches!(
                 stored_model_endpoint_override(conn).map_err(|error| (503, error.into_message()))?,
-                Some(StoredEndpointOverride::Value { ref raw, ref canonical })
-                    if !endpoint_value_is_scrubbed(
+                Some(StoredEndpointOverride::Value { ref raw_text, ref raw, ref canonical })
+                    if !value_override_is_scrubbed(
+                        raw_text,
                         raw,
-                        Some(&guard.known_secrets),
-                        Some(&guard.scrubbed_hashes),
-                    ) && !endpoint_value_is_scrubbed(
                         canonical,
-                        Some(&guard.known_secrets),
-                        Some(&guard.scrubbed_hashes),
+                        &guard.known_secrets,
+                        &guard.scrubbed_hashes,
                     )
             );
             remove_from_config(context, setting, &guard, has_clean_stored_endpoint)

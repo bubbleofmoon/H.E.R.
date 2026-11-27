@@ -97,9 +97,15 @@ export const InspectorDrawer: React.FC = () => {
       return;
     }
     const saveRev = draftRevRef.current;
-    const expectedEndpoint = MODEL_CREDENTIAL_KEYS.has(settingItem.key)
-      ? resolveActiveModelEndpoint(settings)
-      : undefined;
+    let expectedEndpoint: string | undefined;
+    if (MODEL_CREDENTIAL_KEYS.has(settingItem.key)) {
+      const resolvedEndpoint = resolveActiveModelEndpoint(settings) ?? null;
+      if (!resolvedEndpoint) {
+        pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+        return;
+      }
+      expectedEndpoint = resolvedEndpoint;
+    }
     const isClearedEndpoint =
       (settingItem.kind.type === 'model endpoint' || settingItem.key === MODEL_ENDPOINT_KEY) &&
       parsedValue === null;

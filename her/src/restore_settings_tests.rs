@@ -1466,6 +1466,7 @@ fn ticket443_r7_restore_preview_suppresses_archived_scrub_hash_after_secret_rota
     // Without archive_scrubbed_hashes, the rotated-key archive would surface leaked_url.
     let without_hashes = crate::settings::archive_effective_model_endpoint(
         Some(crate::settings::StoredEndpointOverride::Value {
+            raw_text: json!(leaked_url).to_string(),
             raw: leaked_url.clone(),
             canonical: leaked_url.clone(),
         }),

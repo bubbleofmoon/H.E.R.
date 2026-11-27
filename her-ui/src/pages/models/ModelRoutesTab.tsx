@@ -239,8 +239,9 @@ export const ModelRoutesTab: React.FC = () => {
   );
 
   const savingRef = useRef(false);
+  const modelSaveTargetEndpointRef = useRef<string | null>(null);
 
-  const prepareSecretSave = useCallback((): ((resolvedEndpoint?: string) => Promise<void>) | null => {
+  const prepareSecretSave = useCallback((): ((resolvedEndpoint?: string | null) => Promise<void>) | null => {
     if (secretBusyKey !== null || savingRef.current) return null;
     const frozenEntries: { item: SettingItemView; raw: string }[] = [];
     for (const key of dirtySecretKeys) {
@@ -254,17 +255,28 @@ export const ModelRoutesTab: React.FC = () => {
       }
       frozenEntries.push({ item, raw });
     }
-    return async (resolvedEndpoint?: string) => {
-      const targetEndpoint = resolvedEndpoint ?? activeEndpointInfo.endpoint ?? undefined;
+    const hasModelSecret = frozenEntries.some(({ item }) => MODEL_CREDENTIAL_KEYS.has(item.key));
+    if (hasModelSecret && modelSaveTargetEndpointRef.current === null) {
+      pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+      return null;
+    }
+    return async (resolvedEndpoint?: string | null) => {
+      const targetEndpoint =
+        resolvedEndpoint !== undefined ? resolvedEndpoint : activeEndpointInfo.endpoint;
       for (const { item, raw } of frozenEntries) {
         if (!mountedRef.current) break;
+        const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
+        if (isModelSecret && !targetEndpoint) {
+          pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+          break;
+        }
         setSecretBusyKey(item.key);
         let ok = false;
         try {
           ok = await persistValidatedSecret(
             item,
             raw,
-            MODEL_CREDENTIAL_KEYS.has(item.key) ? targetEndpoint : undefined,
+            isModelSecret ? (targetEndpoint ?? '') : undefined,
           );
         } finally {
           if (mountedRef.current) {
@@ -284,7 +296,7 @@ export const ModelRoutesTab: React.FC = () => {
   ]);
 
   const saveAllSecrets = useCallback(
-    async (resolvedEndpoint?: string) => {
+    async (resolvedEndpoint?: string | null) => {
       const runner = prepareSecretSave();
       if (runner) {
         await runner(resolvedEndpoint);
@@ -346,6 +358,7 @@ export const ModelRoutesTab: React.FC = () => {
     }
     return activeEndpointInfo.endpoint;
   }, [dirtyKeys, apiBaseUrlItem, drafts, settings, activeEndpointInfo.endpoint]);
+  modelSaveTargetEndpointRef.current = modelSaveTargetEndpoint;
 
   const handleSaveSecret = useCallback(
     async (item: SettingItemView) => {

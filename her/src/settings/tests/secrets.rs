@@ -1705,3 +1705,54 @@ fn ticket443_r15_corrupt_db_endpoint_still_scrubs_leaked_config_on_503() {
         "leaked config/harness.apiBaseUrl must still be scrubbed even when DB endpoint is corrupt (503)"
     );
 }
+
+#[test]
+fn ticket443_r16_escaped_valid_url_credential_suppressed_before_rotation() {
+    let tok = r#"\"r16-esc"#;
+    let esc_host = "esc-r16.example.test";
+    let unescaped_url = format!("https://{esc_host}/tok\"r16-esc");
+    let serialized_row = serde_json::to_string(&unescaped_url).unwrap();
+    assert!(
+        serialized_row.contains(tok),
+        "test setup requires escaped substring only in serialized SQLite JSON form"
+    );
+    assert!(
+        !unescaped_url.contains(tok),
+        "unescaped URL must not already match tok before JSON serialization"
+    );
+
+    let (root, context) = settings_fixture("ticket443 r16 escaped valid url suppressed");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    std::fs::write(root.0.join("config/harness-api-key"), tok).unwrap();
+    StoreProbe::at(&root.0).edit(&format!(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+        serialized_row.replace('\'', "''")
+    ));
+
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert!(
+        snap.stored_url_suppressed,
+        "escaped credential in serialized Value row must set stored_url_suppressed before rotation: {:?}",
+        snap.effective_endpoint
+    );
+    assert_eq!(
+        snap.effective_endpoint.as_deref(),
+        Some(default_ep.as_str()),
+        "resolver must fall back to D before rotation"
+    );
+
+    let url_view = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(url_view["stored"], json!("(hidden)"), "{url_view}");
+    assert_eq!(url_view["value"], Value::Null, "{url_view}");
+
+    let (m_status, models_reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(m_status, 200);
+    assert_eq!(
+        models_reply["effectiveModelEndpoint"],
+        json!(default_ep),
+        "GET /api/settings/models must return D rather than leaked escaped URL: {models_reply}"
+    );
+    assert_eq!(models_reply["effectiveModelEndpointSource"], json!("dependencies.json"));
+}
