@@ -100,7 +100,7 @@ pub(crate) use store::{
     read_archive_values, read_store,
     record_setting_change, redact_route_array, registry_free, reset, reset_conversation,
     resolve_config, resolve_live_batch, resolve_model_endpoint_and_key, restore_gate,
-    restore_switch_choice, schema_version_checked,
+    restore_switch_choice, schema_version_checked, scrub_archived_config_endpoint,
     secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
     stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
     Applied, Change, InspectError, ModelEndpointSnapshot, ModelEndpointSource, StoreInspection,

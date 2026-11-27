@@ -843,3 +843,103 @@ fn ticket443_r8_undo_scrubbed_migration_entry_returns_400() {
     );
     assert_eq!(reply["error"], "setting text contains a credential");
 }
+
+#[test]
+fn ticket443_r9_scrub_overwrites_audit_plaintext_and_blocks_repost_after_rotation() {
+    let (root, context) = settings_fixture("ticket443 r9 scrub audit plaintext");
+    let tok = "fixture-r9-leaked-tok";
+    let leaked_url = format!("https://api.example.com/{tok}/path");
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    // Rotate key so `tok` is no longer in active secrets.
+    assert_eq!(put(&context, CLI, "fixture-r9-rotated-key").0, 200);
+    assert_eq!(post(&context, "/api/settings/reset", json!({"setting": "harness.apiBaseUrl"})).0, 200);
+
+    // Inspect settings.db directly: neither settings nor settings_audit may retain `tok` in plaintext,
+    // and the append-only update trigger must still be installed.
+    let db = rusqlite::Connection::open(root.0.join("data/settings.db")).unwrap();
+    let audit_rows: Vec<(Option<String>, Option<String>)> = {
+        let mut stmt = db
+            .prepare("SELECT old_value, new_value FROM settings_audit WHERE scope='global' AND key='harness.apiBaseUrl'")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(!audit_rows.is_empty());
+    for (old_val, new_val) in &audit_rows {
+        assert!(
+            !old_val.as_deref().unwrap_or("").contains(tok)
+                && !new_val.as_deref().unwrap_or("").contains(tok),
+            "settings_audit must scrub plaintext leaked url on disk: {audit_rows:?}"
+        );
+    }
+    assert!(
+        db.execute("UPDATE settings_audit SET new_value='\"tamper\"' WHERE key='harness.apiBaseUrl'", []).is_err(),
+        "settings_audit_no_update trigger must stay active after scrub"
+    );
+    drop(db);
+
+    // Re-posting the tombstoned URL after key rotation must be rejected with 400 (via scrubbed_hashes).
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({"setting": "harness.apiBaseUrl", "value": leaked_url}),
+    );
+    assert_eq!(st, 400, "reposting rotated scrubbed endpoint must fail closed with 400: {reply}");
+    assert_eq!(reply["error"], "setting text contains a credential");
+}
+
+#[test]
+fn ticket443_r9_trailing_slash_secret_matches_embedded_path_segment() {
+    let (root, context) = settings_fixture("ticket443 r9 trailing slash embedded");
+    let slash_tok = "fixture-r9-mid//";
+    assert_eq!(put(&context, CLI, slash_tok).0, 200);
+    let url_with_suffix = "https://api.example.com/fixture-r9-mid/v1";
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({"setting": "harness.apiBaseUrl", "value": url_with_suffix}),
+    );
+    assert_eq!(
+        st, 400,
+        "endpoint containing stripped trailing-slash secret before suffix must return 400: {reply}"
+    );
+    assert_eq!(reply["error"], "setting text contains a credential");
+
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": url_with_suffix});
+    });
+    assert_eq!(set_quiet(&context, json!(4600)).0, 200);
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "write_back must scrub embedded stripped trailing-slash secret url from config.json"
+    );
+}
+
+#[test]
+fn ticket443_r9_non_string_malformed_config_endpoint_scrubbed_by_write_back_and_mirror_into() {
+    let (root, context) = settings_fixture("ticket443 r9 non-string config endpoint");
+    let tok = "fixture-r9-arr-tok";
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": [tok]});
+    });
+    assert_eq!(set_quiet(&context, json!(4700)).0, 200);
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "write_back must scrub non-string credential-bearing /harness/apiBaseUrl"
+    );
+
+    let mut doc = stored_config(&root);
+    doc["harness"] = json!({"apiBaseUrl": {"nested": tok}});
+    assert!(crate::settings::mirror_into(&context, &mut doc).unwrap());
+    assert!(
+        doc.pointer("/harness/apiBaseUrl").is_none(),
+        "mirror_into must scrub non-string object credential-bearing /harness/apiBaseUrl"
+    );
+}

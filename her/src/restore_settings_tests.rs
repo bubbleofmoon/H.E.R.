@@ -1469,3 +1469,60 @@ fn ticket443_r7_restore_preview_suppresses_archived_scrub_hash_after_secret_rota
     );
     assert_eq!(without_hashes.as_deref(), Some(leaked_url.as_str()));
 }
+
+#[test]
+fn ticket443_r9_full_restore_roundtrip_and_scrubs_suppressed_archived_config_url() {
+    let f = Fixture::new();
+    let context = f.context();
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    // (a) Clean harness.apiBaseUrl + bound harness.apiKey roundtrip across full restore.
+    let clean_ep = "https://restored-clean.example.test/v1";
+    let clean_key = "fixture-r9-clean-bound-key";
+    crate::settings::apply(&context, "harness.apiBaseUrl", &json!(clean_ep), "fixture-admin", "console")
+        .unwrap();
+    crate::settings::apply(&context, "harness.apiKey", &json!(clean_key), "fixture-admin", "console")
+        .unwrap();
+    let archive_clean = f.backup();
+
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    crate::settings::reset(&context, "harness.apiKey", "fixture-admin").unwrap();
+    auth_restore(&f, &archive_clean, false, &mut FakeControl::default()).unwrap();
+    let restored_snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(restored_snap.effective_endpoint.as_deref(), Some(clean_ep));
+    assert_eq!(restored_snap.harness_db_key.as_deref(), Some(clean_key));
+
+    // (b) Credential-bearing unseeded /harness/apiBaseUrl in archive config.json is suppressed in preview
+    // AND stripped from restored config/config.json on full restore.
+    let f2 = Fixture::new();
+    let context2 = f2.context();
+    let leaked_tok = "fixture-r9-restore-tok";
+    crate::settings::apply(&context2, "cliModel.apiKey", &json!(leaked_tok), "fixture-admin", "console")
+        .unwrap();
+    let cfg_path2 = f2.0.join("config/config.json");
+    let mut cfg2: Value = serde_json::from_slice(&fs::read(&cfg_path2).unwrap()).unwrap();
+    cfg2["harness"] = json!({"apiBaseUrl": format!("https://leaked-r9.example.test/{leaked_tok}")});
+    fs::write(&cfg_path2, serde_json::to_string_pretty(&cfg2).unwrap()).unwrap();
+    let archive_leaked = f2.backup();
+
+    cfg2["harness"] = json!({});
+    fs::write(&cfg_path2, serde_json::to_string_pretty(&cfg2).unwrap()).unwrap();
+    let preview_warnings = preview(&context2, &archive_leaked, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !preview_warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "suppressed archived config url must not warn on switch: {preview_warnings:?}"
+    );
+    auth_restore(&f2, &archive_leaked, false, &mut FakeControl::default()).unwrap();
+    let restored_cfg2: Value = serde_json::from_slice(&fs::read(&cfg_path2).unwrap()).unwrap();
+    assert!(
+        restored_cfg2.pointer("/harness/apiBaseUrl").is_none(),
+        "full restore must strip suppressed /harness/apiBaseUrl from restored config.json: {restored_cfg2}"
+    );
+    let snap2 = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
+    assert_eq!(snap2.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+}

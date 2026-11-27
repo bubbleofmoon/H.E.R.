@@ -189,15 +189,21 @@ impl Prepared {
                 .map_err(|e| e.to_string())?
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            let raw = crate::backup::parse_archive_config(&bytes)?;
-            if let Ok(live_snap) = crate::settings::resolve_model_endpoint_and_key(context) {
+            let mut raw = crate::backup::parse_archive_config(&bytes)?;
+            let live_snap = crate::settings::resolve_model_endpoint_and_key(context);
+            let host_disk_key = live_snap
+                .as_ref()
+                .ok()
+                .and_then(|snap| snap.harness_disk_key.clone())
+                .or_else(|| crate::settings::harness_credential(context));
+            if let Ok(live_snap) = &live_snap {
                 let archive_endpoint = crate::settings::archive_effective_model_endpoint(
-                    verified.archive_model_endpoint,
+                    verified.archive_model_endpoint.clone(),
                     &raw,
                     context.dependency_url("model"),
                     &verified.archive_secrets,
                     &verified.archive_scrubbed_hashes,
-                    live_snap.harness_disk_key.as_deref(),
+                    host_disk_key.as_deref(),
                 );
                 if let (Some(e_archive), Some(e_live)) = (
                     archive_endpoint.as_deref(),
@@ -207,6 +213,16 @@ impl Prepared {
                         warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
                     }
                 }
+            }
+            if crate::settings::scrub_archived_config_endpoint(
+                &mut raw,
+                verified.archive_model_endpoint.as_ref(),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            ) {
+                bytes = serde_json::to_vec_pretty(&raw)
+                    .map_err(|e| format!("backup config is invalid: {e}"))?;
             }
             let (config, _) = crate::backup::validate_archive_config(
                 context.runtime_root(),
