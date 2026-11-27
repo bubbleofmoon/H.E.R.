@@ -538,7 +538,14 @@ fn wait_secs(cfg: &Value) -> u64 {
 
 /// Same session mapping, same token epoch, conversation still allowed.
 fn validity(context: &RuntimeContext, cfg: &Value, turn: &Turn) -> Result<(), String> {
-    if !crate::social_state::inbound_admitted(cfg, &turn.key) {
+    let admitted = if turn.reserved2 || turn.wake_claim.is_some() {
+        crate::social_state::inbound_admitted(cfg, &turn.key)
+    } else if turn.reason.starts_with("reserved") {
+        crate::chat::allowed_key(cfg, &turn.key)
+    } else {
+        crate::chat::allowed_in_mode(cfg, &crate::social_state::mode(context), &turn.key)
+    };
+    if !admitted {
         return Err("会话已不在允许范围内".to_string());
     }
     if !turn.session_id.is_empty() {
@@ -611,8 +618,11 @@ fn hand_back(journal: &Journal, keys: &[String]) {
     }
 }
 
-fn allowed(cfg: &Value, event: &Replayable) -> bool {
-    crate::social_state::inbound_admitted(cfg, &event.conversation)
+fn allowed(context: &RuntimeContext, cfg: &Value, event: &Replayable) -> bool {
+    match crate::social_state::mode(context).as_str() {
+        "reserved2" => crate::social_state::inbound_admitted(cfg, &event.conversation),
+        mode => crate::chat::allowed_in_mode(cfg, mode, &event.conversation),
+    }
 }
 
 fn close_interrupted_harness(
@@ -1235,7 +1245,7 @@ impl Pass<'_> {
             if !ledger_covers(records, at) {
                 continue;
             }
-            if allowed(self.cfg, &event) {
+            if allowed(self.context, self.cfg, &event) {
                 println!("[recovery] 事件 {} 没有对应回合，未执行，交回重处理", event.event_key);
                 hand_back(journal, std::slice::from_ref(&event.event_key));
             } else {
@@ -4977,5 +4987,72 @@ mod tests {
         let paused = updated.iter().find(|t| t.id == fx_open.turn_id).unwrap();
         assert_eq!(paused.state, State::Paused);
         assert_eq!(paused.pause_reason, "harness-interrupted");
+    }
+
+    #[tokio::test]
+    async fn ticket172_r2_allow_all_when_empty_recovers_reserved_and_refuses_deny_and_reserved2() {
+        let mut allow_empty_cfg = json!({
+            "consoleToken": "synthetic-review-token-172",
+            "allow": {"groups": []},
+            "allowAllWhenEmpty": true,
+            "deny": {"groups": [99]},
+            "harness": {"model": "fake-chat"}
+        });
+        for reason in ["reserved", "reserved-summary"] {
+            let fx = setup_submitted_harness_turn(&format!("her-172-r2-{reason}-"), "reserved", false, None, true);
+            std::fs::write(fx.context.runtime_root().join("config/config.json"), allow_empty_cfg.to_string()).unwrap();
+            let mut records = turn_ledger::read_records(&fx.context).unwrap();
+            let begun_idx = records.iter().position(|r| r["k"] == "begun").unwrap();
+            records[begun_idx]["reason"] = json!(reason);
+            std::fs::write(
+                fx.context.runtime_root().join("data/turn-ledger.jsonl"),
+                records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+            ).unwrap();
+            let rec = Recorder::attach(&fx.context, &fx.turn_id, "group:1");
+            rec.verified("unsubmitted", "reserved retry is safe").unwrap();
+            rec.end("failed", "route unconfigured").unwrap();
+
+            let records = turn_ledger::read_records(&fx.context).unwrap();
+            let (turns, _) = fold(&records);
+            Pass { context: &fx.context, cfg: &allow_empty_cfg }.finished(&fx.journal, &turns);
+            assert_eq!(
+                fx.journal.stage_of(&fx.input).unwrap().as_deref(),
+                Some("received"),
+                "{reason}: allowAllWhenEmpty must recover Gen-1 reserved event"
+            );
+            assert!(take_resumable().iter().any(|ev| ev.event_key == fx.input));
+
+            // Orphan event in allowAllWhenEmpty reserved mode must also recover; denied group:99 must settle handled.
+            let orphan_ok = format!("group:43|message:501-{reason}");
+            let orphan_deny = format!("group:99|message:502-{reason}");
+            for (k, conv) in [(&orphan_ok, "group:43"), (&orphan_deny, "group:99")] {
+                fx.journal.record_received(k, conv, "{}", 2).unwrap();
+                fx.journal.mark_processing(std::slice::from_ref(k), 3).unwrap();
+            }
+            fx.journal.recover_interrupted(now()).unwrap();
+            Pass { context: &fx.context, cfg: &allow_empty_cfg }.orphans(&fx.journal, &turns, &records);
+            assert_eq!(fx.journal.stage_of(&orphan_ok).unwrap().as_deref(), Some("received"));
+            assert_eq!(fx.journal.stage_of(&orphan_deny).unwrap().as_deref(), Some("handled"));
+            let _ = take_resumable();
+        }
+
+        // reserved2 must still refuse allowAllWhenEmpty: true.
+        let fx2 = setup_submitted_harness_turn("her-172-r2-res2-", "reserved2", true, None, true);
+        let orphan_res2 = "group:44|message:503";
+        fx2.journal.record_received(orphan_res2, "group:44", "{}", 2).unwrap();
+        fx2.journal.mark_processing(std::slice::from_ref(&orphan_res2.to_string()), 3).unwrap();
+        fx2.journal.recover_interrupted(now()).unwrap();
+        let records = turn_ledger::read_records(&fx2.context).unwrap();
+        let (turns, _) = fold(&records);
+        let rec = Recorder::attach(&fx2.context, &fx2.turn_id, "group:1");
+        rec.verified("unsubmitted", "retry").unwrap();
+        rec.end("failed", "route unconfigured").unwrap();
+        let records = turn_ledger::read_records(&fx2.context).unwrap();
+        let (turns2, _) = fold(&records);
+        allow_empty_cfg["socialV2"] = fx2.cfg["socialV2"].clone();
+        Pass { context: &fx2.context, cfg: &allow_empty_cfg }.finished(&fx2.journal, &turns2);
+        Pass { context: &fx2.context, cfg: &allow_empty_cfg }.orphans(&fx2.journal, &turns, &records);
+        assert_eq!(fx2.journal.stage_of(orphan_res2).unwrap().as_deref(), Some("handled"));
+        assert_eq!(fx2.journal.stage_of(&fx2.input).unwrap().as_deref(), Some("handled"));
     }
 }

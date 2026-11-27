@@ -55,6 +55,13 @@ impl From<DshTurnError> for String {
     }
 }
 
+/// Outcome of retiring an old Gen-1 `reserved` epoch across open ledger turns.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CancelReservedOutcome {
+    pub open_harness: bool,
+    pub cancelled_non_harness: bool,
+}
+
 impl Pipeline {
     fn dsh_switch_summary(&self, key: &str, sid: &str, cfg: &serde_json::Value) -> Result<Option<String>, String> {
         let generation = self.turn_epochs.first().unwrap_or(&self.turn_epoch);
@@ -460,20 +467,26 @@ impl Pipeline {
 
     /// Mode retirement already revoked the old epoch. Stale driver cleanup must
     /// never resolve the new mapping or rotate a replacement turn's token.
-    pub fn cancel_reserved_epoch(&self, key: &str, token: &str) -> Result<(), String> {
+    pub fn cancel_reserved_epoch(&self, key: &str, token: &str) -> Result<CancelReservedOutcome, String> {
         let epoch = crate::send_outbox::token_epoch(token);
         let (turns, _) =
             crate::turn_ledger::fold(&crate::turn_ledger::read_records(&self.context)?);
         let mut sessions = std::collections::BTreeSet::new();
+        let mut outcome = CancelReservedOutcome::default();
         for turn in turns
             .iter()
             .filter(|t| t.key == key && t.epochs.contains(&epoch) && t.state.is_open())
         {
+            if turn.backend == "harness" {
+                outcome.open_harness = true;
+                continue;
+            }
             if !turn.session_id.is_empty() {
                 sessions.insert(turn.session_id.clone());
             }
             crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry()
                 .end("cancelled", "reserved mode retired")?;
+            outcome.cancelled_non_harness = true;
         }
         if !sessions.is_empty() {
             let rpc = if self.has_dsh() {
@@ -487,7 +500,7 @@ impl Pipeline {
                 crate::dsh::stop_session_work(client, &sid)?;
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn note_session(&self, sid: &str) {

@@ -172,6 +172,8 @@ struct Handover {
     epoch: Option<String>,
     summary: Option<String>,
     pending: Option<Pending>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prior_epochs: Vec<String>,
 }
 
 fn read_handover(conv: Option<&Conversation>) -> Result<Handover, String> {
@@ -179,6 +181,17 @@ fn read_handover(conv: Option<&Conversation>) -> Result<Handover, String> {
         None | Some(Value::Null) => Ok(Handover::default()),
         Some(value) => serde_json::from_value(value.clone()).map_err(|_| "invalid conversation handover".into()),
     }
+}
+
+pub(crate) fn is_switched_token(
+    context: &RuntimeContext, key: &str, previous_token: &str, current_token: &str,
+) -> Result<bool, String> {
+    let conversation = ConversationState::for_runtime(context).read(key).map_err(|(_, e)| e)?;
+    let record = read_handover(conversation.as_ref())?;
+    let prev_epoch = crate::conversation_state::token_epoch(previous_token);
+    let curr_epoch = crate::conversation_state::token_epoch(current_token);
+    Ok(record.epoch.as_deref() == Some(curr_epoch.as_str())
+        && record.prior_epochs.iter().any(|e| e == &prev_epoch))
 }
 
 fn handover_uses_dsh(
@@ -236,6 +249,7 @@ fn clear_pending(
             epoch: Some(epoch(Some(conv))),
             summary: Some(pending.summary.clone()),
             pending: None,
+            prior_epochs: Vec::new(),
         }));
         return Ok(());
     }
@@ -344,7 +358,15 @@ fn prepare_admission(
     }
 
     let permitted = |current_cfg: &Value| -> Result<(), (u16, String)> {
-        if !crate::settings::conversation_admitted(current_cfg, key)
+        let admitted = if requested.is_some() {
+            crate::settings::conversation_admitted(current_cfg, key)
+        } else {
+            match mode {
+                "reserved2" => crate::social_state::inbound_admitted(current_cfg, key),
+                _ => crate::chat::allowed_in_mode(current_cfg, mode, key),
+            }
+        };
+        if !admitted
             || !crate::social_state::access_allowed(current_cfg, mode, key)
             || (mode == "reserved2" && !crate::social_state::inbound_admitted(current_cfg, key))
         {
@@ -532,13 +554,25 @@ fn finish_pending(
                 return Err(admission_changed());
             }
         }
+        let prev = read_handover(Some(conv)).map_err(refused)?;
+        let mut prior_epochs = if prev.epoch.as_deref() == Some(generation) {
+            prev.prior_epochs
+        } else {
+            Vec::new()
+        };
+        if !generation.is_empty() && !prior_epochs.iter().any(|e| e == generation) {
+            prior_epochs.push(generation.to_string());
+        }
+        if prior_epochs.len() > 16 {
+            prior_epochs.drain(..prior_epochs.len() - 16);
+        }
         if conv.token_is_null() {
             *conv = Conversation::new_default(context);
         }
         let token = conv.rotate_token();
         conv.set_field(FIELD, json!(Handover {
             engine: Some(pending.to), epoch: Some(crate::conversation_state::token_epoch(&token)),
-            summary: Some(pending.summary.clone()), pending: None,
+            summary: Some(pending.summary.clone()), pending: None, prior_epochs,
         }));
         conv.set_field("bootstrapSent", json!(false));
         Ok(token)
@@ -628,4 +662,82 @@ fn summarize(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows
     let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).map_err(|error| failure(error.0))?;
     let accepted = crate::harness::handover::accept(&data, &answer).map_err(failure)?;
     filtered_text(context, cfg, &accepted, ROW_CHARS, &known).ok_or_else(|| failure("wording"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeArea;
+
+    #[test]
+    fn ticket172_r2_automatic_switch_honors_allow_all_when_empty_while_console_keeps_conversation_admitted() {
+        let cfg = json!({
+            "consoleToken": "synthetic-console-token",
+            "allow": {"groups": []},
+            "allowAllWhenEmpty": true,
+            "deny": {"groups": [99]},
+            "harness": {"model": "fake-chat"},
+            "conversationEngines": {"group:42": "harness", "group:99": "harness"}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-172-switch-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("config/harness-api-key"), "synthetic-harness-key").unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+
+        for mode in ["reserved", "chat"] {
+            context.write_atomic(RuntimeArea::Data, "mode.json", json!({"mode": mode}).to_string().as_bytes()).unwrap();
+            let key = "group:42";
+            let token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+            let gen = epoch(Some(&ConversationState::for_runtime(&context).read(key).unwrap().unwrap()));
+            ConversationState::for_runtime(&context).update(key, |conv| {
+                conv.set_field(FIELD, json!(Handover {
+                    engine: Some(Engine::Dsh), epoch: Some(gen.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
+                }));
+                Ok(())
+            }).unwrap();
+            // Console switch keeps strict conversation_admitted (409 NOT_ADMITTED when allow is empty).
+            let (_, rollback) = crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
+            assert_eq!(prepare(&context, key, mode, Engine::Harness).unwrap_err(), (409, NOT_ADMITTED.into()));
+
+            // Automatic turn switch honors allowAllWhenEmpty in reserved & chat (DSH -> Harness).
+            let (prep, _) = prepare_turn(&context, key, mode, Some(&token), None).unwrap();
+            assert!(matches!(prep, TurnPreparation::Switched(Engine::Harness, _)), "{mode}: DSH->Harness failed");
+
+            // Flip target back to DSH (clearing prior summary so empty-transcript switch stays offline):
+            // automatic switch Harness -> DSH must also succeed.
+            let gen2 = epoch(Some(&ConversationState::for_runtime(&context).read(key).unwrap().unwrap()));
+            ConversationState::for_runtime(&context).update(key, |conv| {
+                conv.set_field(FIELD, json!(Handover {
+                    engine: Some(Engine::Harness), epoch: Some(gen2.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
+                }));
+                Ok(())
+            }).unwrap();
+            crate::settings::apply_switch_choice(&context, key, &json!("dsh")).unwrap();
+            let (prep_back, _) = prepare_turn(&context, key, mode, None, None).unwrap();
+            assert!(matches!(prep_back, TurnPreparation::Switched(Engine::Dsh, _)), "{mode}: Harness->DSH failed");
+            if let Some(prev) = rollback {
+                crate::settings::restore_switch_choice(&context, key, prev).unwrap();
+            }
+
+            // Deny list must still refuse automatic switch.
+            crate::settings::apply_switch_choice(&context, "group:99", &json!("harness")).unwrap();
+            let tok99 = crate::social_state::ensure_or_rotate(&context, "group:99", true).unwrap();
+            let gen99 = epoch(Some(&ConversationState::for_runtime(&context).read("group:99").unwrap().unwrap()));
+            ConversationState::for_runtime(&context).update("group:99", |conv| {
+                conv.set_field(FIELD, json!(Handover {
+                    engine: Some(Engine::Dsh), epoch: Some(gen99.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
+                }));
+                Ok(())
+            }).unwrap();
+            let deny_err = prepare_turn(&context, "group:99", mode, Some(&tok99), None).err().unwrap();
+            assert!(deny_err.contains(NOT_ADMITTED), "{mode}: denied group must be refused: {deny_err}");
+        }
+
+        // reserved2 still refuses allowAllWhenEmpty even for automatic switch.
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved2"}"#).unwrap();
+        assert!(prepare_turn(&context, "group:42", "reserved2", None, None).err().unwrap().contains(NOT_ADMITTED));
+    }
 }

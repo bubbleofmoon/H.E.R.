@@ -5328,3 +5328,56 @@ fn ticket172_reserved_harness_engine_switch_round_trip() {
     assert!(prompts[1].text.contains("【之前聊天的摘要】"));
     assert!(prompts[1].text.contains("Later group chat context."));
 }
+
+#[test]
+fn ticket172_r2_mode_exit_waits_for_live_reserved_harness_turn_and_keeps_next_chat_clean() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![
+        ModelReply::Active {
+            text: "held reserved answer".into(),
+            started: entered.clone(),
+            release: release.clone(),
+        },
+        ModelReply::Text("chat after exit".into()),
+    ]);
+    let mut rig = reserved_v1_fixture("t172-r2-mode-exit", &model, "harness");
+    rig.start();
+
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 hold reserved turn");
+    assert!(wait_for(LONG, || entered.load(Ordering::SeqCst)), "live reserved turn never started streaming");
+    assert!(
+        wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "begun" && r["backend"] == "harness" && r["reason"] == "reserved")),
+        "missing open harness reserved turn"
+    );
+
+    let (status, _) = rig.console("POST", "/api/mode", Some(&json!({"mode": "chat"})));
+    assert_eq!(status, 200);
+    assert!(
+        wait_for(LONG, || rig.data_json("social-v1.json")["conversations"].as_object().is_some_and(|m| m.is_empty())),
+        "reserved Hub::sync_mode never retired mode state while harness turn was active"
+    );
+    assert!(
+        !rig.ledger().iter().any(|r| r["k"] == "ended" && r["reason"] == "reserved mode retired"),
+        "mode exit must not write a premature ended record while harness turn is still running"
+    );
+
+    release.store(true, Ordering::SeqCst);
+    assert!(
+        wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended")),
+        "held reserved turn did not finish after release"
+    );
+
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 reply cleanly after exit");
+    assert!(
+        wait_for(LONG, || rig.texts_to(GROUP_KEY).iter().any(|t| t == "chat after exit")),
+        "next chat turn failed to complete cleanly: {:?}",
+        rig.ledger()
+    );
+    assert!(
+        !rig.ledger().iter().any(|r| r["detail"].as_str().unwrap_or("").contains("unfinished turn")),
+        "SQLite conversations.db must never be left wedged: {:?}",
+        rig.ledger()
+    );
+}
