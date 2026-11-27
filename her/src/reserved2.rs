@@ -26,13 +26,11 @@ fn rearm_dropped_provisional_sleep(
     cfg: &Value,
     key: &str,
     at: i64,
-    reason: &str,
+    _reason: &str,
     previous: &Value,
     expected_token: &str,
 ) -> Result<(), String> {
-    if previous["wakeConfig"]["infinite"] != false
-        || (reason == "timeout" && previous["wakeConfig"]["sleepUntil"].is_string())
-    {
+    if previous["wakeConfig"]["infinite"] != false {
         return Ok(());
     }
     let current = social_state::token(context, key)
@@ -1904,6 +1902,18 @@ mod tests {
                 hub.ready.iter().any(|(k, r)| k == key && r == "timeout"),
                 "advancing hub clock past preserved sleepUntil must fire timeout wake"
             );
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(hub.active.contains_key(key), "preserved timeout wake must dispatch");
+            assert_eq!(hub.active[key].reason, "timeout");
+            wait_for_harness_cap_wake(&hub).await;
+            hub.tick("bot", 9001).await.unwrap();
+            for tick in 0..2 {
+                hub.tick("bot", 9001).await.unwrap();
+                assert!(
+                    !hub.active.contains_key(key),
+                    "tick {tick}: fired preserved timeout after mention exhaustion must tick clean"
+                );
+            }
 
             // Also verify dispatch-prep retry exhaustion re-arms, adopts, and fires timeout.
             hub.ready.clear();
@@ -1998,6 +2008,133 @@ mod tests {
             hub.rearm_pending.contains_key(key) && hub.drivers.contains_key(key),
             "malformed mode.json must fail closed without calling drop_everything"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket297_exhausted_timeout_does_not_loop_every_tick() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) = harness_cap_fixture("harness-cap-exhaust-timeout", None).await;
+            drop(console);
+            let key = HARNESS_CAP_KEY;
+            let due_ms = (crate::now_ms() as i64) - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            for attempt in 1..=(MAX_WAKE_RETRIES + 1) {
+                for (at, _) in hub.retries.values_mut() {
+                    *at = 0;
+                }
+                hub.tick("bot", 9001).await.unwrap();
+                assert!(hub.active.contains_key(key), "attempt {attempt} must dispatch");
+                assert_eq!(hub.active[key].reason, "timeout");
+                wait_for_harness_cap_wake(&hub).await;
+                hub.tick("bot", 9001).await.unwrap();
+                assert_eq!(hub.failures[key], attempt);
+                if attempt <= MAX_WAKE_RETRIES {
+                    assert!(hub.retries.contains_key(key));
+                }
+            }
+
+            assert!(hub.retries.is_empty(), "retries must be empty after exhaustion");
+            assert_eq!(hub.dsh_wait.len(key), 0);
+            for tick in 0..3 {
+                hub.tick("bot", 9001).await.unwrap();
+                assert!(
+                    !hub.active.contains_key(key),
+                    "tick {tick}: exhausted timeout wake must not loop every tick"
+                );
+            }
+        })
+        .await
+        .expect("the exhausted timeout fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_transient_completion_error_recovers_consumed_timeout() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (root, mut hub, console) = harness_cap_fixture("harness-cap-transient-timeout", None).await;
+            let key = HARNESS_CAP_KEY;
+            let due_ms = (crate::now_ms() as i64) - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(hub.active.contains_key(key), "timeout wake must dispatch");
+            assert_eq!(hub.active[key].reason, "timeout");
+            assert_eq!(
+                hub.active[key].previous["wakeConfig"]["sleepUntil"],
+                json!(due_iso)
+            );
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+
+            // Wait until pipeline.rs reaches wake-snapshot, proving consume_reserved2_deadline already cleared sleepUntil.
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                Value::Null,
+                "pre-submit consume_reserved2_deadline must clear sleepUntil before failing"
+            );
+            drop(snapshot);
+            drop(console);
+            wait_for_harness_cap_wake(&hub).await;
+            assert!(
+                hub.active[key].route() != pipeline::Reserved2Route::ExpiredBeforeAdmission
+            );
+
+            let social_path = root.0.join("data/social-v2.json");
+            let social_backup = root.0.join("data/social-v2.json.bak");
+            let (snap_tx, snap_rx) = tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+            let (fin_tx, fin_rx) = tokio::sync::oneshot::channel();
+            hub.tick_snapshot_hook = Some(snap_tx);
+            hub.collector_finished_hook = Some(fin_rx);
+            let social_path_task = social_path.clone();
+            let social_backup_task = social_backup.clone();
+            let inject = tokio::spawn(async move {
+                let done = snap_rx.await.unwrap();
+                done.send(()).unwrap();
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                std::fs::rename(&social_path_task, &social_backup_task).unwrap();
+                fin_tx.send(()).unwrap();
+            });
+
+            hub.tick("bot", 9001).await.unwrap();
+            inject.await.unwrap();
+            assert!(!social_path.exists(), "transient fault must hide social-v2.json during completion");
+
+            std::fs::rename(&social_backup, &social_path).unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some(),
+                "next tick must repair consumed timeout sleepUntil after transient completion read error"
+            );
+            assert!(
+                hub.drivers[key].sched.wc.sleep_until.is_some(),
+                "live driver must adopt repaired sleep_until after transient completion read error"
+            );
+        })
+        .await
+        .expect("the transient timeout completion fixture must settle");
     }
 
     async fn wait_for_harness_cap_wake(hub: &Hub) {
@@ -5051,6 +5188,9 @@ impl Hub {
             let retry_exhausted = retry
                 && !wait_for_dsh
                 && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
+            let retire_expired_timeout = route == pipeline::Reserved2Route::ExpiredBeforeAdmission
+                && active.reason == "timeout"
+                && active.previous["wakeConfig"]["sleepUntil"].is_string();
             let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
                 || retry_exhausted
                 || (held && had_inbound);
@@ -5061,9 +5201,8 @@ impl Hub {
                 && unsubmitted;
             let needs_provisional_rearm = !access_refused
                 && !is_reminder
+                && !retire_expired_timeout
                 && active.previous["wakeConfig"]["infinite"] == false
-                && (active.previous["wakeConfig"]["sleepUntil"].is_null()
-                    || active.reason != "timeout")
                 && ((still_valid && dropped_unadmitted) || transient_read_drop);
             if needs_provisional_rearm {
                 self.rearm_pending.insert(
@@ -5072,7 +5211,21 @@ impl Hub {
                 );
             }
             if held || retry {
-                social_state::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
+                let mut rollback_prev = active.previous.clone();
+                if retry_exhausted
+                    && active.reason == "timeout"
+                    && active.previous["wakeConfig"]["sleepUntil"].is_string()
+                {
+                    social_state::consume_reserved2_deadline(
+                        &self.context,
+                        &key,
+                        &current_token,
+                        active.at,
+                        &active.previous,
+                    )?;
+                    rollback_prev["wakeConfig"]["sleepUntil"] = Value::Null;
+                }
+                social_state::rollback_reserved2_wake(&self.context, &key, active.at, &rollback_prev)?;
                 if held && !had_inbound {
                     self.held.insert(key.clone(), active.reason.clone());
                 }
@@ -5332,10 +5485,28 @@ impl Hub {
                 }
                 Err(error) => {
                     println!("[reserved2] {key} dispatch preparation failed: {error}");
-                    if let Some((previous, _)) = claimed.as_ref() {
-                        if let Err(error) = social_state::rollback_reserved2_wake(&self.context, &key, now, previous) {
+                    let prep_retry_exhausted = error != social_state::WAKE_SUSPENDED
+                        && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
+                    if let Some((previous, dispatch_token)) = claimed.as_ref() {
+                        let mut rollback_prev = previous.clone();
+                        if prep_retry_exhausted
+                            && reason == "timeout"
+                            && previous["wakeConfig"]["sleepUntil"].is_string()
+                        {
+                            if let Err(err) = social_state::consume_reserved2_deadline(
+                                &self.context,
+                                &key,
+                                dispatch_token,
+                                now,
+                                previous,
+                            ) {
+                                println!("[reserved2] {key} dispatch timeout consume failed: {err}");
+                            }
+                            rollback_prev["wakeConfig"]["sleepUntil"] = Value::Null;
+                        }
+                        if let Err(error) = social_state::rollback_reserved2_wake(&self.context, &key, now, &rollback_prev) {
                             println!("[reserved2] {key} dispatch rollback failed: {error}");
-                            self.rollback_pending.insert(key.clone(), (now, previous.clone()));
+                            self.rollback_pending.insert(key.clone(), (now, rollback_prev));
                         }
                     }
                     // A failed journal transition may have left the original entry in place.
@@ -5359,9 +5530,7 @@ impl Hub {
                     if *failures <= MAX_WAKE_RETRIES {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
                     } else if let Some((previous, dispatch_token)) = claimed.as_ref() {
-                        if previous["wakeConfig"]["infinite"] == false
-                            && (previous["wakeConfig"]["sleepUntil"].is_null() || reason != "timeout")
-                        {
+                        if previous["wakeConfig"]["infinite"] == false {
                             self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
                             self.drain_rearm_pending(&cfg);
                         }

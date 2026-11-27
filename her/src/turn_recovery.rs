@@ -856,7 +856,8 @@ fn apply_at(
         Verdict::Reattach | Verdict::Defer(_) => {}
         Verdict::Pause { reason, detail, rotate } => {
             if *rotate {
-                if let Err(error) = crate::social_state::ensure_or_rotate(context, &turn.key, true)
+                if let Err(error) =
+                    crate::social_state::rotate_if_epoch(context, &turn.key, &turn.epochs)
                 {
                     println!("[recovery] ⚠️ 暂停时换令牌失败 {}：{error}", turn.key);
                 }
@@ -3629,6 +3630,50 @@ mod tests {
         );
         crate::social_state::rotate_if_epoch(&fx_match.context, "group:999", std::slice::from_ref(&fx_match.epoch)).unwrap();
         assert_eq!(crate::social_state::token(&fx_match.context, "group:999").unwrap(), None);
+    }
+
+    #[test]
+    fn ticket297_pause_recovery_preserves_replacement_epoch_wake() {
+        let fx = setup_submitted_harness_turn("her-297-pause-epoch-", "reserved2", true, None, true);
+        let replacement_token = crate::social_state::ensure_or_rotate(&fx.context, "group:1", true).unwrap();
+        let replacement_epoch = crate::send_outbox::token_epoch(&replacement_token);
+        assert_ne!(replacement_epoch, fx.epoch);
+        let queued_wake = json!([{"reason": "admin", "at": 20}]);
+        crate::conversation_state::ConversationState::for_runtime(&fx.context)
+            .update_existing("group:1", |conv| {
+                conv.set_field("adminWakes", queued_wake.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&fx.context).unwrap()).0;
+        let pause = Verdict::Pause {
+            reason: "send-unresolved".into(),
+            detail: "unresolved test".into(),
+            rotate: true,
+        };
+        apply_at(&fx.context, &fx.cfg, &fx.journal, &turns[0], &pause, None, None);
+
+        let paused = fold(&turn_ledger::read_records(&fx.context).unwrap()).0.remove(0);
+        assert_eq!(paused.state, State::Paused);
+        let current_token = crate::social_state::token(&fx.context, "group:1").unwrap().unwrap();
+        assert_eq!(
+            crate::send_outbox::token_epoch(&current_token),
+            replacement_epoch,
+            "pause recovery of expired T1 must preserve replacement epoch ep2"
+        );
+        let social = fx.context.read_social_state().unwrap();
+        assert_eq!(social["conversations"]["group:1"]["adminWakes"], queued_wake);
+
+        // Matching epoch still rotates on Verdict::Pause with rotate=true.
+        let fx_match = setup_submitted_harness_turn("her-297-pause-match-", "reserved2", true, None, true);
+        let turns_match = fold(&turn_ledger::read_records(&fx_match.context).unwrap()).0;
+        apply_at(&fx_match.context, &fx_match.cfg, &fx_match.journal, &turns_match[0], &pause, None, None);
+        assert_ne!(
+            crate::social_state::token(&fx_match.context, "group:1").unwrap().as_deref(),
+            Some("fixture-token-297"),
+            "pause recovery with matching epoch must still rotate"
+        );
     }
 
     #[test]
