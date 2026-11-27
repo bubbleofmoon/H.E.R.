@@ -747,7 +747,8 @@ fn apply_at(
                 ) {
                     return;
                 }
-            } else if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
+            }
+            if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
                 return;
             }
             let _ = recorder.verified("not-executed", why);
@@ -1144,7 +1145,13 @@ impl Pass<'_> {
     }
 
     /// Interrupted events of turns that already ended (crash between turn end and the stage mark).
+    #[cfg(test)]
     fn finished(&self, journal: &Journal, turns: &[Turn]) {
+        let mut closed = HashSet::new();
+        self.finished_with_cache(journal, turns, &mut closed);
+    }
+
+    fn finished_with_cache(&self, journal: &Journal, turns: &[Turn], abandoned_closed: &mut HashSet<String>) {
         for turn in turns.iter().filter(|t| t.state.is_final() && t.state != State::Resumed) {
             if turn.state == State::Resolved && !turn.resolution_applied {
                 continue;
@@ -1180,15 +1187,20 @@ impl Pass<'_> {
                 }
                 continue;
             }
-            if turn.backend == "harness" && turn.state == State::Abandoned {
-                if let Err(error) = close_interrupted_harness(
+            if turn.backend == "harness" && turn.state == State::Abandoned && !abandoned_closed.contains(&turn.id) {
+                match close_interrupted_harness(
                     self.context,
                     turn,
                     &crate::harness::Status::Cancelled,
                     Some("abandoned"),
                 ) {
-                    crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
-                    continue;
+                    Ok(_) => {
+                        abandoned_closed.insert(turn.id.clone());
+                    }
+                    Err(error) => {
+                        crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
+                        continue;
+                    }
                 }
             }
             settle(journal, &turn.inbound, "handled");
@@ -1333,6 +1345,7 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
     {
         let mut last_try: std::collections::HashMap<String, i64> = Default::default();
         let mut terminal_rearm_done = false;
+        let mut abandoned_closed: HashSet<String> = HashSet::new();
         loop {
             if let (Ok(cfg), Ok(journal), Ok(records)) =
                 (context.load_config(), Journal::open(&context), turn_ledger::read_records(&context))
@@ -1406,7 +1419,7 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                 }
                 pass.resolutions(&journal, &turns, &records);
                 pass.release_held(&journal, &turns, &records);
-                pass.finished(&journal, &turns);
+                pass.finished_with_cache(&journal, &turns, &mut abandoned_closed);
                 pass.report_stuck_resumed(&journal, &turns);
                 // Orphans only after every startup turn has a verdict that is not "still open".
                 let unsettled = turns.iter().any(|t| startup.contains(&t.id) && t.state.is_open());
@@ -2218,17 +2231,18 @@ mod tests {
         assert_eq!(paused.state, State::Paused);
         assert_eq!(paused.pause_reason, "send-unresolved");
 
-        // An already-closed historical unclaimed abandoned turn must not re-arm a live wake's timer.
+        // An already-closed historical unclaimed turn must respect the unclaimed confirmedAt startup fence even when lastWakeAt <= cutoff.
         let fx_unclaimed_abandoned = setup_submitted_harness_turn("her-297-unclaimed-aband-", "reserved2", true, None, false);
         turn_ledger::Recorder::attach(&fx_unclaimed_abandoned.context, &fx_unclaimed_abandoned.turn_id, "group:1")
             .end_reconciled("abandoned", "revoked")
             .unwrap();
         fx_unclaimed_abandoned.store.finish(&fx_unclaimed_abandoned.turn_id, &crate::harness::Status::Cancelled, None).unwrap();
+        let unclaimed_cutoff = crate::turn_ledger::now_ms() + 500;
         crate::conversation_state::ConversationState::for_runtime(&fx_unclaimed_abandoned.context)
             .update("group:1", |conv| {
                 let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-                wc["lastWakeAt"] = json!(crate::turn_ledger::now_ms() + 100_000);
-                wc["confirmedAt"] = json!(crate::turn_ledger::now_ms() + 100_000);
+                wc["lastWakeAt"] = json!(unclaimed_cutoff - 10);
+                wc["confirmedAt"] = json!(unclaimed_cutoff + 100);
                 wc["sleepUntil"] = Value::Null;
                 wc["infinite"] = json!(false);
                 conv.set_field("wakeConfig", wc);
@@ -2237,11 +2251,47 @@ mod tests {
             .unwrap();
         let unclaimed_turns = fold(&turn_ledger::read_records(&fx_unclaimed_abandoned.context).unwrap()).0;
         assert!(unclaimed_turns[0].wake_claim.is_none());
+        assert!(rearm_startup_terminal_sleeps(&fx_unclaimed_abandoned.context, &fx_unclaimed_abandoned.cfg, &unclaimed_turns, unclaimed_cutoff));
+        let mut closed_cache = HashSet::new();
         Pass { context: &fx_unclaimed_abandoned.context, cfg: &fx_unclaimed_abandoned.cfg }
-            .finished(&fx_unclaimed_abandoned.journal, &unclaimed_turns);
+            .finished_with_cache(&fx_unclaimed_abandoned.journal, &unclaimed_turns, &mut closed_cache);
+        assert!(closed_cache.contains(&unclaimed_turns[0].id));
         assert!(
             fx_unclaimed_abandoned.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].is_null(),
-            "historical unclaimed closed abandoned turn must not overwrite live wake timer"
+            "historical unclaimed closed abandoned turn must not overwrite newer finite config"
+        );
+
+        // Provisional claim (lastWakeAt bumped before cutoff without a ledger turn) still allows BOTH
+        // startup repair (`Completed`) AND `Verdict::Resume` (`reconcile_at`), plus `socialV2.enabled=false`.
+        let mut fx_prov_resume = setup_submitted_harness_turn("her-297-prov-resume-", "reserved2", true, None, true);
+        fx_prov_resume.cfg["socialV2"]["wake"] = json!({"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000});
+        turn_ledger::Recorder::attach(&fx_prov_resume.context, &fx_prov_resume.turn_id, "group:1")
+            .wake_claim(&obs_claim)
+            .unwrap();
+        let resume_cutoff = crate::turn_ledger::now_ms() + 500;
+        crate::conversation_state::ConversationState::for_runtime(&fx_prov_resume.context)
+            .update("group:1", |conv| {
+                let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+                wc["lastWakeAt"] = json!(resume_cutoff - 10);
+                wc["confirmedAt"] = json!(1);
+                wc["sleepUntil"] = Value::Null;
+                wc["infinite"] = json!(false);
+                conv.set_field("wakeConfig", wc);
+                Ok(())
+            })
+            .unwrap();
+        let prov_resume_turns = fold(&turn_ledger::read_records(&fx_prov_resume.context).unwrap()).0;
+        let prov_resume_outbox = crate::send_outbox::read_records(&fx_prov_resume.context);
+        Pass { context: &fx_prov_resume.context, cfg: &fx_prov_resume.cfg }
+            .reconcile_at(&fx_prov_resume.journal, &prov_resume_turns[0], &prov_resume_turns, &prov_resume_outbox, Some(resume_cutoff))
+            .await;
+        assert_eq!(fold(&turn_ledger::read_records(&fx_prov_resume.context).unwrap()).0.remove(0).state, State::Resumed);
+        assert!(
+            fx_prov_resume.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "Resume with provisional lastWakeAt before cutoff must still re-arm finite sleepUntil"
         );
 
         // Provisional claim (lastWakeAt bumped before cutoff without a ledger turn) still allows startup repair,

@@ -1847,7 +1847,13 @@ pub(crate) fn rollback_reserved2_wake(
                         wc[field] = previous["wakeConfig"][field].clone();
                     }
                     conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
-                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"] {
+                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+                        && wc["infinite"] != true
+                        && wc["sleepUntil"]
+                            .as_str()
+                            .and_then(crate::wake::parse_iso_ms)
+                            .is_none()
+                    {
                         wc["sleepUntil"] = previous["wakeConfig"]["sleepUntil"].clone();
                     }
                     conv.set_field("wakeConfig", wc);
@@ -3919,6 +3925,25 @@ mod tests {
         assert!(
             context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
             "unclaimed turn must keep newer config (confirmedAt > begun_at) untouched"
+        );
+
+        // Rollback must preserve an already-valid finite sleepUntil (e.g., drawn by newer operator defaults).
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "lastWakeAt": 10,
+                "sleepUntil": future,
+                "confirmedAt": 2
+            });
+            Ok(())
+        })
+        .unwrap();
+        rollback_reserved2_wake(&context, "group:42", 10, &past_claim).unwrap();
+        assert_eq!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
+            future,
+            "rollback must not overwrite an already-valid finite sleepUntil with an old deadline"
         );
     }
 }
