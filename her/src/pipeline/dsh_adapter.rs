@@ -475,8 +475,17 @@ impl Pipeline {
             crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry()
                 .end("cancelled", "reserved mode retired")?;
         }
-        for sid in sessions {
-            crate::dsh::stop_session_work(&self.rpc, &sid)?;
+        if !sessions.is_empty() {
+            let rpc = if self.has_dsh() {
+                None
+            } else {
+                let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+                Some(crate::dsh::rpc_for(&self.context, &cfg)?)
+            };
+            let client = rpc.as_ref().unwrap_or(&self.rpc);
+            for sid in sessions {
+                crate::dsh::stop_session_work(client, &sid)?;
+            }
         }
         Ok(())
     }
@@ -520,6 +529,11 @@ impl Pipeline {
             &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"), "turn-failure",
         );
         true
+    }
+
+    pub(super) fn reserved_wake_parks(&self, cfg: &serde_json::Value, key: &str) -> bool {
+        crate::dsh_health::is_down(&self.context)
+            && crate::reserved::job_needs_dsh(&self.context, cfg, key)
     }
 
     pub(super) fn reserved2_wake_parks(&self, cfg: &serde_json::Value, key: &str) -> bool {

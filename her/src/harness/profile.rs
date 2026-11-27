@@ -14,9 +14,9 @@ use serde_json::Value;
 /// One row of the mode-profile table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Profile {
-    /// `chat` mode: groups and every private chat but the owner's.
+    /// `chat` and `reserved` modes: groups and every private chat but the owner's.
     Chat,
-    /// `chat` mode: the owner's private chat.
+    /// `chat` and `reserved` modes: the owner's private chat.
     OwnerPrivate,
     /// `closed-agent` mode (the Admin agent): only the owner's private chat.
     ClosedAgent,
@@ -203,8 +203,8 @@ impl Profile {
     pub(crate) fn of_conversation(cfg: &Value, mode: &str, conversation: &str) -> Option<Self> {
         let owner = crate::chat::is_owner_key(cfg, conversation);
         match mode {
-            "chat" if owner => Some(Self::OwnerPrivate),
-            "chat" => Some(Self::Chat),
+            "chat" | "reserved" if owner => Some(Self::OwnerPrivate),
+            "chat" | "reserved" => Some(Self::Chat),
             "closed-agent" if owner => Some(Self::ClosedAgent),
             "reserved2" if owner => Some(Self::Reserved2Owner),
             "reserved2" => Some(Self::Reserved2),

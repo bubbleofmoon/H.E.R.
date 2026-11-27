@@ -5163,3 +5163,168 @@ fn ticket159_reserved2_thinking_begins_after_checkpoint_preparation() {
         "a request that clipped the briefing base must carry a full briefing");
     assert_eq!(rig.ledger().iter().filter(|r| r["turn"] == id && r["k"] == "started").count(), 1);
 }
+
+fn reserved_v1_fixture(name: &str, model: &FakeModel, engine: &str) -> Rig {
+    let config = json!({
+        "ackMessage": "",
+        "conversationEngines": {GROUP_KEY: engine, OWNER_KEY: engine},
+        "harness": {"model": "fake-chat", "summaries": false},
+        "social": {
+            "triggerProbability": 0, "proactiveEnabled": false, "activeDurationEnabled": false,
+            "activeCheckMinMs": 0, "activeCheckMaxMs": 0, "activeReplyDelayMinMs": 0,
+            "activeReplyDelayMaxMs": 0, "idleWindowMs": 120000, "idleRetryProbability": 0,
+            "skipProbability": 0, "longGapProbability": 0, "burstIntervalMinMs": 1,
+            "burstIntervalMaxMs": 1
+        }
+    });
+    let mut rig = Rig::new(name, Seed { mode: "reserved", config, ..Seed::default() });
+    fs::write(rig.root.join("config/harness-api-key"), "synthetic-model-key-172").unwrap();
+    let path = rig.root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    deps["model"] = json!(&model.base);
+    fs::write(path, deps.to_string()).unwrap();
+    rig.console.kill().unwrap();
+    rig.console.wait().unwrap();
+    rig.console = spawn_console(&rig.root, rig.console_port);
+    console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN,
+        Duration::from_secs(20), |port| spawn_console(&rig.root, port));
+    rig
+}
+
+#[test]
+fn ticket172_reserved_harness_parity_burst_silence_flush_and_mode_prompt() {
+    let mut outcomes = Vec::new();
+    for engine in ["dsh", "harness"] {
+        let model = FakeModel::start(vec![
+            "第一句 hello world 第二句",
+            "[SILENT]",
+            "flush silent summary",
+            "owner private ok",
+        ]);
+        let mut rig = reserved_v1_fixture(&format!("t172-resv1-{engine}"), &model, engine);
+        let cfg_path = rig.root.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&cfg_path).unwrap()).unwrap();
+        cfg["socialV2"]["context"]["stripFromModelText"] = json!(["SECRET172"]);
+        fs::write(&cfg_path, cfg.to_string()).unwrap();
+        fs::write(
+            rig.root.join("data/personas.json"),
+            json!({
+                "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+                "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+                    {"version": 1, "approved": true, "name": "Fixture172", "core": "PERSONA_CORE_172 SECRET172"}
+                ]}}
+            }).to_string(),
+        ).unwrap();
+        assert_eq!(rig.console("POST", "/api/settings/set", Some(&json!({"setting":"prompt.mode.chat","value":"CHAT_MODE_PROMPT_172"}))).0, 200);
+        assert_eq!(rig.console("POST", "/api/settings/set", Some(&json!({"setting":"prompt.mode.ownerPrivate","value":"OWNER_MODE_PROMPT_172"}))).0, 200);
+        rig.start();
+
+        says(&rig, GROUP_KEY, 1001, "tester", "watching-only172 SECRET172");
+        assert!(wait_for(LONG, || rig.console("GET", "/api/social", None).1["pendingSummaries"][GROUP_KEY] == 1));
+        assert!(rig.texts_to(GROUP_KEY).is_empty());
+
+        says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SPLIT15# SECRET172");
+        assert_eq!(rig.wait_texts(GROUP_KEY, 3), ["第一句", "hello world", "第二句"]);
+        assert!(wait_for(LONG, || rig.data_lines("send-outbox.jsonl").iter().filter(|r| r["k"] == "confirmed").count() == 3));
+
+        says(&rig, GROUP_KEY, 1001, "tester", "#SILENT#");
+        if engine == "dsh" {
+            rig.wait_prompts(2);
+        } else {
+            assert!(wait_for(LONG, || lock(&model.requests).len() >= 2), "silent turn never reached fake model");
+        }
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(rig.texts_to(GROUP_KEY).len(), 3, "silent marker must not be sent");
+
+        assert_eq!(rig.console("POST", "/api/social/flush", Some(&json!({"key": GROUP_KEY}))), (200, json!({"ok": true})));
+        assert!(wait_for(LONG, || rig.console("GET", "/api/social", None).1["pendingSummaries"] == json!({})));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(rig.texts_to(GROUP_KEY).len(), 3, "summary flush must remain silent");
+
+        let group_outbox: Vec<Value> = rig.data_lines("send-outbox.jsonl").into_iter()
+            .filter(|r| r["key"] == GROUP_KEY && r["k"] == "confirmed")
+            .map(|r| r["messages"].clone())
+            .collect();
+        let last_ai = rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["lastAiReplyAt"].as_i64().unwrap_or(0);
+        assert!(last_ai > 0, "{engine}: lastAiReplyAt must advance after burst");
+
+        if engine == "harness" {
+            says(&rig, OWNER_KEY, OWNER, "owner", "owner-check172");
+            assert_eq!(rig.wait_texts(OWNER_KEY, 1), ["owner private ok"]);
+            assert!(rig.dsh.prompts().is_empty(), "harness reserved must not prompt DSH");
+            assert!(rig.dsh.calls("session/create").is_empty());
+            assert!(rig.dsh.calls("workspace/create").is_empty());
+            assert!(rig.dsh.calls("agentPresets/list").is_empty());
+
+            let requests = lock(&model.requests);
+            assert_eq!(requests.len(), 4, "expected 4 harness model requests: {requests:?}");
+            let sys0 = requests[0]["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(sys0.contains("CHAT_MODE_PROMPT_172"), "group system prompt must carry prompt.mode.chat: {sys0}");
+            let tools0 = requests[0]["tools"].as_array().unwrap();
+            assert!(tools0.iter().any(|t| t["function"]["name"] == "memory_index"));
+            assert!(!tools0.iter().any(|t| t["function"]["name"] == "qq_send_group_message"));
+            assert!(!tools0.iter().any(|t| t["function"]["name"] == "memory_acl"));
+
+            let user0 = requests[0]["messages"].as_array().and_then(|a| a.last()).unwrap()["content"].as_str().unwrap_or("");
+            assert!(user0.contains("PERSONA_CORE_172 SECRET172"), "role_prefix must not be stripped: {user0}");
+            assert!(user0.contains("watching-only172 【已隐藏】"), "recent body must strip SECRET172: {user0}");
+            assert!(!user0.contains("#SPLIT15# SECRET172"), "current body must strip SECRET172: {user0}");
+
+            let sys3 = requests[3]["messages"][0]["content"].as_str().unwrap_or("");
+            assert!(sys3.contains("OWNER_MODE_PROMPT_172"), "owner system prompt must carry prompt.mode.ownerPrivate: {sys3}");
+            let tools3 = requests[3]["tools"].as_array().unwrap();
+            assert!(tools3.iter().any(|t| t["function"]["name"] == "memory_acl"));
+            assert!(tools3.iter().any(|t| t["function"]["name"] == "settings_get"));
+            drop(requests);
+
+            let ledger = rig.ledger();
+            assert!(ledger.iter().any(|r| r["k"] == "begun" && r["backend"] == "harness" && r["reason"] == "reserved"));
+            assert!(ledger.iter().any(|r| r["k"] == "begun" && r["backend"] == "harness" && r["reason"] == "reserved-summary"));
+        }
+
+        outcomes.push((rig.texts_to(GROUP_KEY), group_outbox));
+    }
+    assert_eq!(outcomes[0], outcomes[1], "DSH and harness reserved turns must produce identical group output and outbox");
+}
+
+#[test]
+fn ticket172_reserved_harness_engine_switch_round_trip() {
+    let model = FakeModel::start(vec![
+        "Earlier group chat context.",
+        "switched route reply",
+        "Later group chat context.",
+    ]);
+    let mut rig = reserved_v1_fixture("t172-resv1-switch", &model, "dsh");
+    rig.start();
+
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 first dsh reserved turn");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["synthetic reply"]);
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    let old_sid = rig.wait_prompts(1)[0].session.clone();
+    let old_token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation": GROUP_KEY, "engine": "harness"})));
+    assert_eq!(status, 200, "switch to harness in reserved mode must succeed: {body}");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
+    assert!(rig.data_json("sessions.json")["sessions"][GROUP_KEY].is_null());
+    assert_ne!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], old_token);
+
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 second harness reserved turn");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2), ["synthetic reply", "switched route reply"]);
+    assert_eq!(rig.dsh.prompts().len(), 1, "DSH must not run after switch to harness");
+    {
+        let requests = lock(&model.requests);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]["messages"].to_string().contains("【之前聊天的摘要】"));
+        assert!(requests[1]["messages"].to_string().contains("Earlier group chat context."));
+    }
+
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation": GROUP_KEY, "engine": "dsh"})));
+    assert_eq!(status, 200, "switch back to dsh in reserved mode must succeed: {body}");
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 third dsh reserved turn");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 3), ["synthetic reply", "switched route reply", "synthetic reply"]);
+    let prompts = rig.wait_prompts(2);
+    assert_ne!(prompts[1].session, old_sid);
+    assert!(prompts[1].text.contains("【之前聊天的摘要】"));
+    assert!(prompts[1].text.contains("Later group chat context."));
+}

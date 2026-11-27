@@ -1287,7 +1287,8 @@ impl Pass<'_> {
             if turn.state == State::Resolved && !turn.resolution_applied {
                 continue;
             }
-            if turn.reason == "reserved"
+            if !turn.reserved2
+                && turn.reason.starts_with("reserved")
                 && turn.state == State::Failed
                 && (turn.attempts.is_empty() || turn.notes.iter().any(|n| n["verdict"] == "unsubmitted"))
             {
@@ -4940,5 +4941,41 @@ mod tests {
         let kept = std::fs::read_to_string(root.join("data").join(REPORTED_FILE)).unwrap();
         assert!(serde_json::from_str::<Vec<String>>(&kept).unwrap().len() <= REPORTED_MAX, "the memory is bounded");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_reserved_and_reserved_summary_pre_submit_failures_resume_without_altering_reserved2() {
+        for reason in ["reserved", "reserved-summary"] {
+            let fx = setup_submitted_harness_turn(&format!("her-172-{reason}-"), "reserved", false, None, true);
+            let mut records = turn_ledger::read_records(&fx.context).unwrap();
+            let begun_idx = records.iter().position(|r| r["k"] == "begun").unwrap();
+            records[begun_idx]["reason"] = json!(reason);
+            std::fs::write(
+                fx.context.runtime_root().join("data/turn-ledger.jsonl"),
+                records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+            ).unwrap();
+            let rec = Recorder::attach(&fx.context, &fx.turn_id, "group:1");
+            rec.verified("unsubmitted", "reserved retry is safe").unwrap();
+            rec.end("failed", "route unconfigured").unwrap();
+
+            let records = turn_ledger::read_records(&fx.context).unwrap();
+            let (turns, _) = fold(&records);
+            Pass { context: &fx.context, cfg: &fx.cfg }.finished(&fx.journal, &turns);
+            assert_eq!(fx.journal.stage_of(&fx.input).unwrap().as_deref(), Some("received"), "{reason}: interrupted event must resume");
+            let queued = take_resumable();
+            assert!(queued.iter().any(|ev| ev.event_key == fx.input), "{reason}: event must be handed back for replay");
+        }
+
+        // An open interrupted Gen-1 `reserved` harness turn pauses as `harness-interrupted`, never #297 auto-reconciled.
+        let fx_open = setup_submitted_harness_turn("her-172-open-", "reserved", false, None, false);
+        let journal = Journal::open(&fx_open.context).unwrap();
+        let records = turn_ledger::read_records(&fx_open.context).unwrap();
+        let (turns, _) = fold(&records);
+        let turn = turns.iter().find(|t| t.id == fx_open.turn_id).unwrap();
+        Pass { context: &fx_open.context, cfg: &fx_open.cfg }.reconcile(&journal, turn, &turns, &Ok(vec![])).await;
+        let updated = fold(&turn_ledger::read_records(&fx_open.context).unwrap()).0;
+        let paused = updated.iter().find(|t| t.id == fx_open.turn_id).unwrap();
+        assert_eq!(paused.state, State::Paused);
+        assert_eq!(paused.pause_reason, "harness-interrupted");
     }
 }

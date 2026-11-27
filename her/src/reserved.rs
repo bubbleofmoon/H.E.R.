@@ -18,6 +18,18 @@ use std::time::{Duration, Instant};
 
 const SPLIT_HINT: &str = "需要拆发多段时请以空格隔开；若整段发送请勿留空格，改用标点衔接（中英文或数字间的空格同样会触发分段）。";
 const DIRECTION: &str = "提示：消息中的 [引用 某人：...] 代表该句在回应所引之人；只有引用了你才是在对你说话，引用他人请勿误以为找你。";
+
+/// Harness jobs can run during a DSH outage if admission needs no DSH handover.
+pub(crate) fn job_needs_dsh(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
+    match crate::turn_engine::Engine::selected(context, cfg, key, "reserved") {
+        Ok(engine) => {
+            engine.uses_dsh()
+                || crate::engine_switch::handover_needs_dsh(context, key, engine).unwrap_or(true)
+        }
+        Err(_) => true,
+    }
+}
+
 fn now() -> i64 {
     crate::parity_clock::now_ms()
 }
@@ -430,6 +442,7 @@ fn push_bounded(pending: &mut VecDeque<Job>, job: Job) -> Vec<Job> {
 struct Active {
     job: Job,
     task: tokio::task::JoinHandle<(Result<(), String>, bool, Option<bool>)>,
+    minted: crate::pipeline::MintedEpoch,
 }
 pub struct Hub {
     context: RuntimeContext,
@@ -919,7 +932,7 @@ impl Hub {
             for (key, active) in std::mem::take(&mut self.active) {
                 let context = self.context.clone();
                 let cfg = context.load_config().map_err(|e| e.to_string())?;
-                if let Ok(p) = Pipeline::new_with_runtime(&context, &cfg, true) {
+                if let Ok(p) = Pipeline::new_without_dsh(&context, &cfg, true) {
                     let _ = p.cancel_reserved_epoch(&key, &active.job.authority.token);
                 }
                 active.task.abort();
@@ -954,10 +967,16 @@ impl Hub {
             .collect::<Vec<_>>();
         for key in done {
             let active = self.active.remove(&key).unwrap();
-            let job = active.job;
+            let mut job = active.job;
+            if let Some(token) = active.minted.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                job.authority.token = token;
+            }
             let (result, unsubmitted, failure_parks) = active.task.await.map_err(|e| e.to_string())?;
             if result.is_err() && unsubmitted && job.authority.check(&self.context, &key).is_ok() {
-                if failure_parks.unwrap_or_else(|| crate::dsh_health::is_down(&self.context)) {
+                if failure_parks.unwrap_or_else(|| {
+                    crate::dsh_health::is_down(&self.context)
+                        && self.context.load_config().ok().is_none_or(|c| job_needs_dsh(&self.context, &c, &key))
+                }) {
                     // The prompt never reached DSH and DSH is known down: the message waits for it (JS queues while
                     // dshReady is false and replays on recovery) instead of burning its retries and being lost. No attempt
                     // is used; the dispatch below holds it until DSH is back, then re-checks its authority.
@@ -1193,7 +1212,7 @@ impl Hub {
                 self.pending.push_back(job);
                 continue;
             }
-            if crate::dsh_health::is_down(&context) {
+            if crate::dsh_health::is_down(&context) && job_needs_dsh(&context, &cfg, &job.key) {
                 // DSH is known down: no call is made for waiting work. Its authority was re-checked just above; it is
                 // checked again, with everything else, on the pass that finds DSH back.
                 if self.waiting_noted.insert(job.key.clone()) {
@@ -1214,11 +1233,14 @@ impl Hub {
             let ctx = context.clone();
             let cfg = cfg.clone();
             let work = job.clone();
+            let minted = crate::pipeline::MintedEpoch::default();
+            let minted_shared = minted.clone();
             let task = tokio::spawn(async move {
-                let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg, true) {
+                let mut pipe = match Pipeline::new_without_dsh(&ctx, &cfg, true) {
                     Ok(p) => p,
                     Err(e) => return (Err(e), true, None),
                 };
+                pipe.share_minted_epoch(minted_shared);
                 pipe.set_reserved_retry_budget(work.attempt < 3);
                 let result = pipe
                     .run_reserved_turn(
@@ -1233,7 +1255,7 @@ impl Hub {
                     .await;
                 (result, pipe.dispatch_definitely_unsubmitted(), pipe.reserved_failure_parks())
             });
-            self.active.insert(job.key.clone(), Active { job, task });
+            self.active.insert(job.key.clone(), Active { job, task, minted });
         }
         Ok(())
     }
@@ -1510,7 +1532,7 @@ mod tests {
         .unwrap();
         old.session("old-reserved-session").unwrap();
         let task = tokio::spawn(std::future::pending());
-        hub.active.insert(key.into(), Active { job, task });
+        hub.active.insert(key.into(), Active { job, task, minted: Default::default() });
 
         // Mode retirement happened, then new chat ingress replaced the mapping/epoch.
         context
@@ -1631,5 +1653,17 @@ mod tests {
             assert!(push_bounded(&mut pending, waiting_job(&format!("group:{n}"), "x")).is_empty());
         }
         assert_eq!(pending.len(), 300);
+    }
+
+    #[test]
+    fn reserved_job_needs_dsh_tracks_selected_engine_and_handover() {
+        let (root, context) = fixture();
+        let dsh_cfg = json!({"allow":{"groups":[42]},"consoleToken":"synthetic-console-token"});
+        assert!(job_needs_dsh(&context, &dsh_cfg, "group:42"), "DSH engine needs DSH");
+        let harness_cfg = json!({"allow":{"groups":[42]},"consoleToken":"synthetic-console-token","engineDefault":"harness"});
+        assert!(!job_needs_dsh(&context, &harness_cfg, "group:42"), "pure harness conversation does not need DSH");
+        crate::session_map::bind(&context, "group:42", "old-dsh-sid", None).unwrap();
+        assert!(job_needs_dsh(&context, &harness_cfg, "group:42"), "harness conversation with live DSH mapping needs DSH for handover");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

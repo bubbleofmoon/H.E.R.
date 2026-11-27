@@ -244,7 +244,7 @@ export const SimPromptTab: React.FC = () => {
     const isOwnerPrivate = Boolean(ownerStr && previewData.key === `private:${ownerStr}`);
 
     let settingKey: string | null = null;
-    if (globalMode === 'chat') {
+    if (globalMode === 'chat' || globalMode === 'reserved') {
       settingKey = isOwnerPrivate ? 'prompt.mode.ownerPrivate' : 'prompt.mode.chat';
     } else if (globalMode === 'reserved2' || globalMode === 'simulation') {
       settingKey = isOwnerPrivate ? 'prompt.mode.reserved2Owner' : 'prompt.mode.reserved2';

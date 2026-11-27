@@ -190,7 +190,7 @@ fn handover_uses_dsh(
     })
 }
 
-/// Whether admitting a reserved2 wake may need DSH history or a captured archive.
+/// Whether admitting a reserved or reserved2 turn may need DSH history or a captured archive.
 pub(crate) fn handover_needs_dsh(context: &RuntimeContext, key: &str, wanted: Engine) -> Result<bool, String> {
     let conversation = ConversationState::for_runtime(context)
         .read(key)
@@ -300,8 +300,8 @@ fn prepare_admission(
     let generation = epoch(conversation.as_ref());
     let mut record = read_handover(conversation.as_ref()).map_err(refused)?;
     let session = crate::session_map::lookup(context, key).map_err(refused);
-    let automatic_reserved2 = requested.is_none() && mode == "reserved2";
-    if automatic_reserved2 && crate::dsh_health::is_down(context) {
+    let automatic_reserved = requested.is_none() && matches!(mode, "reserved" | "reserved2");
+    if automatic_reserved && crate::dsh_health::is_down(context) {
         let live = session.as_ref().map_err(Clone::clone)?.as_deref();
         let stamp = crate::reserved::mode_stamp(context).map_err(refused)?;
         if handover_uses_dsh(&record, wanted, live, &generation, &stamp) {
@@ -361,7 +361,7 @@ fn prepare_admission(
         if Engine::read_choice(context, current_cfg, key, mode).map_err(refused)? != wanted {
             return Err(admission_changed());
         }
-        if automatic_reserved2 && wanted == Engine::Dsh
+        if requested.is_none() && mode == "reserved2" && wanted == Engine::Dsh
             && crate::pipeline::pinned_cli_backend(current_cfg, key) != crate::pipeline::pinned_cli_backend(cfg, key)
         {
             return Err(admission_changed());
@@ -484,7 +484,7 @@ fn prepare_admission(
             }
         },
     };
-    if automatic_reserved2 && pending.session.is_some() && crate::dsh_health::is_down(context) {
+    if automatic_reserved && pending.session.is_some() && crate::dsh_health::is_down(context) {
         return Err(refused("DSH is unavailable for the handover".into()));
     }
     match finish_pending(context, key, cfg, &generation, &mut pending, recheck_choice, minted) {

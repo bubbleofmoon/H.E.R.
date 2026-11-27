@@ -1390,7 +1390,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     if self.reserved_retries_remaining == Some(true) {
                         return;
                     }
-                    let parks = self.unsubmitted_dsh_deferred();
+                    let Ok(cfg) = self.context.load_config() else { return };
+                    let parks = self.reserved_wake_parks(&cfg, key);
                     self.reserved_failure_parks = Some(parks);
                     if parks {
                         return;
@@ -1527,7 +1528,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         inbound: &[String],
         media: &[serde_json::Value],
         silent: bool,
-        authority: crate::reserved::Authority,
+        mut authority: crate::reserved::Authority,
     ) -> Result<(), String> {
         authority.check(&self.context, key)?;
         self.reserved_failure_parks = None;
@@ -1541,6 +1542,15 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             },
             inbound,
         );
+        let (adapter, _admission, _) = self.turn_adapter(key, "reserved").await?;
+        if let Some(token) = self.dispatch_token.as_ref() {
+            authority.token = token.clone();
+        }
+        authority.check(&self.context, key)?;
+        if adapter.uses_dsh() && !self.prepare_dsh_chat(cfg, "reserved")? {
+            self.reserved_failure_parks = Some(true);
+            return Err("DSH is unavailable".into());
+        }
         let context = self.context.clone();
         let media_cfg = cfg.clone();
         let media = media.to_vec();
@@ -1549,7 +1559,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         })
         .await
         .map_err(|_| "图片获取失败".to_string())?;
-        let (adapter, _admission, _) = self.turn_adapter(key, "reserved").await?;
         authority.check(&self.context, key)?;
         self.begin_ledger_turn_as(key, adapter.id(), false)?;
         let ack = if authority.social() || silent {
@@ -1599,9 +1608,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return Ok((crate::turn_engine::Adapter::Scripted(script), Some(gates), None));
         }
         let (context, key, mode) = (self.context.clone(), key.to_string(), mode.to_string());
+        let reserved = matches!(mode.as_str(), "reserved" | "reserved2");
         let simulation = mode == "reserved2";
-        let expected = self.dispatch_token.clone().filter(|_| simulation);
-        let publication = self.minted_slot.clone().filter(|_| simulation);
+        let expected = self.dispatch_token.clone().filter(|_| reserved);
+        let publication = self.minted_slot.clone().filter(|_| reserved);
         // The blocking task retains both gates if its async caller is cancelled.
         let (engine, token, gates, cfg) = tokio::task::spawn_blocking(move || {
             use crate::engine_switch::TurnPreparation;
@@ -1613,7 +1623,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 TurnPreparation::ParkUntil(at) => Err(TurnAdmissionError::ParkSwitchUntil(at)),
             }
         }).await.map_err(|_| "engine admission worker stopped".to_string())??;
-        if let Some(token) = token.filter(|_| simulation && self.dispatch_token.is_some()) {
+        if let Some(token) = token.filter(|_| reserved && self.dispatch_token.is_some()) {
             self.dispatch_token = Some(token);
         }
         Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates), simulation.then_some(cfg)))
