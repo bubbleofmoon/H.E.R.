@@ -1535,15 +1535,31 @@ fn spawn_dsh_reconcile_turns(
         let outbox = outbox.clone();
         tokio::spawn(async move {
             let mut guard = ActiveTurnGuard(Some(turn.id.clone()));
-            let pass = Pass { context: &context, cfg: &cfg };
-            if let Some((verdict, facts)) = pass.assess_non_harness(&turn, &turns, &outbox).await {
-                if matches!(verdict, Verdict::Reattach) {
-                    // Release the reconcile guard before reattach re-claims `turn.id` in active_turns().
-                    drop(guard);
-                    pass.reattach(&turn);
-                    return;
+            let context_bg = context.clone();
+            let cfg_bg = cfg.clone();
+            let turn_bg = turn.clone();
+            let assessed = tokio::task::spawn_blocking(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                    println!("[recovery] ❌ 无法为回合 {} 创建 DSH 核对运行时", turn_bg.id);
+                    return None;
+                };
+                let pass = Pass { context: &context_bg, cfg: &cfg_bg };
+                match rt.block_on(pass.assess_non_harness(&turn_bg, &turns, &outbox)) {
+                    Some((Verdict::Reattach, _)) => Some(true),
+                    Some((verdict, facts)) => {
+                        pass.apply_non_harness_verdict(None, &turn_bg, &verdict, facts.as_ref());
+                        Some(false)
+                    }
+                    None => Some(false),
                 }
-                pass.apply_non_harness_verdict(None, &turn, &verdict, facts.as_ref());
+            })
+            .await;
+            if matches!(assessed, Ok(Some(true))) {
+                // Release the reconcile guard before reattach re-claims `turn.id` in active_turns().
+                drop(guard);
+                let pass = Pass { context: &context, cfg: &cfg };
+                pass.reattach(&turn);
+                return;
             }
             let _ = &mut guard;
         });
@@ -3332,6 +3348,194 @@ mod tests {
         assert!(
             turns.iter().any(|t| t.id == rec2.id && !t.state.is_open()),
             "group:2 DSH turn must settle even when group:1 harness rearm persistently errors"
+        );
+    }
+
+    #[test]
+    fn ticket297_blocking_dsh_probe_does_not_starve_single_worker_harness_pass() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dsh_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe_in_flight = Arc::new(AtomicBool::new(false));
+        let probe_finished = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let in_flight_srv = Arc::clone(&probe_in_flight);
+        let finished_srv = Arc::clone(&probe_finished);
+        let server = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut first_line = String::new();
+                        let _ = reader.read_line(&mut first_line);
+                        let mut length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        if first_line.starts_with("POST ") {
+                            let mut body = vec![0; length];
+                            let _ = reader.read_exact(&mut body);
+                            in_flight_srv.store(true, Ordering::Release);
+                            for _ in 0..150 {
+                                if stop_srv.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            finished_srv.store(true, Ordering::Release);
+                            let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                            let rpc_id = req["rpcId"].as_str().unwrap_or("");
+                            let reply = json!({
+                                "type": "server-response",
+                                "rpcId": rpc_id,
+                                "result": {
+                                    "ok": false,
+                                    "error": {"code": "session-not-found", "message": "gone"}
+                                }
+                            })
+                            .to_string();
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                                reply.len()
+                            );
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1, 2]},
+            "harness": {"model": "fake-chat"},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-blocking-probe-")),
+            &cfg,
+            &json!({"dsh": dsh_url, "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        std::fs::create_dir_all(root.0.join("user/dsh")).unwrap();
+        std::fs::write(
+            root.0.join("user/dsh/.credentials.yaml"),
+            "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let future_iso = crate::sticker::iso_at(now() + 300_000);
+        let wake_cfg = json!({
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": null,
+            "triggers": {"atMention": true},
+            "confirmedAt": 1,
+            "lastWakeAt": 10,
+            "wakeCount": 1
+        });
+        let valid_social = json!({
+            "conversations": {
+                "group:1": {"agentToken": "tok-297-g1", "wakeTimes": [10], "wakeConfig": wake_cfg},
+                "group:2": {"agentToken": "tok-297-g2", "wakeTimes": [10], "wakeConfig": wake_cfg}
+            }
+        })
+        .to_string();
+        std::fs::write(root.0.join("data/social-v2.json"), &valid_social).unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let _journal = Journal::open(&context).unwrap();
+
+        let rec1 = Recorder::begin_reserved2(
+            &context,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g1"),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "infinite": false, "sleepUntil": future_iso}
+            }
+        }))
+        .unwrap();
+        rec1.end("completed", "ok").unwrap();
+
+        let rec2 = Recorder::begin_reserved2(
+            &context,
+            "group:2",
+            "dsh",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g2"),
+            &[],
+        )
+        .unwrap();
+        rec2.attempt("rpc-297-dsh", "sess-297-dsh").unwrap();
+
+        // Fail pass 1's startup rearm transiently so group:1 needs pass 2 while group:2's DSH probe is in flight.
+        std::fs::write(root.0.join("data/social-v2.json"), "{broken").unwrap();
+        let cutoff = now() + 500;
+        let startup = startup_turns(&turn_ledger::read_records(&context).unwrap(), cutoff);
+        assert!(startup.contains(&rec2.id));
+        let mut state = RecoveryState { startup: Some(startup), ..Default::default() };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            run_recovery_pass(&context, cutoff, &mut state).await;
+            std::fs::write(root.0.join("data/social-v2.json"), &valid_social).unwrap();
+
+            let pass2 = tokio::time::timeout(Duration::from_millis(400), async {
+                while !probe_in_flight.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                run_recovery_pass(&context, cutoff, &mut state).await;
+            })
+            .await;
+
+            assert!(
+                pass2.is_ok(),
+                "pass 2 on worker_threads(1) must finish in <400ms while DSH probe is in flight"
+            );
+            assert!(
+                !probe_finished.load(Ordering::Acquire),
+                "DSH probe must still be in flight when pass 2 finishes"
+            );
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+
+        assert!(
+            state.terminal_rearm_done.contains("group:1"),
+            "pass 2 must mark group:1 done once social-v2.json recovers"
+        );
+        let social = context.read_social_state().unwrap();
+        assert_eq!(
+            social["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "pass 2 must restore group:1's deadline without starving behind the DSH probe"
         );
     }
 

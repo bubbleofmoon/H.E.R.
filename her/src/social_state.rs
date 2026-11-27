@@ -782,21 +782,12 @@ pub(crate) fn mode(context: &RuntimeContext) -> String {
     mode_checked(context).unwrap_or_else(|_| "reserved2".to_string())
 }
 
-/// Active mode, failing explicitly when the selected runtime's `mode.json` is unreadable or invalid.
-pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialError> {
-    if !context.is_isolated() {
-        return Ok(legacy_read_json(LEGACY_MODE_PATH)
-            .and_then(|v| v.get("mode").and_then(Value::as_str).map(str::to_string))
-            .map(|s| normalize_mode(&s).map(str::to_string).unwrap_or(s))
-            .unwrap_or_else(|| "reserved2".to_string()));
-    }
-    let text = context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| SocialError::Storage("runtime mode is unavailable".to_string()))?;
-    let Some(text) = text else {
+/// Validate the JSON text of an isolated runtime's `mode.json` snapshot.
+pub(crate) fn validate_mode_text(raw: Option<&str>) -> Result<String, SocialError> {
+    let Some(text) = raw else {
         return Ok("reserved2".to_string());
     };
-    let value: Value = serde_json::from_str(&text)
+    let value: Value = serde_json::from_str(text)
         .map_err(|_| SocialError::Storage("runtime mode is invalid".to_string()))?;
     let Some(object) = value.as_object() else {
         return Err(SocialError::Storage("runtime mode is invalid".to_string()));
@@ -808,6 +799,20 @@ pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialErr
         None => Ok("reserved2".to_string()),
         Some(_) => Err(SocialError::Storage("runtime mode is invalid".to_string())),
     }
+}
+
+/// Active mode, failing explicitly when the selected runtime's `mode.json` is unreadable or invalid.
+pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialError> {
+    if !context.is_isolated() {
+        return Ok(legacy_read_json(LEGACY_MODE_PATH)
+            .and_then(|v| v.get("mode").and_then(Value::as_str).map(str::to_string))
+            .map(|s| normalize_mode(&s).map(str::to_string).unwrap_or(s))
+            .unwrap_or_else(|| "reserved2".to_string()));
+    }
+    let text = context
+        .read_optional_text(RuntimeArea::Data, "mode.json")
+        .map_err(|_| SocialError::Storage("runtime mode is unavailable".to_string()))?;
+    validate_mode_text(text.as_deref())
 }
 
 pub(crate) fn set_mode(

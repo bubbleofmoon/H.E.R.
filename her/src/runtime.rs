@@ -122,6 +122,7 @@ pub(crate) struct AuthorityGuard<'a> {
 thread_local! {
     pub(crate) static APPEND_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>>> = std::cell::RefCell::new(None);
     pub(crate) static APPEND_IO_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> std::io::Result<()>>>> = std::cell::RefCell::new(None);
+    pub(crate) static MODE_READ_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -640,9 +641,18 @@ impl RuntimeContext {
         if !self.is_isolated() {
             return Err("optional runtime reads require an isolated context");
         }
-        self.read_bytes_retrying(area, relative, true)?
+        let result = self.read_bytes_retrying(area, relative, true)?
             .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid"))
-            .transpose()
+            .transpose();
+        #[cfg(test)]
+        if relative == "mode.json" {
+            MODE_READ_TEST_HOOK.with(|hook| {
+                if let Some(cb) = hook.borrow_mut().as_mut() {
+                    cb();
+                }
+            });
+        }
+        result
     }
 
     /// `read_optional_text` for a caller that holds no lock, gate or chain and can afford to wait: on

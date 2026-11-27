@@ -1853,6 +1853,153 @@ mod tests {
         .expect("the malformed mode fixture must settle");
     }
 
+    #[tokio::test]
+    async fn ticket297_retry_exhaustion_adopts_preserved_deadline_and_fires_timeout() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (root, mut hub, console) = harness_cap_fixture("harness-cap-retry-exhaust", None).await;
+            drop(console);
+            let key = HARNESS_CAP_KEY;
+            let future_ms = (crate::now_ms() as i64) + 500_000;
+            let future_iso = crate::sticker::iso_at(future_ms);
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(future_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            for attempt in 1..=(MAX_WAKE_RETRIES + 1) {
+                for (at, _) in hub.retries.values_mut() {
+                    *at = 0;
+                }
+                hub.tick("bot", 9001).await.unwrap();
+                assert!(hub.active.contains_key(key), "attempt {attempt} must dispatch");
+                wait_for_harness_cap_wake(&hub).await;
+                hub.tick("bot", 9001).await.unwrap();
+                assert_eq!(hub.failures[key], attempt);
+                if attempt <= MAX_WAKE_RETRIES {
+                    assert!(hub.retries.contains_key(key));
+                }
+            }
+
+            assert!(hub.retries.is_empty(), "retries must be empty after exhaustion");
+            assert_eq!(hub.dsh_wait.len(key), 0);
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                json!(future_iso)
+            );
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(
+                hub.drivers[key].sched.wc.sleep_until.as_deref(),
+                Some(future_iso.as_str()),
+                "live driver must adopt preserved deadline after retry exhaustion"
+            );
+            hub.pump_timers(&cfg, future_ms + 1);
+            assert!(
+                hub.ready.iter().any(|(k, r)| k == key && r == "timeout"),
+                "advancing hub clock past preserved sleepUntil must fire timeout wake"
+            );
+
+            // Also verify dispatch-prep retry exhaustion re-arms, adopts, and fires timeout.
+            hub.ready.clear();
+            hub.failures.remove(key);
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+            hub.drivers.get_mut(key).unwrap().sched.wc.sleep_until = None;
+            let wake_log = root.0.join("data/logs/rbridge-live-wakes.jsonl");
+            let _ = std::fs::remove_file(&wake_log);
+            std::fs::create_dir(&wake_log).unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            for attempt in 1..=(MAX_WAKE_RETRIES + 1) {
+                for (at, _) in hub.retries.values_mut() {
+                    *at = 0;
+                }
+                hub.tick("bot", 9001).await.unwrap();
+                assert_eq!(hub.failures[key], attempt);
+            }
+            std::fs::remove_dir(&wake_log).unwrap();
+            let rearmed_iso = hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"]
+                .as_str()
+                .map(str::to_string)
+                .expect("dispatch-prep exhaustion must re-arm sleepUntil");
+            let rearmed_ms = crate::wake::parse_iso_ms(&rearmed_iso).unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(
+                hub.drivers[key].sched.wc.sleep_until.as_deref(),
+                Some(rearmed_iso.as_str()),
+                "live driver must adopt re-armed deadline after dispatch-prep exhaustion"
+            );
+            hub.pump_timers(&cfg, rearmed_ms + 1);
+            assert!(
+                hub.ready.iter().any(|(k, r)| k == key && r == "timeout"),
+                "advancing hub clock past dispatch-prep re-armed sleepUntil must fire timeout wake"
+            );
+        })
+        .await
+        .expect("the retry exhaustion fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_adopt_mode_uses_single_snapshot() {
+        struct ClearModeHook;
+        impl Drop for ClearModeHook {
+            fn drop(&mut self) {
+                crate::runtime::MODE_READ_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+
+        let (root, mut hub, _console) = harness_cap_fixture("harness-cap-adopt-mode-snapshot", None).await;
+        let key = HARNESS_CAP_KEY;
+        let cfg = hub.context.load_config().unwrap();
+        hub.tick("bot", 9001).await.unwrap();
+        assert!(hub.drivers.contains_key(key));
+
+        hub.rearm_pending.insert(
+            key.into(),
+            (
+                100,
+                "atMention".into(),
+                json!({"wakeConfig":{"confirmedAt":2,"infinite":false,"sleepUntil":null}}),
+                "tok".into(),
+            ),
+        );
+        let mode_path = root.0.join("data/mode.json");
+        let mode_path_hook = mode_path.clone();
+        let mut flipped = false;
+        let _clear = ClearModeHook;
+        crate::runtime::MODE_READ_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if !flipped {
+                    flipped = true;
+                    std::fs::write(&mode_path_hook, "{bad").unwrap();
+                }
+            }));
+        });
+
+        let first = hub.adopt_mode(&cfg, 9001).await;
+        assert!(first.is_ok(), "first read saw valid mode.json snapshot: {first:?}");
+        assert!(
+            hub.rearm_pending.contains_key(key) && hub.drivers.contains_key(key),
+            "single-snapshot adopt_mode must not drop_everything when mode.json changes after read"
+        );
+
+        let second = hub.adopt_mode(&cfg, 9001).await;
+        assert!(second.is_err(), "subsequent read of malformed mode.json must fail closed");
+        assert!(
+            hub.rearm_pending.contains_key(key) && hub.drivers.contains_key(key),
+            "malformed mode.json must fail closed without calling drop_everything"
+        );
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -4182,12 +4329,20 @@ impl Hub {
     }
 
     async fn adopt_mode(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
-        social_state::mode_checked(&self.context).map_err(|e| e.to_string())?;
-        let stamp = self
-            .context
-            .read_optional_text(RuntimeArea::Data, "mode.json")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
+        let stamp = if self.context.is_isolated() {
+            let raw = self
+                .context
+                .read_optional_text(RuntimeArea::Data, "mode.json")
+                .map_err(|e| e.to_string())?;
+            social_state::validate_mode_text(raw.as_deref()).map_err(|e| e.to_string())?;
+            raw.unwrap_or_default()
+        } else {
+            social_state::mode_checked(&self.context).map_err(|e| e.to_string())?;
+            self.context
+                .read_optional_text(RuntimeArea::Data, "mode.json")
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default()
+        };
         let reset = self.rotation_state(cfg, "guard-read", now)?["resetEpoch"].clone();
         if reset != self.reset_stamp {
             // The console already stopped DSH work, cancelled the ledger turns and removed every
@@ -4755,7 +4910,8 @@ impl Hub {
             // not a tool configuration change, so confirmedAt alone cannot detect it. Local
             // retries/holds already own their deadline and must retain their bounded backoff.
             if !self.active.contains_key(key) && !self.held.contains_key(key)
-                && !self.failures.contains_key(key) && !persisted_wake.infinite
+                && !self.retries.contains_key(key) && !self.dsh_wait.per_key.contains_key(key)
+                && !persisted_wake.infinite
                 && persisted_wake.sleep_until.is_some()
                 && persisted_wake.sleep_until != d.sched.wc.sleep_until {
                 d.adopt_wake_config(persisted_wake, now);
@@ -4986,7 +5142,8 @@ impl Hub {
                     d.adopt_wake_config(persisted_wake, now);
                     self.synced.insert(key.clone(), next);
                 } else if !self.held.contains_key(&key)
-                    && !self.failures.contains_key(&key)
+                    && !self.retries.contains_key(&key)
+                    && !self.dsh_wait.per_key.contains_key(&key)
                     && !persisted_wake.infinite
                     && persisted_wake.sleep_until.is_some()
                     && persisted_wake.sleep_until != d.sched.wc.sleep_until
