@@ -602,7 +602,7 @@ fn ticket443_r4_raw_trailing_slash_secret_and_single_tx_view_consistency() {
     let (stored_root, stored_ctx) = settings_fixture("ticket443 r4 stored trailing slash");
     let stored_default = stored_ctx.dependency_url("model").unwrap().trim_end_matches('/').to_string();
     assert_eq!(set_quiet(&stored_ctx, json!(4700)).0, 200);
-    StoreProbe::at(&stored_root.0).set_value(
+    StoreProbe::at(&stored_root.0).insert_value(
         "harness.apiBaseUrl",
         &json!(format!("https://api.example.com/{slash_tok}")).to_string(),
     );

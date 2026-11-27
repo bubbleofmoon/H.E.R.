@@ -893,6 +893,7 @@ pub(crate) struct ModelEndpointSnapshot {
     pub default_endpoint: Option<String>,
     pub effective_endpoint: Option<String>,
     pub effective_source: Option<ModelEndpointSource>,
+    pub stored_url_suppressed: bool,
     pub harness_db_key: Option<String>,
     pub harness_disk_key: Option<String>,
     pub harness_bound_elsewhere: bool,
@@ -1085,6 +1086,12 @@ fn resolve_model_endpoint_from_parts(
         Some(conn) => stored_model_endpoint_override(conn)?,
         None => None,
     };
+    let stored_url_suppressed = matches!(
+        &stored_override,
+        Some(Some((raw, canonical)))
+            if text_contains_any_secret(raw, &all_secrets)
+                || text_contains_any_secret(canonical, &all_secrets)
+    );
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
     let (effective_endpoint, effective_source) = effective_endpoint_from_overrides(
         stored_override,
@@ -1120,6 +1127,7 @@ fn resolve_model_endpoint_from_parts(
         default_endpoint,
         effective_endpoint,
         effective_source,
+        stored_url_suppressed,
         harness_db_key,
         harness_disk_key,
         harness_bound_elsewhere,
@@ -2691,10 +2699,11 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             }
             let mut stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
             if setting.key == HARNESS_API_BASE_URL.key
-                && stored_value
-                    .as_ref()
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| text_contains_any_secret(s, &known_secrets))
+                && (endpoint_snapshot.as_ref().is_some_and(|s| s.stored_url_suppressed)
+                    || stored_value
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| text_contains_any_secret(s, &known_secrets)))
             {
                 stored_value = Some(json!(SECRET_MARKER));
             }
