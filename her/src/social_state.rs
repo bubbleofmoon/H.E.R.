@@ -1588,6 +1588,14 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
                 return Ok(());
             };
             let original = wake.clone();
+            if wake["infinite"] != true
+                && wake["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some()
+            {
+                return Ok(());
+            }
             if wake["infinite"] == false && wake["sleepUntil"].is_null() {
                 let previous = wake_claim.and_then(|claim| claim.get("previous"));
                 let restored_future = previous
