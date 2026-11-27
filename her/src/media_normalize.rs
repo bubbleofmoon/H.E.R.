@@ -95,29 +95,178 @@ pub struct Normalized {
     pub original_mime: &'static str,
 }
 
-pub fn normalize(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
-    let _gate = DECODE_GATE.lock().unwrap_or_else(|p| p.into_inner());
-    // Decoder failures never cross a public boundary with paths or library diagnostics.
-    std::panic::catch_unwind(|| normalize_inner(bytes, max_pixels)).unwrap_or(Err(()))
+/// Content-free classification of image validation or normalization failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalizeError {
+    EmptyInput,
+    InputTooLarge {
+        bytes: usize,
+        max: usize,
+    },
+    UnsupportedFormat,
+    InvalidDimensions,
+    DimensionsExceeded {
+        width: u64,
+        height: u64,
+        max_pixels: u64,
+    },
+    GifMissingTrailer,
+    GifFrameOutOfBounds {
+        width: u64,
+        height: u64,
+    },
+    GifTooManyFrames {
+        frames: usize,
+        max: usize,
+    },
+    GifCumulativePixels {
+        width: u64,
+        height: u64,
+        frames: usize,
+        max_pixels: u64,
+    },
+    GifMalformed,
+    WebpFrameOutOfBounds {
+        width: u64,
+        height: u64,
+    },
+    WebpDimensionMismatch {
+        width: u64,
+        height: u64,
+    },
+    WebpTooManyFrames {
+        frames: usize,
+        max: usize,
+    },
+    WebpCumulativePixels {
+        width: u64,
+        height: u64,
+        frames: usize,
+        max_pixels: u64,
+    },
+    WebpUnsupportedLossless,
+    WebpMalformed,
+    WorkMemoryExceeded {
+        width: u64,
+        height: u64,
+        frames: usize,
+        work_bytes: u64,
+        max_bytes: u64,
+    },
+    DecodeFailed,
+    FrameCountMismatch,
+    EncodeFailed,
+    Panicked,
 }
 
-fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
-    if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
-        return Err(());
+impl NormalizeError {
+    /// Format this failure as a symbolic token and bounded integers without paths or library diagnostics.
+    pub fn diagnostic(self) -> String {
+        match self {
+            Self::EmptyInput => "empty_input".to_string(),
+            Self::InputTooLarge { bytes, max } => format!("input_too_large(bytes={bytes},max={max})"),
+            Self::UnsupportedFormat => "unsupported_format".to_string(),
+            Self::InvalidDimensions => "invalid_dimensions".to_string(),
+            Self::DimensionsExceeded {
+                width,
+                height,
+                max_pixels,
+            } => format!("dimensions_exceeded(w={width},h={height},max_pixels={max_pixels})"),
+            Self::GifMissingTrailer => "gif_missing_trailer".to_string(),
+            Self::GifFrameOutOfBounds { width, height } => {
+                format!("gif_frame_out_of_bounds(w={width},h={height})")
+            }
+            Self::GifTooManyFrames { frames, max } => {
+                format!("gif_too_many_frames(frames={frames},max={max})")
+            }
+            Self::GifCumulativePixels {
+                width,
+                height,
+                frames,
+                max_pixels,
+            } => format!(
+                "gif_cumulative_pixels(w={width},h={height},frames={frames},max_pixels={max_pixels})"
+            ),
+            Self::GifMalformed => "gif_malformed".to_string(),
+            Self::WebpFrameOutOfBounds { width, height } => {
+                format!("webp_frame_out_of_bounds(w={width},h={height})")
+            }
+            Self::WebpDimensionMismatch { width, height } => {
+                format!("webp_dimension_mismatch(w={width},h={height})")
+            }
+            Self::WebpTooManyFrames { frames, max } => {
+                format!("webp_too_many_frames(frames={frames},max={max})")
+            }
+            Self::WebpCumulativePixels {
+                width,
+                height,
+                frames,
+                max_pixels,
+            } => format!(
+                "webp_cumulative_pixels(w={width},h={height},frames={frames},max_pixels={max_pixels})"
+            ),
+            Self::WebpUnsupportedLossless => "webp_unsupported_lossless".to_string(),
+            Self::WebpMalformed => "webp_malformed".to_string(),
+            Self::WorkMemoryExceeded {
+                width,
+                height,
+                frames,
+                work_bytes,
+                max_bytes,
+            } => format!(
+                "work_memory_exceeded(w={width},h={height},frames={frames},work={work_bytes},max={max_bytes})"
+            ),
+            Self::DecodeFailed => "decode_failed".to_string(),
+            Self::FrameCountMismatch => "frame_count_mismatch".to_string(),
+            Self::EncodeFailed => "encode_failed".to_string(),
+            Self::Panicked => "panicked".to_string(),
+        }
     }
-    let format = image::guess_format(bytes).map_err(|_| ())?;
+}
+
+/// Decode, validate, and compact-encode image bytes while returning a content-free failure reason.
+pub fn normalize_diagnosed(bytes: &[u8], max_pixels: u64) -> Result<Normalized, NormalizeError> {
+    let _gate = DECODE_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    // Decoder failures never cross a public boundary with paths or library diagnostics.
+    std::panic::catch_unwind(|| normalize_inner(bytes, max_pixels))
+        .unwrap_or(Err(NormalizeError::Panicked))
+}
+
+pub fn normalize(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
+    normalize_diagnosed(bytes, max_pixels).map_err(|_| ())
+}
+
+fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, NormalizeError> {
+    if bytes.is_empty() {
+        return Err(NormalizeError::EmptyInput);
+    }
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(NormalizeError::InputTooLarge {
+            bytes: bytes.len(),
+            max: MAX_INPUT_BYTES,
+        });
+    }
+    let format = image::guess_format(bytes).map_err(|_| NormalizeError::UnsupportedFormat)?;
     let mime = match format {
         ImageFormat::Png => "image/png",
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Gif => "image/gif",
         ImageFormat::WebP => "image/webp",
-        _ => return Err(()),
+        _ => return Err(NormalizeError::UnsupportedFormat),
     };
     // Header-only checks precede construction of pixel decoders and all frame buffers.
-    let (w, h) = image_dimensions(bytes).ok_or(())?;
-    let pixels = w.checked_mul(h).ok_or(())?;
-    if w == 0 || h == 0 || w > 16_384 || h > 16_384 || pixels > max_pixels.min(64_000_000) {
-        return Err(());
+    let (w, h) = image_dimensions(bytes).ok_or(NormalizeError::InvalidDimensions)?;
+    let pixels = w.checked_mul(h).ok_or(NormalizeError::InvalidDimensions)?;
+    let max_allowed_pixels = max_pixels.min(64_000_000);
+    if w == 0 || h == 0 {
+        return Err(NormalizeError::InvalidDimensions);
+    }
+    if w > 16_384 || h > 16_384 || pixels > max_allowed_pixels {
+        return Err(NormalizeError::DimensionsExceeded {
+            width: w,
+            height: h,
+            max_pixels: max_allowed_pixels,
+        });
     }
     let count = match format {
         ImageFormat::Gif => gif_frame_count(bytes, w, h)?,
@@ -138,14 +287,18 @@ fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
     } else {
         0
     };
-    if pixels
+    let work_bytes = pixels
         .checked_mul(factor)
         .and_then(|n| n.checked_add(entropy_memory))
-        .ok_or(())?
-        > WORK_MEMORY
-        || pixels.checked_mul(count as u64).ok_or(())? > MAX_FRAME_PIXELS
-    {
-        return Err(());
+        .ok_or(NormalizeError::InvalidDimensions)?;
+    if work_bytes > WORK_MEMORY {
+        return Err(NormalizeError::WorkMemoryExceeded {
+            width: w,
+            height: h,
+            frames: count,
+            work_bytes,
+            max_bytes: WORK_MEMORY,
+        });
     }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
@@ -153,17 +306,20 @@ fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
     limits.max_alloc = Some(128 * 1024 * 1024);
     let mut images = Vec::new();
     if format == ImageFormat::Gif {
-        let mut decoder =
-            image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).map_err(|_| ())?;
+        let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+            .map_err(|_| NormalizeError::DecodeFailed)?;
         if decoder.dimensions() != (w as u32, h as u32) {
-            return Err(());
+            return Err(NormalizeError::InvalidDimensions);
         }
-        decoder.set_limits(limits).map_err(|_| ())?;
+        decoder
+            .set_limits(limits)
+            .map_err(|_| NormalizeError::DecodeFailed)?;
         images = sample_frames(decoder.into_frames(), count)?;
     } else if format == ImageFormat::WebP && webp_is_animated(bytes) {
-        let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).map_err(|_| ())?;
+        let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+            .map_err(|_| NormalizeError::DecodeFailed)?;
         if decoder.dimensions() != (w as u32, h as u32) {
-            return Err(());
+            return Err(NormalizeError::InvalidDimensions);
         }
         // WebP's frame decoder composites disposal/blending; structural preflight bounds
         // every ANMF rectangle as well as the full canvas before its allocations.
@@ -171,9 +327,9 @@ fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
     } else {
         let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         reader.limits(limits);
-        let decoded = reader.decode().map_err(|_| ())?;
+        let decoded = reader.decode().map_err(|_| NormalizeError::DecodeFailed)?;
         if decoded.width() != w as u32 || decoded.height() != h as u32 {
-            return Err(());
+            return Err(NormalizeError::InvalidDimensions);
         }
         // Decode even pass-through candidates, so a plausible header cannot bypass validation.
         // Animated PNG is flattened rather than accidentally passing an animation onward.
@@ -194,7 +350,10 @@ fn normalize_inner(bytes: &[u8], max_pixels: u64) -> Result<Normalized, ()> {
     })
 }
 
-fn sample_frames(frames: image::Frames<'_>, count: usize) -> Result<Vec<EncodedImage>, ()> {
+fn sample_frames(
+    frames: image::Frames<'_>,
+    count: usize,
+) -> Result<Vec<EncodedImage>, NormalizeError> {
     let sample_count = count.min(8);
     let selected: Vec<usize> = if sample_count == 1 {
         vec![0]
@@ -209,9 +368,9 @@ fn sample_frames(frames: image::Frames<'_>, count: usize) -> Result<Vec<EncodedI
     // Retain only compressed samples, never all decoded frames.
     for frame in frames {
         if actual >= count {
-            return Err(());
+            return Err(NormalizeError::FrameCountMismatch);
         }
-        let frame = frame.map_err(|_| ())?;
+        let frame = frame.map_err(|_| NormalizeError::DecodeFailed)?;
         if selected.contains(&actual) {
             out.push(encode_compact(DynamicImage::ImageRgba8(
                 frame.into_buffer(),
@@ -220,12 +379,12 @@ fn sample_frames(frames: image::Frames<'_>, count: usize) -> Result<Vec<EncodedI
         actual += 1;
     }
     if actual != count || out.len() != sample_count {
-        return Err(());
+        return Err(NormalizeError::FrameCountMismatch);
     }
     Ok(out)
 }
 
-fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
+fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, NormalizeError> {
     if img.width().max(img.height()) > 1024 {
         img = img.resize(1024, 1024, image::imageops::FilterType::Triangle);
     }
@@ -236,7 +395,7 @@ fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
             let mut png = Cursor::new(Vec::new());
             DynamicImage::ImageRgba8(rgba.clone())
                 .write_to(&mut png, ImageFormat::Png)
-                .map_err(|_| ())?;
+                .map_err(|_| NormalizeError::EncodeFailed)?;
             let mut webp = Vec::new();
             image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
                 .encode(
@@ -245,7 +404,7 @@ fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
                     rgba.height(),
                     image::ExtendedColorType::Rgba8,
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| NormalizeError::EncodeFailed)?;
             if webp.len() < png.get_ref().len() {
                 EncodedImage {
                     bytes: webp,
@@ -269,7 +428,7 @@ fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
                         rgb.height(),
                         image::ExtendedColorType::Rgb8,
                     )
-                    .map_err(|_| ())?;
+                    .map_err(|_| NormalizeError::EncodeFailed)?;
                 if bytes.len() <= MAX_OUTPUT_BYTES {
                     break;
                 }
@@ -283,7 +442,7 @@ fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
             return Ok(out);
         }
         if img.width() == 1 && img.height() == 1 {
-            return Err(());
+            return Err(NormalizeError::EncodeFailed);
         }
         // High-entropy transparent images may need a smaller canvas to meet the byte budget.
         img = img.resize(
@@ -294,41 +453,62 @@ fn encode_compact(mut img: DynamicImage) -> Result<EncodedImage, ()> {
     }
 }
 
-fn skip_subblocks(bytes: &[u8], pos: &mut usize) -> Result<(), ()> {
+fn skip_subblocks(bytes: &[u8], pos: &mut usize) -> Result<(), NormalizeError> {
     loop {
-        let n = *bytes.get(*pos).ok_or(())? as usize;
+        let n = *bytes.get(*pos).ok_or(NormalizeError::GifMalformed)? as usize;
         *pos += 1;
         if n == 0 {
             return Ok(());
         }
-        *pos = pos.checked_add(n).filter(|p| *p <= bytes.len()).ok_or(())?;
+        *pos = pos
+            .checked_add(n)
+            .filter(|p| *p <= bytes.len())
+            .ok_or(NormalizeError::GifMalformed)?;
     }
 }
 
-fn gif_frame_count(bytes: &[u8], w: u64, h: u64) -> Result<usize, ()> {
-    let packed = *bytes.get(10).ok_or(())?;
+fn gif_frame_count(bytes: &[u8], w: u64, h: u64) -> Result<usize, NormalizeError> {
+    let packed = *bytes.get(10).ok_or(NormalizeError::GifMalformed)?;
     let mut pos = 13
         + if packed & 128 != 0 {
             3usize << ((packed & 7) + 1)
         } else {
             0
         };
+    if bytes.len() < pos {
+        return Err(NormalizeError::GifMalformed);
+    }
     let mut count = 0;
     loop {
-        let tag = *bytes.get(pos).ok_or(())?;
+        let tag = *bytes.get(pos).ok_or(if count > 0 {
+            NormalizeError::GifMissingTrailer
+        } else {
+            NormalizeError::GifMalformed
+        })?;
         pos += 1;
         match tag {
-            0x3b => return if count > 0 { Ok(count) } else { Err(()) },
+            0x3b => {
+                return if count > 0 {
+                    Ok(count)
+                } else {
+                    Err(NormalizeError::GifMalformed)
+                };
+            }
             0x21 => {
                 pos += 1;
                 skip_subblocks(bytes, &mut pos)?;
             }
             0x2c => {
-                let desc = bytes.get(pos..pos + 9).ok_or(())?;
+                let desc = bytes
+                    .get(pos..pos + 9)
+                    .ok_or(NormalizeError::GifMalformed)?;
                 let n = |i| u16::from_le_bytes([desc[i], desc[i + 1]]) as u64;
                 let (fw, fh) = (n(4), n(6));
                 if fw == 0 || fh == 0 || n(0) + fw > w || n(2) + fh > h {
-                    return Err(());
+                    return Err(NormalizeError::GifFrameOutOfBounds {
+                        width: w,
+                        height: h,
+                    });
                 }
                 pos += 9 + if desc[8] & 128 != 0 {
                     3usize << ((desc[8] & 7) + 1)
@@ -338,11 +518,22 @@ fn gif_frame_count(bytes: &[u8], w: u64, h: u64) -> Result<usize, ()> {
                 pos += 1; // LZW minimum code size; data subblocks remain compressed here.
                 skip_subblocks(bytes, &mut pos)?;
                 count += 1;
-                if count > MAX_FRAMES || w * h * count as u64 > MAX_FRAME_PIXELS {
-                    return Err(());
+                if count > MAX_FRAMES {
+                    return Err(NormalizeError::GifTooManyFrames {
+                        frames: count,
+                        max: MAX_FRAMES,
+                    });
+                }
+                if w * h * count as u64 > MAX_FRAME_PIXELS {
+                    return Err(NormalizeError::GifCumulativePixels {
+                        width: w,
+                        height: h,
+                        frames: count,
+                        max_pixels: MAX_FRAME_PIXELS,
+                    });
                 }
             }
-            _ => return Err(()),
+            _ => return Err(NormalizeError::GifMalformed),
         }
     }
 }
@@ -355,34 +546,40 @@ fn webp_is_animated(bytes: &[u8]) -> bool {
 // lossless subset: one main Huffman group and constant transform maps. Parsing
 // this prefix requires no allocation or pixel decoding. General transform maps
 // and meta-Huffman maps are disabled until the dependency can budget them.
-fn webp_lossless_preflight(data: &[u8]) -> Result<(), ()> {
+fn webp_lossless_preflight(data: &[u8]) -> Result<(), NormalizeError> {
     struct Bits<'a> {
         data: &'a [u8],
         pos: usize,
     }
     impl Bits<'_> {
-        fn read(&mut self, n: usize) -> Result<u32, ()> {
+        fn read(&mut self, n: usize) -> Result<u32, NormalizeError> {
             let mut v = 0;
             for i in 0..n {
-                v |=
-                    u32::from((*self.data.get(self.pos / 8).ok_or(())? >> (self.pos % 8)) & 1) << i;
+                v |= u32::from(
+                    (*self
+                        .data
+                        .get(self.pos / 8)
+                        .ok_or(NormalizeError::WebpMalformed)?
+                        >> (self.pos % 8))
+                        & 1,
+                ) << i;
                 self.pos += 1;
             }
             Ok(v)
         }
-        fn cache(&mut self) -> Result<(), ()> {
+        fn cache(&mut self) -> Result<(), NormalizeError> {
             if self.read(1)? != 0 && !(1..=11).contains(&self.read(4)?) {
-                return Err(());
+                return Err(NormalizeError::WebpUnsupportedLossless);
             }
             Ok(())
         }
-        fn constant_map(&mut self) -> Result<(), ()> {
+        fn constant_map(&mut self) -> Result<(), NormalizeError> {
             self.cache()?;
             // Nested image streams have no transforms or meta-Huffman flag.
             // Single literal trees consume zero pixel bits, regardless of map size.
             for _ in 0..5 {
                 if self.read(1)? != 1 || self.read(1)? != 0 {
-                    return Err(());
+                    return Err(NormalizeError::WebpUnsupportedLossless);
                 }
                 let wide = self.read(1)?;
                 self.read(if wide == 0 { 1 } else { 8 })?;
@@ -391,7 +588,7 @@ fn webp_lossless_preflight(data: &[u8]) -> Result<(), ()> {
         }
     }
     if data.len() < 5 || data[0] != 0x2f || data[4] & 0xe0 != 0 {
-        return Err(());
+        return Err(NormalizeError::WebpUnsupportedLossless);
     }
     let mut bits = Bits {
         data: &data[5..],
@@ -401,7 +598,7 @@ fn webp_lossless_preflight(data: &[u8]) -> Result<(), ()> {
     while bits.read(1)? != 0 {
         let kind = bits.read(2)?;
         if seen & (1 << kind) != 0 {
-            return Err(());
+            return Err(NormalizeError::WebpMalformed);
         }
         seen |= 1 << kind;
         match kind {
@@ -414,30 +611,34 @@ fn webp_lossless_preflight(data: &[u8]) -> Result<(), ()> {
                 bits.read(8)?;
                 bits.constant_map()?;
             }
-            _ => return Err(()),
+            _ => return Err(NormalizeError::WebpMalformed),
         }
     }
     bits.cache()?;
     if bits.read(1)? != 0 {
-        return Err(());
+        return Err(NormalizeError::WebpUnsupportedLossless);
     }
     Ok(())
 }
 
-fn webp_alpha_preflight(tag: &[u8], data: &[u8]) -> Result<(), ()> {
+fn webp_alpha_preflight(tag: &[u8], data: &[u8]) -> Result<(), NormalizeError> {
     // Compressed ALPH also invokes the lossless decoder, without a VP8L header.
     // Refuse it rather than letting a second entropy entry point bypass admission.
-    if tag == b"ALPH" && data.first().ok_or(())? & 3 != 0 {
-        return Err(());
+    if tag == b"ALPH" && data.first().ok_or(NormalizeError::WebpMalformed)? & 3 != 0 {
+        return Err(NormalizeError::WebpUnsupportedLossless);
     }
     Ok(())
 }
 
-fn webp_bitstream_dimensions(tag: &[u8], data: &[u8]) -> Result<(u64, u64), ()> {
+fn webp_bitstream_dimensions(tag: &[u8], data: &[u8]) -> Result<(u64, u64), NormalizeError> {
     match tag {
         b"VP8L" if data.len() >= 5 && data[0] == 0x2f => {
             webp_lossless_preflight(data)?;
-            let bits = u32::from_le_bytes(data[1..5].try_into().map_err(|_| ())?);
+            let bits = u32::from_le_bytes(
+                data[1..5]
+                    .try_into()
+                    .map_err(|_| NormalizeError::WebpMalformed)?,
+            );
             Ok((
                 u64::from(bits & 0x3fff) + 1,
                 u64::from((bits >> 14) & 0x3fff) + 1,
@@ -447,86 +648,123 @@ fn webp_bitstream_dimensions(tag: &[u8], data: &[u8]) -> Result<(u64, u64), ()> 
             u64::from(u16::from_le_bytes([data[6], data[7]]) & 0x3fff),
             u64::from(u16::from_le_bytes([data[8], data[9]]) & 0x3fff),
         )),
-        _ => Err(()),
+        _ => Err(NormalizeError::WebpMalformed),
     }
 }
 
-fn webp_frame_bitstream(bytes: &[u8], width: u64, height: u64) -> Result<(), ()> {
+fn webp_frame_bitstream(bytes: &[u8], width: u64, height: u64) -> Result<(), NormalizeError> {
     let mut pos = 0usize;
     let mut found = false;
     while pos < bytes.len() {
-        let header = bytes.get(pos..pos + 8).ok_or(())?;
-        let len = u32::from_le_bytes(header[4..8].try_into().map_err(|_| ())?) as usize;
+        let header = bytes
+            .get(pos..pos + 8)
+            .ok_or(NormalizeError::WebpMalformed)?;
+        let len = u32::from_le_bytes(
+            header[4..8]
+                .try_into()
+                .map_err(|_| NormalizeError::WebpMalformed)?,
+        ) as usize;
         let start = pos + 8;
         let end = start
             .checked_add(len)
             .filter(|p| *p <= bytes.len())
-            .ok_or(())?;
+            .ok_or(NormalizeError::WebpMalformed)?;
         webp_alpha_preflight(&header[..4], &bytes[start..end])?;
         if &header[..4] == b"VP8L" || &header[..4] == b"VP8 " {
-            if found
-                || webp_bitstream_dimensions(&header[..4], &bytes[start..end])? != (width, height)
-            {
-                return Err(());
+            if found {
+                return Err(NormalizeError::WebpMalformed);
+            }
+            if webp_bitstream_dimensions(&header[..4], &bytes[start..end])? != (width, height) {
+                return Err(NormalizeError::WebpDimensionMismatch { width, height });
             }
             found = true;
         }
         pos = end
             .checked_add(len % 2)
             .filter(|p| *p <= bytes.len())
-            .ok_or(())?;
+            .ok_or(NormalizeError::WebpMalformed)?;
     }
     if found {
         Ok(())
     } else {
-        Err(())
+        Err(NormalizeError::WebpMalformed)
     }
 }
 
-fn webp_frame_count(bytes: &[u8], w: u64, h: u64) -> Result<usize, ()> {
+fn webp_frame_count(bytes: &[u8], w: u64, h: u64) -> Result<usize, NormalizeError> {
     if bytes.len() < 12 {
-        return Err(());
+        return Err(NormalizeError::WebpMalformed);
     }
-    let size = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| ())?) as usize;
+    let size = u32::from_le_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| NormalizeError::WebpMalformed)?,
+    ) as usize;
     if size.checked_add(8) != Some(bytes.len()) {
-        return Err(());
+        return Err(NormalizeError::WebpMalformed);
     }
     let mut pos = 12;
     let mut count = 0;
     while pos < bytes.len() {
-        let header = bytes.get(pos..pos + 8).ok_or(())?;
-        let len = u32::from_le_bytes(header[4..8].try_into().map_err(|_| ())?) as usize;
+        let header = bytes
+            .get(pos..pos + 8)
+            .ok_or(NormalizeError::WebpMalformed)?;
+        let len = u32::from_le_bytes(
+            header[4..8]
+                .try_into()
+                .map_err(|_| NormalizeError::WebpMalformed)?,
+        ) as usize;
         let start = pos + 8;
         let end = start
             .checked_add(len)
             .filter(|p| *p <= bytes.len())
-            .ok_or(())?;
+            .ok_or(NormalizeError::WebpMalformed)?;
         webp_alpha_preflight(&header[..4], &bytes[start..end])?;
         if &header[..4] == b"ANMF" {
-            let d = bytes.get(start..end).filter(|d| d.len() >= 16).ok_or(())?;
+            let d = bytes
+                .get(start..end)
+                .filter(|d| d.len() >= 16)
+                .ok_or(NormalizeError::WebpMalformed)?;
             let n = |i| u64::from(d[i]) | (u64::from(d[i + 1]) << 8) | (u64::from(d[i + 2]) << 16);
             if n(0) * 2 + n(6) + 1 > w || n(3) * 2 + n(9) + 1 > h {
-                return Err(());
+                return Err(NormalizeError::WebpFrameOutOfBounds {
+                    width: w,
+                    height: h,
+                });
             }
             // VP8/VP8L carries its own dimensions. Check them before a codec can
             // allocate from a forged inner size inconsistent with the ANMF rectangle.
             webp_frame_bitstream(&d[16..], n(6) + 1, n(9) + 1)?;
             count += 1;
-            if count > MAX_FRAMES || w * h * count as u64 > MAX_FRAME_PIXELS {
-                return Err(());
+            if count > MAX_FRAMES {
+                return Err(NormalizeError::WebpTooManyFrames {
+                    frames: count,
+                    max: MAX_FRAMES,
+                });
+            }
+            if w * h * count as u64 > MAX_FRAME_PIXELS {
+                return Err(NormalizeError::WebpCumulativePixels {
+                    width: w,
+                    height: h,
+                    frames: count,
+                    max_pixels: MAX_FRAME_PIXELS,
+                });
             }
         } else if &header[..4] == b"VP8L" || &header[..4] == b"VP8 " {
             if webp_bitstream_dimensions(&header[..4], &bytes[start..end])? != (w, h) {
-                return Err(());
+                return Err(NormalizeError::WebpDimensionMismatch {
+                    width: w,
+                    height: h,
+                });
             }
         }
         pos = end
             .checked_add(len % 2)
             .filter(|p| *p <= bytes.len())
-            .ok_or(())?;
+            .ok_or(NormalizeError::WebpMalformed)?;
     }
     if webp_is_animated(bytes) && count == 0 {
-        return Err(());
+        return Err(NormalizeError::WebpMalformed);
     }
     Ok(count.max(1))
 }
@@ -840,5 +1078,76 @@ mod tests {
         assert!(looks_like_image(b"RIFF____WEBP"));
         assert!(!looks_like_image(b"<html>not an image"));
         assert!(!looks_like_image(b""));
+    }
+
+    #[test]
+    fn normalize_diagnosed_reports_content_free_reasons() {
+        assert_eq!(
+            normalize_diagnosed(&[], 64_000_000).err(),
+            Some(NormalizeError::EmptyInput)
+        );
+        assert_eq!(
+            normalize_diagnosed(b"<html>no image</html>", 64_000_000).err(),
+            Some(NormalizeError::UnsupportedFormat)
+        );
+        let gif_err = normalize_diagnosed(&fixtures::gif(257, 1, 1), 64_000_000).err();
+        assert_eq!(
+            gif_err,
+            Some(NormalizeError::GifTooManyFrames {
+                frames: 257,
+                max: MAX_FRAMES,
+            })
+        );
+        assert_eq!(
+            gif_err.unwrap().diagnostic(),
+            "gif_too_many_frames(frames=257,max=256)"
+        );
+
+        let cumulative = normalize_diagnosed(&fixtures::gif(210, 800, 800), 64_000_000).err();
+        assert_eq!(
+            cumulative,
+            Some(NormalizeError::GifCumulativePixels {
+                width: 800,
+                height: 800,
+                frames: 201,
+                max_pixels: MAX_FRAME_PIXELS,
+            })
+        );
+
+        let mut truncated = fixtures::gif(3, 8, 8);
+        truncated.pop();
+        assert_eq!(
+            normalize_diagnosed(&truncated, 64_000_000).err(),
+            Some(NormalizeError::GifMissingTrailer)
+        );
+
+        let big_still = fixtures::still(ImageFormat::Png, 1200, 1000, false);
+        assert_eq!(
+            normalize_diagnosed(&big_still, 1_000_000).err(),
+            Some(NormalizeError::DimensionsExceeded {
+                width: 1200,
+                height: 1000,
+                max_pixels: 1_000_000,
+            })
+        );
+
+        let mut truncated_gct = b"GIF89a\x02\x00\x02\x00\xf7\x00\x00".to_vec();
+        truncated_gct.extend_from_slice(&[0u8; 30]);
+        assert_eq!(
+            normalize_diagnosed(&truncated_gct, 64_000_000).err(),
+            Some(NormalizeError::GifMalformed)
+        );
+
+        let mut webp = fixtures::webp_animation(2);
+        let vp8l = webp.windows(4).position(|b| b == b"VP8L").unwrap();
+        let header = vp8l + 9;
+        webp[header..header + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            normalize_diagnosed(&webp, 64_000_000).err(),
+            Some(NormalizeError::WebpDimensionMismatch {
+                width: 4,
+                height: 4,
+            })
+        );
     }
 }
