@@ -447,34 +447,6 @@ pub fn scheduler_from_state(
     s
 }
 
-/// Reset an un-wakeable session wake config at load time so the session cannot remain permanently unreachable.
-pub fn ensure_wakeable_at_load(sched: &mut WakeScheduler, cfg_json: &serde_json::Value, now: i64, rand01: f64) -> bool {
-    let wc = &sched.wc;
-    let timed = !wc.infinite
-        && wc
-            .sleep_until
-            .as_deref()
-            .and_then(wake::parse_iso_ms)
-            .map(|t| t > now)
-            .unwrap_or(false);
-    let wakeable = timed
-        || wc.mode_active
-        || wc.any_message
-        || wc.at_mention
-        || wc.name_mention
-        || wc.poke
-        || wc.question_boolean
-        || wc.probability > 0.0
-        || !wc.keywords.is_empty()
-        || !wc.speaker_ids.is_empty();
-    if wakeable {
-        return false;
-    }
-    // 一个触发条件都没有：用默认配置兜底（与 JS ensureWakeableV2 一致）
-    let def = wake::default_wake_config(cfg_json, now, rand01);
-    sched.wc = wake_config_from_json(Some(&def));
-    true
-}
 /// Marker of a conversation's persisted wake settings that the live hub compares with the state
 /// file: what a running driver consumes (`WakeConfig`) plus `confirmedAt`, and the last non-null
 /// `sleepUntil`. A refreshed default (JS `refreshDefaultWakeConfigV2`) changes the settings and
@@ -956,26 +928,6 @@ mod tests {
         assert!(ra.iter().all(|x| (0.0..1.0).contains(x)));
     }
 
-    #[test]
-    fn ensure_wakeable_at_load_resets_dead_config() {
-        // A config with all triggers disabled, zero probability, and no keywords must fall back to defaults at load time.
-        let cfg = serde_json::json!({"socialV2": {"wake": {"recommendedSleepMinMs": 300000}}});
-        let dead = serde_json::json!({
-            "infinite": true,
-            "triggers": {"atMention": false, "nameMention": false, "question": false,
-                         "poke": false, "anyMessage": false, "keywords": [], "probability": 0,
-                         "speakerIds": []}
-        });
-        let session = serde_json::json!({"wakeConfig": dead});
-        let mut sched = scheduler_from_state(wake::WakeCfg::default(), &session);
-        assert!(ensure_wakeable_at_load(&mut sched, &cfg, 1_000_000, 0.5), "死配置应被重置");
-        assert!(sched.wc.at_mention || sched.wc.name_mention || sched.wc.probability > 0.0, "重置后必须可唤醒");
-
-        // 正常配置不该被动
-        let alive = serde_json::json!({"wakeConfig": {"infinite": true, "triggers": {"atMention": true}}});
-        let mut s2 = scheduler_from_state(wake::WakeCfg::default(), &alive);
-        assert!(!ensure_wakeable_at_load(&mut s2, &cfg, 1_000_000, 0.5), "正常配置不该被重置");
-    }
     #[test]
     fn wake_config_parses_from_json() {
         let v = serde_json::json!({

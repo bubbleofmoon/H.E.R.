@@ -298,18 +298,11 @@ pub(crate) fn mint_request_id() -> String {
     )
 }
 
-pub(crate) fn rpc_for(context: &RuntimeContext, cfg: &serde_json::Value) -> Result<Rpc, String> {
-    let base = if context.is_isolated() {
-        context
-            .dependency_url("dsh")
-            .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?
-    } else {
-        cfg.get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080")
-    };
-    Rpc::connect_with_runtime(context, base)
+pub(crate) fn rpc_for(context: &RuntimeContext, _cfg: &serde_json::Value) -> Result<Rpc, String> {
+    let base = context
+        .dependency_url("dsh")
+        .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?;
+    Rpc::connect(context, base)
 }
 
 pub struct Rpc {
@@ -329,11 +322,7 @@ impl Rpc {
         &self.credential
     }
 
-    pub fn connect(base: &str) -> Result<Self, String> {
-        Self::connect_with_runtime(&RuntimeContext::legacy(), base)
-    }
-
-    pub fn connect_with_runtime(context: &RuntimeContext, base: &str) -> Result<Self, String> {
+    pub fn connect(context: &RuntimeContext, base: &str) -> Result<Self, String> {
         let base = base.trim_end_matches('/').to_string();
         let credential = Credential::mint(context, &base)?;
         Ok(Self { base, credential })
@@ -347,14 +336,12 @@ impl Rpc {
         Self { base, credential }
     }
 
-    /// Compatibility constructor for callers which already extracted a credentials-file secret.
-    /// Isolated handlers must use `connect_with_runtime` so a later 401 refresh stays bound to the
-    /// selected runtime credentials rather than consulting the ambient DSH home.
     #[cfg(test)]
-    pub fn connect_with_secret(base: &str, secret: &str) -> Result<Self, String> {
-        let base = base.trim_end_matches('/').to_string();
-        let credential = Credential::from_secret(&base, secret)?;
-        Ok(Self { base, credential })
+    pub(crate) fn from_credential(base: &str, credential: Credential) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            credential,
+        }
     }
 
     /// Re-read the credentials, mint a new cookie and verify it with the side-effect-free `agentPresets/list`
@@ -1225,7 +1212,7 @@ impl FollowStream {
 
     fn track_mapped_briefing(&mut self, rpc: &Rpc, sid: &str) -> Result<(), String> {
         let context = rpc.credential().context();
-        if context.is_isolated() && crate::social_state::mode(context) == "reserved2" {
+        if crate::social_state::mode(context) == "reserved2" {
             if let Some((key, _)) = crate::session_map::all(context)?.into_iter().find(|(_, mapped)| mapped == sid) {
                 if let Some(epoch) = crate::social_state::token(context, &key)? {
                     self.track_briefing(context, &key, sid, &epoch)?;
@@ -1933,9 +1920,17 @@ mod tests {
 
     use super::*;
 
-    fn test_rpc(base: String) -> Rpc {
-        let credential = Credential::fixed(&base, "dsh-auth-ticket04=synthetic-cookie".into());
-        Rpc { base, credential }
+    fn test_rpc(base: String) -> (crate::runtime::tests::FixtureRoot, Rpc) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(format!("her-dsh-test-{}-{id}", std::process::id())),
+            &serde_json::json!({"consoleToken": "fixture-dsh-console-token"}),
+            &serde_json::json!({"dsh": base, "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let credential = Credential::fixed_in(&context, &base, "dsh-auth-ticket04=synthetic-cookie".into());
+        (root, Rpc { base, credential })
     }
 
     #[test]
@@ -2063,7 +2058,7 @@ mod tests {
     #[test]
     fn call_rejects_a_reply_for_another_rpc_id() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake DSH");
-        let rpc = test_rpc(format!("http://{}", listener.local_addr().unwrap()));
+        let (_root, rpc) = test_rpc(format!("http://{}", listener.local_addr().unwrap()));
         let server = std::thread::spawn(move || {
             let mut stream = accept_test_stream(&listener);
             let request = test_rpc_request_body(&read_test_request(&mut stream));
@@ -2126,7 +2121,7 @@ mod tests {
         for (path, call) in calls {
             for reply in ["matching", "different", "missing", "null", "number"] {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake DSH");
-                let rpc = test_rpc(format!("http://{}", listener.local_addr().unwrap()));
+                let (_root, rpc) = test_rpc(format!("http://{}", listener.local_addr().unwrap()));
                 let server = std::thread::spawn(move || {
                     let mut stream = accept_test_stream(&listener);
                     let request = test_rpc_request_body(&read_test_request(&mut stream));
@@ -2268,7 +2263,7 @@ mod tests {
 
     #[test]
     fn call_with_deadline_rejects_expired_budget_before_connecting() {
-        let rpc = test_rpc("http://127.0.0.1:1".into());
+        let (_root, rpc) = test_rpc("http://127.0.0.1:1".into());
         let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let error = rpc
             .call_with_deadline("session.modelCatalog", serde_json::json!({}), deadline)
@@ -2280,7 +2275,7 @@ mod tests {
     fn call_with_deadline_preserves_plain_http_404_status() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake DSH");
         let base = format!("http://{}", listener.local_addr().expect("read fake DSH address"));
-        let rpc = test_rpc(base);
+        let (_root, rpc) = test_rpc(base);
         let server = std::thread::spawn(move || {
             let mut stream = accept_test_stream(&listener);
             let request = read_test_request(&mut stream);
@@ -2309,7 +2304,7 @@ mod tests {
     fn call_with_deadline_shares_one_budget_across_fallback_requests() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake DSH");
         let base = format!("http://{}", listener.local_addr().expect("read fake DSH address"));
-        let rpc = test_rpc(base);
+        let (_root, rpc) = test_rpc(base);
         let server = std::thread::spawn(move || {
             let mut first = accept_test_stream(&listener);
             let first_request = read_test_request(&mut first);

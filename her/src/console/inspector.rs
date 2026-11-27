@@ -42,12 +42,6 @@ pub(super) fn route(caller: AdminCaller<'_>, cfg: &Value, req: &Request) -> (u16
     if req.method != "GET" {
         return json_result(Err((405, "method not allowed".into())));
     }
-    if !context.is_isolated() {
-        return json_result(Err((
-            503,
-            "the session inspector requires a selected runtime".into(),
-        )));
-    }
     match req.path.as_str() {
         PAGE_PATH => (
             200,

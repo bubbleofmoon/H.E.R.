@@ -341,7 +341,7 @@ fn ticket336_provenance_renders_before_kind_in_search_and_recall() {
     assert!(block.contains("- [推断·inference] 202说：管理员喜欢咖啡"), "{block}");
     assert!(!block.contains("fact·推断"), "{block}");
 
-    let tool_written = crate::mcp::call_tool_with_context(
+    let tool_written = crate::mcp::call_tool(
         "memory_write",
         &json!({
             "key":"private:7001","token":"owner-token","kind":"fact","content":"工具写入乌龙茶"
@@ -351,7 +351,7 @@ fn ticket336_provenance_renders_before_kind_in_search_and_recall() {
     .unwrap();
     assert!(tool_written.contains("已记住"), "{tool_written}");
 
-    let search_text = crate::mcp::call_tool_with_context(
+    let search_text = crate::mcp::call_tool(
         "memory_search",
         &json!({"key":"private:7001","token":"owner-token","query":"","limit":10}),
         &context,
@@ -436,7 +436,7 @@ fn ticket336_rewriting_archived_message_returns_archived_state_until_unarchived(
     assert_eq!(s9, 200, "{unlinked_arch}");
     server.join().unwrap();
 
-    let tool_dedup = crate::mcp::call_tool_with_context(
+    let tool_dedup = crate::mcp::call_tool(
         "memory_write",
         &json!({
             "key":"private:7001","token":"owner-token","content":"未关联归档内容","kind":"thought"

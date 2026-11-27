@@ -396,11 +396,7 @@ fn poll(context: &RuntimeContext, installed: bool) -> Result<(), String> {
 pub(super) fn start(context: RuntimeContext) {
     let installed = crate::install_root::InstallRoot::configured()
         .ok()
-        .is_some_and(|install| {
-            context
-                .runtime_root()
-                .is_some_and(|root| install.protects(root).unwrap_or(false))
-        });
+        .is_some_and(|install| install.protects(context.runtime_root()).unwrap_or(false));
     std::thread::spawn(move || {
         let mut last_error = None;
         loop {
@@ -557,9 +553,7 @@ fn ready_and_healthy(
             );
             healthy(states, dependency.name, clock.now(context));
             publish(context, states)?;
-            let root = context
-                .runtime_root()
-                .ok_or("runtime root is unavailable")?;
+            let root = context.runtime_root();
             if crate::health_check::check(
                 root,
                 Instant::now() + crate::update::HEALTH_PROBE_ALLOWANCE,

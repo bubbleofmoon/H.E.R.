@@ -26,22 +26,19 @@ fn unavailable() -> Failure {
     (503, "feedback store is unavailable".to_string())
 }
 
-/// Held for the duration of one read-modify-write: the in-process mutex plus, in a selected root,
-/// the OS lock `locks/feedback.lock` that serializes the console and the live bridge.
+/// Held for the duration of one read-modify-write: the in-process mutex plus the OS lock
+/// `locks/feedback.lock` that serializes the console and the live bridge.
 struct Gate {
     _process: std::sync::MutexGuard<'static, ()>,
-    _file: Option<std::fs::File>,
+    _file: std::fs::File,
 }
 
 fn acquire(context: &RuntimeContext) -> Result<Gate, Failure> {
     let process = GATE.lock().unwrap_or_else(|p| p.into_inner());
-    if !context.is_isolated() {
-        return Ok(Gate { _process: process, _file: None });
-    }
     let deadline = std::time::Instant::now() + GATE_WAIT;
     loop {
         match context.open_locked_file(RuntimeArea::Data, GATE_FILE) {
-            Ok(file) => return Ok(Gate { _process: process, _file: Some(file) }),
+            Ok(file) => return Ok(Gate { _process: process, _file: file }),
             Err(error) if error == "runtime file is already locked" => {
                 if std::time::Instant::now() >= deadline {
                     return Err((503, "selected runtime feedback store is busy".to_string()));
@@ -59,16 +56,7 @@ fn quarantine(context: &RuntimeContext) -> Result<(), Failure> {
     let stamp = crate::dsh_mcp_config::utc_stamp();
     for attempt in 0..100 {
         let name = if attempt == 0 { format!("{FILE}.corrupt-{stamp}") } else { format!("{FILE}.corrupt-{stamp}-{attempt}") };
-        let renamed = if context.is_isolated() {
-            context.rename_file(RuntimeArea::Data, FILE, &name)
-        } else {
-            let dir = context.data_dir();
-            if dir.join(&name).exists() {
-                Err("runtime destination already exists".to_string())
-            } else {
-                std::fs::rename(dir.join(FILE), dir.join(&name)).map_err(|e| e.to_string())
-            }
-        };
+        let renamed = context.rename_file(RuntimeArea::Data, FILE, &name);
         match renamed {
             Ok(()) => return Ok(()),
             Err(error) if error == "runtime destination already exists" => continue,
@@ -82,22 +70,14 @@ fn quarantine(context: &RuntimeContext) -> Result<(), Failure> {
 /// not a JSON array is moved aside as a backup and also reads as empty. An I/O error other than
 /// "not found" is refused rather than guessed at.
 fn read_locked(context: &RuntimeContext) -> Result<Vec<Value>, Failure> {
-    let text = if context.is_isolated() {
-        match context.read_optional_text(RuntimeArea::Data, FILE) {
-            Ok(Some(text)) => Some(text),
-            Ok(None) => return Ok(Vec::new()),
-            // Unreadable as text: damaged (not UTF-8) only if the bytes themselves can be read.
-            Err(_) => match context.read_file(RuntimeArea::Data, FILE) {
-                Ok(_) => None,
-                Err(_) => return Err(unavailable()),
-            },
-        }
-    } else {
-        match std::fs::read(context.data_dir().join(FILE)) {
-            Ok(bytes) => String::from_utf8(bytes).ok(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    let text = match context.read_optional_text(RuntimeArea::Data, FILE) {
+        Ok(Some(text)) => Some(text),
+        Ok(None) => return Ok(Vec::new()),
+        // Unreadable as text: damaged (not UTF-8) only if the bytes themselves can be read.
+        Err(_) => match context.read_file(RuntimeArea::Data, FILE) {
+            Ok(_) => None,
             Err(_) => return Err(unavailable()),
-        }
+        },
     };
     if let Some(text) = &text {
         let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);

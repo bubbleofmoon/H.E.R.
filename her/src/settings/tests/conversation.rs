@@ -289,24 +289,8 @@ fn conversation_settings_skip_rows_with_a_non_canonical_conversation() {
 
 #[test]
 fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
-    let legacy = RuntimeContext::legacy();
     let owner_set = r#"{"conversation":"private:7001","setting":"conversation.engine","value":"harness"}"#;
     let owner_reset = r#"{"conversation":"private:7001","setting":"conversation.engine"}"#;
-    for (method, path, body) in [
-        ("GET", "/api/settings/conversations", ""),
-        ("POST", "/api/settings/conversation/set", owner_set),
-        ("POST", "/api/settings/conversation/reset", owner_reset),
-    ] {
-        let (status, _, reply, _) = crate::console_settings::route(
-            crate::console_front::AdminCaller::new(&legacy),
-            method,
-            path,
-            &HashMap::new(),
-            body,
-        );
-        let reply: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
-    }
     let (root, context) = settings_fixture("conversation settings refusals");
     admit_groups(&root, json!([101]));
     let revoked = crate::console_front::revoked_admin_context(&context);
@@ -857,15 +841,6 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
         let (status, reply) = agent_request(&context, "GET", path, None, "fixture-agent-token");
         assert_eq!(status, 403, "{path}: {reply}");
     }
-    let legacy_ctx = RuntimeContext::legacy();
-    let (status, _, reply, _) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&legacy_ctx),
-        "GET",
-        "/api/settings/models",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!(status, 503, "{reply}");
     let source = include_str!("../../console_settings/models.rs");
     assert!(!source.contains("write_atomic(RuntimeArea::Config") && !source.contains("dsh"), "the list writes nothing and asks no DSH");
 

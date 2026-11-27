@@ -8,10 +8,7 @@
 use super::*;
 
 fn scope_of(context: &RuntimeContext) -> String {
-    context
-        .runtime_root()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "legacy".to_string())
+    context.runtime_root().to_string_lossy().to_string()
 }
 
 fn failure((status, message): (u16, String)) -> (u16, Value) {

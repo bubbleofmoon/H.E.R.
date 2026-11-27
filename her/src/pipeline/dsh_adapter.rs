@@ -57,7 +57,6 @@ impl From<DshTurnError> for String {
 
 impl Pipeline {
     fn dsh_switch_summary(&self, key: &str, sid: &str, cfg: &serde_json::Value) -> Result<Option<String>, String> {
-        if !self.context.is_isolated() { return Ok(None); }
         let generation = self.turn_epochs.first().unwrap_or(&self.turn_epoch);
         let Some(summary) = crate::engine_switch::summary(&self.context, key, generation, crate::turn_engine::Engine::Dsh)? else {
             return Ok(None);
@@ -102,18 +101,14 @@ impl Pipeline {
     }
 
     fn preset_for(&self, key: &str) -> String {
-        if self.context.is_isolated()
-            && crate::social_state::mode(&self.context) == "closed-agent"
-        {
+        if crate::social_state::mode(&self.context) == "closed-agent" {
             return self.preset_closed.clone();
         }
         // Chat mode has one preset for every conversation (JS `modePreset`).
-        if self.context.is_isolated()
-            && matches!(
-                crate::social_state::mode(&self.context).as_str(),
-                "chat" | "reserved"
-            )
-        {
+        if matches!(
+            crate::social_state::mode(&self.context).as_str(),
+            "chat" | "reserved"
+        ) {
             return self.preset_chat.clone();
         }
         let owner_key = format!("private:{}", self.owner_qq);
@@ -125,24 +120,16 @@ impl Pipeline {
     }
 
     fn ensure_workspace(&mut self) -> Result<String, String> {
-        if self.context.is_isolated() {
-            if let Some(id) = crate::session_map::workspace_id(&self.context)? {
-                self.store.workspace_id = id.clone();
-                return Ok(id);
-            }
-        } else if !self.store.workspace_id.is_empty() {
-            return Ok(self.store.workspace_id.clone());
+        if let Some(id) = crate::session_map::workspace_id(&self.context)? {
+            self.store.workspace_id = id.clone();
+            return Ok(id);
         }
-        if self.context.is_isolated() {
-            let selected = self
-                .context
-                .resolve_path(RuntimeArea::Data, "agents", PathIntent::CreateDirectory)
-                .map_err(str::to_string)?;
-            if selected.to_string_lossy() != self.workspace_dir {
-                return Err("候选 workspace path changed after initialization".to_string());
-            }
-        } else {
-            let _ = std::fs::create_dir_all(&self.workspace_dir);
+        let selected = self
+            .context
+            .resolve_path(RuntimeArea::Data, "agents", PathIntent::CreateDirectory)
+            .map_err(str::to_string)?;
+        if selected.to_string_lossy() != self.workspace_dir {
+            return Err("候选 workspace path changed after initialization".to_string());
         }
         let ws = self
             .rpc
@@ -154,11 +141,7 @@ impl Pipeline {
             .ok_or_else(|| format!("workspace/create 没返回 workspaceId：{ws}"))?
             .to_string();
         self.store.workspace_id = id.clone();
-        if self.context.is_isolated() {
-            crate::session_map::set_workspace_id(&self.context, &id)?;
-        } else {
-            self.store.save_for_runtime(&self.context)?;
-        }
+        crate::session_map::set_workspace_id(&self.context, &id)?;
         Ok(id)
     }
 
@@ -169,47 +152,39 @@ impl Pipeline {
         }
         // JS `ensureSession`: the access epoch seen before DSH creates a session must still hold when
         // it is bound; a revocation, reset or mode change in between archives the new session.
-        let epoch = if self.context.is_isolated() { Some(self.access_epoch(key)) } else { None };
-        if epoch.as_ref().is_some_and(|e| !matches!(e.allowed, Ok(true))) {
+        let epoch = self.access_epoch(key);
+        if !matches!(epoch.allowed, Ok(true)) {
             return Err(DshTurnError::AccessRefused(format!("当前运行模式未放行会话 {key}")));
         }
-        if self.context.is_isolated() {
-            // Fresh read: the console may have reset or replaced this mapping since the last turn.
-            match crate::session_map::lookup(&self.context, key)? {
-                Some(sid) => {
-                    // A session made under another mode must not carry this mode's messages
-                    // (JS `isCurrentSession` policy check): retire it and start a new one.
-                    if let Some(reason) = self.stale_policy(key)? {
-                        return self.replace_session(key, &sid, reason);
-                    }
-                    self.store.sessions.insert(
-                        key.to_string(),
-                        SessionRef { session_id: sid.clone(), workspace_id: self.store.workspace_id.clone() },
-                    );
-                    return Ok(sid);
+        // Fresh read: the console may have reset or replaced this mapping since the last turn.
+        match crate::session_map::lookup(&self.context, key)? {
+            Some(sid) => {
+                // A session made under another mode must not carry this mode's messages
+                // (JS `isCurrentSession` policy check): retire it and start a new one.
+                if let Some(reason) = self.stale_policy(key)? {
+                    return self.replace_session(key, &sid, reason);
                 }
-                None => {
-                    self.store.sessions.remove(key);
-                }
+                self.store.sessions.insert(
+                    key.to_string(),
+                    SessionRef { session_id: sid.clone(), workspace_id: self.store.workspace_id.clone() },
+                );
+                return Ok(sid);
             }
-        } else if let Some(s) = self.store.sessions.get(key) {
-            if !s.session_id.is_empty() {
-                return Ok(s.session_id.clone());
+            None => {
+                self.store.sessions.remove(key);
             }
         }
         let ws_id = self.ensure_workspace()?;
         let preset = self.preset_for(key);
         // A conversation of a QQ group must never fall back to DSH's default preset (it carries local
         // tools): chat refuses to create a session unless DSH offers the configured preset.
-        if self.context.is_isolated()
-            && matches!(
-                crate::social_state::mode(&self.context).as_str(),
-                "chat" | "reserved"
-            )
-        {
+        if matches!(
+            crate::social_state::mode(&self.context).as_str(),
+            "chat" | "reserved"
+        ) {
             self.require_preset(&preset)?;
         }
-        let access_changed = |pipe: &Self| epoch.as_ref().is_some_and(|before| !pipe.access_epoch(key).still(before));
+        let access_changed = |pipe: &Self| !pipe.access_epoch(key).still(&epoch);
         let refused = || DshTurnError::AccessRefused(format!("创建对话过程中 {key} 发生重置或权限变动"));
         if access_changed(self) {
             return Err(refused());
@@ -250,12 +225,10 @@ impl Pipeline {
         if access_changed(self) {
             return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, false)));
         }
-        if self.context.is_isolated()
-            && matches!(
-                crate::social_state::mode(&self.context).as_str(),
-                "chat" | "reserved"
-            )
-        {
+        if matches!(
+            crate::social_state::mode(&self.context).as_str(),
+            "chat" | "reserved"
+        ) {
             // Chat: the JS title (`renameSessionForUi`) is resolved after the model is selected and
             // set once the first prompt is in DSH's hands.
             self.title_for = Some((sid.clone(), key.to_string()));
@@ -274,15 +247,11 @@ impl Pipeline {
             key.to_string(),
             SessionRef { session_id: sid.clone(), workspace_id: ws_id },
         );
-        if self.context.is_isolated() {
-            let policy = self.session_policy(key);
-            if let Err(error) = crate::session_map::bind(&self.context, key, &sid, Some(&policy)) {
-                // Never leave a created session running unbound in DSH.
-                let discarded = self.discard_created_session(key, &sid, false);
-                return Err(format!("绑定新会话失败：{error}；{discarded}").into());
-            }
-        } else {
-            self.store.save_for_runtime(&self.context)?;
+        let policy = self.session_policy(key);
+        if let Err(error) = crate::session_map::bind(&self.context, key, &sid, Some(&policy)) {
+            // Never leave a created session running unbound in DSH.
+            let discarded = self.discard_created_session(key, &sid, false);
+            return Err(format!("绑定新会话失败：{error}；{discarded}").into());
         }
         // A change between the check and the binding retires the mapping again (JS re-checks after
         // `saveState`).
@@ -423,16 +392,6 @@ impl Pipeline {
 
     /// 取消这个会话正在跑的回合（对应 DSH 的 `session/cancel`）。
     ///
-    /// 用途：新来的是确定性触发（@ / 关键词 / 提问），而当前回合还没说出口、
-    /// 又已经跑够久 —— 与其让 @ 排队 3 分钟（JS 那边实测 10:58→11:01），
-    /// 不如把这一轮作废，用新消息重开。已经说过话的回合不取消（见 wake.rs 的判定）。
-    pub fn cancel(&mut self, key: &str) -> Result<(), String> {
-        match self.cancel_with_reason(key, "superseded")?.stop_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
     /// Report exactly the epoch minted by this cancellation so the scheduler can retain
     /// buffered work without adopting a later reset or revocation's token. A failed DSH stop is
     /// reported beside the minted epoch, never instead of it.
@@ -450,11 +409,7 @@ impl Pipeline {
     fn cancel_with_dispatch(
         &mut self, key: &str, reason: &str, dispatch: Option<(&str, &MintedEpoch)>,
     ) -> Result<Cancelled, String> {
-        let sid = if self.context.is_isolated() {
-            crate::session_map::lookup(&self.context, key)?
-        } else {
-            self.store.sessions.get(key).map(|r| r.session_id.clone())
-        };
+        let sid = crate::session_map::lookup(&self.context, key)?;
         let Some(sid) = sid else {
             if let Some((expected, publication)) = dispatch {
                 // An unmapped first wake can still be waiting for the turn gate.
@@ -468,48 +423,39 @@ impl Pipeline {
             }
             return Ok(Cancelled::default());
         };
-        if reason == "turnTimeout" && self.context.is_isolated() && !self.has_dsh() {
+        if reason == "turnTimeout" && !self.has_dsh() {
             let cfg = self.context.load_config().map_err(str::to_string)?;
             self.rpc = crate::dsh::rpc_for(&self.context, &cfg)?;
         }
-        if self.context.is_isolated() {
-            // 被取消/被替代的回合不能再有迟到的结果：先清 inbox（DSH 的 cancel 保留队列）并取消，
-            // 再换令牌，之后它的工具调用与发送都因令牌不符被拒；账本里把它记为已取消。
-            // A diagnostic intent preserves the reason if DSH ends before cancel returns.
-            // It does not finalize the turn: crash recovery must still reconcile live work.
-            let open = crate::turn_ledger::read_records(&self.context).ok()
-                .map(|records| crate::turn_ledger::fold(&records).0).unwrap_or_default();
-            let pending_wait = crate::social_state::observation_wait_turn(&self.context, key)
-                .unwrap_or(None);
-            let sleeping = reason == "turnTimeout" && open.iter().any(|t|t.key == key && t.state.is_open()
-                && pending_wait.as_deref() == Some(t.id.as_str()));
-            let terminal_reason = if sleeping { "observationSleep" } else { reason };
-            for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
-                if crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry()
-                    .verified("cancel-requested", terminal_reason).is_err() {
-                    eprintln!("[turn] cancellation intent write failed; enforcing stop and revocation; recovery required");
-                }
+        // 被取消/被替代的回合不能再有迟到的结果：先清 inbox（DSH 的 cancel 保留队列）并取消，
+        // 再换令牌，之后它的工具调用与发送都因令牌不符被拒；账本里把它记为已取消。
+        // A diagnostic intent preserves the reason if DSH ends before cancel returns.
+        // It does not finalize the turn: crash recovery must still reconcile live work.
+        let open = crate::turn_ledger::read_records(&self.context).ok()
+            .map(|records| crate::turn_ledger::fold(&records).0).unwrap_or_default();
+        let pending_wait = crate::social_state::observation_wait_turn(&self.context, key)
+            .unwrap_or(None);
+        let sleeping = reason == "turnTimeout" && open.iter().any(|t|t.key == key && t.state.is_open()
+            && pending_wait.as_deref() == Some(t.id.as_str()));
+        let terminal_reason = if sleeping { "observationSleep" } else { reason };
+        for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
+            if crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry()
+                .verified("cancel-requested", terminal_reason).is_err() {
+                eprintln!("[turn] cancellation intent write failed; enforcing stop and revocation; recovery required");
             }
-            let stopped = crate::dsh::stop_session_work(&self.rpc, &sid);
-            let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
-            for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
-                let recorder = crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry();
-                let result = if sleeping && stopped.is_ok() {
-                    recorder.end_cancellation("completed", terminal_reason)
-                } else if sleeping {
-                    recorder.unknown("dsh-unreachable", "observation stop unconfirmed")
-                } else { recorder.end_cancellation("cancelled", terminal_reason) };
-                if result.is_err() { eprintln!("[turn] terminal ledger write failed; recovery required"); }
-            }
-            return Ok(Cancelled { token: Some(token), stop_error: stopped.err().map(|e| format!("取消回合失败：{e}")) });
         }
-        match self.rpc.call(
-            "session/cancel",
-            serde_json::json!({ "sessionId": sid }),
-        ) {
-            Ok(_) => Ok(Cancelled::default()),
-            Err(e) => Err(format!("取消回合失败：{e}")),
+        let stopped = crate::dsh::stop_session_work(&self.rpc, &sid);
+        let token = crate::social_state::ensure_or_rotate(&self.context, key, true)?;
+        for turn in open.iter().filter(|t| t.key == key && t.state.is_open()) {
+            let recorder = crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry();
+            let result = if sleeping && stopped.is_ok() {
+                recorder.end_cancellation("completed", terminal_reason)
+            } else if sleeping {
+                recorder.unknown("dsh-unreachable", "observation stop unconfirmed")
+            } else { recorder.end_cancellation("cancelled", terminal_reason) };
+            if result.is_err() { eprintln!("[turn] terminal ledger write failed; recovery required"); }
         }
+        Ok(Cancelled { token: Some(token), stop_error: stopped.err().map(|e| format!("取消回合失败：{e}")) })
     }
 
     /// Mode retirement already revoked the old epoch. Stale driver cleanup must
@@ -1052,7 +998,7 @@ impl Pipeline {
             let rpc_id = crate::dsh::mint_request_id();
             self.turn_validity(key, &sid)?;
             let mut layers: Option<serde_json::Value> = None;
-            if let Some(turn) = self.cur_turn.as_ref().filter(|_| self.context.is_isolated() && self.chat.is_none()) {
+            if let Some(turn) = self.cur_turn.as_ref().filter(|_| self.chat.is_none()) {
                 follow.track_briefing(&self.context, key, &sid, &self.turn_token)?;
                 if self.current_reason != "wakeReminder" {
                     // A persona switch or compaction can start a new briefing generation while this
@@ -1229,8 +1175,7 @@ impl Pipeline {
                     // Deterministic race seam: hold bookkeeping after a genuine end,
                     // while the independent hard-cap handler can still run.
                     #[cfg(feature = "parity-clock")]
-                    if self.context.is_isolated()
-                        && ended.pointer("/reason/kind").and_then(|v| v.as_str()) == Some("completed")
+                    if ended.pointer("/reason/kind").and_then(|v| v.as_str()) == Some("completed")
                     {
                         let bookkeeping = async {
                             if self.context.read_optional_text(RuntimeArea::Data, "fault-hold-collector-bookkeeping")?.is_some() {

@@ -9,8 +9,7 @@ use crate::settings::{
     check_store_schema, has_endpoint_credentials, has_stored_setting, inspect_store,
     migrate_store_v2, open_store_for_write, read_store, record_setting_change, restore_gate,
     schema_version_checked, store_schema_version, stored_setting_row, stored_setting_row_checked,
-    InspectError, StoreInspection, ADMINISTRATOR_PASSWORD, LEGACY_ERROR, STORAGE_ERROR,
-    STORE_SIDECARS,
+    InspectError, StoreInspection, ADMINISTRATOR_PASSWORD, STORAGE_ERROR, STORE_SIDECARS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -131,9 +130,6 @@ fn write_administrator_password<T>(
     existing_only: bool,
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<Option<T>, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let _gate = restore_gate(context).map_err(unavailable)?;
     if existing_only
         && matches!(
@@ -359,9 +355,6 @@ fn session_write<T>(
     context: &RuntimeContext,
     operation: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<Option<T>, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     if matches!(
         inspect_store(context).map_err(unavailable)?,
         StoreInspection::Missing | StoreInspection::Fresh
@@ -767,9 +760,6 @@ fn active_throttle_tx(conn: &Connection, now: i64) -> Result<(i64, i64), (u16, S
 }
 
 pub(crate) fn auth_status(context: &RuntimeContext) -> Result<AuthStatusSnapshot, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let (password_set, consecutive_failures, deadline) = read_store(context, |conn| {
         let Some(conn) = conn else {
             return Ok((false, 0, 0));
@@ -791,9 +781,6 @@ pub(super) fn load_login_challenge(
     context: &RuntimeContext,
     honor_throttle: bool,
 ) -> Result<LoginChallenge, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let (hash, throttle) = read_store(context, |conn| {
         let Some(conn) = conn else {
             return Ok((None, (0, 0)));
@@ -1072,9 +1059,6 @@ pub(super) fn list_browser_sessions_raw(
     token_digest: Generation,
     current_id: Option<Generation>,
 ) -> Result<Vec<BrowserSessionView>, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let Some(restore) = restore_generation(context).map_err(unavailable)? else {
         return Ok(Vec::new());
     };

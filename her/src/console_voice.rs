@@ -146,7 +146,6 @@ fn audio_options(vc: &VoiceCfg, volume: Option<&Value>, normalize: bool, loudnes
 struct Library {
     root: PathBuf,
     dir_rel: String,
-    isolated: bool,
     cwd: PathBuf,
 }
 
@@ -171,53 +170,29 @@ fn library_dir_missing(resources: &Path, dir_rel: &str) -> bool {
 /// any file by path; a directory that escapes the resources area or is a link stays refused. Every
 /// file still passes the contained resolver before it is read.
 fn open_library(context: &RuntimeContext, vc: &VoiceCfg) -> Result<Library, (u16, String)> {
-    if context.is_isolated() {
-        // The analogue of the JS `ROOT`: relative operator paths resolve against it.
-        let cwd = context
-            .resolve_path(RuntimeArea::Resources, "", PathIntent::ReadDirectory)
-            .unwrap_or_else(|_| context.resources_dir().to_path_buf());
-        let root = match context.resolve_path(RuntimeArea::Resources, &vc.dir_rel, PathIntent::ReadDirectory) {
-            Ok(root) => root,
-            Err(_) if library_dir_missing(&cwd, &vc.dir_rel) => cwd.join(&vc.dir_rel),
-            Err(_) => return Err((503, "selected voice directory is unavailable".to_string())),
-        };
-        Ok(Library { root: voice::normalize_lexically(&root), dir_rel: vc.dir_rel.clone(), isolated: true, cwd })
-    } else {
-        let configured = Path::new(&vc.dir_rel);
-        let root = if configured.is_absolute() {
-            configured.to_path_buf()
-        } else {
-            PathBuf::from(format!("{}{}", crate::legacy_path!(windows "qq-bridge\\"), vc.dir_rel.replace('/', "\\")))
-        };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
-        Ok(Library { root: voice::normalize_lexically(&root), dir_rel: vc.dir_rel.clone(), isolated: false, cwd })
-    }
+    // The analogue of the JS `ROOT`: relative operator paths resolve against it.
+    let cwd = context
+        .resolve_path(RuntimeArea::Resources, "", PathIntent::ReadDirectory)
+        .unwrap_or_else(|_| context.resources_dir().to_path_buf());
+    let root = match context.resolve_path(RuntimeArea::Resources, &vc.dir_rel, PathIntent::ReadDirectory) {
+        Ok(root) => root,
+        Err(_) if library_dir_missing(&cwd, &vc.dir_rel) => cwd.join(&vc.dir_rel),
+        Err(_) => return Err((503, "selected voice directory is unavailable".to_string())),
+    };
+    Ok(Library { root: voice::normalize_lexically(&root), dir_rel: vc.dir_rel.clone(), cwd })
 }
 
 impl Library {
     /// `(relative name, size)` of every audio file, in library order.
     fn files(&self, context: &RuntimeContext) -> Vec<(String, u64)> {
-        if self.isolated {
-            return list_audio_files_for_runtime(context, &self.dir_rel);
-        }
-        voice::list_audio_files(&self.root)
-            .into_iter()
-            .map(|path| {
-                let name = path.strip_prefix(&self.root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                (name, size)
-            })
-            .collect()
+        list_audio_files_for_runtime(context, &self.dir_rel)
     }
 
     /// A library file by its listed name; in a selected runtime the path is resolved again through
     /// the contained resolver (links and escapes fail closed).
     fn file(&self, context: &RuntimeContext, name: &str) -> Option<PathBuf> {
-        if self.isolated {
-            let full = if self.dir_rel.is_empty() { name.to_string() } else { format!("{}/{name}", self.dir_rel.trim_end_matches('/')) };
-            return context.resolve_path(RuntimeArea::Resources, &full, PathIntent::ReadFile).ok();
-        }
-        Some(self.root.join(name))
+        let full = if self.dir_rel.is_empty() { name.to_string() } else { format!("{}/{name}", self.dir_rel.trim_end_matches('/')) };
+        context.resolve_path(RuntimeArea::Resources, &full, PathIntent::ReadFile).ok()
     }
 
     /// Existing regular file for a library-relative reference (`safeJoinLibrary` plus the checks the
@@ -226,9 +201,6 @@ impl Library {
         let joined = voice::safe_join_library(&self.root, relative)?;
         if !joined.is_file() {
             return None;
-        }
-        if !self.isolated {
-            return Some(joined);
         }
         let real_root = std::fs::canonicalize(&self.root).ok()?;
         let rel = joined.strip_prefix(&real_root).ok()?.to_string_lossy().replace('\\', "/");
@@ -676,7 +648,7 @@ fn record_voice_sent(context: &RuntimeContext, key: &str, sent: &Sent, label: &s
 }
 
 fn budget_scope(context: &RuntimeContext, key: &str) -> String {
-    format!("{}|{key}", context.runtime_root().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
+    format!("{}|{key}", context.runtime_root().to_string_lossy())
 }
 
 fn js_member(body: &Value, name: &str) -> String {

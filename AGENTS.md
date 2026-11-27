@@ -2,7 +2,7 @@
 
 QQ bot bridge in Rust (`her/`, `her-memory/`) (ADR 0004). Terms: `GLOSSARY.md`. Specs and validation evidence live in the vault (`docs/agents/issue-tracker.md`).
 
-Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH support stays until #78 retires it, and memory data is protected (`docs/adr/0001-cleanup-retention.md`).
+Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH support stays until #13 retires it, and memory data is protected (`docs/adr/0001-cleanup-retention.md`).
 
 ## Public and vault
 

@@ -43,10 +43,6 @@ pub(super) fn admitted_conversations(cfg: &Value) -> Vec<String> {
     keys
 }
 
-fn legacy_refused(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    if context.is_isolated() { Ok(()) } else { Err((503, "settings require a selected runtime".to_string())) }
-}
-
 fn loaded_config(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     context.load_config().map_err(|_| (503, "runtime config is unavailable".to_string()))
 }
@@ -61,7 +57,6 @@ fn conversation_reply(conversation: &str, setting: &str, applied: crate::setting
 /// `GET /api/settings/conversations` (`settings::conversation_view`), with `note` and, per conversation, `engineToday`:
 /// the desired engine for its next admission (`Engine::read_choice`), or `refused` if the choice is unreadable.
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    legacy_refused(context)?;
     let cfg = loaded_config(context)?;
     let mode = crate::social_state::mode(context);
     let mut reply = crate::settings::conversation_view(context, &admitted_conversations(&cfg))?;
@@ -81,7 +76,6 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
 /// (400); then, under the configuration gate, a conversation that is not admitted (409) and a refused value (400).
 fn write(caller: AdminCaller<'_>, body: &str, reset: bool) -> Result<Value, (u16, String)> {
     let context = caller.context();
-    legacy_refused(context)?;
     let allowed: &[&str] = if reset { &["conversation", "setting"] } else { &["conversation", "setting", "value"] };
     let fields = body_fields(body, allowed)?;
     let conversation = conversation_field(&fields)?;
@@ -113,7 +107,6 @@ pub(super) fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, 
 pub(super) fn switch(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     use crate::turn_engine::Engine;
     let context = caller.context();
-    legacy_refused(context)?;
     let fields = body_fields(body, &["conversation", "engine"])?;
     let key = conversation_field(&fields)?;
     let value = fields.get("engine").ok_or((400, "engine is required".to_string()))?;

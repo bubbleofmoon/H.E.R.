@@ -263,7 +263,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             | "--mcp-host-serve"
             | "--console-serve"
             | "--live"
-            | "--live-all"
             | "--no-reconnect" => {}
             arg if arg.starts_with('-') => {
                 eprintln!("[her] unknown option");
@@ -287,10 +286,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
     // MCP server (stdio)
     if args.iter().skip(1).any(|a| a == "--mcp-serve") {
-        if runtime_context.is_isolated() {
-            return Ok(mcp::serve_with_context(&runtime_context)?);
-        }
-        return Ok(mcp::serve()?);
+        return Ok(mcp::serve(&runtime_context)?);
     }
 
     // Auxiliary MCP servers launched alongside `--mcp-serve`.
@@ -303,7 +299,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Console HTTP server
     if args.iter().skip(1).any(|a| a == "--console-serve") {
-        let _console_owner = if runtime_context.is_isolated() {
+        let _console_owner = {
             let gate_path = runtime_context.resolve_path(
                 runtime::RuntimeArea::Data,
                 "lifecycle/lifecycle.lock",
@@ -332,52 +328,39 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 now_ms() as i64,
                 std::time::Duration::from_millis(500),
             ) {
-                lifecycle::Acquire::Acquired(owner) => Some(owner),
+                lifecycle::Acquire::Acquired(owner) => owner,
                 other => {
                     eprintln!("[her] console owner unavailable: {other:?}");
                     std::process::exit(3);
                 }
             }
-        } else {
-            None
         };
         let requested_port = args
             .iter()
             .position(|arg| arg == "--console-port")
             .and_then(|index| args.get(index + 1));
-        let port = if runtime_context.is_isolated() {
-            match requested_port
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-            {
-                Some(port) => port,
-                None => {
-                    eprintln!("[her] isolated runtime requires an explicit non-zero console port");
-                    std::process::exit(2);
-                }
+        let port = match requested_port
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+        {
+            Some(port) => port,
+            None => {
+                eprintln!("[her] --console-serve requires an explicit non-zero --console-port");
+                std::process::exit(2);
             }
-        } else {
-            requested_port
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(3101)
         };
-        if runtime_context.is_isolated() {
-            let cfg = {
-                let _config = social_state::acquire_config_gate(&runtime_context)?;
-                if restore::recovery_pending(&runtime_context) {
-                    json!({})
-                } else {
-                    if console_auth::reconcile_token_rotation(&runtime_context).is_err() {
-                        crate::safe_eprintln!("[console] console credentials require recovery");
-                    }
-                    runtime_context.load_config().map_err(str::to_owned)?
+        let cfg = {
+            let _config = social_state::acquire_config_gate(&runtime_context)?;
+            if restore::recovery_pending(&runtime_context) {
+                json!({})
+            } else {
+                if console_auth::reconcile_token_rotation(&runtime_context).is_err() {
+                    crate::safe_eprintln!("[console] console credentials require recovery");
                 }
-            };
-            console::serve_with_context(&cfg, port, runtime_context)?;
-        } else {
-            let cfg = console::load_config();
-            console::serve(&cfg, port)?;
-        }
+                runtime_context.load_config().map_err(str::to_owned)?
+            }
+        };
+        console::serve(&cfg, port, runtime_context)?;
         return Ok(());
     }
 

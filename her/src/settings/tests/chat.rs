@@ -143,27 +143,6 @@ fn chat_settings_get_reads_registry_settings_as_the_next_use_and_hides_everythin
     for name in all["writable"].as_array().unwrap() {
         assert!(!crate::config_tx::setting_is_secret(name.as_str().unwrap()), "{name}");
     }
-
-    // A legacy (no-root) context has no settings store: no registry setting is offered, read or written there.
-    let legacy = RuntimeContext::legacy();
-    let cfg = json!({"socialV2": {"reply": {"wakeQuietMs": 9000}}});
-    let all = crate::config_tx::settings_action("settings-get", &json!({}), &cfg, &legacy).unwrap();
-    assert!(all["settings"].get(CHAT_NAME).is_none(), "{all}");
-    assert!(!all["writable"].as_array().unwrap().contains(&json!(CHAT_NAME)), "{all}");
-    let one = crate::config_tx::settings_action(
-        "settings-get",
-        &json!({"settingKey": CHAT_NAME}),
-        &cfg,
-        &legacy,
-    );
-    assert_eq!(one, Err((403, SETTINGS_READ_REFUSED.to_string())));
-    let set = crate::config_tx::settings_action(
-        "settings-set",
-        &json!({"settingKey": CHAT_NAME, "value": 4500}),
-        &cfg,
-        &legacy,
-    );
-    assert_eq!(set, Err((403, CHAT_WRITE_REFUSED.to_string())));
 }
 
 #[test]

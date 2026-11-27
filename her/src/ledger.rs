@@ -7,17 +7,13 @@ mod storage;
 
 pub use storage::{LedgerStorage, DEFAULT_MAX_LINES};
 #[cfg(test)]
-pub use storage::{LEDGER_FILE, LEDGER_FILES, RUST_LEDGER_FILE};
+use storage::{JS_LEDGER_NAME, RUST_LEDGER_NAME};
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::pricing::{normalize_usage, price_usage, Buckets, PriceTable};
 use crate::runtime::RuntimeContext;
-
-pub fn append_record(record: &Value) -> Result<(), String> {
-    LedgerStorage::append_record(record)
-}
 
 pub fn append_record_for_runtime(
     context: &RuntimeContext,
@@ -32,15 +28,6 @@ pub fn append_record_to(path: &str, record: &Value) -> Result<(), String> {
 
 pub(crate) fn append_record_to_durable(path: &str, record: &Value) -> Result<(), String> {
     LedgerStorage::append_record_to_durable(path, record)
-}
-
-pub(crate) fn append_turn_record_to(
-    path: &str,
-    record: &Value,
-    durable: bool,
-    deadline: Option<std::time::Instant>,
-) -> Result<(), String> {
-    LedgerStorage::append_turn_record_to(path, record, durable, deadline)
 }
 
 /// 一条单轮采样。
@@ -79,7 +66,7 @@ pub struct Ledger {
     /// 账本文件路径（stats 回给控制台排障用）。
     ///
     /// 合并读取时固定报 JS 的那一份（控制台与 JS 对拍的是同一个字段）；
-    /// Rust 自己写的那份见 [`LEDGER_FILES`]。
+    /// Rust 自己写的那份见 `data/token-usage-rust.jsonl`。
     #[allow(dead_code)]
     pub file: String,
     // ── 插入顺序 ─────────────────────────────────────────────────────────
@@ -122,10 +109,6 @@ impl Ledger {
     #[cfg(test)]
     pub fn load(path: &str) -> Ledger {
         LedgerStorage::load_single(path)
-    }
-
-    pub fn load_all() -> Ledger {
-        LedgerStorage::load_all()
     }
 
     /// Rebuild the merged ledger from already-selected source contents. This is the shared seam
@@ -1597,12 +1580,12 @@ mod tests {
     #[test]
     fn rust_writes_its_own_ledger_not_the_js_one() {
         // TD-1：两个进程各写各的文件，不能被改回同一个路径（否则 append 又会交错）
-        assert_ne!(RUST_LEDGER_FILE, LEDGER_FILE);
-        assert!(
-            RUST_LEDGER_FILE.ends_with("/token-usage-rust.jsonl"),
+        assert_ne!(RUST_LEDGER_NAME, JS_LEDGER_NAME);
+        assert_eq!(
+            RUST_LEDGER_NAME,
+            "token-usage-rust.jsonl",
             "Rust 必须写自己的 token-usage-rust.jsonl"
         );
-        assert_eq!(LEDGER_FILES, [LEDGER_FILE, RUST_LEDGER_FILE], "读账本必须同时覆盖两份");
     }
 
     #[test]

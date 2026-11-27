@@ -103,9 +103,6 @@ fn unauthenticated_context(context: &RuntimeContext) -> RuntimeContext {
 
 /// Read only under the configuration gate. A bad existing marker stays distinct from absence.
 pub(crate) fn restore_generation(context: &RuntimeContext) -> Result<Option<Generation>, String> {
-    if !context.is_isolated() {
-        return Err(GENERATION_UNAVAILABLE.to_string());
-    }
     let resolve = || {
         context.resolve_path(
             RuntimeArea::Data,
@@ -141,9 +138,6 @@ pub(crate) fn rotate_restore_generation(
     context: &RuntimeContext,
 ) -> Result<Generation, GenerationWriteError> {
     use GenerationWriteError::{Published, Unpublished};
-    if !context.is_isolated() {
-        return Err(Unpublished(GENERATION_UNAVAILABLE.to_string()));
-    }
     let generation = new_generation().map_err(|_| Unpublished(GENERATION_UNAVAILABLE.to_string()))?;
     let area = RuntimeArea::Data;
     let name = RESTORE_GENERATION_FILE;
@@ -647,9 +641,7 @@ pub(crate) fn ensure_credentials_ready(context: &RuntimeContext) -> Result<(), (
     if crate::restore::recovery_pending(context) {
         return Err((503, crate::restore::RECOVERY_REASON.into()));
     }
-    if context.is_isolated()
-        && !matches!(read_rotation_file(context, ROTATION_FILE, 4096), Ok(None))
-    {
+    if !matches!(read_rotation_file(context, ROTATION_FILE, 4096), Ok(None)) {
         return Err((503, "console credentials require recovery".into()));
     }
     Ok(())
@@ -907,9 +899,6 @@ fn first_run_with_password_work(
     actor: &str,
     derive: impl FnOnce(&str) -> Result<AdministratorPasswordHash, PasswordError>,
 ) -> Result<(), PasswordError> {
-    if !context.is_isolated() {
-        return Err(PasswordError::Unavailable);
-    }
     validate_new_password(password)?;
     check_first_run_proof(context, proof)?;
     let hash = derive(password)?;
@@ -964,9 +953,6 @@ pub(crate) fn auth_first_run_browser(
     proof: &str,
     password: &str,
 ) -> Result<IssuedSession, PasswordError> {
-    if !context.is_isolated() {
-        return Err(PasswordError::Unavailable);
-    }
     validate_new_password(password)?;
     check_first_run_proof(context, proof)?;
     let hash = AdministratorPasswordHash::derive(password)?;
@@ -999,9 +985,6 @@ pub(crate) fn auth_login(
 ) -> Result<IssuedSession, LoginError> {
     use storage::{LoginChallenge, LoginOutcome};
 
-    if !context.is_isolated() {
-        return Err(LoginError::Unavailable);
-    }
     validate_password_maximum(password).map_err(|_| LoginError::Input)?;
     let mut attempted_clamp = false;
     let hash = loop {
@@ -1094,9 +1077,6 @@ pub(crate) fn auth_local_browser_auto_sign_in(
     context: &RuntimeContext,
     port: u16,
 ) -> Result<Option<(IssuedSession, ConsoleAuthority)>, (u16, String)> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     let _credential = credential_mutation_gate(context)
         .map_err(|error| (503, error))?;
     let unauth = unauthenticated_context(context);
@@ -1136,9 +1116,6 @@ pub(crate) fn auth_change_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<Option<IssuedSession>, ChangePasswordError> {
-    if !context.is_isolated() {
-        return Err(ChangePasswordError::Unavailable);
-    }
     validate_password_maximum(current_password).map_err(|_| ChangePasswordError::Input)?;
     validate_new_password(new_password).map_err(|_| ChangePasswordError::Input)?;
     let storage::LoginChallenge::Ready { hash } =

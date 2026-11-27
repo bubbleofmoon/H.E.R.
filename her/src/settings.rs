@@ -16,7 +16,7 @@
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
 //! `config/config.json.pre-settings`; after it, `write_back` mirrors ordinary stored values into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
-//! (`config_tx::acquire_config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
+//! (`config_tx::acquire_config_gate`) and takes the store gate inside it, never the reverse.
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
@@ -99,8 +99,8 @@ pub(crate) use store::{
     resolve_live_batch, restore_gate, restore_switch_choice, schema_version_checked,
     secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
     stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
-    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, LEGACY_ERROR,
-    STORAGE_ERROR, STORE_SIDECARS,
+    Applied, Change, InspectError, StoreInspection, CONVERSATION_ERROR, STORAGE_ERROR,
+    STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

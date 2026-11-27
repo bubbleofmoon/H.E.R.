@@ -566,7 +566,7 @@ fn latin_key(s: &str) -> Vec<(u8, char)> {
         .collect()
 }
 
-/// Order of role names as the JS list shows them (see `list_roles`).
+/// Order of role names in alphabetical/pinyin order as the console role list displays them.
 pub fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
     let (ha, hb) = (a.chars().next().is_some_and(is_han), b.chars().next().is_some_and(is_han));
     if ha != hb {
@@ -582,45 +582,6 @@ pub fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(&latin_key(b))
         // same letters: lowercase first, as ICU's tertiary level does
         .then_with(|| b.cmp(a))
-}
-
-pub fn list_roles(dir: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if stem == "README" {
-            continue;
-        }
-        names.push(stem.to_string());
-    }
-    names.sort_by(|a, b| compare_names(a, b));
-    names
-}
-
-pub fn role_summaries(dir: &str, inject_max: usize) -> Vec<RoleSummary> {
-    let files = list_roles(dir).into_iter().map(|name| {
-        let path = format!("{dir}/{name}.md");
-        let Ok(meta) = std::fs::metadata(&path) else {
-            return (name, None, 0, 0);
-        };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return (name, None, 0, 0);
-        };
-        let mtime = meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64).unwrap_or(0);
-        (name, Some(content), meta.len(), mtime)
-    });
-    role_summaries_from_contents(files, inject_max)
 }
 
 /// Build role summaries from content read by a caller that owns path policy. This keeps isolated

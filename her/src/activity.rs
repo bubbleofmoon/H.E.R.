@@ -9,8 +9,7 @@
 //! - the tail is the last `n` non-empty lines joined by `\n`, empty when the file is missing.
 //!
 //! Writing is best effort, as in JS: a failed append never fails the action it describes. The
-//! file belongs to the selected runtime root (`data/`); the legacy context uses the old state
-//! directory only when that directory already exists.
+//! file belongs to the selected runtime root (`data/`).
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use serde_json::Value;
@@ -181,10 +180,7 @@ pub fn known_session_tokens(context: &RuntimeContext) -> Vec<String> {
 fn known_tokens(context: &RuntimeContext) -> Vec<String> {
     type Cache = HashMap<String, ((u64, std::time::SystemTime), Vec<String>)>;
     static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
-    let scope = context
-        .runtime_root()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "legacy".to_string());
+    let scope = context.runtime_root().to_string_lossy().to_string();
     let identity = context
         .resolve_path(
             RuntimeArea::Data,
@@ -237,9 +233,6 @@ fn collapse_newlines(text: &str) -> String {
 
 /// JS `appendActivity(line)`.
 pub fn append(context: &RuntimeContext, line: &str) {
-    if !context.is_isolated() && !legacy_state_dir_exists(context) {
-        return;
-    }
     let config = context.load_config_document().unwrap_or_default();
     let zone = crate::local_time::configured_zone(&config);
     let time = crate::local_time::at(crate::parity_clock::now_ms(), &zone);
@@ -265,17 +258,9 @@ pub fn append(context: &RuntimeContext, line: &str) {
     }
 }
 
-fn legacy_state_dir_exists(context: &RuntimeContext) -> bool {
-    context.data_dir().is_dir()
-}
-
 /// JS `readActivityTail(n)`.
 pub fn tail(context: &RuntimeContext, n: usize) -> String {
-    let text = if context.is_isolated() {
-        context.read_optional_text(RuntimeArea::Data, FILE).ok().flatten()
-    } else {
-        context.read_text(RuntimeArea::Data, FILE).ok()
-    };
+    let text = context.read_optional_text(RuntimeArea::Data, FILE).ok().flatten();
     let Some(text) = text else { return String::new() };
     let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
     lines[lines.len().saturating_sub(n)..].join("\n")

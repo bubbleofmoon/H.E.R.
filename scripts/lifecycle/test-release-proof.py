@@ -20,7 +20,7 @@ parser.add_argument('--timeout', type=float, default=240, help='fixture timeout 
 args = parser.parse_args()
 if args.timeout <= 0:
     parser.error('--timeout must be positive')
-repo = Path(__file__).resolve().parent.parent
+repo = Path(__file__).resolve().parents[2]
 evidence = tempfile.development_root(Path(args.evidence).resolve())
 root = tempfile.development_root(Path(tempfile.gettempdir()) / ('relproof-' + uuid.uuid4().hex))
 evidence.mkdir(parents=True, exist_ok=True)
@@ -35,7 +35,7 @@ if args.highest and not caller_elevated:
     parser.error('--highest requires an elevated caller (Run as administrator); no fixture task was registered')
 fixture = ReleaseFixture(root, evidence, [task_name])
 command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-           '-File', str(args.fixture or repo / 'scripts/test-lifecycle-fixture.ps1'), '-Candidate', str(Path(args.candidate).resolve()),
+           '-File', str(args.fixture or repo / 'scripts/lifecycle/test-lifecycle-fixture.ps1'), '-Candidate', str(Path(args.candidate).resolve()),
            '-FixtureRoot', str(root), '-NodePath', shutil.which('node'), '-FixtureTaskName', task_name]
 if args.highest:
     command.append('-RunLevelHighest')
@@ -43,8 +43,7 @@ if not args.baseline:
     command.extend(['-DigestSupportRoot', str(Path(args.support).resolve())])
 (evidence / 'command.json').write_text(json.dumps(command), encoding='utf-8')
 try:
-    code = fixture.run(command, 'fixture', timeout=args.timeout,
-                       env=dict(os.environ, MEMORY_DB_PATH=str(root / 'digest-runtime/data/memory.db')))
+    code = fixture.run(command, 'fixture', timeout=args.timeout)
     assert code == 0, ('fixture exit', code, (evidence / 'fixture.stderr.log').read_text(encoding='utf-8'))
     principal = json.loads((root / 'task-principal.json').read_text(encoding='utf-8-sig'))
     assert principal['callerElevated'] == caller_elevated and principal['readBeforeTrigger'], principal

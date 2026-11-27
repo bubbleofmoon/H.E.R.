@@ -35,7 +35,6 @@ const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authenticati
 pub(crate) const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
-pub(crate) const LEGACY_ERROR: &str = "settings require a selected runtime";
 /// The configuration file the store seeds from and writes back into (`RuntimeArea::Config`).
 const CONFIG: &str = "config.json";
 /// The copy of `config.json` from before settings first wrote anything, beside it.
@@ -81,7 +80,7 @@ pub(crate) struct Applied {
 
 /// Applies the stored settings over `document`, the parsed `config.json`. A stored value goes to its registry pointer;
 /// missing or null objects on the way are created, and any other non-object on the way leaves that setting unapplied.
-/// A legacy context and a document that is not an object are returned unchanged. A store this release cannot read
+/// A document that is not an object is returned unchanged. A store this release cannot read
 /// applies nothing and is reported once per process on stderr (MCP servers use stdout).
 pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     if let Err(error) = overlay_checked(context, &mut document) {
@@ -104,7 +103,7 @@ pub(crate) fn overlay_values(document: &mut Value, values: &[(&'static Setting, 
 
 /// Applies the overlay only after a successful read, so durable repairs can refuse to use file-only values.
 pub(crate) fn overlay_checked(context: &RuntimeContext, document: &mut Value) -> Result<(), String> {
-    if context.is_isolated() && document.is_object() {
+    if document.is_object() {
         let values = stored_values(context)?;
         overlay_values(document, &values);
     }
@@ -306,9 +305,6 @@ pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, St
 /// transitions up to `WAL_SWITCH_WAIT`; genuine hard-link, containment, leftover-journal, or non-database refusals
 /// fail at once.
 pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
-    if !context.is_isolated() {
-        return Ok(None);
-    }
     retry_until(std::time::Instant::now() + WAL_SWITCH_WAIT, || {
         backup_source_attempt(context)
     })
@@ -785,9 +781,6 @@ pub(super) fn read_stored_values_checked(
 
 /// Only the credential readers and redaction use these rows. Ordinary settings never decode them.
 fn read_secrets(context: &RuntimeContext) -> Result<Vec<(&'static str, String, String)>, String> {
-    if !context.is_isolated() {
-        return Ok(Vec::new());
-    }
     read_store(context, |conn| match conn {
         None => Ok(Vec::new()),
         Some(conn) => secrets_in_checked(conn),
@@ -834,9 +827,7 @@ pub(crate) fn secret_value(
     setting: &Setting,
     endpoint: &str,
 ) -> Result<Option<String>, String> {
-    if !context.is_isolated()
-        || (setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key)
-    {
+    if setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key {
         return Ok(None);
     }
     read_store(context, |conn| {
@@ -867,9 +858,6 @@ pub(crate) fn has_stored_setting(conn: &Connection, key: &str) -> Result<bool, (
 
 /// The settings row revision partitions the per-process search cache after a credential change.
 pub(crate) fn secret_revision(context: &RuntimeContext, setting: &Setting) -> Option<i64> {
-    if !context.is_isolated() {
-        return None;
-    }
     read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(None) };
         stored_row_sqlite(conn, setting.key).map_err(InspectError::from_sqlite)
@@ -886,9 +874,6 @@ pub(crate) fn stored_secrets(context: &RuntimeContext) -> Result<Vec<String>, St
 }
 
 pub(crate) fn harness_credential(context: &RuntimeContext) -> Option<String> {
-    if !context.is_isolated() {
-        return None;
-    }
     let text = context.read_text(RuntimeArea::Config, "harness-api-key").ok()?;
     let key = text.trim();
     (!key.is_empty()).then(|| key.to_string())
@@ -1313,9 +1298,6 @@ fn seed(
 /// place); a file `canonical_config` refuses is not written. No store, no schema yet and no stored value write
 /// nothing; a store that cannot be read is an error.
 pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
-    if !context.is_isolated() {
-        return Ok(Vec::new());
-    }
     write_back_values(context, stored_values(context)?)
 }
 
@@ -1366,10 +1348,10 @@ fn mirror_after_commit(
 
 /// Puts every stored value into `document`, a `config.json` a console writer is about to write, so the writer never
 /// puts back an older value of a stored setting. Returns whether `document` changed; a change keeps
-/// `config.json.pre-settings` first, and a copy that cannot be kept is an error. A legacy context, a document that is
+/// `config.json.pre-settings` first, and a copy that cannot be kept is an error. A document that is
 /// not an object and a store that cannot be read (the overlay reports it) change nothing.
 pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Result<bool, String> {
-    if !context.is_isolated() || !document.is_object() {
+    if !document.is_object() {
         return Ok(false);
     }
     let Ok(stored) = stored_values(context) else { return Ok(false) };
@@ -1380,12 +1362,9 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
     Ok(changed)
 }
 
-/// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
+/// Whether the store holds a value `write_back` would write; false for no store and a store that
 /// cannot be read. Reports a read error on stderr. Reads only: nothing is created.
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
-    if !context.is_isolated() {
-        return false;
-    }
     match stored_values(context) {
         Ok(stored) => !stored.is_empty(),
         Err(error) => {
@@ -1728,9 +1707,6 @@ pub(crate) fn apply(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let setting = generic_setting(key)?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
     store(context, setting, value, actor, source)
@@ -1806,9 +1782,6 @@ fn store(
 /// stores `null`, read as not configured, and `config.json` gets `null`; a text setting stores its compiled text, an
 /// empty one included. A stored default already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let setting = generic_setting(key)?;
     store(context, setting, setting.default_value(), actor, "reset")
 }
@@ -1848,9 +1821,6 @@ pub(crate) fn undo(
     actor: &str,
     permit: &dyn Fn(&Setting) -> Result<(), (u16, String)>,
 ) -> Result<Undone, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
     let harness_key = harness_credential(context);
     let (undone, mirror_error) = write_store(context, true, &[], |conn, document| {
@@ -1935,9 +1905,6 @@ pub(crate) fn history(
     conversation: Option<&str>,
     before: Option<i64>,
 ) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let key = setting
         .map(|key| {
             find(key)
@@ -2032,16 +1999,13 @@ pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Res
 /// with the value the store keeps. A value the registry refuses is 400 with its refusal, before anything is written,
 /// unless `base` holds that same value already (an old or hand-edited file's value passes through unchanged). A member
 /// the request omits or sends as `null` is no change: a console page never removes a registry setting (the settings
-/// page's reset and undo do), and a member it does not send keeps the file's value. A legacy context has none. The page
+/// page's reset and undo do), and a member it does not send keeps the file's value. The page
 /// stores the changes (`apply_changes`), then keeps the file's registry members (`keep_registry_values`) and writes it.
 pub(crate) fn console_changes(
     context: &RuntimeContext,
     base: &Value,
     carried: &Value,
 ) -> Result<Vec<(&'static Setting, Value)>, (u16, String)> {
-    if !context.is_isolated() {
-        return Ok(Vec::new());
-    }
     let mut now = overlay(context, base.clone());
     complete_timing(&mut now);
     let mut changes = Vec::new();
@@ -2085,9 +2049,6 @@ pub(crate) fn apply_changes(
     }
     if changes.is_empty() {
         return Ok(None);
-    }
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
     }
     if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key)) {
         let unavailable = |error| (503, error);
@@ -2207,9 +2168,6 @@ fn sorted(value: Value) -> Value {
 /// values are not applied. While the admin agent mode puts another owner in force (`RuntimeContext::load_config`), the
 /// owner's entry has `overriddenBy` with that owner.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let mut document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
     complete_timing(&mut document);
     let (stored, store_error) = match stored_values(context) {
@@ -2276,16 +2234,12 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
 /// default), differs from the value in effect (`current`, the stored `config.json` the undo read under the
 /// configuration gate, with the stored values applied), paired with the value the store keeps. A value the store
 /// cannot keep (an id list over its limit) is 409, before anything is written. The undo stores them
-/// (`apply_changes`) after it recorded its revocation; every other registry setting keeps its current value. A legacy
-/// context has none.
+/// (`apply_changes`) after it recorded its revocation; every other registry setting keeps its current value.
 pub(crate) fn security_restore(
     context: &RuntimeContext,
     current: &Value,
     restored: &Value,
 ) -> Result<Vec<(&'static Setting, Value)>, (u16, String)> {
-    if !context.is_isolated() {
-        return Ok(Vec::new());
-    }
     let now = overlay(context, current.clone());
     let mut changes = Vec::new();
     for setting in registry().filter(|setting| setting.confirmed()) {
@@ -2392,11 +2346,8 @@ pub(crate) fn holds_any(context: &RuntimeContext, changes: &[(&'static Setting, 
 }
 
 /// #154: the newest audit row id, a mark that changes with every stored change, for what the console keys on the
-/// configuration (`console_access.rs`). A legacy context and no store yet are 0; a store that cannot be read is `None`.
+/// configuration (`console_access.rs`). No store yet is 0; a store that cannot be read is `None`.
 pub(crate) fn store_mark(context: &RuntimeContext) -> Option<i64> {
-    if !context.is_isolated() {
-        return Some(0);
-    }
     read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(0) };
         conn.query_row("SELECT coalesce(max(id), 0) FROM settings_audit", [], |row| row.get(0))

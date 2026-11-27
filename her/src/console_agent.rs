@@ -21,11 +21,7 @@ fn receipt_store() -> &'static Mutex<ReceiptMap> {
 }
 
 fn receipt_scope(context: &RuntimeContext) -> String {
-    if context.is_isolated() {
-        context.data_dir().to_string_lossy().to_string()
-    } else {
-        "legacy".to_string()
-    }
+    context.data_dir().to_string_lossy().to_string()
 }
 
 /// Token epoch of a conversation record ("" when it has no token).
@@ -815,12 +811,10 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
         .map(|c| c.to_value())
         .unwrap_or(Value::Null);
     let chain = send_chain();
-    let fresh = if context.is_isolated() {
-        Some(context.load_config().map_err(|_| (503, "send settings are unavailable".to_string()))?)
-    } else {
-        None
-    };
-    let cfg = fresh.as_ref().unwrap_or(cfg);
+    let fresh = context
+        .load_config()
+        .map_err(|_| (503, "send settings are unavailable".to_string()))?;
+    let cfg = &fresh;
     let turn_scope = match policy {
         GuardPolicy::ApprovedGroup { turn, .. } => repeat_guard::admit_in_scope(context, key, messages, Some(turn))?,
         _ if token.is_empty() => String::new(),
@@ -1717,10 +1711,29 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn runtime_fixture(label: &str) -> (std::path::PathBuf, RuntimeContext) {
+        let root = std::env::temp_dir().join(crate::turn_ledger::mint_id(label));
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"fixture-agent-test-token"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        (root, context)
+    }
+
     #[test]
     fn wake_snapshot_count_limits_follow_js_number_coercion() {
-        // Pure selection: the legacy context supplies only the in-memory receipt scope.
-        let context = RuntimeContext::legacy();
+        let (root, context) = runtime_fixture("rbridge-wake-count-");
         let conv = json!({
             "agentToken": "wake-number-count-test",
             "unread": (1..=105).map(|seq| json!({"seq":seq})).collect::<Vec<_>>(),
@@ -1770,11 +1783,12 @@ mod tests {
         let missing = build_wake_snapshot(&context, &json!({}), "private:wake-number-count", &conv).unwrap();
         assert_eq!(missing["includedUnreadCount"], 12);
         assert_eq!(missing["recent"].as_array().unwrap().len(), 4);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn wake_snapshot_character_limit_follows_js_number_coercion() {
-        let context = RuntimeContext::legacy();
+        let (root, context) = runtime_fixture("rbridge-wake-chars-");
         let conv = json!({
             "agentToken":"wake-number-budget-test",
             "unread": (1..=3).map(|seq| json!({"seq":seq,"text":"x".repeat(200)})).collect::<Vec<_>>(),
@@ -1802,12 +1816,12 @@ mod tests {
             assert_eq!(packet["partial"], included < 3, "character limit {value}");
             assert!(packet.to_string().encode_utf16().count() <= budget, "character limit {value}");
         }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn note_receipts_retains_buffered_legacy_unsafe_process_receipts() {
-        // This exercises only the process map: no legacy config or data is read or written.
-        let context = RuntimeContext::legacy();
+    fn note_receipts_retains_buffered_unsafe_process_receipts() {
+        let (root, context) = runtime_fixture("rbridge-receipts-unsafe-");
         let key = "private:14";
         let unsafe_seq = 9_007_199_254_740_992_i64;
         let mut conv = json!({
@@ -1841,6 +1855,7 @@ mod tests {
         note_receipts(&context, key, &conv, &[json!({ "seq": unsafe_seq })], &[json!({ "seq": unsafe_seq })]);
         assert_eq!(receipts_for(&context, key, &conv), Vec::<i64>::new(),
             "an unsafe seq cannot create a new receipt, including after token rotation");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The outbound sensitive-text filter must give the verdict of the frozen JS `SENSITIVE_RE` on every case of

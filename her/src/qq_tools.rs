@@ -8,7 +8,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::model_view::serialize_model_data;
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 
 const SPEC: &str = include_str!("../spec/tools-snowluma-safe.json");
 
@@ -242,51 +242,32 @@ fn console_port(context: &RuntimeContext, cfg: &Value) -> Result<u16, String> {
         .and_then(|p| p.as_u64())
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port != 0);
-    if context.is_isolated() {
-        context
-            .console_port()
-            .filter(|port| *port != 0)
-            .or(configured_port)
-            .ok_or_else(|| "isolated runtime requires an explicit console port".to_string())
-    } else {
-        Ok(configured_port.unwrap_or(3100))
-    }
+    context
+        .console_port()
+        .filter(|port| *port != 0)
+        .or(configured_port)
+        .ok_or_else(|| "isolated runtime requires an explicit console port".to_string())
 }
 
-/// Selected OneBot adapter. Isolated mode accepts only the selected runtime's dependency URL.
+/// Selected OneBot adapter. Accepts only the selected runtime's dependency URL.
 fn onebot_for_tools(context: &RuntimeContext, cfg: &Value) -> Result<crate::onebot::OneBot, String> {
-    let url = if context.is_isolated() {
-        context
-            .dependency_url("onebot")
-            .ok_or_else(|| "isolated runtime OneBot dependency is unavailable".to_string())?
-    } else {
-        cfg.get("snowluma")
-            .and_then(|s| s.get("httpUrl"))
-            .and_then(|u| u.as_str())
-            .unwrap_or("http://127.0.0.1:3000")
-            .trim_end_matches('/')
-    };
+    let url = context
+        .dependency_url("onebot")
+        .ok_or_else(|| "isolated runtime OneBot dependency is unavailable".to_string())?;
     let token = cfg
         .get("snowluma")
         .and_then(|s| s.get("accessToken"))
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    crate::onebot::OneBot::try_new_url(url, token).map_err(|_| {
-        if context.is_isolated() {
-            "isolated runtime OneBot dependency is invalid".to_string()
-        } else {
-            "fetch failed".to_string()
-        }
-    })
+    crate::onebot::OneBot::try_new_url(url, token)
+        .map_err(|_| "isolated runtime OneBot dependency is invalid".to_string())
 }
 
-/// Selected-runtime config document from the loader; legacy contexts tolerate a missing/invalid file (JS
-/// `loadConfig` returns `{}`).
+/// Selected-runtime config document from the loader.
 pub(crate) fn config(context: &RuntimeContext) -> Result<Value, String> {
     match context.load_config_document() {
         Ok(value) => Ok(value),
-        Err(_) if !context.is_isolated() => Ok(json!({})),
         Err(crate::runtime::ConfigReadError::Unavailable(_)) => Err("selected runtime config is unavailable".to_string()),
         Err(crate::runtime::ConfigReadError::Invalid) => Err("selected runtime config is invalid".to_string()),
     }
@@ -300,12 +281,9 @@ fn console_token(context: &RuntimeContext, cfg: &Value) -> String {
     if valid {
         return configured.to_string();
     }
-    if context.is_isolated() {
-        // The credential the selected console accepts (its generated token in `data/console-token`
-        // when `consoleToken` is "").
-        return context.effective_console_token(cfg);
-    }
-    context.read_text(RuntimeArea::Config, "state/console-token").map(|t| t.trim().to_string()).unwrap_or_default()
+    // The credential the selected console accepts (its generated token in `data/console-token`
+    // when `consoleToken` is "").
+    context.effective_console_token(cfg)
 }
 
 /// JS `errorText(value, fallback)`.
@@ -414,7 +392,7 @@ impl Api<'_> {
         let port = console_port(self.context, &cfg)?;
         let endpoint = crate::loopback_http::LoopbackEndpoint::localhost_v4(port)?;
         let token = console_token(self.context, &cfg);
-        if self.context.is_isolated() && token.is_empty() {
+        if token.is_empty() {
             return Err("isolated runtime console token is unavailable".to_string().into());
         }
         let mut headers: Vec<(String, String)> = vec![("content-type".to_string(), "application/json".to_string())];

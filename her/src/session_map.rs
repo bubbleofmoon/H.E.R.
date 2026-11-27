@@ -209,8 +209,8 @@ fn verify_legacy_fence(path: &std::path::Path, record: &[u8]) -> Result<(), Stri
 /// Publishing and import/export are retired; removal of this active check is an open scope item.
 pub fn verify_cutover(context: &RuntimeContext) -> Result<(), String> {
     let required = context.read_optional_text(RuntimeArea::Data, "lifecycle/session-handover-required.json").map_err(str::to_string)?.is_some();
-    let imported = if let Some(root) = context.runtime_root() {
-        let path = root.join("import-manifest.json");
+    let imported = {
+        let path = context.runtime_root().join("import-manifest.json");
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 let manifest: Value = serde_json::from_slice(&read_legacy(&path)?).map_err(|_| "runtime import manifest is invalid")?;
@@ -219,7 +219,7 @@ pub fn verify_cutover(context: &RuntimeContext) -> Result<(), String> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(_) => return Err("runtime import manifest is unavailable".into()),
         }
-    } else { false };
+    };
     let Some(text) = context.read_optional_text(RuntimeArea::Data, "lifecycle/session-handover.json").map_err(str::to_string)? else {
         return if required || imported { Err("required cutover is incomplete; a guarded import is required".into()) } else { Ok(()) };
     };

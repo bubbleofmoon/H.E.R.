@@ -931,9 +931,7 @@ pub fn run(
 const MEMORY_COPIES: usize = 14;
 
 fn memory_destination(context: &RuntimeContext) -> Result<PathBuf, String> {
-    let runtime = context
-        .runtime_root()
-        .ok_or("memory backup requires a selected runtime root")?;
+    let runtime = context.runtime_root();
     let destination = crate::install_root::InstallRoot::configured()?
         .backup_destination(runtime, Path::new("backups/memory"))?;
     #[cfg(windows)]
@@ -1139,9 +1137,7 @@ pub(crate) fn create_pre_restore_scoped(
 
 /// Validate the pre-restore destination path before stopping owners without opening databases.
 pub(crate) fn check_pre_restore_destination(context: &RuntimeContext) -> Result<(), String> {
-    let root = context
-        .runtime_root()
-        .ok_or("backup requires a selected runtime root")?;
+    let root = context.runtime_root();
     let (_, raw) = snapshot_config(context)?;
     let settings = Settings::from_config_resolved(root, &raw)?;
     ensure_destination(&settings.destination)
@@ -1436,9 +1432,7 @@ fn create_snapshot(
     pre_restore: bool,
 ) -> Result<PathBuf, String> {
     check()?;
-    let root = context
-        .runtime_root()
-        .ok_or("backup requires a selected runtime root")?;
+    let root = context.runtime_root();
     let (config, raw) = snapshot_config(context)?;
     let settings = Settings::from_config_resolved(root, &raw)?;
     let destination = settings.destination;

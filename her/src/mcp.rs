@@ -202,13 +202,8 @@ pub(crate) fn discovered_tools(cfg: &Value, mode: Option<&str>, key: Option<&str
         .collect()
 }
 
-#[allow(dead_code)] // Keep the no-context wrapper for existing in-crate callers.
-pub fn call_tool(name: &str, args: &Value) -> Result<String, String> {
-    call_tool_with_context(name, args, &RuntimeContext::legacy())
-}
-
 /// Execute a tool using the caller's explicit runtime selection.
-pub fn call_tool_with_context(
+pub fn call_tool(
     name: &str,
     args: &Value,
     context: &RuntimeContext,
@@ -376,11 +371,6 @@ const SUPPORTED_PROTOCOLS: [&str; 5] = [
 const SERVER_NAME: &str = "snowluma-safe";
 /// Same string as the JS server so that clients see an identical `serverInfo`.
 const SERVER_VERSION: &str = "0.2.0-r4";
-
-/// stdio JSON-RPC loop with the legacy runtime.
-pub fn serve() -> std::io::Result<()> {
-    serve_with_context(&RuntimeContext::legacy())
-}
 
 fn text_outcome(text: String, is_error: bool) -> Value {
     if is_error {
@@ -619,15 +609,13 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
 
 /// stdio JSON-RPC loop bound to an explicit runtime context. Requests run concurrently (a long
 /// `qq_wait_for_messages` must not hold up another session's tool calls); responses are written whole.
-pub fn serve_with_context(context: &RuntimeContext) -> std::io::Result<()> {
+pub fn serve(context: &RuntimeContext) -> std::io::Result<()> {
     use std::sync::Arc;
     let discovery_context = context.clone();
     let key = std::env::var("QQ_SESSION_KEY").unwrap_or_default();
     let tools: ToolDiscovery = Arc::new(move || {
-        let cfg = match discovery_context.load_config_document() {
-            Ok(cfg) => cfg,
-            Err(_) if !discovery_context.is_isolated() => json!({}),
-            Err(_) => return Vec::new(),
+        let Ok(cfg) = discovery_context.load_config_document() else {
+            return Vec::new();
         };
         let mode = crate::social_state::mode_checked(&discovery_context).ok();
         let key = key.trim();
@@ -782,6 +770,12 @@ mod tests {
 
     #[test]
     fn invalid_token_rejected() {
-        assert!(!token_ok(&RuntimeContext::legacy(), "group:1", ""));
+        let fixture = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(format!("her-mcp-invalid-token-{}", std::process::id())),
+            &json!({"consoleToken": "fixture-mcp-token"}),
+            &json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        assert!(!token_ok(&context, "group:1", ""));
     }
 }

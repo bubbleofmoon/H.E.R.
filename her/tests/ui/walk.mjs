@@ -920,7 +920,7 @@ export const walks = {
       await click(page, page.getByRole('button', { name: '保存更新策略' }), 'POST', '/api/releases/settings');
     },
     dependencies: async ({ page }) => {
-      await usable(page.getByText('1.0.0').first());
+      await usable(page.getByText('0.2.1-rc.2').first());
     },
     'dependencies-check': ({ page }) => click(page, page.getByRole('button', { name: '检查依赖更新' }), 'POST', '/api/dependencies/check'),
     'dependencies-approve': ({ page }) => clickConfirm(page, page.getByRole('button', { name: '批准升级' }).first(),

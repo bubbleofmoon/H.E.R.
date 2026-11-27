@@ -54,16 +54,6 @@ fn authority_of(base_url: &str) -> Option<String> {
     }
 }
 
-/// Read DSH's 32-byte browser session signing secret from `.credentials.yaml`.
-///
-/// Scans `secret:` lines directly and base64url-decodes candidates until a 32-byte value is found.
-pub fn read_session_secret() -> Option<Vec<u8>> {
-    // No DSH home configured means no DSH secret: never fall back to a relative path.
-    let path = crate::runtime::dsh_home()?.join(".credentials.yaml");
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_session_secret(&text)
-}
-
 pub fn session_secret_from_text(text: &str) -> Option<String> {
     for line in text.lines() {
         let Some(idx) = line.find("secret:") else {
@@ -94,15 +84,12 @@ fn parse_session_secret(text: &str) -> Option<Vec<u8>> {
 }
 
 /// Read the DSH signing secret from the selected runtime's user area.
-pub fn read_session_secret_for_runtime(context: &RuntimeContext) -> Option<Vec<u8>> {
-    if context.is_isolated() {
-        return parse_session_secret(
-            &context
-                .read_text(RuntimeArea::DshUser, ".credentials.yaml")
-                .ok()?,
-        );
-    }
-    read_session_secret()
+pub fn read_session_secret(context: &RuntimeContext) -> Option<Vec<u8>> {
+    parse_session_secret(
+        &context
+            .read_text(RuntimeArea::DshUser, ".credentials.yaml")
+            .ok()?,
+    )
 }
 
 /// 铸造会话 Cookie（返回完整 `name=value`）。
@@ -139,17 +126,11 @@ fn mint_cookie_at(base_url: &str, secret: &[u8], now: u128) -> Option<String> {
 }
 
 pub fn session_cookie_for_runtime(context: &RuntimeContext, base_url: &str) -> Option<String> {
-    let secret = read_session_secret_for_runtime(context)?;
+    let secret = read_session_secret(context)?;
     mint_cookie(base_url, &secret)
 }
 
-fn unavailable(context: &RuntimeContext, ambient: &str) -> String {
-    if context.is_isolated() {
-        "selected runtime DSH credentials are unavailable or invalid".to_string()
-    } else {
-        ambient.to_string()
-    }
-}
+const UNAVAILABLE_CREDENTIALS: &str = "selected runtime DSH credentials are unavailable or invalid";
 
 /// The login in force for one DSH endpoint of one runtime. A rejection refreshes it from the same runtime's
 /// credentials (never the ambient DSH home for an isolated runtime), so it is shared state behind `&self`.
@@ -195,32 +176,11 @@ impl Credential {
     /// Read the runtime's credentials and mint a fresh cookie for `base`.
     pub fn mint(context: &RuntimeContext, base: &str) -> Result<Self, String> {
         let cookie = session_cookie_for_runtime(context, base)
-            .ok_or_else(|| unavailable(context, "本地找不到签名私钥文稿（位于用户家目录的凭据文件）"))?;
+            .ok_or_else(|| UNAVAILABLE_CREDENTIALS.to_string())?;
         Ok(Self::with_cookie(base, cookie, context.clone()))
     }
 
-    /// For tests that already hold a credentials-file secret (ambient refresh).
-    #[cfg(test)]
-    pub fn from_secret(base: &str, secret: &str) -> Result<Self, String> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(secret.trim())
-            .ok()
-            .filter(|bytes| bytes.len() == SECRET_BYTES)
-            .ok_or_else(|| "DSH session secret is invalid".to_string())?;
-        let cookie = mint_cookie(base, &bytes)
-            .ok_or_else(|| "DSH session cookie could not be created".to_string())?;
-        Ok(Self::with_cookie(base, cookie, RuntimeContext::legacy()))
-    }
-
-    /// A synthetic cookie that is never refreshed (transport tests).
-    #[cfg(test)]
-    pub fn fixed(base: &str, cookie: String) -> Self {
-        let credential = Self::with_cookie(base, cookie, RuntimeContext::legacy());
-        credential.disable_refresh();
-        credential
-    }
-
-    /// `fixed`, bound to a selected runtime (the upstream capture tests).
+    /// `fixed`, bound to a selected runtime (the upstream capture and contract tests).
     #[cfg(test)]
     pub fn fixed_in(context: &RuntimeContext, base: &str, cookie: String) -> Self {
         let credential = Self::with_cookie(base, cookie, context.clone());
@@ -274,9 +234,8 @@ impl Credential {
         let mut last = String::new();
         for attempt in 0..4 {
             let cookie =
-                session_cookie_for_runtime(&self.context, &self.base).ok_or_else(|| {
-                    unavailable(&self.context, "回写刷新 DSH 本地凭据文稿遇到错误")
-                })?;
+                session_cookie_for_runtime(&self.context, &self.base)
+                    .ok_or_else(|| UNAVAILABLE_CREDENTIALS.to_string())?;
             self.set_cookie(cookie);
             match verify() {
                 Ok(()) => return Ok(()),

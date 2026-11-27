@@ -350,9 +350,6 @@ pub struct Harness {
 
 impl Harness {
     pub fn open(context: &RuntimeContext) -> Result<Self, String> {
-        if !context.is_isolated() {
-            return Err("harness requires a selected runtime".into());
-        }
         Ok(Self {
             context: context.clone(),
             store: Arc::new(store::Store::open(context)?),

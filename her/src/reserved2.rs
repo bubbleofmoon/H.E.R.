@@ -231,7 +231,7 @@ mod tests {
         std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
-        let mut hub = Hub::new(&context, journal, vec![], true);
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into(), "group:420043".into()]);
         hub.tick("bot", 9001).await.unwrap();
         for key in ["group:420042", "group:420043"] {
             let event = format!("{key}|message:1");
@@ -710,7 +710,7 @@ mod tests {
         let context=RuntimeContext::from_root(&root).unwrap();
         let cfg=context.load_config().unwrap();
         crate::dsh_health::observe(&context,&cfg,false,"synthetic outage",true);
-        hub=Hub::new(&context,journal,vec![],true);
+        hub=Hub::new(&context,journal,vec![key.into()]);
         hub.awaiting.insert(key.into(),vec![format!("{key}|message:1")]);
         hub.ready.push((key.into(),"atMention".into()));
         hub.maintain_sessions(&cfg,false,crate::now_ms() as i64).await.unwrap();
@@ -4783,7 +4783,7 @@ mod tests {
             let mut state = hub.state().unwrap();
             match predicate {
                 "suspended" => state["paused"] = json!(true),
-                "notTaken" => { hub.live_all = false; hub.groups = vec!["group:420043".into()]; },
+                "notTaken" => { hub.groups = vec!["group:420043".into()]; },
                 "notAllowed" => {
                     let mut cfg = hub.context.load_config().unwrap();
                     cfg["allow"]["groups"] = json!([420043]);
@@ -4898,7 +4898,7 @@ mod tests {
         let journal = hub.journal.clone();
         drop(hub);
         assert_eq!(context.read_social_state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"], deadline, "crash consumed the only durable timer before any turn existed");
-        let mut restarted = Hub::new(&context, journal, vec![], true);
+        let mut restarted = Hub::new(&context, journal, vec![key.into()]);
         restarted.tick("bot", 9001).await.unwrap();
         assert_eq!(restarted.active[key].reason, "timeout", "restart must recover a timer-only wake with proactive scheduling disabled");
         restarted.active[key].task.abort();
@@ -5021,7 +5021,7 @@ mod tests {
         std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
-        let mut hub = Hub::new(&context, journal, vec![key.into()], false);
+        let mut hub = Hub::new(&context, journal, vec![key.into()]);
         hub.tick("bot", 9001).await.unwrap();
         let frame = json!({"post_type":"message","message_type":"group","group_id":420042,"user_id":1001,"message_id":16201,"message":[{"type":"text","data":{"text":"logged once"}}]});
         let ev: crate::Event = serde_json::from_value(frame.clone()).unwrap();
@@ -5049,7 +5049,7 @@ mod tests {
         std::fs::write(&path, state.to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
-        let mut hub = Hub::new(&context, journal, vec![key.into()], false);
+        let mut hub = Hub::new(&context, journal, vec![key.into()]);
         hub.tick("bot", 9001).await.unwrap();
         state["conversations"][key]["wakeConfig"]["confirmedAt"] = json!(2);
         state["conversations"][key]["wakeConfig"]["mode"] = json!("active");
@@ -5120,7 +5120,7 @@ mod tests {
         let context = RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
         // Both conversations are served (`--live-groups`); only the configuration decides.
-        let mut hub = Hub::new(&context, journal, vec!["group:420042".into(), "group:420044".into()], false);
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into(), "group:420044".into()]);
         hub.tick("bot", 9001).await.unwrap();
         async fn recorded(hub: &mut Hub, message_id: i64) -> bool {
             let frame = json!({"post_type":"message","message_type":"group","group_id":420044,"user_id":1001,"message_id":message_id,"message":[{"type":"text","data":{"text":"scope probe"}}]});
@@ -5158,7 +5158,7 @@ mod tests {
         std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
-        let mut hub = Hub::new(&context, journal, vec!["group:420042".into()], false);
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into()]);
         hub.tick("bot", 9001).await.unwrap();
         let read = context.load_config().unwrap();
         std::fs::write(root.join("config/config.json"), "{ not json").unwrap();
@@ -5319,7 +5319,6 @@ pub struct Hub {
     /// Batches whose claim detected suspension after the tick read its settings.
     suspended_claims: HashSet<String>,
     groups: Vec<String>,
-    live_all: bool,
     mode_stamp: String,
     /// `social-v2.json` `resetEpoch`: a console whole reset (`POST /api/socialV2/reset`).
     reset_stamp: Value,
@@ -5358,7 +5357,6 @@ impl Hub {
         context: &RuntimeContext,
         journal: inbound::SharedJournal,
         groups: Vec<String>,
-        live_all: bool,
     ) -> Self {
         let mode_stamp = context
             .read_optional_text(RuntimeArea::Data, "mode.json")
@@ -5394,7 +5392,6 @@ impl Hub {
             ready: Vec::new(),
             suspended_claims: HashSet::new(),
             groups,
-            live_all,
             mode_stamp,
             reset_stamp: crate::conversation_state::ConversationState::for_runtime(context)
                 .read_optional_document()
@@ -5671,7 +5668,7 @@ impl Hub {
     }
 
     fn taken(&self, key: &str) -> bool {
-        self.live_all || self.groups.iter().any(|k| k == key)
+        self.groups.iter().any(|k| k == key)
     }
 
     /// Ticket 33: a Schedule store error is logged at most once a minute (the hub ticks every 500 ms).
@@ -5807,7 +5804,7 @@ impl Hub {
     }
 
     fn record(&self, name: &str, value: &Value) -> Result<(), String> {
-        crate::append_runtime_json_line(&self.context, name, "", value).map_err(|e| e.to_string())
+        crate::append_runtime_json_line(&self.context, name, value).map_err(|e| e.to_string())
     }
 
     /// Cancel each running turn's own DSH session (captured when the turn learned it). A session
@@ -5823,20 +5820,12 @@ impl Hub {
     }
 
     async fn adopt_mode(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
-        let stamp = if self.context.is_isolated() {
-            let raw = self
-                .context
-                .read_optional_text(RuntimeArea::Data, "mode.json")
-                .map_err(|e| e.to_string())?;
-            social_state::validate_mode_text(raw.as_deref()).map_err(|e| e.to_string())?;
-            raw.unwrap_or_default()
-        } else {
-            social_state::mode_checked(&self.context).map_err(|e| e.to_string())?;
-            self.context
-                .read_optional_text(RuntimeArea::Data, "mode.json")
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default()
-        };
+        let raw = self
+            .context
+            .read_optional_text(RuntimeArea::Data, "mode.json")
+            .map_err(|e| e.to_string())?;
+        social_state::validate_mode_text(raw.as_deref()).map_err(|e| e.to_string())?;
+        let stamp = raw.unwrap_or_default();
         let reset = self.rotation_state(cfg, "guard-read", now)?["resetEpoch"].clone();
         if reset != self.reset_stamp {
             // The console already stopped DSH work, cancelled the ledger turns and removed every

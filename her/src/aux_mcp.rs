@@ -43,7 +43,7 @@ pub(crate) fn call_tool(name: &str, args: &Value, context: &RuntimeContext) -> V
     }
 }
 
-/// The selected config document from the loader (`{}` when a legacy context has none, as JS `loadConfig`); an
+/// The selected config document from the loader (`{}` when unavailable, as JS `loadConfig`); an
 /// invalid file is `{}` too.
 pub(crate) fn read_config(context: &RuntimeContext) -> Value {
     context.load_config_document().unwrap_or_else(|_| json!({}))
@@ -112,18 +112,10 @@ pub fn serve_host(context: &RuntimeContext) -> std::io::Result<()> {
     serve_stdio("snowluma-host", Arc::new(move || tools.as_ref().clone()), dispatch)
 }
 
-/// Where the gateway answers: an isolated runtime uses only its selected OneBot dependency, a legacy one
-/// `snowluma.httpUrl` (default `http://127.0.0.1:3000`). `Err`: not a plain-http target (reported as unreachable).
-fn gateway_target(context: &RuntimeContext, cfg: &Value) -> Result<(String, String), String> {
-    let url = if context.is_isolated() {
-        context.dependency_url("onebot").unwrap_or("").to_string()
-    } else {
-        match cfg.pointer("/snowluma/httpUrl") {
-            Some(Value::Null) | None => "http://127.0.0.1:3000".to_string(),
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-        }
-    };
+/// Where the gateway answers: the selected runtime uses only its OneBot dependency.
+/// `Err`: not a plain-http target (reported as unreachable).
+fn gateway_target(context: &RuntimeContext) -> Result<(String, String), String> {
+    let url = context.dependency_url("onebot").unwrap_or("").to_string();
     let url = url.trim_end_matches('/');
     let rest = url.strip_prefix("http://").ok_or_else(|| "fetch failed".to_string())?;
     let (authority, prefix) = match rest.find('/') {
@@ -157,7 +149,7 @@ fn v8_json_error(body: &[u8], error: &serde_json::Error) -> String {
 fn gateway_info(context: &RuntimeContext, cfg: &Value) -> Map<String, Value> {
     let mut info = Map::new();
     let token = cfg.pointer("/snowluma/accessToken").filter(|v| js_truthy(v)).map(crate::aux_text::js_string).unwrap_or_default();
-    let reply = gateway_target(context, cfg).and_then(|(host_port, prefix)| {
+    let reply = gateway_target(context).and_then(|(host_port, prefix)| {
         let ob = crate::onebot::OneBot::try_new_authority(&host_port, token.clone())
             .map_err(|_| "fetch failed".to_string())?;
         ob.get_raw_path(

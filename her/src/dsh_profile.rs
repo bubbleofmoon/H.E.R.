@@ -4,7 +4,7 @@
 //! (`restore`: the supervisor before it starts DSH, and the live bridge), checks the profile and the preset bundle
 //! before every DSH prompt (`admit`) and, while anything is missing, refuses the prompt before any DSH call and
 //! alerts the owner once per distinct gap. The guard applies to the install root's runtime (production); development
-//! roots outside it and the fixed-path legacy mode (retired by #78) are not guarded.
+//! roots outside it are not guarded.
 //!
 //! The YAML reader here is a small line reader for the block style DSH profiles and presets use, on an allowlist:
 //! keys are plain identifiers; values are plain, single-quoted, double-quoted without a backslash, block scalars, `{}`
@@ -119,10 +119,7 @@ pub(crate) fn apply_rows(existing: &str) -> Result<String, String> {
 
 /// Whether the guard applies: the install root's runtime only (a selected root inside the configured install root).
 fn applies(context: &RuntimeContext) -> bool {
-    if !context.is_isolated() {
-        return false;
-    }
-    let Some(root) = context.runtime_root() else { return false };
+    let root = context.runtime_root();
     #[cfg(test)]
     if test_support::FORCED.lock().unwrap_or_else(|p| p.into_inner()).contains(root) {
         return true;
@@ -135,7 +132,7 @@ fn applies(context: &RuntimeContext) -> bool {
 /// The runtime an alert belongs to (test capture).
 #[cfg(test)]
 fn scope(context: &RuntimeContext) -> String {
-    context.runtime_root().map(|root| root.to_string_lossy().into_owned()).unwrap_or_default()
+    context.runtime_root().to_string_lossy().into_owned()
 }
 
 fn record(context: &RuntimeContext, trigger: Trigger, event: &str, outcome: Outcome, reason: &str) {
@@ -950,7 +947,7 @@ pub(crate) mod test_support {
 
     /// Guard this runtime as the install root's runtime.
     pub(crate) fn force(context: &RuntimeContext) {
-        FORCED.lock().unwrap_or_else(|p| p.into_inner()).insert(context.runtime_root().unwrap().to_path_buf());
+        FORCED.lock().unwrap_or_else(|p| p.into_inner()).insert(context.runtime_root().to_path_buf());
     }
 
     /// Make the notice queue refuse (or accept again) this runtime's owner notices.
@@ -978,7 +975,7 @@ pub(crate) mod test_support {
 
     /// The runtime's DSH home.
     pub(crate) fn home(context: &RuntimeContext) -> PathBuf {
-        context.runtime_root().unwrap().join("user/dsh")
+        context.runtime_root().join("user/dsh")
     }
 
     pub(crate) fn write(context: &RuntimeContext, relative: &str, text: &str) {

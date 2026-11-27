@@ -16,20 +16,11 @@ use crate::runtime::{
     RuntimeContext, APPEND_CONFLICT_WAIT,
 };
 
-pub const LEDGER_FILE: &str = crate::legacy_path!("qq-bridge/state/token-usage.jsonl");
-/// Rust's own token ledger file. Separate from JS's `token-usage.jsonl` to prevent Windows
-/// interleaved appends.
-pub const RUST_LEDGER_FILE: &str = crate::legacy_path!("state/token-usage-rust.jsonl");
-/// All ledger files merged by read views.
-pub const LEDGER_FILES: [&str; 2] = [LEDGER_FILE, RUST_LEDGER_FILE];
-/// Active DSH sessions map for legacy key resolution.
-const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
-
 pub const DEFAULT_MAX_LINES: usize = 20_000;
 const DEFAULT_KEEP_SAMPLES: usize = 10_000;
 
-const RUST_LEDGER_NAME: &str = "token-usage-rust.jsonl";
-const JS_LEDGER_NAME: &str = "token-usage.jsonl";
+pub(super) const RUST_LEDGER_NAME: &str = "token-usage-rust.jsonl";
+pub(super) const JS_LEDGER_NAME: &str = "token-usage.jsonl";
 const COMPACT_SIDECAR: &str = "token-usage-rust.jsonl.compact";
 const RECONCILE_FILE: &str = "harness-usage-reconcile.json";
 /// Leaf lock protecting `RECONCILE_FILE` read-modify-write only. Lock order: `RECONCILE_LOCK` and
@@ -41,19 +32,11 @@ const RECONCILE_LOCK: &str = "locks/harness-reconcile.lock";
 pub struct LedgerStorage;
 
 impl LedgerStorage {
-    /// Append one usage record to Rust's legacy ledger.
-    pub fn append_record(record: &Value) -> Result<(), String> {
-        Self::append_record_to(RUST_LEDGER_FILE, record)
-    }
-
-    /// Append one usage record to the selected runtime's Rust ledger (or legacy fallback).
+    /// Append one usage record to the selected runtime's Rust ledger.
     pub fn append_record_for_runtime(
         context: &RuntimeContext,
         record: &Value,
     ) -> Result<(), String> {
-        if !context.is_isolated() {
-            return Self::append_record(record);
-        }
         let mut line =
             serde_json::to_vec(record).map_err(|e| format!("序列化账本记录失败：{e}"))?;
         line.push(b'\n');
@@ -68,16 +51,6 @@ impl LedgerStorage {
     /// Append and sync one usage record under lock (guarded files).
     pub(crate) fn append_record_to_durable(path: &str, record: &Value) -> Result<(), String> {
         append_record_at(Path::new(path), record, true, None)
-    }
-
-    /// Append a turn-ledger record with bounded conflict wait.
-    pub(crate) fn append_turn_record_to(
-        path: &str,
-        record: &Value,
-        durable: bool,
-        deadline: Option<Instant>,
-    ) -> Result<(), String> {
-        append_record_at(Path::new(path), record, durable, deadline)
     }
 
     /// Read the merged runtime ledger, filter `candidates` via pure `plan_appends`, and append
@@ -100,17 +73,11 @@ impl LedgerStorage {
         ledger
     }
 
-    /// Load and merge both legacy ledger files.
-    pub fn load_all() -> Ledger {
-        Self::load_paths(&LEDGER_FILES)
-    }
-
-    /// Load and merge arbitrary ledger file paths (with legacy sessions resolution).
+    /// Load and merge explicit ledger file paths.
     pub fn load_paths(paths: &[&str]) -> Ledger {
-        let sessions = std::fs::read_to_string(SESSIONS_FILE).ok();
         let mut ledger = Ledger::empty(
-            paths.first().copied().unwrap_or(LEDGER_FILE),
-            sessions.as_deref(),
+            paths.first().copied().unwrap_or(JS_LEDGER_NAME),
+            None,
         );
         let mut rows = read_rows(paths);
         order_merged(&mut rows);
@@ -121,9 +88,6 @@ impl LedgerStorage {
     /// Load the selected runtime's ledgers (falling back to any crash-interrupted compaction
     /// sidecar when the Rust ledger was truncated before rewrite completed) and session map.
     pub fn load_all_for_runtime(context: &RuntimeContext) -> Result<Ledger, String> {
-        if !context.is_isolated() {
-            return Ok(Self::load_all());
-        }
         let js_text = context
             .read_optional_text(RuntimeArea::Data, JS_LEDGER_NAME)
             .map_err(|error| error.to_string())?;
@@ -168,9 +132,6 @@ impl LedgerStorage {
         max_lines: usize,
         keep_samples: usize,
     ) -> Result<bool, String> {
-        if !context.is_isolated() {
-            return Ok(false);
-        }
         let rust_len = context
             .optional_file_len(RuntimeArea::Data, RUST_LEDGER_NAME)
             .map_err(|e| e.to_string())?;
@@ -270,63 +231,52 @@ impl LedgerStorage {
     /// sidecar and advancing the reconciliation watermark so previously completed attempts are not
     /// re-added at next startup.
     pub fn reset(context: &RuntimeContext) -> Result<(), String> {
-        if context.is_isolated() {
-            let err = || "重置失败：所选用量账本不可用".to_string();
-            let js_path = context
-                .resolve_path(RuntimeArea::Data, JS_LEDGER_NAME, PathIntent::WriteFile)
-                .map_err(|_| err())?;
-            let rust_path = context
-                .resolve_path(RuntimeArea::Data, RUST_LEDGER_NAME, PathIntent::WriteFile)
-                .map_err(|_| err())?;
-            let exists = |path: &Path| match std::fs::symlink_metadata(path) {
-                Ok(_) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(_) => Err(err()),
+        let err = || "重置失败：所选用量账本不可用".to_string();
+        let js_path = context
+            .resolve_path(RuntimeArea::Data, JS_LEDGER_NAME, PathIntent::WriteFile)
+            .map_err(|_| err())?;
+        let rust_path = context
+            .resolve_path(RuntimeArea::Data, RUST_LEDGER_NAME, PathIntent::WriteFile)
+            .map_err(|_| err())?;
+        let exists = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(err()),
+        };
+        let js_exists = exists(&js_path)?;
+        let rust_exists = exists(&rust_path)?;
+        {
+            let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
+                let rust = context
+                    .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
+                    .map_err(|_| err())?;
+                let js = context
+                    .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
+                    .map_err(|_| err())?;
+                (js, rust)
+            } else {
+                let js = context
+                    .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
+                    .map_err(|_| err())?;
+                let rust = context
+                    .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
+                    .map_err(|_| err())?;
+                (js, rust)
             };
-            let js_exists = exists(&js_path)?;
-            let rust_exists = exists(&rust_path)?;
-            {
-                let (js_ledger, rust_ledger) = if !js_exists && rust_exists {
-                    let rust = context
-                        .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
-                        .map_err(|_| err())?;
-                    let js = context
-                        .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
-                        .map_err(|_| err())?;
-                    (js, rust)
-                } else {
-                    let js = context
-                        .open_locked_file(RuntimeArea::Data, JS_LEDGER_NAME)
-                        .map_err(|_| err())?;
-                    let rust = context
-                        .open_locked_file(RuntimeArea::Data, RUST_LEDGER_NAME)
-                        .map_err(|_| err())?;
-                    (js, rust)
-                };
-                js_ledger
-                    .set_len(0)
-                    .and_then(|_| js_ledger.sync_all())
-                    .map_err(|_| err())?;
-                rust_ledger
-                    .set_len(0)
-                    .and_then(|_| rust_ledger.sync_all())
-                    .map_err(|_| err())?;
-                remove_sidecar(context);
-            }
-            // Release ledger locks before querying `conversations.db` or taking `RECONCILE_LOCK`.
-            if let Ok(max_seq) = crate::harness::store::max_attempt_event_seq(context, None) {
-                if max_seq > 0 {
-                    let _ = Self::advance_reconcile_seq(context, max_seq);
-                }
-            }
-        } else {
-            for path in LEDGER_FILES {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(path)
-                    .map_err(|e| format!("重置失败 {path}：{e}"))?;
+            js_ledger
+                .set_len(0)
+                .and_then(|_| js_ledger.sync_all())
+                .map_err(|_| err())?;
+            rust_ledger
+                .set_len(0)
+                .and_then(|_| rust_ledger.sync_all())
+                .map_err(|_| err())?;
+            remove_sidecar(context);
+        }
+        // Release ledger locks before querying `conversations.db` or taking `RECONCILE_LOCK`.
+        if let Ok(max_seq) = crate::harness::store::max_attempt_event_seq(context, None) {
+            if max_seq > 0 {
+                let _ = Self::advance_reconcile_seq(context, max_seq);
             }
         }
         Ok(())
@@ -334,9 +284,6 @@ impl LedgerStorage {
 
     /// Read the highest `model_attempt_ended` sequence watermark recorded as reconciled/evicted.
     pub(crate) fn read_reconcile_seq(context: &RuntimeContext) -> Result<i64, String> {
-        if !context.is_isolated() {
-            return Ok(0);
-        }
         let Some(text) = context
             .read_optional_text(RuntimeArea::Data, RECONCILE_FILE)
             .map_err(|e| e.to_string())?
@@ -350,7 +297,7 @@ impl LedgerStorage {
 
     /// Monotonically raise the reconciliation sequence watermark to at least `seq`.
     pub(crate) fn advance_reconcile_seq(context: &RuntimeContext, seq: i64) -> Result<(), String> {
-        if !context.is_isolated() || seq <= 0 {
+        if seq <= 0 {
             return Ok(());
         }
         let _lock = open_locked_file_retry(

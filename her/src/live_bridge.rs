@@ -1,18 +1,17 @@
 //! Live QQ gateway bridge: startup/lock/heartbeat, WebSocket reconnect loop, inbound replay
-//! and held-event gating, OneBot event/wake trigger evaluation, and unified Second-generation
-//! simulation (`reserved2`) wake orchestration (`reserved2::Hub` for isolated runtimes and
-//! fallback drivers for legacy/observation runs).
+//! and held-event gating, OneBot event/wake trigger evaluation, and Second-generation
+//! simulation (`reserved2`) wake orchestration (`reserved2::Hub`).
 
 #[path = "reserved2.rs"]
 pub(crate) mod reserved2;
 pub(crate) use reserved2::wake_needs_dsh;
 
 use crate::{
-    activity, chat, closed_agent, conversation_state, dependency, dependency_watch, dsh_profile,
+    activity, chat, closed_agent, dependency, dependency_watch, dsh_profile,
     gateway_health, group_mute, harness, history_log, inbound, ledger, lifecycle, local_time,
-    onebot, parity_clock, persona_command, pipeline, pricing, prompt, question, recovery_log,
+    onebot, parity_clock, persona_command, pipeline, pricing, recovery_log,
     release, reserved, run_record, runtime, session, session_map, slang_learn, snowluma_heal,
-    social_state, turn_recovery, wake, wake_words, watchdog,
+    social_state, turn_recovery, wake, watchdog,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -22,41 +21,18 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 const DECISION_NAME: &str = "logs/rbridge-live.jsonl";
-const DECISION_LOG: &str = crate::legacy_path!("logs/rbridge-live.jsonl");
-/// Wake firing timestamps (after batching/scheduling delays) for live/replay diagnostics.
-const WAKE_NAME: &str = "logs/rbridge-live-wakes.jsonl";
-const WAKE_LOG: &str = crate::legacy_path!("logs/rbridge-live-wakes.jsonl");
 
 #[derive(Deserialize, Debug, Default)]
 struct Config {
     #[serde(default)]
     snowluma: Option<SnowLuma>,
-    #[serde(rename = "socialV2", default)]
-    social_v2: Option<SocialV2>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 struct SnowLuma {
-    #[serde(rename = "wsUrl", default)]
-    ws_url: Option<String>,
     #[serde(rename = "accessToken", default)]
     access_token: Option<String>,
-    #[serde(rename = "httpUrl", default)]
-    http_url: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct SocialV2 {
-    #[serde(default)]
-    social: SocialTuning,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct SocialTuning {
-    #[serde(rename = "skipProbability", default)]
-    skip_probability: f64,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -80,12 +56,6 @@ pub(crate) struct Triggers {
     pub(crate) any_message: bool,
     #[serde(default)]
     pub(crate) probability: f64,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct WakeConfig {
-    #[serde(default)]
-    triggers: Triggers,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -351,10 +321,10 @@ fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> 
     }
 }
 
-/// #192 (F3): whether this process's reserved2 hub serves `key`, by the rule of `Hub::taken` (reserved2.rs): every
-/// conversation with `--live-all` (the flag the hub is built with), otherwise those listed in `--live-groups`.
-fn reserved2_serves(live_all: bool, live_groups: &[String], key: &str) -> bool {
-    !key.is_empty() && (live_all || live_groups.iter().any(|g| g == key))
+/// #192 (F3): whether this process's reserved2 hub serves `key`, by the rule of `Hub::taken` (reserved2.rs):
+/// conversations listed in `--live-groups`.
+fn reserved2_serves(live_groups: &[String], key: &str) -> bool {
+    !key.is_empty() && live_groups.iter().any(|g| g == key)
 }
 
 /// #192 (F3): events refused while the configuration cannot be read (outside reserved2, which holds them) go to the
@@ -676,35 +646,6 @@ pub(crate) fn decide(
     (false, "no-trigger".into())
 }
 
-fn discover_ws_token() -> Option<String> {
-    let dir = std::path::Path::new(crate::legacy_path!("SnowLuma/config"));
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if !name.starts_with("onebot_") || !name.ends_with(".json") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(e.path()) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
-            continue;
-        };
-        let tok = v
-            .get("networks")
-            .and_then(|n| n.get("wsServers"))
-            .and_then(|w| w.get(0))
-            .and_then(|s| s.get("accessToken"))
-            .and_then(|t| t.as_str())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_string());
-        if tok.is_some() {
-            println!("[her] ws token from {name}");
-            return tok;
-        }
-    }
-    None
-}
-
 fn is_loopback_ws_url(url: &str) -> bool {
     let Some(authority_and_path) = url.strip_prefix("ws://") else {
         return false;
@@ -740,32 +681,17 @@ fn parse_live_groups(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn read_json(path: &str) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
-}
-
 pub(crate) fn append_runtime_json_line(
     context: &runtime::RuntimeContext,
     relative: &str,
-    legacy_path: &str,
     record: &Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write as _;
     let safe = activity::mask_json_session_tokens(record, &activity::known_session_tokens(context));
     let mut line = serde_json::to_vec(&safe)?;
     line.push(b'\n');
-    if context.is_isolated() {
-        context
-            .append_bytes(runtime::RuntimeArea::Logs, relative, &line)
-            .map_err(std::io::Error::other)?;
-    } else {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(legacy_path)?;
-        file.write_all(&line)?;
-    }
+    context
+        .append_bytes(runtime::RuntimeArea::Logs, relative, &line)
+        .map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -798,18 +724,14 @@ pub(crate) fn wake_cfg_of(cfg_raw: &Value) -> wake::WakeCfg {
 /// The OS-held owner gate, not the age or contents of a lock file, decides ownership.
 fn acquire_single_instance(context: &runtime::RuntimeContext) -> Option<lifecycle::OwnerGuard> {
     let relative = "logs/rbridge-live.lock";
-    let path = if context.is_isolated() {
-        context
-            .resolve_path(
-                runtime::RuntimeArea::Data,
-                relative,
-                runtime::PathIntent::WriteFile,
-            )
-            .map_err(|e| println!("[her] owner path unavailable: {e}"))
-            .ok()?
-    } else {
-        std::path::PathBuf::from(format!("{}/{relative}", crate::legacy_path!()))
-    };
+    let path = context
+        .resolve_path(
+            runtime::RuntimeArea::Data,
+            relative,
+            runtime::PathIntent::WriteFile,
+        )
+        .map_err(|e| println!("[her] owner path unavailable: {e}"))
+        .ok()?;
     let identity = lifecycle::current_identity()
         .map_err(|e| println!("[her] identity unavailable: {e}"))
         .ok()?;
@@ -837,18 +759,16 @@ fn acquire_single_instance(context: &runtime::RuntimeContext) -> Option<lifecycl
     }
 }
 
-/// Initialize the live pipeline before publishing a heartbeat. In isolated mode, a missing or
-/// corrupt candidate session map, selected DSH credential, or dependency is a startup failure;
-/// the process must not claim that it has taken over a session when it cannot answer it. Legacy
-/// mode retains its historical behavior of logging the failure and remaining in observation mode.
+/// Initialize the live pipeline before publishing a heartbeat. A missing or corrupt candidate
+/// session map, selected DSH credential, or dependency is a startup failure; the process must
+/// not claim that it has taken over a session when it cannot answer it.
 fn prepare_live_pipeline(
     context: &runtime::RuntimeContext,
     cfg: &Value,
     live_mode: bool,
     live_groups: &[String],
-    live_all: bool,
 ) -> Result<Option<pipeline::Pipeline>, String> {
-    if !live_mode || (live_groups.is_empty() && !live_all) {
+    if !live_mode || live_groups.is_empty() {
         return Ok(None);
     }
     match pipeline::Pipeline::new_with_runtime(context, cfg, true) {
@@ -856,17 +776,13 @@ fn prepare_live_pipeline(
             println!("[her] LIVE 模式：会真的建会话并发送 QQ 消息");
             Ok(Some(pipeline))
         }
-        Err(error) if context.is_isolated() => Err(format!(
+        Err(error) => Err(format!(
             "isolated live pipeline initialization failed; refusing to publish a live heartbeat: {error}"
         )),
-        Err(error) => {
-            println!("[her] ⚠️ 无法初始化 pipeline（退回只判定）：{error}");
-            Ok(None)
-        }
     }
 }
 
-type LiveStartup = (Vec<String>, bool, Option<pipeline::Pipeline>);
+type LiveStartup = (Vec<String>, Option<pipeline::Pipeline>);
 
 fn prepare_live_startup(
     context: &runtime::RuntimeContext,
@@ -887,10 +803,9 @@ fn prepare_live_startup(
         println!("           应当把它们补进启动参数里，或者从配置文件的灰度群组列表中移走。");
         std::process::exit(2);
     }
-    let live_all = args.iter().any(|a| a == "--live-all");
-    let pipeline = prepare_live_pipeline(context, cfg_raw, true, &live_groups, live_all)
+    let pipeline = prepare_live_pipeline(context, cfg_raw, true, &live_groups)
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-    Ok((live_groups, live_all, pipeline))
+    Ok((live_groups, pipeline))
 }
 
 fn publish_live_heartbeat(
@@ -912,18 +827,11 @@ fn publish_live_heartbeat(
         "state": state,
         "gatewayConnected": gateway_connected,
     });
-    if context.is_isolated() {
-        let _ = context.write_atomic(
-            runtime::RuntimeArea::Data,
-            name,
-            payload.to_string().as_bytes(),
-        );
-    } else {
-        let _ = std::fs::write(
-            format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
-            payload.to_string(),
-        );
-    }
+    let _ = context.write_atomic(
+        runtime::RuntimeArea::Data,
+        name,
+        payload.to_string().as_bytes(),
+    );
 }
 
 fn set_gateway_connected(tx: &tokio::sync::watch::Sender<bool>, ready: bool) {
@@ -967,30 +875,6 @@ pub(crate) fn feed_slang(
     }
 }
 
-/// Query via OneBot `get_msg` whether the replied-to message was sent by `self_id`.
-fn fetch_msg_sender_is_self(ob: &onebot::OneBot, msg_id: i64, self_id: i64) -> bool {
-    let Some(v) = ob.request_with_timeout(
-        "get_msg",
-        json!({ "message_id": msg_id }),
-        std::time::Duration::from_secs(8),
-    ) else {
-        return false;
-    };
-    let sender = v
-        .get("data")
-        .and_then(|d| d.get("sender"))
-        .and_then(|s| s.get("user_id"))
-        .and_then(protocol_integer)
-        .filter(|id| *id > 0)
-        .or_else(|| {
-            v.get("data")
-                .and_then(|d| d.get("user_id"))
-                .and_then(protocol_integer)
-                .filter(|id| *id > 0)
-        });
-    sender == Some(self_id)
-}
-
 /// Query our group card in one group over OneBot HTTP (WS may not implement this action).
 fn fetch_group_card(ob: &onebot::OneBot, gid: i64, self_id: i64) -> Option<String> {
     let v = ob.request_with_timeout(
@@ -1023,611 +907,10 @@ pub(crate) fn parse_target(
     Ok(onebot::Target::Private(owner))
 }
 
-/// Unified Second-generation simulation (`reserved2`) wake orchestration inside the live bridge:
-/// `Isolated` delegates to `reserved2::Hub` for selected runtimes, while `Fallback` owns the
-/// legacy/observation wake drivers and per-connection turn scheduling.
-enum SimulationBridge {
-    Isolated {
-        hub: Box<reserved2::Hub>,
-        events: u64,
-    },
-    Fallback(Box<FallbackWakeDrivers>),
-}
-
-struct FallbackWakeDrivers {
-    journal: inbound::SharedJournal,
-    live_groups: Vec<String>,
-    shadow_flag: bool,
-    drivers: HashMap<String, session::Driver>,
-    wake_synced: HashMap<String, session::WakeSync>,
-    awaiting: HashMap<String, Vec<String>>,
-    in_flight: Vec<String>,
-    pending_live: Vec<(String, String)>,
-    recent_by_key: HashMap<String, Vec<String>>,
-    runtime_recent_by_key: HashMap<String, Vec<prompt::RuntimeRecentMessage>>,
+/// Second-generation simulation (`reserved2`) wake orchestration inside the live bridge.
+struct SimulationBridge {
+    hub: Box<reserved2::Hub>,
     events: u64,
-    wakes: u64,
-}
-
-impl FallbackWakeDrivers {
-    fn new(journal: inbound::SharedJournal, live_groups: Vec<String>) -> Self {
-        let shadow_flag = live_groups.is_empty();
-        Self {
-            journal,
-            live_groups,
-            shadow_flag,
-            drivers: HashMap::new(),
-            wake_synced: HashMap::new(),
-            awaiting: HashMap::new(),
-            in_flight: Vec::new(),
-            pending_live: Vec::new(),
-            recent_by_key: HashMap::new(),
-            runtime_recent_by_key: HashMap::new(),
-            events: 0,
-            wakes: 0,
-        }
-    }
-
-    fn reset_connection(&mut self) {
-        self.drivers.clear();
-        self.wake_synced.clear();
-        self.awaiting.clear();
-        self.in_flight.clear();
-        self.pending_live.clear();
-        self.recent_by_key.clear();
-        self.runtime_recent_by_key.clear();
-        self.events = 0;
-        self.wakes = 0;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_turn(
-        &mut self,
-        pipe: &mut pipeline::Pipeline,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        key: &str,
-        reason: &str,
-        self_nick: &str,
-        self_id: i64,
-        track_driver_lifecycle: bool,
-    ) {
-        let Ok(target) = parse_target(key, cfg_raw) else {
-            println!("[her] {key} 的 target 解析失败，跳过");
-            return;
-        };
-        if track_driver_lifecycle {
-            let turn_at = now_ms() as i64;
-            if let Some(d) = self.drivers.get_mut(key) {
-                let _ = d.apply(session::Input::TurnStart { at_ms: turn_at });
-            }
-        }
-        let runtime_recent = self
-            .runtime_recent_by_key
-            .get(key)
-            .cloned()
-            .unwrap_or_default();
-        let recent = self.recent_by_key.get(key).cloned().unwrap_or_default();
-        let dsh_prompt = prompt::build_with_runtime_and_recent(
-            context,
-            key,
-            reason,
-            self_nick,
-            &self_id.to_string(),
-            &runtime_recent,
-        );
-        let cli_prompt = prompt::build_text_only_with_runtime(
-            context,
-            key,
-            &recent,
-            self_nick,
-            &self_id.to_string(),
-        );
-        pipe.note_turn(reason, &self.in_flight);
-        let outcome = pipe.run_turn(&target, &dsh_prompt, &cli_prompt, cfg_raw).await;
-        if track_driver_lifecycle {
-            let spoke = match outcome {
-                Ok(n) => {
-                    println!("[her] 回合完成（{n} 字输出）");
-                    n > 0
-                }
-                Err(err) => {
-                    println!("[her] ❌ 回合失败：{err}");
-                    false
-                }
-            };
-            let end_at = now_ms() as i64;
-            if let Some(d) = self.drivers.get_mut(key) {
-                if spoke {
-                    let _ = d.apply(session::Input::ReplySent {
-                        at_ms: end_at,
-                        text: String::new(),
-                    });
-                }
-                let _ = d.apply(session::Input::TurnEnd { at_ms: end_at });
-            }
-        } else {
-            match outcome {
-                Ok(n) => println!("[her] 回合完成（{n} 字输出）"),
-                Err(e) => {
-                    println!("[her] ❌ 回合失败：{e}");
-                    // A held wake never started a turn; clear pending busy mark so future wakes are not suppressed.
-                    if e.starts_with(pipeline::HELD_ERROR_PREFIX) {
-                        if let Some(d) = self.drivers.get_mut(key) {
-                            d.sched.pending_wake_key_at = None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drop scheduler work and settle its saved inputs when current policy refuses it.
-    async fn admitted(
-        &mut self,
-        cfg: &Value,
-        key: &str,
-        now: i64,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        if social_state::inbound_admitted(cfg, key) {
-            return Ok(true);
-        }
-        if let Some(events) = self.awaiting.get(key) {
-            self.journal.mark_handled(events.clone(), now).await?;
-            self.awaiting.remove(key);
-        }
-        self.drivers.remove(key);
-        self.wake_synced.remove(key);
-        Ok(false)
-    }
-
-    async fn pump(
-        &mut self,
-        context: &runtime::RuntimeContext,
-        cfg: &Value,
-        now: i64,
-    ) -> Result<Vec<(String, session::WakeEvent)>, Box<dyn std::error::Error>> {
-        if let Some(state) = conversation_state::read_document_with_bom(context) {
-            sync_wake_configs(
-                context,
-                cfg,
-                &state,
-                &mut self.drivers,
-                &mut self.wake_synced,
-                now,
-            );
-        }
-        let keys: Vec<_> = self.drivers.keys().cloned().collect();
-        for key in keys {
-            self.admitted(cfg, &key, now).await?;
-        }
-        Ok(session::pump_all(&mut self.drivers, now))
-    }
-
-    async fn next_live(
-        &mut self,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        pending: &mut impl Iterator<Item = (String, String)>,
-        now: i64,
-    ) -> Result<Option<(String, String, Value)>, Box<dyn std::error::Error>> {
-        for (key, reason) in pending {
-            let cfg = if context.is_isolated() {
-                let Ok(cfg) = context.load_config() else {
-                    self.pending_live.push((key, reason));
-                    continue;
-                };
-                cfg
-            } else {
-                cfg_raw.clone()
-            };
-            if !self.admitted(&cfg, &key, now).await? {
-                continue;
-            }
-            inbound::start_processing(
-                &self.journal,
-                &mut self.awaiting,
-                &mut self.in_flight,
-                &key,
-                now,
-            )
-            .await?;
-            return Ok(Some((key, reason, cfg)));
-        }
-        Ok(None)
-    }
-
-    async fn flush_pending(
-        &mut self,
-        pipeline: Option<&mut pipeline::Pipeline>,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        self_nick: &str,
-        self_id: i64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(pipe) = pipeline else {
-            self.pending_live.clear();
-            return Ok(());
-        };
-        let tick_now = now_ms() as i64;
-        let mut queued = std::mem::take(&mut self.pending_live).into_iter();
-        while let Some((key, reason, cfg)) =
-            self.next_live(context, cfg_raw, &mut queued, tick_now).await?
-        {
-            println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
-            self.execute_turn(pipe, context, &cfg, &key, &reason, self_nick, self_id, false)
-                .await;
-        }
-        Ok(())
-    }
-
-    async fn finish_in_flight(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.in_flight.is_empty() {
-            let keys = std::mem::take(&mut self.in_flight);
-            self.journal.mark_handled(keys, now_ms() as i64).await?;
-        }
-        Ok(())
-    }
-
-    async fn tick(
-        &mut self,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        tick_now: i64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let current_cfg = if context.is_isolated() {
-            let Ok(cfg) = context.load_config() else {
-                return Ok(());
-            };
-            cfg
-        } else {
-            cfg_raw.clone()
-        };
-        for (k, e) in self.pump(context, &current_cfg, tick_now).await? {
-            let dispatch = self.live_groups.iter().any(|g| g == &k);
-            if !dispatch {
-                inbound::start_processing(
-                    &self.journal,
-                    &mut self.awaiting,
-                    &mut self.in_flight,
-                    &k,
-                    now_ms() as i64,
-                )
-                .await?;
-            }
-            self.wakes += 1;
-            println!("[her] 定时唤醒 {k} ({})", e.reason);
-            append_runtime_json_line(
-                context,
-                WAKE_NAME,
-                WAKE_LOG,
-                &json!({
-                    "ts": e.at_ms,
-                    "key": k,
-                    "reason": e.reason,
-                    "pid": std::process::id(),
-                    "shadow": self.shadow_flag
-                }),
-            )?;
-            if dispatch {
-                self.pending_live.push((k, e.reason));
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_event(
-        &mut self,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        ev: &Event,
-        text: &str,
-        replayed: bool,
-        self_id: i64,
-        self_nick: &str,
-        self_cards: &HashMap<i64, String>,
-        http_ob: &onebot::OneBot,
-        skip_probability: f64,
-        slang_enabled: bool,
-        slang_learning: &slang_learn::SlangLearning,
-        mut pipeline: Option<&mut pipeline::Pipeline>,
-        is_message: bool,
-        is_notice: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let key = if is_message && ev.message_type == "private" {
-            format!("private:{}", ev.user_id.unwrap_or(0))
-        } else if is_notice && ev.sub_type == "poke" && ev.group_id.is_none() {
-            let Some(peer) = ev
-                .user_id
-                .or(ev.sender_id)
-                .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id))
-            else {
-                return Ok(());
-            };
-            format!("private:{peer}")
-        } else if ev.message_type == "group"
-            || (is_notice && ev.sub_type == "poke" && ev.group_id.is_some())
-        {
-            format!("group:{}", ev.group_id.unwrap_or(0))
-        } else {
-            return Ok(());
-        };
-
-        // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
-        let gate_cfg = match context.load_config() {
-            Ok(gate_cfg) => gate_cfg,
-            Err(error) => {
-                println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
-                return Ok(());
-            }
-        };
-        if !social_state::inbound_admitted(&gate_cfg, &key) {
-            return Ok(());
-        }
-
-        let (plain, at_self_direct, reply_id) = plain_text(&ev.message, self_id);
-        let body = if plain.is_empty() {
-            ev.raw_message.clone()
-        } else {
-            plain
-        };
-        // Quoting one of our own messages counts as addressing the bot directly.
-        let quote_self = match (reply_id, self_id != 0) {
-            (Some(mid), true) => fetch_msg_sender_is_self(http_ob, mid, self_id),
-            _ => false,
-        };
-        // Conversations absent from social state are skipped rather than given synthetic default triggers.
-        let Some(mut tr) = conversation_state::read_document_with_bom(context)
-            .and_then(|v| conversation_state::Conversation::from_value(&v["conversations"][&key]))
-            .and_then(|c| c.field("wakeConfig").filter(|w| !w.is_null()).cloned())
-            .and_then(|w| serde_json::from_value::<WakeConfig>(w).ok())
-            .map(|w| w.triggers)
-        else {
-            return Ok(());
-        };
-        // The persona's names wake her like keywords, except the ones she dropped.
-        tr.keywords = wake_words::effective(context, &key, &tr.keywords, &tr.drop_names);
-
-        let inbound_key =
-            inbound::event_key(&key, &ev.post_type, event_message_id(ev).as_deref(), text);
-        if !replayed
-            && self
-                .journal
-                .record_received(
-                    inbound_key.clone(),
-                    key.clone(),
-                    text.to_string(),
-                    now_ms() as i64,
-                )
-                .await?
-                == inbound::Receipt::Duplicate
-        {
-            return Ok(());
-        }
-        self.events += 1;
-        let conv = conversation_state::read_document_with_bom(context)
-            .map(|s| s["conversations"][&key].clone())
-            .unwrap_or(Value::Null);
-        let directed = question::directed(ev, &body, quote_self, &conv, cfg_raw, now_ms() as i64);
-        let (mut wake, mut reason) = decide(
-            ev,
-            &body,
-            at_self_direct || quote_self,
-            self_nick,
-            self_cards,
-            &tr,
-            directed,
-        );
-
-        // First contact with a reserved2 conversation: its first wake is the bootstrap wake that
-        // carries the operator's initial prompt (`bootstrapSent`), whatever the triggers say.
-        if pipeline.is_some()
-            && (self.live_groups.is_empty() || self.live_groups.iter().any(|g| g == &key))
-            && (is_message || ev.sub_type == "poke")
-        {
-            match social_state::claim_first_wake(context, &gate_cfg, &key) {
-                Ok(true) => {
-                    println!("[her] {key} 初次触发唤醒：切为引导开场");
-                    wake = true;
-                    reason = "bootstrap".to_string();
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    println!("[her] ❌ {key} 首次唤醒标记失败（本次不注入初始提示词）：{error}")
-                }
-            }
-        }
-
-        // Batch window (`socialV2.wake.batchWindowMs`) coalesces burst messages inside the driver.
-        if wake && reason == "probability" && skip_probability > 0.0 {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            text_seed(&body, ev.user_id).hash(&mut h);
-            let roll = (h.finish() % 10_000) as f64 / 10_000.0;
-            if roll < skip_probability {
-                reason = "skip:probability".into();
-                wake = false;
-            }
-        }
-
-        if wake {
-            self.wakes += 1;
-            self.awaiting
-                .entry(key.clone())
-                .or_default()
-                .push(inbound_key);
-        } else {
-            self.journal
-                .mark_handled(vec![inbound_key], now_ms() as i64)
-                .await?;
-        }
-
-        // Maintain per-conversation recent history regardless of wake outcome.
-        {
-            let who = ev
-                .user_id
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            let line = format!("{who}: {body}");
-            let buf = self.recent_by_key.entry(key.clone()).or_default();
-            buf.push(line);
-            if buf.len() > 12 {
-                buf.remove(0);
-            }
-            let sender = ev
-                .sender
-                .as_ref()
-                .map(|value| {
-                    if !value.card.trim().is_empty() {
-                        value.card.trim().to_string()
-                    } else if !value.nickname.trim().is_empty() {
-                        value.nickname.trim().to_string()
-                    } else {
-                        ev.user_id
-                            .map(|user| user.to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    }
-                })
-                .unwrap_or_else(|| {
-                    ev.user_id
-                        .map(|user| user.to_string())
-                        .unwrap_or_else(|| "?".to_string())
-                });
-            let live_message = prompt::RuntimeRecentMessage {
-                message_id: event_message_id(ev),
-                sender,
-                text: body.clone(),
-                is_self: ev.user_id == Some(self_id),
-                time_ms: now_ms().min(i64::MAX as u128) as i64,
-            };
-            let live_messages = self.runtime_recent_by_key.entry(key.clone()).or_default();
-            live_messages.push(live_message);
-            if live_messages.len() > 12 {
-                live_messages.remove(0);
-            }
-        }
-
-        if is_message && slang_enabled {
-            let sender = ev
-                .sender
-                .as_ref()
-                .map(|s| {
-                    if !s.card.trim().is_empty() {
-                        s.card.trim().to_string()
-                    } else if !s.nickname.trim().is_empty() {
-                        s.nickname.trim().to_string()
-                    } else {
-                        ev.user_id
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| "未知".to_string())
-                    }
-                })
-                .or_else(|| ev.user_id.map(|u| u.to_string()))
-                .unwrap_or_else(|| "未知".to_string());
-            feed_slang(slang_learning, true, cfg_raw, &key, &sender, &body);
-        }
-
-        let now_i = now_ms() as i64;
-        self.drivers.entry(key.clone()).or_insert_with(|| {
-            let sess = conversation_state::read_document_with_bom(context)
-                .and_then(|s| s.get("conversations").and_then(|c| c.get(&key)).cloned())
-                .unwrap_or_else(|| serde_json::json!({}));
-            let mut sched = session::scheduler_from_state(wake_cfg_of(cfg_raw), &sess);
-            // Reset empty trigger configurations to defaults at load time so a conversation never sleeps forever.
-            if session::ensure_wakeable_at_load(&mut sched, cfg_raw, now_i, 0.5) {
-                println!("[her] {key} 的唤醒配置没有任何触发条件，已按默认配置兜底");
-            }
-            let mut d = session::Driver::new(sched, text_seed(&key, None));
-            d.arm_proactive_now(now_i);
-            d
-        });
-
-        if let Some(state) = conversation_state::read_document_with_bom(context) {
-            sync_wake_configs(
-                context,
-                &gate_cfg,
-                &state,
-                &mut self.drivers,
-                &mut self.wake_synced,
-                now_i,
-            );
-        }
-        let driver = self.drivers.get_mut(&key).expect("driver exists");
-        let rec = json!({
-            "ts": now_i,
-            "key": key,
-            "shouldWake": wake,
-            "reason": reason,
-            "textChars": body.chars().count(),
-            "postType": ev.post_type,
-            "busy": driver.sched.is_busy(now_i),
-            "pending": driver.sched.pending.len(),
-            "pid": std::process::id(),
-            "shadow": true
-        });
-        append_runtime_json_line(context, DECISION_NAME, DECISION_LOG, &rec)?;
-
-        let fired = if wake {
-            driver.apply(session::Input::Message {
-                reason: reason.clone(),
-                seq: now_i,
-                at_ms: now_i,
-            })
-        } else {
-            driver.apply(session::Input::Tick { at_ms: now_i })
-        };
-
-        if let Some(why) = driver.preempted.take() {
-            if let Some(pipe) = pipeline.as_deref_mut() {
-                println!("[her] 抢占 {key}（{why}）：取消当前回合");
-                if let Err(e) = pipe.cancel(&key) {
-                    println!("[her] ❌ 取消回合失败：{e}");
-                }
-            }
-        }
-
-        if !fired.is_empty() {
-            inbound::start_processing(
-                &self.journal,
-                &mut self.awaiting,
-                &mut self.in_flight,
-                &key,
-                now_ms() as i64,
-            )
-            .await?;
-        }
-        for e in fired {
-            self.wakes += 1;
-            println!("[her] wake {key} ({})", e.reason);
-            append_runtime_json_line(
-                context,
-                WAKE_NAME,
-                WAKE_LOG,
-                &json!({
-                    "ts": e.at_ms,
-                    "key": key,
-                    "reason": e.reason,
-                    "pid": std::process::id(),
-                    "shadow": self.shadow_flag
-                }),
-            )?;
-
-            if let Some(pipe) = pipeline.as_deref_mut() {
-                let taken =
-                    self.live_groups.is_empty() || self.live_groups.iter().any(|g| g == &key);
-                if !taken {
-                    println!("[her] {key} 不在灰度名单，交给其他处理器");
-                } else {
-                    self.execute_turn(
-                        pipe, context, cfg_raw, &key, &reason, self_nick, self_id, true,
-                    )
-                    .await;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl SimulationBridge {
@@ -1635,90 +918,36 @@ impl SimulationBridge {
         context: &runtime::RuntimeContext,
         journal: inbound::SharedJournal,
         live_groups: Vec<String>,
-        live_all: bool,
     ) -> Self {
-        if context.is_isolated() {
-            Self::Isolated {
-                hub: Box::new(reserved2::Hub::new(context, journal, live_groups, live_all)),
-                events: 0,
-            }
-        } else {
-            Self::Fallback(Box::new(FallbackWakeDrivers::new(journal, live_groups)))
+        Self {
+            hub: Box::new(reserved2::Hub::new(context, journal, live_groups)),
+            events: 0,
         }
-    }
-
-    fn is_isolated(&self) -> bool {
-        matches!(self, Self::Isolated { .. })
     }
 
     fn note_event(&mut self) {
-        match self {
-            Self::Isolated { events, .. } => *events += 1,
-            Self::Fallback(fallback) => fallback.events += 1,
-        }
+        self.events += 1;
     }
 
     fn counters(&self) -> (u64, u64) {
-        match self {
-            Self::Isolated { events, .. } => (*events, 0),
-            Self::Fallback(fallback) => (fallback.events, fallback.wakes),
-        }
+        (self.events, 0)
     }
 
     fn reset_connection(&mut self) {
-        match self {
-            Self::Isolated { events, .. } => *events = 0,
-            Self::Fallback(fallback) => fallback.reset_connection(),
-        }
+        self.events = 0;
     }
 
-    async fn flush_pending(
-        &mut self,
-        pipeline: Option<&mut pipeline::Pipeline>,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        self_nick: &str,
-        self_id: i64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Self::Fallback(fallback) = self {
-            fallback
-                .flush_pending(pipeline, context, cfg_raw, self_nick, self_id)
-                .await?;
+    async fn tick(&mut self, self_nick: &str, self_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        if let Err(error) = self.hub.tick(self_nick, self_id).await {
+            println!("[reserved2] scheduler error: {error}");
         }
         Ok(())
-    }
-
-    async fn finish_in_flight(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Self::Fallback(fallback) = self {
-            fallback.finish_in_flight().await?;
-        }
-        Ok(())
-    }
-
-    async fn tick(
-        &mut self,
-        context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
-        self_nick: &str,
-        self_id: i64,
-        tick_now: i64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Isolated { hub, .. } => {
-                if let Err(error) = hub.tick(self_nick, self_id).await {
-                    println!("[reserved2] scheduler error: {error}");
-                }
-                Ok(())
-            }
-            Self::Fallback(fallback) => fallback.tick(context, cfg_raw, tick_now).await,
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_event(
         &mut self,
         context: &runtime::RuntimeContext,
-        cfg_raw: &Value,
         event_cfg: Option<Value>,
         ev: &Event,
         text: &str,
@@ -1726,57 +955,25 @@ impl SimulationBridge {
         self_id: i64,
         self_nick: &str,
         self_cards: &HashMap<i64, String>,
-        http_ob: &onebot::OneBot,
-        skip_probability: f64,
-        slang_enabled: bool,
-        slang_learning: &slang_learn::SlangLearning,
-        pipeline: Option<&mut pipeline::Pipeline>,
-        is_message: bool,
-        is_notice: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Isolated { hub, .. } => {
-                if social_state::mode(context) == "reserved2" {
-                    let handled = match event_cfg {
-                        Some(cfg) => {
-                            hub.handle_with_config(
-                                cfg, ev, text, replayed, self_id, self_nick, self_cards,
-                            )
-                            .await
-                        }
-                        None => {
-                            hub.handle(ev, text, replayed, self_id, self_nick, self_cards)
-                                .await
-                        }
-                    };
-                    if let Err(error) = handled {
-                        println!("[reserved2] ingress error: {error}");
-                    }
+        if social_state::mode(context) == "reserved2" {
+            let handled = match event_cfg {
+                Some(cfg) => {
+                    self.hub
+                        .handle_with_config(cfg, ev, text, replayed, self_id, self_nick, self_cards)
+                        .await
                 }
-                Ok(())
-            }
-            Self::Fallback(fallback) => {
-                fallback
-                    .handle_event(
-                        context,
-                        cfg_raw,
-                        ev,
-                        text,
-                        replayed,
-                        self_id,
-                        self_nick,
-                        self_cards,
-                        http_ob,
-                        skip_probability,
-                        slang_enabled,
-                        slang_learning,
-                        pipeline,
-                        is_message,
-                        is_notice,
-                    )
-                    .await
+                None => {
+                    self.hub
+                        .handle(ev, text, replayed, self_id, self_nick, self_cards)
+                        .await
+                }
+            };
+            if let Err(error) = handled {
+                println!("[reserved2] ingress error: {error}");
             }
         }
+        Ok(())
     }
 }
 
@@ -1784,26 +981,20 @@ pub(crate) async fn run(
     runtime_context: &runtime::RuntimeContext,
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let legacy_source = !runtime_context.is_isolated();
-    let _live_transition = if runtime_context.is_isolated() {
-        let gate_path = runtime_context.resolve_path(
-            runtime::RuntimeArea::Data,
-            "lifecycle/lifecycle.lock",
-            runtime::PathIntent::WriteFile,
-        )?;
-        let gate = lifecycle::lock_with_wait(&gate_path, std::time::Duration::from_secs(5))?;
-        let desired = lifecycle::DesiredStore::new(runtime_context.data_dir().join("lifecycle"));
-        match lifecycle::effective(&desired.read(), now_ms() as i64) {
-            lifecycle::Effective::Act { wants, .. } if wants.live => {}
-            _ => {
-                eprintln!("[her] desired state does not permit live startup");
-                std::process::exit(3);
-            }
+    let gate_path = runtime_context.resolve_path(
+        runtime::RuntimeArea::Data,
+        "lifecycle/lifecycle.lock",
+        runtime::PathIntent::WriteFile,
+    )?;
+    let _live_transition = lifecycle::lock_with_wait(&gate_path, std::time::Duration::from_secs(5))?;
+    let desired = lifecycle::DesiredStore::new(runtime_context.data_dir().join("lifecycle"));
+    match lifecycle::effective(&desired.read(), now_ms() as i64) {
+        lifecycle::Effective::Act { wants, .. } if wants.live => {}
+        _ => {
+            eprintln!("[her] desired state does not permit live startup");
+            std::process::exit(3);
         }
-        Some(gate)
-    } else {
-        None
-    };
+    }
     let Some(mut lock) = acquire_single_instance(runtime_context) else {
         recovery_log::record(
             runtime_context,
@@ -1815,20 +1006,18 @@ pub(crate) async fn run(
         );
         return Ok(());
     };
-    let _source_owner = if runtime_context.is_isolated() {
-        session_map::verify_cutover(runtime_context)?;
-        let endpoint = runtime_context
-            .dependency_url("onebot_ws")
-            .ok_or("isolated runtime requires a loopback onebot_ws dependency")?;
-        let selected = args
-            .iter()
-            .position(|arg| arg == "--live-groups")
-            .and_then(|index| args.get(index + 1));
-        let groups = parse_live_groups(selected.map(String::as_str));
-        Some(lifecycle::acquire_message_source(endpoint, &groups)?)
-    } else {
-        None
-    };
+    session_map::verify_cutover(runtime_context)?;
+    let mut ws = runtime_context
+        .dependency_url("onebot_ws")
+        .filter(|url| is_loopback_ws_url(url))
+        .ok_or("isolated runtime requires a loopback onebot_ws dependency")?
+        .to_string();
+    let selected = args
+        .iter()
+        .position(|arg| arg == "--live-groups")
+        .and_then(|index| args.get(index + 1));
+    let groups = parse_live_groups(selected.map(String::as_str));
+    let _source_owner = lifecycle::acquire_message_source(&ws, &groups)?;
     drop(_live_transition);
     recovery_log::bind_default(runtime_context);
     recovery_log::record(
@@ -1843,37 +1032,13 @@ pub(crate) async fn run(
     // The marker is diagnostic; only the held OS gate decides ownership.
     let mut lock_touched = std::time::Instant::now();
 
-    let mut cfg_raw = if runtime_context.is_isolated() {
-        runtime_context.load_config().map_err(|e| e.to_string())?
-    } else {
-        read_json(CONFIG_PATH).ok_or("no config.json")?
-    };
+    let mut cfg_raw = runtime_context.load_config().map_err(|e| e.to_string())?;
     let cfg: Config = serde_json::from_value(cfg_raw.clone())?;
-    let mut ws = if runtime_context.is_isolated() {
-        runtime_context
-            .dependency_url("onebot_ws")
-            .filter(|url| is_loopback_ws_url(url))
-            .ok_or("isolated runtime requires a loopback onebot_ws dependency")?
-            .to_string()
-    } else {
-        cfg.snowluma
-            .as_ref()
-            .and_then(|s| s.ws_url.clone())
-            .unwrap_or_else(|| "ws://127.0.0.1:3001".to_string())
-    };
-    let mut token = if !legacy_source {
-        cfg.snowluma
-            .as_ref()
-            .and_then(|s| s.access_token.clone())
-            .filter(|t| !t.is_empty())
-    } else {
-        discover_ws_token().or_else(|| {
-            cfg.snowluma
-                .as_ref()
-                .and_then(|s| s.access_token.clone())
-                .filter(|t| !t.is_empty())
-        })
-    };
+    let mut token = cfg
+        .snowluma
+        .as_ref()
+        .and_then(|s| s.access_token.clone())
+        .filter(|t| !t.is_empty());
 
     println!("[her] mode: --live 已指定（是否真发消息还要看 --live-groups）");
     println!(
@@ -1906,32 +1071,30 @@ pub(crate) async fn run(
         })
         .await?;
     }
-    if runtime_context.is_isolated() {
-        dependency_watch::report_last_crash(runtime_context, &cfg_raw);
-        // #179: write the guarded DSH profile rows back and check the whole profile once at start.
-        dsh_profile::startup(runtime_context);
-        harness::route_health::reconcile_startup(runtime_context, &cfg_raw);
-        if let Err(error) = harness::usage::reconcile_startup(runtime_context) {
-            recovery_log::record(
-                runtime_context,
-                run_record::Trigger::Recovery,
-                run_record::Component::ModelChain,
-                "usage-reconcile-failed",
-                run_record::Outcome::Failed,
-                &error,
-            );
-        }
-        let price_table = pricing::resolve(cfg_raw.get("pricing"));
-        if let Err(error) = ledger::LedgerStorage::compact_if_needed(runtime_context, &price_table) {
-            recovery_log::record(
-                runtime_context,
-                run_record::Trigger::Recovery,
-                run_record::Component::ModelChain,
-                "usage-compact-failed",
-                run_record::Outcome::Failed,
-                &error,
-            );
-        }
+    dependency_watch::report_last_crash(runtime_context, &cfg_raw);
+    // #179: write the guarded DSH profile rows back and check the whole profile once at start.
+    dsh_profile::startup(runtime_context);
+    harness::route_health::reconcile_startup(runtime_context, &cfg_raw);
+    if let Err(error) = harness::usage::reconcile_startup(runtime_context) {
+        recovery_log::record(
+            runtime_context,
+            run_record::Trigger::Recovery,
+            run_record::Component::ModelChain,
+            "usage-reconcile-failed",
+            run_record::Outcome::Failed,
+            &error,
+        );
+    }
+    let price_table = pricing::resolve(cfg_raw.get("pricing"));
+    if let Err(error) = ledger::LedgerStorage::compact_if_needed(runtime_context, &price_table) {
+        recovery_log::record(
+            runtime_context,
+            run_record::Trigger::Recovery,
+            run_record::Component::ModelChain,
+            "usage-compact-failed",
+            run_record::Outcome::Failed,
+            &error,
+        );
     }
     // Validate local live state (rollout scope, session map, DSH credentials, dependencies)
     // before publishing any heartbeat or contacting the gateway. Once local initialization
@@ -1945,23 +1108,16 @@ pub(crate) async fn run(
         runtime_context,
         journal.clone(),
         initial_startup.0.clone(),
-        initial_startup.1,
     );
-    let mut reserved_hub = if runtime_context.is_isolated() {
-        Some(reserved::Hub::new(
-            runtime_context,
-            journal.clone(),
-            initial_startup.0.clone(),
-            initial_startup.1,
-        )?)
-    } else {
-        None
-    };
+    let mut reserved_hub = reserved::Hub::new(
+        runtime_context,
+        journal.clone(),
+        initial_startup.0.clone(),
+        false,
+    )?;
     let mut interaction_hub = None;
-    if runtime_context.is_isolated() {
-        // DSH probe, health snapshot for the console and the SnowLuma status poll: once per process, not per connection.
-        tokio::spawn(dependency_watch::run(runtime_context.clone()));
-    }
+    // DSH probe, health snapshot for the console and the SnowLuma status poll: once per process, not per connection.
+    tokio::spawn(dependency_watch::run(runtime_context.clone()));
     // Reconnect pacing: doubling waits up to 30 s, reset only by a connection that delivered frames (no storm
     // during a long outage); a warning at the third failure in a row.
     let mut gateway_backoff = dependency::ReconnectBackoff::gateway();
@@ -2003,7 +1159,7 @@ pub(crate) async fn run(
         // Keep this inside the reconnect loop: a failed handshake drops this candidate pipeline,
         // and the next attempt repeats local validation before dialing again. The selected-root
         // gate is already held, so pipeline setup may create only its selected workspace folder.
-        let (live_groups, _live_all, mut pipeline) = if let Some(prepared) = initial_startup.take()
+        let (live_groups, pipeline) = if let Some(prepared) = initial_startup.take()
         {
             prepared
         } else {
@@ -2107,37 +1263,18 @@ pub(crate) async fn run(
         let mut self_cards: HashMap<i64, String> = HashMap::new();
 
         // Idle-chat skip probability from `socialV2.social.skipProbability`.
-        let skip_probability = cfg
-            .social_v2
-            .as_ref()
-            .map(|s| s.social.skip_probability)
-            .unwrap_or(0.0);
-        let http_base = if runtime_context.is_isolated() {
-            runtime_context
-                .dependency_url("onebot")
-                .ok_or("isolated runtime requires a OneBot HTTP endpoint")?
-                .to_string()
-        } else {
-            cfg.snowluma
-                .as_ref()
-                .and_then(|s| s.http_url.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
-        };
+        let http_base = runtime_context
+            .dependency_url("onebot")
+            .ok_or("isolated runtime requires a OneBot HTTP endpoint")?
+            .to_string();
         let http_token = heal_http_token.clone().unwrap_or_else(|| {
             cfg.snowluma
                 .as_ref()
                 .and_then(|s| s.access_token.clone())
                 .unwrap_or_default()
         });
-        let http_ob = if runtime_context.is_isolated() {
-            onebot::OneBot::try_new_url(&http_base, http_token.clone())
-                .map_err(|_| "isolated runtime requires a valid loopback OneBot HTTP endpoint")?
-        } else {
-            onebot::OneBot::try_new_url(http_base.trim_end_matches('/'), http_token.clone())
-                .map_err(|error| {
-                    format!("live runtime requires a valid loopback OneBot HTTP endpoint: {error}")
-                })?
-        };
+        let http_ob = onebot::OneBot::try_new_url(&http_base, http_token.clone())
+            .map_err(|_| "isolated runtime requires a valid loopback OneBot HTTP endpoint")?;
 
         // Disconnect gap recovery and replay before accepting new frames from the socket.
         {
@@ -2218,26 +1355,25 @@ pub(crate) async fn run(
         if pipeline.is_some() {
             turn_recovery::spawn(runtime_context.clone());
         }
-        let mut chat_hub: Option<chat::Hub> =
-            if pipeline.is_some() && runtime_context.is_isolated() {
-                if interaction_hub.is_none() {
-                    interaction_hub = Some(closed_agent::Hub::start(runtime_context)?);
+        let mut chat_hub: Option<chat::Hub> = if pipeline.is_some() {
+            if interaction_hub.is_none() {
+                interaction_hub = Some(closed_agent::Hub::start(runtime_context)?);
+            }
+            match chat::Hub::new(
+                runtime_context,
+                journal.clone(),
+                &cfg_raw,
+                interaction_hub.clone(),
+            ) {
+                Ok(hub) => Some(hub),
+                Err(error) => {
+                    println!("[her] ❌ chat 模式不可用：{error}");
+                    None
                 }
-                match chat::Hub::new(
-                    runtime_context,
-                    journal.clone(),
-                    &cfg_raw,
-                    interaction_hub.clone(),
-                ) {
-                    Ok(hub) => Some(hub),
-                    Err(error) => {
-                        println!("[her] ❌ chat 模式不可用：{error}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         // Transition the heartbeat state to ready now that the gateway connection and
         // local recovery setup are active.
         set_gateway_connected(&gateway_tx, true);
@@ -2257,7 +1393,6 @@ pub(crate) async fn run(
         append_runtime_json_line(
             runtime_context,
             DECISION_NAME,
-            DECISION_LOG,
             &json!({
                 "ts": now_ms(),
                 "type": "start",
@@ -2274,16 +1409,6 @@ pub(crate) async fn run(
         loop {
             let tick_now = now_ms() as i64;
 
-            simulation
-                .flush_pending(
-                    pipeline.as_mut(),
-                    runtime_context,
-                    &cfg_raw,
-                    &self_nick,
-                    self_id,
-                )
-                .await?;
-
             if lock_touched.elapsed().as_secs() >= 10 {
                 let _ = lock.refresh(tick_now);
                 lock_touched = std::time::Instant::now();
@@ -2297,7 +1422,6 @@ pub(crate) async fn run(
                     }
                 });
             }
-            simulation.finish_in_flight().await?;
             replay_queue.extend(turn_recovery::take_resumable());
             if !held.is_empty() || refusals.count > 0 {
                 if let Ok(now_cfg) = runtime_context.load_config() {
@@ -2338,14 +1462,10 @@ pub(crate) async fn run(
                                 .collect();
                             group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, groups);
                         }
-                        if let Some(hub) = reserved_hub.as_mut() {
-                            if let Err(error) = hub.tick(&self_nick).await {
-                                println!("[reserved] scheduler error: {error}");
-                            }
+                        if let Err(error) = reserved_hub.tick(&self_nick).await {
+                            println!("[reserved] scheduler error: {error}");
                         }
-                        simulation
-                            .tick(runtime_context, &cfg_raw, &self_nick, self_id, tick_now)
-                            .await?;
+                        simulation.tick(&self_nick, self_id).await?;
                         continue;
                     }
                 };
@@ -2469,19 +1589,17 @@ pub(crate) async fn run(
                                 .filter(|id| *id > 0)
                                 .unwrap_or(self_id);
                             println!("[her] identity {self_nick} ({self_id})");
-                            if runtime_context.is_isolated() {
-                                let identity = serde_json::json!({
-                                    "userId": self_id.to_string(),
-                                    "nickname": self_nick,
-                                    "updatedAt": now_ms()
-                                });
-                                if let Err(error) = runtime_context.write_atomic(
-                                    runtime::RuntimeArea::Data,
-                                    "identity.json",
-                                    identity.to_string().as_bytes(),
-                                ) {
-                                    println!("[her] identity.json 未能写入：{error}");
-                                }
+                            let identity = serde_json::json!({
+                                "userId": self_id.to_string(),
+                                "nickname": self_nick,
+                                "updatedAt": now_ms()
+                            });
+                            if let Err(error) = runtime_context.write_atomic(
+                                runtime::RuntimeArea::Data,
+                                "identity.json",
+                                identity.to_string().as_bytes(),
+                            ) {
+                                println!("[her] identity.json 未能写入：{error}");
                             }
                             if !http_token.is_empty() && self_id != 0 {
                                 let admitted = runtime_context
@@ -2529,7 +1647,7 @@ pub(crate) async fn run(
             }
             if self_id == 0 {
                 self_id = ev.self_id.unwrap_or(0);
-                if self_id > 0 && runtime_context.is_isolated() {
+                if self_id > 0 {
                     let saved: Value = runtime_context
                         .read_optional_text(runtime::RuntimeArea::Data, "identity.json")
                         .ok()
@@ -2614,16 +1732,13 @@ pub(crate) async fn run(
             }
 
             // #192 (F3): read config once here; while unreadable, reserved2 holds served events in order.
-            let event_cfg = if runtime_context.is_isolated() {
+            let event_cfg = {
                 let read = runtime_context.load_config();
-                let reserved2_now = simulation.is_isolated()
-                    && social_state::mode(runtime_context) == "reserved2";
+                let reserved2_now = social_state::mode(runtime_context) == "reserved2";
                 let key = held_conversation(&ev).unwrap_or_default();
-                let live_all = args.iter().any(|a| a == "--live-all");
-                let served = reserved2_serves(live_all, &live_groups, &key);
-                let listed = !key.is_empty() && live_groups.iter().any(|g| g == &key);
+                let served = reserved2_serves(&live_groups, &key);
                 let refusable =
-                    !key.is_empty() && !reserved2_now && (live_groups.is_empty() || listed);
+                    !key.is_empty() && !reserved2_now && (live_groups.is_empty() || served);
                 match ingress_for(
                     read.is_ok(),
                     reserved2_now && served,
@@ -2669,12 +1784,10 @@ pub(crate) async fn run(
                     }
                     Ingress::Skip => continue,
                 }
-            } else {
-                None
             };
 
             // Administrative release approval and persona switching are independent of participation mode.
-            if is_message && pipeline.is_some() && runtime_context.is_isolated() {
+            if is_message && pipeline.is_some() {
                 let (plain, _, _) = plain_text(&ev.message, self_id);
                 let persona_command = persona_command::is_persona_command(&plain);
                 if persona_command || chat::is_update_command(&plain) {
@@ -2824,11 +1937,8 @@ pub(crate) async fn run(
                         message: ev.message.clone(),
                     };
                     if social_state::mode(runtime_context) == "reserved" {
-                        if let Some(reserved) = reserved_hub.as_mut() {
-                            if let Err(error) = reserved.handle(&inb, &inbound_key, &self_nick).await
-                            {
-                                println!("[reserved] ingress error: {error}");
-                            }
+                        if let Err(error) = reserved_hub.handle(&inb, &inbound_key, &self_nick).await {
+                            println!("[reserved] ingress error: {error}");
                         }
                         continue;
                     }
@@ -2860,7 +1970,6 @@ pub(crate) async fn run(
             simulation
                 .handle_event(
                     runtime_context,
-                    &cfg_raw,
                     event_cfg,
                     &ev,
                     &text,
@@ -2868,13 +1977,6 @@ pub(crate) async fn run(
                     self_id,
                     &self_nick,
                     &self_cards,
-                    &http_ob,
-                    skip_probability,
-                    slang_enabled,
-                    &slang_learning,
-                    pipeline.as_mut(),
-                    is_message,
-                    is_notice,
                 )
                 .await?;
         }
@@ -3053,7 +2155,6 @@ mod tests {
             &cfg,
             true,
             &["group:42".to_string()],
-            false,
         );
 
         let error = match result {
@@ -3137,7 +2238,7 @@ mod tests {
                 "nested": [{"detail": format!("known-structured-{newline}token-128"), "ok": true}],
                 "count": 2
             });
-            append_runtime_json_line(&context, "logs/wrapped128.jsonl", "", &record).unwrap();
+            append_runtime_json_line(&context, "logs/wrapped128.jsonl", &record).unwrap();
         }
         let raw = std::fs::read_to_string(root.join("data/logs/wrapped128.jsonl")).unwrap();
         std::fs::remove_dir_all(root).unwrap();
@@ -3169,7 +2270,6 @@ mod tests {
         append_runtime_json_line(
             &context,
             "logs/decision128.jsonl",
-            "",
             &json!({
                 "message": format!("ordinary known-structured-token-128 {shape}"),
                 "count": 2
@@ -3210,7 +2310,6 @@ mod tests {
             append_runtime_json_line(
                 &context,
                 "logs/snapshot128.jsonl",
-                "",
                 &json!({"snapshot": diagnostic, "count": 2}),
             )
             .unwrap();
@@ -3395,7 +2494,8 @@ mod tests {
 
     #[test]
     fn t186_startup_reports_each_rollout_scope_gap() {
-        let context = runtime::RuntimeContext::legacy();
+        let root = isolated_runtime_fixture("t186-rollout-scope");
+        let context = runtime::RuntimeContext::from_root(&root).unwrap();
         let split = json!({
             "allow": {"groups": [420042], "private": ["7001"]},
             "rollout": {"enabled": true, "rustGroups": ["group:420042", "group:420044"]}
@@ -3408,6 +2508,7 @@ mod tests {
         );
         let agreed = json!({"allow": {"groups": [420042]}, "rollout": {"enabled": true, "rustGroups": ["group:420042"]}});
         assert!(report_rollout_scope(&context, &agreed).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3616,62 +2717,39 @@ mod tests {
     }
 
     #[test]
-    fn t192_live_all_is_served_and_held_like_the_reserved2_hub_serves_it() {
+    fn t192_live_groups_are_served_and_held_like_the_reserved2_hub_serves_them() {
         let listed = vec!["group:420042".to_string()];
-        assert!(reserved2_serves(false, &listed, "group:420042"));
+        assert!(reserved2_serves(&listed, "group:420042"));
         assert!(
-            !reserved2_serves(false, &listed, "group:420043"),
-            "an unlisted conversation without --live-all"
+            !reserved2_serves(&listed, "group:420043"),
+            "an unlisted conversation is not served"
         );
         assert!(
-            reserved2_serves(true, &listed, "group:420043"),
-            "--live-all serves an unlisted conversation, as Hub::taken does"
+            !reserved2_serves(&[], "private:7001"),
+            "empty live groups serve nothing"
         );
         assert!(
-            reserved2_serves(true, &[], "private:7001"),
-            "--live-all with no explicit groups"
-        );
-        assert!(
-            !reserved2_serves(true, &[], ""),
+            !reserved2_serves(&[], ""),
             "a frame without a conversation is never served"
         );
         assert_eq!(
-            ingress_for(false, reserved2_serves(true, &[], "group:420043"), false, false),
+            ingress_for(false, reserved2_serves(&listed, "group:420042"), false, false),
             Ingress::Hold
         );
     }
 
     #[test]
-    fn simulation_bridge_unifies_isolated_and_fallback_modes_and_resets_connection() {
+    fn simulation_bridge_tracks_events_and_resets_connection() {
         let root = isolated_runtime_fixture("sim-bridge");
         let isolated = runtime::RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&isolated).unwrap());
-        let mut isolated_bridge =
-            SimulationBridge::new(&isolated, journal.clone(), vec!["group:42".into()], false);
-        assert!(isolated_bridge.is_isolated());
-        isolated_bridge.note_event();
-        assert_eq!(isolated_bridge.counters(), (1, 0));
-        isolated_bridge.reset_connection();
-        assert_eq!(isolated_bridge.counters(), (0, 0));
-
-        let legacy = runtime::RuntimeContext::legacy();
-        let mut fallback_bridge =
-            SimulationBridge::new(&legacy, journal, vec!["group:42".into()], false);
-        assert!(!fallback_bridge.is_isolated());
-        if let SimulationBridge::Fallback(ref mut fallback) = fallback_bridge {
-            fallback.pending_live.push(("group:42".into(), "atMention".into()));
-            fallback.in_flight.push("group:42|message:1".into());
-        }
-        fallback_bridge.note_event();
-        assert_eq!(fallback_bridge.counters(), (1, 0));
-        fallback_bridge.reset_connection();
-        assert_eq!(fallback_bridge.counters(), (0, 0));
-        if let SimulationBridge::Fallback(ref fallback) = fallback_bridge {
-            assert!(fallback.pending_live.is_empty());
-            assert!(fallback.in_flight.is_empty());
-        }
-        drop(isolated_bridge);
-        drop(fallback_bridge);
+        let mut bridge =
+            SimulationBridge::new(&isolated, journal, vec!["group:42".into()]);
+        bridge.note_event();
+        assert_eq!(bridge.counters(), (1, 0));
+        bridge.reset_connection();
+        assert_eq!(bridge.counters(), (0, 0));
+        drop(bridge);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3682,8 +2760,7 @@ mod tests {
             let isolated = runtime::RuntimeContext::from_root(&root).unwrap();
             let journal = inbound::SharedJournal::new(inbound::Journal::open(&isolated).unwrap());
             let bridge =
-                SimulationBridge::new(&isolated, journal, vec!["group:42".into()], false);
-            assert!(bridge.is_isolated());
+                SimulationBridge::new(&isolated, journal, vec!["group:42".into()]);
             drop(bridge);
             let lock_present = root.join("data/slang-windows.lock").exists();
             std::fs::remove_dir_all(&root).unwrap_or_else(|error| {
@@ -3956,11 +3033,10 @@ mod tests {
         assert_eq!(why, "atMention");
     }
 
-    #[tokio::test]
-    async fn t48_compat_queued_timer_work_checks_current_access() {
-        let root = isolated_runtime_fixture("t48-compat-timer");
+    #[test]
+    fn sync_wake_configs_skips_denied_conversations() {
+        let root = isolated_runtime_fixture("sync-wake-denied");
         let context = runtime::RuntimeContext::from_root(&root).unwrap();
-        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
         let key = "group:42";
         let allowed = json!({"allow":{"groups":[42]}});
         let timer = json!({"wakeConfig":{"mode":"diving","infinite":false,"confirmedAt":1,
@@ -3973,51 +3049,19 @@ mod tests {
             driver.adopt_wake_config(session::wake_config_from_json(timer.get("wakeConfig")), now);
             driver
         };
-        for (id, current) in [
-            (1, json!({"allow":{"groups":[]},"allowAllWhenEmpty":true})),
-            (2, json!({"allow":{"groups":[42]},"deny":{"groups":[42]}})),
-        ] {
-            let mut wakes = FallbackWakeDrivers::new(journal.clone(), vec![]);
-            let event = format!("{key}|message:{id}");
-            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
-            wakes.awaiting.insert(key.into(), vec![event.clone()]);
-            wakes.drivers.insert(key.into(), due_driver());
-            wakes.wake_synced.insert(key.into(), session::WakeSync::of(&timer["wakeConfig"]));
 
-            sync_wake_configs(&context, &current, &state, &mut wakes.drivers, &mut wakes.wake_synced, now);
+        for current in [
+            json!({"allow":{"groups":[]},"allowAllWhenEmpty":true}),
+            json!({"allow":{"groups":[42]},"deny":{"groups":[42]}}),
+        ] {
+            let mut drivers = HashMap::from([(key.to_string(), due_driver())]);
+            let mut wake_synced = HashMap::from([(key.to_string(), session::WakeSync::of(&timer["wakeConfig"]))]);
+            sync_wake_configs(&context, &current, &state, &mut drivers, &mut wake_synced, now);
             assert!(
-                session::WakeSync::changed(wakes.wake_synced.get(key), &state["conversations"][key]["wakeConfig"]).is_some(),
+                session::WakeSync::changed(wake_synced.get(key), &state["conversations"][key]["wakeConfig"]).is_some(),
                 "a denied driver must not adopt a new wake configuration"
             );
-            assert!(
-                wakes.pump(&context, &current, now).await.unwrap().is_empty(),
-                "a denied timer must not be pumped"
-            );
-            assert!(!wakes.awaiting.contains_key(key) && !wakes.wake_synced.contains_key(key));
-            let check = event.clone();
-            assert_eq!(journal.run(move |j| j.stage_of(&check)).await.unwrap().as_deref(), Some("handled"));
-
-            let event = format!("{key}|message:pending-{id}");
-            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
-            wakes.awaiting.insert(key.into(), vec![event.clone()]);
-            wakes.drivers.insert(key.into(), due_driver());
-            let ready = wakes.pump(&context, &allowed, now).await.unwrap();
-            assert_eq!(ready.len(), 1, "the allowed timer queues a wake");
-            assert_eq!(ready[0].0, key);
-            assert_eq!(ready[0].1.reason, "timeout");
-            wakes.pending_live.extend(ready.into_iter().map(|(key, event)| (key, event.reason)));
-            context.write_atomic(runtime::RuntimeArea::Config, "config.json", current.to_string().as_bytes()).unwrap();
-            let mut pending = std::mem::take(&mut wakes.pending_live).into_iter();
-            assert!(
-                wakes.next_live(&context, &allowed, &mut pending, now).await.unwrap().is_none(),
-                "a queued live wake must be refused if access changes before dispatch"
-            );
-            assert!(wakes.in_flight.is_empty());
-            assert_eq!(journal.run(move |j| j.stage_of(&event)).await.unwrap().as_deref(), Some("handled"));
         }
-        assert!(crate::turn_ledger::read_records(&context).unwrap().is_empty());
-        assert!(crate::send_outbox::read_records(&context).unwrap().is_empty());
-        drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

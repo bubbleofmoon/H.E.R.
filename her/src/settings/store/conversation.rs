@@ -16,8 +16,7 @@
 use super::{
     now_ms, raw_config, read_store, read_stored_values_checked, request_id, schema_version,
     schema_version_checked, write_store_with, Applied, InspectError, Undone, CHANGED_SINCE_ERROR,
-    CONFIG_ERROR, LEGACY_ERROR, NOT_UNDOABLE_ERROR, OLD_VALUE_REFUSED_ERROR, SEED_ACTOR,
-    STORAGE_ERROR,
+    CONFIG_ERROR, NOT_UNDOABLE_ERROR, OLD_VALUE_REFUSED_ERROR, SEED_ACTOR, STORAGE_ERROR,
 };
 use crate::runtime::RuntimeContext;
 use crate::settings::{conversation_registry, find_conversation, registry, ConversationSetting, Setting, OWNER};
@@ -25,7 +24,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 
 pub(crate) fn has_legacy_engine_choices(context: &RuntimeContext) -> Result<bool, (u16, String)> {
-    Ok(context.is_isolated() && raw_config(context).map_err(|error| (503, error))?.get("conversationEngines").is_some())
+    Ok(raw_config(context).map_err(|error| (503, error))?.get("conversationEngines").is_some())
 }
 
 /// Caller holds the configuration gate. An existing scope's audit history is a receipt,
@@ -184,14 +183,11 @@ fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
 
 /// #162: the stored value of the conversation setting `key` for `conversation` (canonicalized), read through the store's
 /// read-only connection, for a reader that runs when a turn starts: `Some` with the value its global setting keeps
-/// (`Setting::storable`: `null` for none, which a reset stores where the default is none), else `None`: a legacy context,
+/// (`Setting::storable`: `null` for none, which a reset stores where the default is none), else `None`:
 /// an unknown key, a key that is not a conversation key, no store, a store of version 1, no row, a value the registry
 /// does not keep, or a store that cannot be read. The caller then reads the global setting; a store problem never fails a
 /// turn. It never writes, migrates or creates the store, and takes no gate.
 pub(crate) fn conversation_value(context: &RuntimeContext, conversation: &str, key: &str) -> Option<Value> {
-    if !context.is_isolated() {
-        return None;
-    }
     let setting = find_conversation(key)?;
     let conversation = canonical_conversation(conversation)?;
     let text = read_store(context, |conn| {
@@ -291,16 +287,13 @@ fn record_change(
     Ok(revision)
 }
 
-/// The checks every conversation write makes before it writes: a selected runtime (else 503), a canonical conversation
+/// The checks every conversation write makes before it writes: a canonical conversation
 /// key (else 400) and a setting of the conversation registry (else 400).
 fn conversation_setting(
-    context: &RuntimeContext,
+    _context: &RuntimeContext,
     conversation: &str,
     key: &str,
 ) -> Result<&'static ConversationSetting, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     if !is_canonical(conversation) {
         return Err((400, CONVERSATION_ERROR.to_string()));
     }
@@ -526,9 +519,6 @@ pub(super) fn clear_unadmitted(conn: &Connection, context: &RuntimeContext) -> R
 /// none) and `value`, the stored value or else the global setting's value on the loader's document. `storeError` says
 /// why stored values cannot be read.
 pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
     let document = context.load_config_document().map_err(|_| (503, CONFIG_ERROR.to_string()))?;
     let read = || -> Result<Vec<Stored>, String> {
         read_store(context, |conn| match conn {

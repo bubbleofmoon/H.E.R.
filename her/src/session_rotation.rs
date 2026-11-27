@@ -185,10 +185,7 @@ fn read_failures() -> &'static Mutex<HashMap<ReadKey, ReadFailure>> {
 
 fn read_key(context: &RuntimeContext, key: &str) -> ReadKey {
     (
-        context
-            .runtime_root()
-            .unwrap_or_else(|| std::path::Path::new("legacy"))
-            .into(),
+        context.runtime_root().into(),
         key.into(),
     )
 }

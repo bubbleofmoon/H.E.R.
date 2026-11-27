@@ -152,11 +152,16 @@ fn dsh_config(args: &[&str]) -> (i32, String, String) {
 }
 
 const EXE: &str = "/opt/qq bot/it's her";
+#[cfg(windows)]
+const RUNTIME_ARG: &str = "C:/her-fixture/runtime";
+#[cfg(not(windows))]
+const RUNTIME_ARG: &str = "/opt/her-fixture/runtime";
+const PORT_ARG: &str = "31999";
 
 fn expected_block() -> String {
     let command = "'/opt/qq bot/it''s her'";
     let entry = |id: &str, server: &str, arg: &str, extra: &str| format!(
-        "- insert:\n    - id: {id}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server}\n        transport: stdio\n        command: {command}\n        args:\n          - '{arg}'\n{extra}"
+        "- insert:\n    - id: {id}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server}\n        transport: stdio\n        command: {command}\n        args:\n          - '{arg}'\n          - '--runtime-root'\n          - '{RUNTIME_ARG}'\n          - '--console-port'\n          - '{PORT_ARG}'\n{extra}"
     );
     format!(
         "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n{}{}{}# === qq-bridge MCP END ===\n",
@@ -347,6 +352,7 @@ fn dsh_config_refuses_incomplete_or_invalid_runtime_selection_before_writing() {
     let root = temp_root("dsh-runtime-options");
     let file = root.0.join("cordis.patch.yml");
     for options in [
+        vec![],
         vec!["--runtime-root", root.0.to_str().unwrap()],
         vec!["--console-port", "3100"],
         vec!["--runtime-root", "relative", "--console-port", "3100"],
@@ -374,14 +380,14 @@ fn dsh_config_installs_all_three_servers_pointing_at_the_bridge_and_is_idempoten
     let root = temp_root("dsh-config");
     let file = root.0.join("profiles/web/cordis.patch.yml");
     let file = file.to_str().unwrap();
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE]).1, "written");
+    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "written");
     assert_eq!(fs::read_to_string(file).unwrap(), expected_block());
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE]).1, "unchanged");
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--check"]), (0, "unchanged".into(), String::new()));
+    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "unchanged");
+    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG, "--check"]), (0, "unchanged".into(), String::new()));
     let backups = fs::read_dir(root.0.join("profiles/web")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".bak-")).count();
     assert_eq!(backups, 0, "an unchanged file must not be rewritten or backed up");
     // another bridge path: --check reports the difference without touching the file
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", "/elsewhere/her", "--check"]).0, 1);
+    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", "/elsewhere/her", "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG, "--check"]).0, 1);
     assert_eq!(fs::read_to_string(file).unwrap(), expected_block());
 }
 
@@ -391,7 +397,7 @@ fn dsh_config_replaces_only_its_block_keeps_the_rest_and_backs_up() {
     let file = root.0.join("cordis.patch.yml");
     let before = "\u{feff}# user comment\r\n- insert:\r\n    - id: other-plugin\r\n      name: x\r\n# === qq-bridge MCP BEGIN ===\n- insert:\n    - id: mcp-snowluma-host\n      config:\n        command: 'node'\n# === qq-bridge MCP END ===\n# tail\r\n";
     fs::write(&file, before).unwrap();
-    assert_eq!(dsh_config(&["--patch-file", file.to_str().unwrap(), "--bridge-exe", EXE]).1, "written");
+    assert_eq!(dsh_config(&["--patch-file", file.to_str().unwrap(), "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "written");
     let after = fs::read_to_string(&file).unwrap();
     assert_eq!(after, format!("# user comment\r\n- insert:\r\n    - id: other-plugin\r\n      name: x\r\n{}# tail\r\n", expected_block()));
     let backup = fs::read_dir(&root.0).unwrap().map(|e| e.unwrap().path()).find(|p| p.to_string_lossy().contains(".bak-")).expect("a backup of the original");
@@ -409,12 +415,12 @@ fn dsh_config_refuses_unowned_managed_ids_and_broken_markers_without_writing() {
         "# === qq-bridge MCP BEGIN ===\n# === qq-bridge MCP END ===\n- insert:\n    - id: 'mcp-snowluma'\n",
     ] {
         fs::write(&file, original).unwrap();
-        let (code, _, stderr) = dsh_config(&["--patch-file", file.to_str().unwrap(), "--bridge-exe", EXE]);
+        let (code, _, stderr) = dsh_config(&["--patch-file", file.to_str().unwrap(), "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]);
         assert_eq!(code, 2, "{original:?}: {stderr}");
         assert!(stderr.contains("nothing was changed"), "{stderr}");
         assert_eq!(fs::read_to_string(&file).unwrap(), original);
     }
-    assert_eq!(dsh_config(&["--bridge-exe", EXE]).0, 2);
+    assert_eq!(dsh_config(&["--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).0, 2);
     assert_eq!(dsh_config(&["--patch-file", file.to_str().unwrap(), "--bogus"]).0, 2);
 }
 

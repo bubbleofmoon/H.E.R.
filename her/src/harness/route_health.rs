@@ -223,9 +223,6 @@ fn unrecorded(context: &RuntimeContext, what: &str, error: &str) {
 /// Records what a request on route `at` of `chain` ended with (`apply`). A selected runtime only; a failed write goes
 /// to the run record (component `model-chain`, event `route-health-unrecorded`) and never fails the request.
 pub(crate) fn observe(context: &RuntimeContext, chain: &[RouteSpec], at: usize, seen: Seen) {
-    if !context.is_isolated() {
-        return;
-    }
     let now = crate::parity_clock::now_ms();
     if let Err(error) = with_state(context, |state| apply(state, chain, at, seen, now)) {
         let route = chain.get(at).map_or("", |route| route.id.as_str());
@@ -249,9 +246,6 @@ pub(crate) fn alert_text(key: &str, routes: usize, class: &str) -> String {
 /// is marked only once the delivery worker reaches the network boundary (`begin_alert_delivery`)
 /// and is released on `NotCommitted` pre-send or crash before delivery (`reconcile_startup`).
 pub(crate) fn alert_if_owed(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
-    if !context.is_isolated() {
-        return false;
-    }
     let Ok(chain) = routes::chain(cfg) else {
         return false;
     };
@@ -303,9 +297,6 @@ pub(crate) fn begin_alert_delivery(
     hash: &str,
     episode_n: u64,
 ) -> Result<bool, String> {
-    if !context.is_isolated() {
-        return Ok(false);
-    }
     with_state(context, |state| {
         if state.v != 1 || state.chain != hash {
             return false;
@@ -325,9 +316,6 @@ pub(crate) fn release_alert_delivery(
     hash: &str,
     episode_n: u64,
 ) -> Result<(), String> {
-    if !context.is_isolated() {
-        return Ok(());
-    }
     with_state(context, |state| {
         if state.v != 1 || state.chain != hash {
             return;
@@ -342,9 +330,6 @@ pub(crate) fn release_alert_delivery(
 /// Clear any stale in-flight alert claim left by a crashed process (its memory queue no longer
 /// exists) and re-queue the owed all-routes-failed alert when the episode is still un-alerted.
 pub(crate) fn reconcile_startup(context: &RuntimeContext, cfg: &Value) -> bool {
-    if !context.is_isolated() {
-        return false;
-    }
     let Ok(chain) = routes::chain(cfg) else {
         return false;
     };
@@ -370,9 +355,6 @@ pub(crate) fn reconcile_startup(context: &RuntimeContext, cfg: &Value) -> bool {
 /// succeeded.
 #[cfg(test)]
 fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&str) -> bool) -> bool {
-    if !context.is_isolated() {
-        return false;
-    }
     let Ok(chain) = routes::chain(cfg) else {
         return false;
     };

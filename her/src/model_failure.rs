@@ -326,10 +326,7 @@ fn prompt_key(
     kind: &str,
 ) -> (std::path::PathBuf, String, String) {
     (
-        context
-            .runtime_root()
-            .unwrap_or_else(|| std::path::Path::new("legacy"))
-            .to_path_buf(),
+        context.runtime_root().to_path_buf(),
         key.into(),
         kind.into(),
     )
@@ -382,7 +379,7 @@ pub(crate) fn record_refusal(
     failure: &Failure,
     input: RefusalInput<'_>,
 ) {
-    if failure.class != "refusal" || !context.is_isolated() {
+    if failure.class != "refusal" {
         return;
     }
     let messages = message_refs(&Value::Array(input.messages.to_vec()));
