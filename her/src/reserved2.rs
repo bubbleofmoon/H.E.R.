@@ -26,21 +26,31 @@ fn rearm_dropped_provisional_sleep(
     key: &str,
     at: i64,
     previous: &Value,
-) {
+) -> Result<(), String> {
     if previous["wakeConfig"]["infinite"] != false || !previous["wakeConfig"]["sleepUntil"].is_null() {
-        return;
+        return Ok(());
     }
-    let claim = json!({ "at": at, "previous": previous });
-    if let Err(error) = social_state::rearm_interrupted_reserved2_wake(
+    let records = crate::turn_ledger::read_records(context)?;
+    let (turns, _) = crate::turn_ledger::fold(&records);
+    let fallback = json!({ "at": at, "previous": previous });
+    let claim = turns
+        .iter()
+        .rev()
+        .find(|t| t.key == key)
+        .and_then(|t| t.wake_claim.as_ref())
+        .filter(|c| {
+            c["previous"]["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+                && c["previous"]["wakeConfig"]["sleepUntil"].is_string()
+        })
+        .unwrap_or(&fallback);
+    social_state::rearm_interrupted_reserved2_wake(
         context,
         cfg,
         key,
-        Some(&claim),
+        Some(claim),
         None,
         Some(at),
-    ) {
-        println!("[reserved2] {key} provisional sleep rearm failed: {error}");
-    }
+    )
 }
 
 struct DispatchResult {
@@ -1349,6 +1359,130 @@ mod tests {
                 "live driver must adopt re-armed finite sleep_until in the same process"
             );
         }).await.expect("the stranded finite sleep fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_expired_provisional_wake_preserves_interrupted_future_deadline() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, _console) = harness_cap_fixture("harness-cap-future-deadline", None).await;
+            let key = HARNESS_CAP_KEY;
+            let future_ms = crate::turn_ledger::now_ms() + 500_000;
+            let future_iso = crate::sticker::iso_at(future_ms);
+            let rec = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "timeout",
+                "tok-epoch",
+                &[],
+            )
+            .unwrap();
+            rec.wake_claim(&json!({
+                "at": 100,
+                "previous": {
+                    "wakeConfig": {
+                        "confirmedAt": 2,
+                        "sleepUntil": future_iso
+                    }
+                }
+            }))
+            .unwrap();
+            rec.end_reconciled("failed", "harness-interrupted").unwrap();
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            assert!(hub.active[key].previous["wakeConfig"]["sleepUntil"].is_null());
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                json!(future_iso),
+                "dropping an unadmitted provisional wake must preserve the interrupted turn's still-future deadline"
+            );
+            assert_eq!(
+                hub.drivers[key].sched.wc.sleep_until.as_deref(),
+                Some(future_iso.as_str()),
+                "live driver must adopt the preserved future deadline"
+            );
+        }).await.expect("the preserved future deadline fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_transient_rearm_failure_retries_on_next_tick() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (root, mut hub, _console) = harness_cap_fixture("harness-cap-transient-rearm", None).await;
+            let key = HARNESS_CAP_KEY;
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            let ledger_path = root.0.join("data").join(crate::turn_ledger::ISOLATED_LEDGER_FILE);
+            let saved_ledger = std::fs::read(&ledger_path).ok();
+            std::fs::write(&ledger_path, b"{corrupt-json-line\n").unwrap();
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"].is_null(),
+                "sleepUntil remains null while the rearm store read fails transiently"
+            );
+
+            match saved_ledger {
+                Some(bytes) => std::fs::write(&ledger_path, bytes).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&ledger_path);
+                }
+            }
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some(),
+                "next tick must retry and re-arm finite sleepUntil after transient failure clears"
+            );
+            assert!(
+                hub.drivers[key].sched.wc.sleep_until.is_some(),
+                "live driver must adopt re-armed sleep_until after retry succeeds"
+            );
+        }).await.expect("the transient rearm retry fixture must settle");
     }
 
     async fn wait_for_harness_cap_wake(hub: &Hub) {
@@ -3229,6 +3363,7 @@ pub struct Hub {
     tokens: HashMap<String, String>,
     retries: HashMap<String, (i64, String)>,
     rollback_pending: HashMap<String, (i64, Value)>,
+    rearm_pending: HashMap<String, (i64, Value)>,
     failures: HashMap<String, u32>,
     closing_seen: HashMap<String, Value>,
     closing_misses: HashMap<String, u32>,
@@ -3300,6 +3435,7 @@ impl Hub {
             tokens: HashMap::new(),
             retries: HashMap::new(),
             rollback_pending: HashMap::new(),
+            rearm_pending: HashMap::new(),
             failures: HashMap::new(),
             closing_seen: crate::conversation_state::ConversationState::for_runtime(context)
                 .read_optional_document()
@@ -3399,6 +3535,7 @@ impl Hub {
         self.tokens.clear();
         self.retries.clear();
         self.rollback_pending.clear();
+        self.rearm_pending.clear();
         self.failures.clear();
         self.closing_seen.clear();
         self.closing_misses.clear();
@@ -3424,6 +3561,7 @@ impl Hub {
         self.dsh_wait.remove(key);
         self.retries.remove(key);
         self.rollback_pending.remove(key);
+        self.rearm_pending.remove(key);
         self.failures.remove(key);
         self.ready.retain(|(k, _)| k != key);
         self.suspended_claims.remove(key);
@@ -3431,6 +3569,23 @@ impl Hub {
             self.journal.mark_handled(keys, now).await?;
         }
         Ok(())
+    }
+
+    fn drain_rearm_pending(&mut self, cfg: &Value) {
+        let keys: Vec<String> = self.rearm_pending.keys().cloned().collect();
+        for key in keys {
+            let Some((at, previous)) = self.rearm_pending.get(&key).cloned() else {
+                continue;
+            };
+            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &previous) {
+                Ok(()) => {
+                    self.rearm_pending.remove(&key);
+                }
+                Err(error) => {
+                    println!("[reserved2] {key} provisional sleep rearm failed: {error}");
+                }
+            }
+        }
     }
 
     /// Driver control events never become prompts. Our cancellation's minted epoch keeps
@@ -4163,6 +4318,7 @@ impl Hub {
             || state["paused"] == true
             || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
         self.maintain_sessions(&cfg,suspended,now).await?;
+        self.drain_rearm_pending(&cfg);
         let mut state=self.state()?;
         let suspended = suspended || state["paused"] == true;
         #[cfg(test)]
@@ -4360,6 +4516,22 @@ impl Hub {
             });
             let is_reminder = active.reason == "wakeReminder";
             let had_inbound = !active.inbound.is_empty();
+            let retry_exhausted = retry
+                && !wait_for_dsh
+                && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
+            let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
+                || retry_exhausted
+                || (held && had_inbound);
+            let needs_provisional_rearm = still_valid
+                && !access_refused
+                && !is_reminder
+                && dropped_unadmitted
+                && active.previous["wakeConfig"]["infinite"] == false
+                && active.previous["wakeConfig"]["sleepUntil"].is_null();
+            if needs_provisional_rearm {
+                self.rearm_pending
+                    .insert(key.clone(), (active.at, active.previous.clone()));
+            }
             if held || retry {
                 social_state::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
                 if held && !had_inbound {
@@ -4418,12 +4590,7 @@ impl Hub {
                     }
                 }
             }
-            let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
-                || (retry && !wait_for_dsh && self.failures.get(&key).copied().unwrap_or(0) > MAX_WAKE_RETRIES)
-                || (held && had_inbound);
-            if still_valid && !access_refused && !is_reminder && dropped_unadmitted {
-                rearm_dropped_provisional_sleep(&self.context, &cfg, &key, active.at, &active.previous);
-            }
+            self.drain_rearm_pending(&cfg);
             let completed_state = self.state()?;
             if clean_sleep {
                 self.closing_seen.insert(key.clone(), completed_state["conversations"][&key]["wakeConfig"]["confirmedAt"].clone());
@@ -4644,7 +4811,12 @@ impl Hub {
                     if *failures <= MAX_WAKE_RETRIES {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
                     } else if let Some(previous) = claimed.as_ref() {
-                        rearm_dropped_provisional_sleep(&self.context, &cfg, &key, now, previous);
+                        if previous["wakeConfig"]["infinite"] == false
+                            && previous["wakeConfig"]["sleepUntil"].is_null()
+                        {
+                            self.rearm_pending.insert(key, (now, previous.clone()));
+                            self.drain_rearm_pending(&cfg);
+                        }
                     }
                     continue;
                 }
