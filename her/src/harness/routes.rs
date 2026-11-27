@@ -443,7 +443,15 @@ pub(crate) fn shared_client() -> Result<Client, &'static str> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = Client::new().map_err(|_| "harness model client is unavailable")?;
+    let web_client = genai::WebConfig::default()
+        .apply_to_builder(reqwest::Client::builder())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "harness model client is unavailable")?;
+    let client = Client::builder()
+        .with_reqwest(web_client)
+        .build()
+        .map_err(|_| "harness model client is unavailable")?;
     let _ = CLIENT.set(client.clone());
     Ok(CLIENT.get().cloned().unwrap_or(client))
 }
@@ -608,7 +616,7 @@ impl ModelRoute {
         if key.is_empty() {
             return Err("harness model credential is empty".into());
         }
-        let endpoint = format!("{}/v1/", origin.trim_end_matches('/'));
+        let endpoint = crate::runtime::model_openai_endpoint(origin);
         let mut credentials = crate::settings::stored_secrets(context)
             .map_err(|_| "stored model credentials are unavailable")?;
         credentials.push(key.to_string());
@@ -741,10 +749,10 @@ pub(crate) fn model_failure(error: &genai::Error) -> crate::model_failure::Failu
     Failure::new("network", "MODEL_CONNECTION_ERROR")
 }
 
-/// Classifies a `genai::Error` into a `Miss` and its content-free summary (`Failure::summary`).
-pub(crate) fn classify_genai_error(error: &genai::Error) -> (Miss, String) {
+/// Classifies a `genai::Error` into a `Miss` and its redacted content-free summary (`Failure::summary`).
+pub(crate) fn classify_genai_error(error: &genai::Error, credentials: &[String]) -> (Miss, String) {
     let failure = model_failure(error);
-    let summary = failure.summary();
+    let summary = redact_credentials(&failure.summary(), credentials);
     if failure.class == "quota" && failure.code == "429" {
         return (Miss::RateLimited { wait: rate_limit_wait(error) }, summary);
     }
@@ -987,7 +995,7 @@ impl RouteStep for OneShotStep {
                     };
                 }
                 Ok(Err(error)) => {
-                    let (miss, _) = classify_genai_error(&error);
+                    let (miss, _) = classify_genai_error(&error, ctx.credentials);
                     let class = miss.class();
                     return StepResult::Missed {
                         miss,
