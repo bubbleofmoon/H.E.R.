@@ -7,7 +7,7 @@ import fixture_paths as tempfile
 
 
 def main():
-    repo = Path(__file__).resolve().parent.parent
+    repo = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix="her-build-fixture-") as tmp:
         root = Path(tmp)
         program_files = root / "program-files"

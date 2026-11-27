@@ -1125,6 +1125,7 @@ pub fn normalize_wake_config(
     };
 
     let mut next = cur.clone();
+    next.remove("sleepRetired");
     next.insert("mode".into(), Value::String(mode.clone()));
     next.insert("infinite".into(), Value::Bool(is_infinite(current)));
     next.insert("sleepUntil".into(), cur.get("sleepUntil").cloned().unwrap_or(Value::Null));
@@ -1273,10 +1274,17 @@ pub(crate) fn default_sleep_range(cfg: &Value) -> Value {
     json!([sleep_duration(cfg, 0.0), sleep_duration(cfg, 1.0)])
 }
 
+pub(crate) fn clear_sleep_retired(plan: &mut Value) {
+    if let Some(obj) = plan.as_object_mut() {
+        obj.remove("sleepRetired");
+    }
+}
+
 pub(crate) fn draw_default_sleep(plan: &mut Value, cfg: &Value, now: i64, rand01: f64) {
     let duration = sleep_duration(cfg, rand01.clamp(0.0, 0.999_999));
     plan["sleepUntil"] = json!(crate::sticker::iso_at(now.saturating_add(duration)));
     plan["sleepRangeMs"] = default_sleep_range(cfg);
+    clear_sleep_retired(plan);
 }
 
 /// Settings shared by new and refreshed inherited plans, before a finite deadline is drawn.
@@ -1357,6 +1365,9 @@ pub fn ensure_wakeable(wc: &mut Value, cfg: &Value, now: i64, rand01: f64) -> bo
             .unwrap_or(false);
     let wakeable = timed || has_any_trigger(wc);
     if wakeable {
+        if timed {
+            clear_sleep_retired(wc);
+        }
         return false;
     }
     // Persona names she turned off stay off through the reset (`wake_words.rs`), like keywords in the other resets.

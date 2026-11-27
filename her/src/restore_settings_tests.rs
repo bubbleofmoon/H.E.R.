@@ -100,7 +100,11 @@ fn restore_settings_full_restore_brings_the_store_back_and_memory_only_leaves_it
         let listed = plan["replaces"].as_array().unwrap().iter().any(|v| v == "data/settings.db");
         assert_eq!(listed, !memory_only, "only a full restore replaces settings.db: {plan}");
         let current = fs::read(f.0.join("data/settings.db")).unwrap();
-        let mut control = FakeControl { leave_settings_sidecars: true, ..Default::default() };
+        let mut control = FakeControl {
+            leave_settings_sidecars: memory_only,
+            leave_settings_sidecars_on_publish: !memory_only,
+            ..Default::default()
+        };
         let result = execute_with(
             &f.context(),
             &archive,
@@ -174,7 +178,11 @@ fn restore_settings_archive_without_the_store_restores_and_only_a_full_restore_r
             assert_eq!(quiet(&f), Some(5000));
         }
         let current = fs::read(f.0.join("data/settings.db")).unwrap();
-        let mut control = FakeControl { leave_settings_sidecars: true, ..Default::default() };
+        let mut control = FakeControl {
+            leave_settings_sidecars: memory_only,
+            leave_settings_sidecars_on_publish: !memory_only,
+            ..Default::default()
+        };
         let result = execute_with(
             &f.context(),
             &archive,
@@ -916,7 +924,7 @@ fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
         assert_eq!(
             full["warnings"],
             json!([
-                "整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。",
+                "整库覆写恢复将会抹掉本地保存的联网搜索密钥、直连服务商密钥与模型接口密钥。",
                 "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。",
             ])
         );
@@ -1246,4 +1254,588 @@ fn restore_settings_preview_retries_sidecars_during_concurrent_writes_without_bl
         }
     });
     assert!(previews >= 5);
+}
+
+#[test]
+fn ticket443_cross_endpoint_restore_preview_warns_and_three_key_warning_applies() {
+    let f = Fixture::new();
+    let archive_no_keys = f.backup();
+    let context = f.context();
+
+    let empty_warn = preview(&context, &archive_no_keys, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        empty_warn.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains("联网搜索") && s.contains("直连") && s.contains("模型接口")
+        }),
+        "missing-credentials warning must name all three credential classes: {empty_warn:?}"
+    );
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-endpoint.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "harness.apiKey",
+        &json!("fixture-harness-archive-key"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_override = f.backup();
+
+    // Archive with harness.apiKey counts as having endpoint credentials (no wipe warning on same endpoint).
+    let same_endpoint_warnings = preview(&context, &archive_override, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !same_endpoint_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("抹掉")),
+        "harness.apiKey must count in has_endpoint_credentials: {same_endpoint_warnings:?}"
+    );
+    assert!(
+        !same_endpoint_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("接口地址")),
+        "same endpoint must not trigger cross-endpoint warning: {same_endpoint_warnings:?}"
+    );
+
+    // Switch live endpoint back to D (or another URL) and preview restoring archive_override -> cross-endpoint warning!
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let cross_warnings = preview(&context, &archive_override, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        cross_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "cross-endpoint restore preview must warn about endpoint switch: {cross_warnings:?}"
+    );
+}
+
+#[test]
+fn ticket443_r3_restore_preview_ignores_credential_bearing_archived_url() {
+    let f = Fixture::new();
+    let context = f.context();
+    let disk_val = "fixture-r3-restore-disk";
+    std::fs::write(f.0.join("config/harness-api-key"), disk_val).unwrap();
+
+    // Archive 1: config.json /harness/apiBaseUrl contains config/harness-api-key (unseeded).
+    let cfg_path = f.0.join("config/config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{disk_val}")});
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    let archive_cred_config = f.backup();
+
+    let warnings = preview(&context, &archive_cred_config, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "restore preview must ignore credential-bearing archived config url when live uses D: {warnings:?}"
+    );
+
+    // Archive 2: stored settings.db harness.apiBaseUrl contains a post-saved archive DB credential.
+    let db_tok = "fixture-r3-restore-db-tok";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://api.example.com/{db_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(db_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_cred_stored = f.backup();
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let stored_warnings = preview(&context, &archive_cred_stored, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !stored_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "restore preview must suppress credential-bearing stored url in archive: {stored_warnings:?}"
+    );
+}
+
+#[test]
+fn ticket443_r4_restore_preview_ignores_destination_only_db_secret() {
+    let f = Fixture::new();
+    let context = f.context();
+    let dest_only_tok = "fixture-r4-dest-only";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://archive-r4.example.test/{dest_only_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_without_secret = f.backup();
+
+    // Reset endpoint on live destination and store a secret ONLY in destination settings.db.
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(dest_only_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+
+    let warnings = preview(&context, &archive_without_secret, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "destination-only DB secret must not suppress archive endpoint switch warning: {warnings:?}"
+    );
+}
+
+#[test]
+fn ticket443_r7_restore_preview_suppresses_archived_scrub_hash_after_secret_rotation() {
+    let f = Fixture::new();
+    let context = f.context();
+    let leaked_tok = "fixture-r7-archive-tok";
+    let leaked_url = format!("https://archive-r7.example.test/{leaked_tok}");
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(leaked_url),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(leaked_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    // Rotate secret so leaked_tok is no longer in archive_secrets, only its hash in __scrubbed.harness.apiBaseUrl.
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!("fixture-r7-rotated-tok"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    // Re-inject the leaked URL into the pre-backup store/config to verify archive_scrubbed_hashes suppresses it.
+    {
+        let db = rusqlite::Connection::open(f.0.join("data/settings.db")).unwrap();
+        db.execute(
+            "UPDATE settings SET value=?1 WHERE key='harness.apiBaseUrl'",
+            [json!(leaked_url).to_string()],
+        )
+        .unwrap();
+    }
+    let mut cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+    cfg["harness"]["apiBaseUrl"] = json!(leaked_url);
+    std::fs::write(f.0.join("config/config.json"), cfg.to_string()).unwrap();
+    let archive_with_scrub_hash = f.backup();
+
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let warnings = preview(&context, &archive_with_scrub_hash, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "archive_scrubbed_hashes must suppress archived leaked url even after secret rotation: {warnings:?}"
+    );
+    // Without archive_scrubbed_hashes, the rotated-key archive would surface leaked_url.
+    let without_hashes = crate::settings::archive_effective_model_endpoint(
+        Some(crate::settings::StoredEndpointOverride::Value {
+            raw_text: json!(leaked_url).to_string(),
+            raw: leaked_url.clone(),
+            canonical: leaked_url.clone(),
+        }),
+        &cfg,
+        context.dependency_url("model"),
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(without_hashes.as_deref(), Some(leaked_url.as_str()));
+}
+
+#[test]
+fn ticket443_r9_full_restore_roundtrip_and_scrubs_suppressed_archived_config_url() {
+    let f = Fixture::new();
+    let context = f.context();
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    // (a) Clean harness.apiBaseUrl + bound harness.apiKey roundtrip across full restore.
+    let clean_ep = "https://restored-clean.example.test/v1";
+    let clean_key = "fixture-r9-clean-bound-key";
+    crate::settings::apply(&context, "harness.apiBaseUrl", &json!(clean_ep), "fixture-admin", "console")
+        .unwrap();
+    crate::settings::apply(&context, "harness.apiKey", &json!(clean_key), "fixture-admin", "console")
+        .unwrap();
+    let archive_clean = f.backup();
+
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    crate::settings::reset(&context, "harness.apiKey", "fixture-admin").unwrap();
+    auth_restore(&f, &archive_clean, false, &mut FakeControl::default()).unwrap();
+    let restored_snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(restored_snap.effective_endpoint.as_deref(), Some(clean_ep));
+    assert_eq!(restored_snap.harness_db_key.as_deref(), Some(clean_key));
+
+    // (b) Credential-bearing unseeded /harness/apiBaseUrl in archive config.json is suppressed in preview
+    // AND stripped from restored config/config.json on full restore.
+    let f2 = Fixture::new();
+    let context2 = f2.context();
+    let leaked_tok = "fixture-r9-restore-tok";
+    crate::settings::apply(&context2, "cliModel.apiKey", &json!(leaked_tok), "fixture-admin", "console")
+        .unwrap();
+    let cfg_path2 = f2.0.join("config/config.json");
+    let mut cfg2: Value = serde_json::from_slice(&fs::read(&cfg_path2).unwrap()).unwrap();
+    cfg2["harness"] = json!({"apiBaseUrl": format!("https://leaked-r9.example.test/{leaked_tok}")});
+    fs::write(&cfg_path2, serde_json::to_string_pretty(&cfg2).unwrap()).unwrap();
+    let archive_leaked = f2.backup();
+
+    cfg2["harness"] = json!({});
+    fs::write(&cfg_path2, serde_json::to_string_pretty(&cfg2).unwrap()).unwrap();
+    let preview_warnings = preview(&context2, &archive_leaked, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !preview_warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "suppressed archived config url must not warn on switch: {preview_warnings:?}"
+    );
+    auth_restore(&f2, &archive_leaked, false, &mut FakeControl::default()).unwrap();
+    let restored_cfg2: Value = serde_json::from_slice(&fs::read(&cfg_path2).unwrap()).unwrap();
+    assert!(
+        restored_cfg2.pointer("/harness/apiBaseUrl").is_none(),
+        "full restore must strip suppressed /harness/apiBaseUrl from restored config.json: {restored_cfg2}"
+    );
+    let snap2 = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
+    assert_eq!(snap2.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+}
+
+#[test]
+fn ticket443_r10_full_restore_scrubs_archived_settings_db_and_backup_raw_bytes() {
+    let f = Fixture::new();
+    let context = f.context();
+    let host_tok = "fixture-r10-host-disk-tok";
+    let leaked_url = format!("https://leaked-r10.example.test/{host_tok}");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    // (a) Verify backup ZIP's scrubbed settings.db has zero raw leaked/session bytes after scrub_auth_snapshot VACUUM.
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let session_marker = "vac-r10-session-origin.example.test";
+    crate::settings::StoreProbe::at(&f.0).edit(&format!(
+        "INSERT INTO console_browser_sessions VALUES \
+         (randomblob(32), 'https://{session_marker}', randomblob(32), randomblob(32), randomblob(32), 0, 0, 1, 1);"
+    ));
+    let db_tok = "fixture-r10-backup-vac-secret";
+    let vac_host = "vac-r10-freed.example.test";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://{vac_host}/{db_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://clean-vac.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(db_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_vac = f.backup();
+    let archived_db_path = extract_settings(&f, &archive_vac);
+    let archived_db_bytes = fs::read(&archived_db_path).unwrap();
+    assert!(
+        !archived_db_bytes
+            .windows(vac_host.len())
+            .any(|w| w == vac_host.as_bytes()),
+        "backup settings.db snapshot must contain zero leaked url bytes after VACUUM"
+    );
+    assert!(
+        !archived_db_bytes
+            .windows(session_marker.len())
+            .any(|w| w == session_marker.as_bytes()),
+        "backup settings.db snapshot must contain zero deleted session bytes after scrub_auth_snapshot VACUUM"
+    );
+
+    // (b) Archive contains settings.db rows embedding host_tok without knowing host_tok at backup time.
+    let f2 = Fixture::new();
+    let context2 = f2.context();
+    crate::settings::apply(
+        &context2,
+        "harness.apiBaseUrl",
+        &json!(leaked_url),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_host_leaked = f2.backup();
+
+    // Reset live store, place host_tok in config/harness-api-key, and full-restore archive_host_leaked.
+    crate::settings::reset(&context2, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    fs::write(f2.0.join("config/harness-api-key"), host_tok).unwrap();
+    auth_restore(&f2, &archive_host_leaked, false, &mut FakeControl::default()).unwrap();
+
+    // Restored data/settings.db must have zero raw host_tok bytes and tombstoned settings/audit rows.
+    let restored_db_bytes = fs::read(f2.0.join("data/settings.db")).unwrap();
+    assert!(
+        !restored_db_bytes
+            .windows(host_tok.len())
+            .any(|w| w == host_tok.as_bytes()),
+        "restored data/settings.db must contain zero raw host_tok bytes"
+    );
+    let restored_cfg: Value =
+        serde_json::from_slice(&fs::read(f2.0.join("config/config.json")).unwrap()).unwrap();
+    assert!(restored_cfg.pointer("/harness/apiBaseUrl").is_none());
+
+    // Even after removing config/harness-api-key, restored store remains suppressed and history masks it.
+    fs::remove_file(f2.0.join("config/harness-api-key")).unwrap();
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
+    assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+    assert!(snap.stored_url_suppressed);
+    let hist = crate::settings::history(&context2, Some("harness.apiBaseUrl"), None, None).unwrap();
+    assert!(!hist.to_string().contains(host_tok), "history must stay masked: {hist}");
+}
+
+#[test]
+fn ticket443_r11_full_restore_vacuums_unmatched_freed_page_remnants() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://clean-r11-restore.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let base_archive = f.backup();
+    let extracted_db = extract_settings(&f, &base_archive);
+
+    let freed_marker = "freed-r11-unmatched-remnant-xyz";
+    let conn = rusqlite::Connection::open(&extracted_db).unwrap();
+    conn.execute_batch("PRAGMA secure_delete=OFF; PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, 1, 1, 'fixture')",
+        ["freed.remnant.probe", &format!("\"https://{freed_marker}/path\"")],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM settings WHERE key='freed.remnant.probe'", [])
+        .unwrap();
+    conn.close().unwrap();
+
+    let dirty_bytes = fs::read(&extracted_db).unwrap();
+    assert!(
+        dirty_bytes
+            .windows(freed_marker.len())
+            .any(|w| w == freed_marker.as_bytes()),
+        "test setup requires freed-page bytes in archived settings.db"
+    );
+    let dirty_archive = rewrite_archive(&base_archive, "freed-remnant.zip", "settings.db", &dirty_bytes);
+
+    auth_restore(&f, &dirty_archive, false, &mut FakeControl::default()).unwrap();
+    let restored_bytes = fs::read(f.0.join("data/settings.db")).unwrap();
+    assert!(
+        !restored_bytes
+            .windows(freed_marker.len())
+            .any(|w| w == freed_marker.as_bytes()),
+        "full restore must vacuum non-empty settings.db even when no row matches"
+    );
+}
+
+#[test]
+fn ticket443_r12_full_restore_rejects_stale_confirmation_when_live_endpoint_changes() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive = f.backup();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-before-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let plan = preview(&context, &archive, false).unwrap();
+    let stale_confirmation = plan["confirmation"].as_str().unwrap().to_string();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-after-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let err = execute_with(
+        &context,
+        &archive,
+        false,
+        &stale_confirmation,
+        "fixture-admin",
+        &mut FakeControl::default(),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "full restore must reject stale confirmation after live endpoint change");
+}
+
+#[test]
+fn ticket443_r13_full_restore_refuses_live_endpoint_change_after_snapshot() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-r13.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive = f.backup();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-before-r13.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let plan = preview(&context, &archive, false).unwrap();
+    let confirmation = plan["confirmation"].as_str().unwrap().to_string();
+
+    let mut control = FakeControl {
+        on_after_snapshot: Some(Box::new(|ctx| {
+            crate::settings::apply(
+                ctx,
+                "harness.apiBaseUrl",
+                &json!("https://live-after-r13.example.test/v1"),
+                "fixture-admin",
+                "console",
+            )
+            .map(|_| ())
+            .map_err(|(_, msg)| msg)
+        })),
+        ..Default::default()
+    };
+    let err = execute_with(
+        &context,
+        &archive,
+        false,
+        &confirmation,
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("preview again"),
+        "full restore must refuse live endpoint change inside stop_and_replace: {err}"
+    );
+    assert_eq!(
+        crate::settings::resolve_model_endpoint_and_key(&context)
+            .unwrap()
+            .effective_endpoint
+            .as_deref(),
+        Some("https://live-after-r13.example.test/v1")
+    );
+}
+
+#[test]
+fn ticket443_r14_malformed_credential_stored_url_suppressed_live_and_in_restore() {
+    let tok = "sk-r14-rest-mal-tok";
+    let mal_host = "mal-arr-r14.example.test";
+    for (case_name, raw_val) in [
+        ("array", json!([format!("https://{mal_host}/{tok}")]).to_string()),
+        ("invalid_str", json!(format!("not-a-url/{mal_host}/{tok}")).to_string()),
+    ] {
+        let f = Fixture::new();
+        let context = f.context();
+        let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+        crate::settings::apply(
+            &context,
+            "cliModel.apiKey",
+            &json!(tok),
+            "fixture-admin",
+            "console",
+        )
+        .unwrap();
+        crate::settings::StoreProbe::at(&f.0).edit(&format!(
+            "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+            raw_val.replace('\'', "''")
+        ));
+
+        let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+        assert!(snap.stored_url_suppressed, "{case_name}: live resolver must suppress credential-bearing malformed URL");
+        assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+
+        let archive = f.backup();
+        let plan = preview(&context, &archive, false).unwrap();
+        let reply = auth_restore(&f, &archive, false, &mut FakeControl::default()).unwrap();
+        assert_eq!(reply["result"], "succeeded", "{case_name}: full restore must succeed (plan={plan})");
+
+        let restored_db = fs::read(f.0.join("data/settings.db")).unwrap();
+        assert!(
+            !restored_db.windows(mal_host.len()).any(|w| w == mal_host.as_bytes()),
+            "{case_name}: restored settings.db must contain zero raw leaked host bytes"
+        );
+        let restored_cfg: Value = serde_json::from_slice(&fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+        assert!(restored_cfg.pointer("/harness/apiBaseUrl").is_none());
+    }
+
+    // Non-secret malformed value 12345 still fails closed in live resolver and archive preview.
+    let f_bad = Fixture::new();
+    let ctx_bad = f_bad.context();
+    crate::settings::apply(&ctx_bad, "cliModel.apiKey", &json!(tok), "fixture-admin", "console").unwrap();
+    crate::settings::StoreProbe::at(&f_bad.0).edit(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '12345', 1, 1, 'fixture');"
+    );
+    assert!(crate::settings::resolve_model_endpoint_and_key(&ctx_bad).is_err());
+    let bad_archive = f_bad.backup();
+    assert!(preview(&ctx_bad, &bad_archive, false).is_err());
 }

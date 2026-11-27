@@ -21,11 +21,17 @@ import {
 import {
   ExtraDirtySource,
   INPUT_CLASS,
+  MODEL_CREDENTIAL_KEYS,
+  MODEL_ENDPOINT_KEY,
+  canonicalModelEndpoint,
   localizeSettingItem,
+  normalizeEndpointDraftValue,
+  resolveActiveModelEndpoint,
   useSettingsDrafts,
 } from '../../utils/herHelpers';
 
 const MODEL_SETTING_KEYS = new Set([
+  'harness.apiBaseUrl',
   'harness.firstRoute',
   'harness.model',
   'harness.maxSteps',
@@ -51,6 +57,7 @@ function isValidSecretValue(value: string): string | null {
 export const ModelRoutesTab: React.FC = () => {
   const {
     settings,
+    settingsMutationSeq,
     conversations,
     saveSetting,
     resetSetting,
@@ -63,6 +70,7 @@ export const ModelRoutesTab: React.FC = () => {
   } = useConsole();
 
   const [modelsData, setModelsData] = useState<DetailedModelsResponse | null>(null);
+  const [modelsSyncedSeq, setModelsSyncedSeq] = useState(0);
   const [legacyChain, setLegacyChain] = useState<LegacyModelChainResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [reordering, setReordering] = useState(false);
@@ -72,12 +80,16 @@ export const ModelRoutesTab: React.FC = () => {
 
   const mountedRef = useRef(true);
   const loadSeqRef = useRef(0);
+  const settingsMutationSeqRef = useRef(settingsMutationSeq);
+  settingsMutationSeqRef.current = settingsMutationSeq;
+  const lastObservedMutationSeqRef = useRef(settingsMutationSeq);
   const secretDraftsRef = useRef(secretDrafts);
   secretDraftsRef.current = secretDrafts;
 
   const loadModels = useCallback(
-    async (opts?: { syncSettings?: boolean }) => {
+    async (opts?: { syncSettings?: boolean }): Promise<DetailedModelsResponse | null> => {
       const seq = ++loadSeqRef.current;
+      const capturedMutationSeq = settingsMutationSeqRef.current;
       setLoading(true);
       try {
         const [modelsRes, legacyRes] = await Promise.allSettled([
@@ -85,9 +97,12 @@ export const ModelRoutesTab: React.FC = () => {
           fetchLegacyModelChain(),
           ...(opts?.syncSettings ? [refreshLiveData()] : []),
         ]);
-        if (!mountedRef.current || seq !== loadSeqRef.current) return;
+        if (!mountedRef.current || seq !== loadSeqRef.current) return null;
+        let fetchedModels: DetailedModelsResponse | null = null;
         if (modelsRes.status === 'fulfilled') {
           setModelsData(modelsRes.value);
+          setModelsSyncedSeq(capturedMutationSeq);
+          fetchedModels = modelsRes.value;
         } else {
           pushToast(formatErrorMessage(modelsRes.reason, '加载模型路由详情失败'), 'danger');
         }
@@ -96,6 +111,7 @@ export const ModelRoutesTab: React.FC = () => {
         } else {
           setLegacyChain(null);
         }
+        return fetchedModels;
       } finally {
         if (mountedRef.current && seq === loadSeqRef.current) {
           setLoading(false);
@@ -107,11 +123,18 @@ export const ModelRoutesTab: React.FC = () => {
 
   useEffect(() => {
     mountedRef.current = true;
-    void loadModels();
+    void loadModels({ syncSettings: true });
     return () => {
       mountedRef.current = false;
     };
   }, [loadModels]);
+
+  useEffect(() => {
+    if (settingsMutationSeq > lastObservedMutationSeqRef.current) {
+      lastObservedMutationSeqRef.current = settingsMutationSeq;
+      void loadModels();
+    }
+  }, [settingsMutationSeq, loadModels]);
 
   const harnessRoutesItem = useMemo(
     () => settings.find((s) => s.key === 'harness.routes') ?? null,
@@ -147,50 +170,140 @@ export const ModelRoutesTab: React.FC = () => {
     [settings],
   );
 
-  const handleSaveSecret = useCallback(
-    async (item: SettingItemView) => {
-      if (secretBusyKey !== null) return;
-      const raw = secretDraftsRef.current[item.key] ?? '';
-      const validationErr = isValidSecretValue(raw);
-      if (validationErr) {
-        pushToast(`${item.key}: ${validationErr}`, 'warn');
-        return;
-      }
-      setSecretBusyKey(item.key);
-      try {
-        await saveSetting(item.key, raw, Boolean(item.confirm));
-        if (!mountedRef.current) return;
-        setSecretDrafts((prev) => {
-          const next = { ...prev };
-          delete next[item.key];
-          return next;
-        });
-      } catch (err) {
-        if (mountedRef.current) {
-          pushToast(formatErrorMessage(err, `保存 ${item.key} 失败`), 'danger');
-        }
-      } finally {
-        if (mountedRef.current) {
-          setSecretBusyKey(null);
-        }
-      }
-    },
-    [secretBusyKey, saveSetting, pushToast],
+  const apiBaseUrlItem = useMemo(
+    () => settings.find((s) => s.key === 'harness.apiBaseUrl') ?? null,
+    [settings],
   );
+
+  const activeEndpointInfo = useMemo(() => {
+    const staleModelsEndpoint = modelsSyncedSeq < settingsMutationSeq;
+    if (!staleModelsEndpoint && modelsData && 'effectiveModelEndpoint' in modelsData) {
+      if (typeof modelsData.effectiveModelEndpoint === 'string' && modelsData.effectiveModelEndpoint) {
+        return {
+          endpoint:
+            canonicalModelEndpoint(modelsData.effectiveModelEndpoint) ??
+            modelsData.effectiveModelEndpoint,
+          source: modelsData.effectiveModelEndpointSource ?? null,
+        };
+      }
+      return {
+        endpoint: null,
+        source: modelsData.effectiveModelEndpointSource ?? null,
+      };
+    }
+    if (typeof apiBaseUrlItem?.value === 'string' && apiBaseUrlItem.value) {
+      return {
+        endpoint: canonicalModelEndpoint(apiBaseUrlItem.value) ?? apiBaseUrlItem.value,
+        source: 'settings' as const,
+      };
+    }
+    const itemEndpoint = resolveActiveModelEndpoint(settings);
+    if (itemEndpoint) {
+      return {
+        endpoint: itemEndpoint,
+        source: 'dependencies.json' as const,
+      };
+    }
+    return {
+      endpoint: null,
+      source: null,
+    };
+  }, [settings, apiBaseUrlItem, modelsData, modelsSyncedSeq, settingsMutationSeq]);
 
   const dirtySecretKeys = useMemo(
     () => Object.entries(secretDrafts).filter(([, v]) => v.length > 0).map(([k]) => k),
     [secretDrafts],
   );
 
-  const saveAllSecrets = useCallback(async () => {
+  const persistValidatedSecret = useCallback(
+    async (item: SettingItemView, raw: string, expectedEndpoint?: string): Promise<boolean> => {
+      try {
+        await saveSetting(item.key, raw, Boolean(item.confirm), expectedEndpoint);
+        if (!mountedRef.current) return true;
+        setSecretDrafts((prev) => {
+          if (prev[item.key] !== raw) return prev;
+          const next = { ...prev };
+          delete next[item.key];
+          return next;
+        });
+        await loadModels();
+        return true;
+      } catch (err) {
+        if (mountedRef.current) {
+          pushToast(formatErrorMessage(err, `保存 ${item.key} 失败`), 'danger');
+        }
+        return false;
+      }
+    },
+    [saveSetting, pushToast, loadModels],
+  );
+
+  const savingRef = useRef(false);
+  const modelSaveTargetEndpointRef = useRef<string | null>(null);
+
+  const prepareSecretSave = useCallback((): ((resolvedEndpoint?: string | null) => Promise<void>) | null => {
+    if (secretBusyKey !== null || savingRef.current) return null;
+    const frozenEntries: { item: SettingItemView; raw: string }[] = [];
     for (const key of dirtySecretKeys) {
       const item = secretSettings.find((s) => s.key === key);
-      if (item) {
-        await handleSaveSecret(item);
+      if (!item) continue;
+      const raw = secretDraftsRef.current[key] ?? '';
+      const validationErr = isValidSecretValue(raw);
+      if (validationErr) {
+        pushToast(`${key}: ${validationErr}`, 'warn');
+        return null;
       }
+      frozenEntries.push({ item, raw });
     }
-  }, [dirtySecretKeys, secretSettings, handleSaveSecret]);
+    const hasModelSecret = frozenEntries.some(({ item }) => MODEL_CREDENTIAL_KEYS.has(item.key));
+    if (hasModelSecret && modelSaveTargetEndpointRef.current === null) {
+      pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+      return null;
+    }
+    return async (resolvedEndpoint?: string | null) => {
+      const targetEndpoint =
+        resolvedEndpoint !== undefined ? resolvedEndpoint : activeEndpointInfo.endpoint;
+      for (const { item, raw } of frozenEntries) {
+        if (!mountedRef.current) break;
+        const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
+        if (isModelSecret && !targetEndpoint) {
+          pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+          break;
+        }
+        setSecretBusyKey(item.key);
+        let ok = false;
+        try {
+          ok = await persistValidatedSecret(
+            item,
+            raw,
+            isModelSecret ? (targetEndpoint ?? '') : undefined,
+          );
+        } finally {
+          if (mountedRef.current) {
+            setSecretBusyKey(null);
+          }
+        }
+        if (!ok) break;
+      }
+    };
+  }, [
+    secretBusyKey,
+    dirtySecretKeys,
+    secretSettings,
+    pushToast,
+    activeEndpointInfo.endpoint,
+    persistValidatedSecret,
+  ]);
+
+  const saveAllSecrets = useCallback(
+    async (resolvedEndpoint?: string | null) => {
+      const runner = prepareSecretSave();
+      if (runner) {
+        await runner(resolvedEndpoint);
+      }
+    },
+    [prepareSecretSave],
+  );
 
   const discardAllSecrets = useCallback(() => {
     setSecretDrafts({});
@@ -201,15 +314,132 @@ export const ModelRoutesTab: React.FC = () => {
     return {
       count: dirtySecretKeys.length,
       label: `${dirtySecretKeys.length} 项未保存 API 密钥草稿`,
+      prepareSave: prepareSecretSave,
       onSave: saveAllSecrets,
       onDiscard: discardAllSecrets,
     };
-  }, [dirtySecretKeys.length, saveAllSecrets, discardAllSecrets]);
+  }, [dirtySecretKeys.length, prepareSecretSave, saveAllSecrets, discardAllSecrets]);
 
-  const { drafts, setDraft, clearDraft, handleReset } = useSettingsDrafts(
+  const onModelSettingSettled = useCallback(
+    async (keys: string[]) => {
+      if (
+        keys.includes(MODEL_ENDPOINT_KEY) ||
+        keys.includes('harness.firstRoute') ||
+        keys.includes('harness.routes')
+      ) {
+        await loadModels();
+      }
+    },
+    [loadModels],
+  );
+
+  const { drafts, dirtyKeys, saving, setDraft, clearDraft, handleReset } = useSettingsDrafts(
     curatedModelSettings,
     '模型设置',
-    { extraDirty: extraSecretDirty },
+    {
+      extraDirty: extraSecretDirty,
+      onSettled: onModelSettingSettled,
+      activeEndpoint: activeEndpointInfo.endpoint,
+    },
+  );
+  savingRef.current = saving;
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+
+  const modelSaveTargetEndpoint = useMemo<string | null>(() => {
+    if (dirtyKeys.includes(MODEL_ENDPOINT_KEY)) {
+      const urlToSave = normalizeEndpointDraftValue(
+        apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
+        drafts[MODEL_ENDPOINT_KEY],
+      );
+      return typeof urlToSave === 'string'
+        ? canonicalModelEndpoint(urlToSave) ?? urlToSave
+        : (resolveActiveModelEndpoint(settings, null) ?? null);
+    }
+    return activeEndpointInfo.endpoint;
+  }, [dirtyKeys, apiBaseUrlItem, drafts, settings, activeEndpointInfo.endpoint]);
+  modelSaveTargetEndpointRef.current = modelSaveTargetEndpoint;
+
+  const handleSaveSecret = useCallback(
+    async (item: SettingItemView) => {
+      if (secretBusyKey !== null || saving) return;
+      const raw = secretDraftsRef.current[item.key] ?? '';
+      const validationErr = isValidSecretValue(raw);
+      if (validationErr) {
+        pushToast(`${item.key}: ${validationErr}`, 'warn');
+        return;
+      }
+      const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
+      const shouldSaveEndpoint = isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY);
+      if (isModelSecret && !shouldSaveEndpoint && !activeEndpointInfo.endpoint) {
+        pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+        return;
+      }
+      const rawEndpointDraft = shouldSaveEndpoint ? draftsRef.current[MODEL_ENDPOINT_KEY] : undefined;
+      const urlToSave = shouldSaveEndpoint
+        ? normalizeEndpointDraftValue(
+            apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
+            rawEndpointDraft,
+          )
+        : undefined;
+      const defaultEndpoint = resolveActiveModelEndpoint(settings, null);
+      let targetEndpoint = isModelSecret ? (activeEndpointInfo.endpoint ?? '') : undefined;
+      setSecretBusyKey(item.key);
+      try {
+        let endpointSaved = false;
+        if (shouldSaveEndpoint) {
+          try {
+            if (urlToSave === null) {
+              await resetSetting(MODEL_ENDPOINT_KEY, false);
+            } else {
+              await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
+            }
+            endpointSaved = true;
+          } catch (err) {
+            if (mountedRef.current) {
+              pushToast(
+                formatErrorMessage(err, '保存模型接口地址失败，已中止保存密钥'),
+                'danger',
+              );
+            }
+            return;
+          }
+          if (!mountedRef.current) return;
+          if (draftsRef.current[MODEL_ENDPOINT_KEY] === rawEndpointDraft) {
+            clearDraft(MODEL_ENDPOINT_KEY);
+          }
+          targetEndpoint =
+            typeof urlToSave === 'string'
+              ? canonicalModelEndpoint(urlToSave) ?? urlToSave
+              : (defaultEndpoint ?? '');
+        }
+        try {
+          await persistValidatedSecret(item, raw, targetEndpoint);
+        } finally {
+          if (endpointSaved && mountedRef.current) {
+            await loadModels({ syncSettings: true });
+          }
+        }
+      } finally {
+        if (mountedRef.current) {
+          setSecretBusyKey(null);
+        }
+      }
+    },
+    [
+      secretBusyKey,
+      saving,
+      activeEndpointInfo.endpoint,
+      dirtyKeys,
+      apiBaseUrlItem,
+      resetSetting,
+      saveSetting,
+      clearDraft,
+      loadModels,
+      settings,
+      pushToast,
+      persistValidatedSecret,
+    ],
   );
 
   const rawRoutesStored = useMemo(() => {
@@ -541,6 +771,7 @@ export const ModelRoutesTab: React.FC = () => {
                 <SettingField
                   setting={item}
                   draftValue={drafts[item.key]}
+                  disabled={secretBusyKey !== null || saving}
                   onDraftChange={(next) => setDraft(item.key, next)}
                   onReset={() => handleReset(item.key)}
                 />
@@ -556,13 +787,32 @@ export const ModelRoutesTab: React.FC = () => {
           subtitle="密钥须为 8–4096 字节可打印 ASCII（不含任何空格）；已保存密钥不在界面回显"
           actions={<KeyRound className="h-4 w-4 text-[var(--text-muted)]" />}
         />
+        {activeEndpointInfo.endpoint && (
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-subtle)]/50 px-3 py-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[var(--text-secondary)]">当前生效模型接口地址：</span>
+              <span className="font-mono font-medium text-[var(--text-primary)]">
+                {activeEndpointInfo.endpoint}
+              </span>
+            </div>
+            <Badge tone={activeEndpointInfo.source === 'settings' ? 'accent' : 'neutral'}>
+              来源：
+              {activeEndpointInfo.source === 'settings'
+                ? '设置库覆盖 (harness.apiBaseUrl)'
+                : activeEndpointInfo.source === 'config'
+                  ? '配置文件覆盖 (config.json)'
+                  : '默认基线 (dependencies.json)'}
+            </Badge>
+          </div>
+        )}
         {secretSettings.length === 0 ? (
           <EmptyState title="当前设置索引中没有可编辑的端点凭据" />
         ) : (
           <div className="space-y-3">
             {secretSettings.map((item) => {
               const draft = secretDrafts[item.key] ?? '';
-              const anySecretBusy = secretBusyKey !== null;
+              const anySecretBusy = secretBusyKey !== null || saving;
+              const isFileFallback = item.key === 'harness.apiKey' && !item.isSet && item.source === 'file';
               return (
                 <div
                   key={item.key}
@@ -572,9 +822,18 @@ export const ModelRoutesTab: React.FC = () => {
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-semibold text-[var(--text-primary)]">{item.label}</span>
-                        <Badge tone={item.isSet ? 'success' : 'warn'}>
-                          {item.isSet ? '已设置' : '未设置'}
-                        </Badge>
+                        {item.isSet ? (
+                          <Badge tone="success">已设置（设置库绑定）</Badge>
+                        ) : isFileFallback ? (
+                          <Badge tone="accent">已设置（配置文件兜底）</Badge>
+                        ) : item.boundElsewhere ? (
+                          <Badge tone="warn">端点已变更，需重新输入</Badge>
+                        ) : (
+                          <Badge tone="warn">未设置</Badge>
+                        )}
+                        {isFileFallback && item.boundElsewhere && (
+                          <Badge tone="neutral">另有其他端点绑定</Badge>
+                        )}
                         <Badge tone="neutral">{formatAppliesLabel(item.applies)}</Badge>
                       </div>
                       <div className="mt-0.5 font-mono text-[11px] text-[var(--text-muted)]">
@@ -585,19 +844,32 @@ export const ModelRoutesTab: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-2">
                     <input
                       type="password"
+                      aria-label={item.label}
                       autoComplete="new-password"
                       value={draft}
                       disabled={anySecretBusy}
                       onChange={(e) =>
                         setSecretDrafts((prev) => ({ ...prev, [item.key]: e.target.value }))
                       }
-                      placeholder={item.isSet ? '输入新密钥以覆盖旧值' : '输入新密钥（8-4096 ASCII）'}
+                      placeholder={
+                        item.isSet
+                          ? '输入新密钥以覆盖旧值'
+                          : isFileFallback
+                            ? '当前由 config/harness-api-key 兜底，输入新密钥可写入设置库'
+                            : item.boundElsewhere
+                              ? '端点已变更，请重新输入当前端点密钥（8-4096 ASCII）'
+                              : '输入新密钥（8-4096 ASCII）'
+                      }
                       className={`${INPUT_CLASS} min-w-[240px] flex-1`}
                     />
                     <Button
                       size="sm"
                       variant="primary"
-                      disabled={anySecretBusy || draft.length === 0}
+                      disabled={
+                        anySecretBusy ||
+                        draft.length === 0 ||
+                        (MODEL_CREDENTIAL_KEYS.has(item.key) && modelSaveTargetEndpoint === null)
+                      }
                       onClick={() => void handleSaveSecret(item)}
                     >
                       保存密钥
@@ -605,7 +877,7 @@ export const ModelRoutesTab: React.FC = () => {
                     <Button
                       size="sm"
                       variant="ghost"
-                      disabled={anySecretBusy || !item.isSet}
+                      disabled={anySecretBusy || (!item.isSet && !item.boundElsewhere)}
                       onClick={() => handleClearSecret(item)}
                     >
                       清空凭据

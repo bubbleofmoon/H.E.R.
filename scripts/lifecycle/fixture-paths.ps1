@@ -6,7 +6,7 @@ function Get-HerFixtureCli {
   if (-not $Cli -and $env:CARGO_TARGET_DIR) {
     $Cli = Join-Path $env:CARGO_TARGET_DIR 'debug\her-cli.exe'
   }
-  if (-not $Cli) { $Cli = Join-Path $PSScriptRoot '..\her\target\debug\her-cli.exe' }
+  if (-not $Cli) { $Cli = Join-Path $PSScriptRoot '..\..\her\target\debug\her-cli.exe' }
   if (-not (Test-Path -LiteralPath $Cli -PathType Leaf)) {
     throw 'Set HER_TEST_CLI to the built her-cli before allocating fixture roots.'
   }

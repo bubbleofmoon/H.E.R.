@@ -2080,7 +2080,7 @@ fn start_all_helper_and_task_entry_are_retired() {
     {
         let output = hidden("powershell.exe")
             .args(["-NoProfile", "-File"])
-            .arg(repo.join("scripts/test-ps-count.ps1"))
+            .arg(repo.join("scripts/lifecycle/test-ps-count.ps1"))
             .output()
             .unwrap();
         assert!(

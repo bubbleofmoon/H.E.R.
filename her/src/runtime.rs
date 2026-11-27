@@ -110,6 +110,7 @@ pub(crate) struct AuthorityGuard<'a> {
 thread_local! {
     pub(crate) static APPEND_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>>> = std::cell::RefCell::new(None);
     pub(crate) static APPEND_IO_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> std::io::Result<()>>>> = std::cell::RefCell::new(None);
+    pub(crate) static MODE_READ_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -593,9 +594,18 @@ impl RuntimeContext {
         area: RuntimeArea,
         relative: &str,
     ) -> Result<Option<String>, &'static str> {
-        self.read_bytes_retrying(area, relative, true)?
+        let result = self.read_bytes_retrying(area, relative, true)?
             .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid"))
-            .transpose()
+            .transpose();
+        #[cfg(test)]
+        if relative == "mode.json" {
+            MODE_READ_TEST_HOOK.with(|hook| {
+                if let Some(cb) = hook.borrow_mut().as_mut() {
+                    cb();
+                }
+            });
+        }
+        result
     }
 
     /// `read_optional_text` for a caller that holds no lock, gate or chain and can afford to wait: on
@@ -1207,7 +1217,7 @@ impl RuntimeContext {
     }
 
     /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
-    fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
+    pub(crate) fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
         if !raw.is_object() {
             return Err("runtime config is invalid");
         }
@@ -3384,11 +3394,17 @@ pub(crate) fn is_model_endpoint(url: &str) -> bool {
     }
 }
 
+/// Normalizes a validated model endpoint URL by stripping trailing slashes while preserving
+/// explicit path prefixes (such as `/compatible-mode/v1`) and host case sensitivity.
+pub(crate) fn canonical_model_endpoint(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 /// Returns the OpenAI-compatible base URL (no trailing slash) for a validated `"model"` entry:
 /// preserves explicit non-root path prefixes (e.g. `/compatible-mode/v1` or `/v1`) and appends
 /// `/v1` only to bare origins.
 pub(crate) fn model_openai_base_url(model_url: &str) -> String {
-    let trimmed = model_url.trim_end_matches('/');
+    let trimmed = canonical_model_endpoint(model_url);
     let has_explicit_path = url::Url::parse(model_url)
         .ok()
         .is_some_and(|parsed| !parsed.path().is_empty() && parsed.path() != "/");

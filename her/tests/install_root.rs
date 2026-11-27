@@ -269,7 +269,7 @@ fn release_helpers_guard_evidence_and_redirected_temp_before_first_write() {
     std::fs::create_dir(&install).unwrap();
     let alias = fixture.0.join("temp-alias");
     link_directory(&install, &alias);
-    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lifecycle");
     let mut failures = Vec::new();
     for name in ["test-release-proof.py", "test-release-chains.py"] {
         for protected_evidence in [true, false] {
@@ -443,7 +443,7 @@ fn script_helpers_refuse_before_allocating_runtime_roots() {
     let install = fixture.0.join("production");
     std::fs::create_dir(&install).unwrap();
     std::fs::write(install.join("sentinel"), "untouched").unwrap();
-    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lifecycle");
     let python = r#"import os, runpy, subprocess, sys
 run = subprocess.run
 def hidden(*args, **kwargs):
@@ -721,7 +721,7 @@ fn script_helpers_allow_disposable_roots_and_existing_checks() {
             vec![
                 "-NoProfile".into(),
                 "-File".into(),
-                repo.join("scripts")
+                repo.join("scripts/lifecycle")
                     .join(name)
                     .to_string_lossy()
                     .into_owned(),
@@ -750,7 +750,7 @@ fn script_helpers_allow_disposable_roots_and_existing_checks() {
 #[test]
 fn affected_native_script_checks_use_disposable_roots() {
     let fixture = Fixture::new();
-    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lifecycle");
     for name in [
         "test-release-timeout.py",
         "test-lifecycle-window-observer.py",

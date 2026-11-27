@@ -151,6 +151,17 @@ impl Store {
         .map_err(|_| STORAGE_ERROR.into())
     }
 
+    /// Whether this turn recorded any tool call intent (completed, refused, running or uncertain).
+    pub fn has_tool_runs(&self, turn: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_runs WHERE turn_id=?1)",
+            [turn],
+            |r| r.get(0),
+        )
+        .map_err(|_| STORAGE_ERROR.into())
+    }
+
     pub fn status(&self, turn: &str) -> Result<Option<Status>, String> {
         let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         // Restore can reconcile a completed turn whose final text was absent from the snapshot.
@@ -1081,12 +1092,20 @@ mod tests {
         let context = RuntimeContext::from_root(root).unwrap();
         let secret = "fixture-endpoint-record-key";
         crate::settings::apply(&context, crate::settings::CLI_MODEL_API_KEY.key, &json!(secret), "fixture", "console").unwrap();
+        let harness_secret = "fixture-harness-db-record-key";
+        crate::settings::apply(&context, crate::settings::HARNESS_API_KEY.key, &json!(harness_secret), "fixture", "console").unwrap();
         let known = record_credentials(&context).unwrap();
-        let captured = safe_record(&known, &json!({"body": secret}));
-        let message = safe_message(&known, ChatMessage::assistant(format!("before {secret} after"))).unwrap();
-        assert!(!captured.to_string().contains(secret) && !message.to_string().contains(secret), "harness record exposed a stored credential");
+        let captured = safe_record(&known, &json!({"body": format!("{secret} {harness_secret}")}));
+        let message = safe_message(&known, ChatMessage::assistant(format!("before {secret} {harness_secret} after"))).unwrap();
+        assert!(
+            !captured.to_string().contains(secret)
+                && !captured.to_string().contains(harness_secret)
+                && !message.to_string().contains(secret)
+                && !message.to_string().contains(harness_secret),
+            "harness record exposed a stored credential"
+        );
         let route = ModelRoute::for_model(&context, "fixture-model").unwrap();
-        assert_eq!(route.redact(&format!("fixture-harness-record-key {secret}")), "[REDACTED] [REDACTED]");
+        assert_eq!(route.redact(&format!("fixture-harness-record-key {secret} {harness_secret}")), "[REDACTED] [REDACTED] [REDACTED]");
     }
 
     #[test]

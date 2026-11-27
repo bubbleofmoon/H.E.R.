@@ -33,7 +33,7 @@ $runtime = Join-Path $FixtureRoot 'runtime'
 . (Join-Path $PSScriptRoot 'fixture-paths.ps1')
 Assert-HerDevelopmentRoot -Path $FixtureRoot
 $target = Join-Path $FixtureRoot 'her\target\release\her.exe'
-$source = Split-Path -Parent $PSScriptRoot
+$source = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $registered = $false
 $script:supervisorPid = 0
 $observer = $null
@@ -124,16 +124,16 @@ try {
   if (-not (Test-Path -LiteralPath $consoleTwin -PathType Leaf)) { throw 'Fixture candidate requires its sibling her-cli.exe.' }
   Copy-Item -LiteralPath $consoleTwin -Destination (Join-Path ([IO.Path]::GetDirectoryName($target)) 'her-cli.exe')
   Copy-Item -LiteralPath (Join-Path $source 'external-path.ps1') -Destination $FixtureRoot
-  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle-window-observer.ps1') -Destination $FixtureRoot
-  Copy-Item -LiteralPath (Join-Path $source 'scripts\fixture-paths.ps1') -Destination $FixtureRoot
+  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle\lifecycle-window-observer.ps1') -Destination $FixtureRoot
+  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle\fixture-paths.ps1') -Destination $FixtureRoot
   $snowDirectory = Join-Path $FixtureRoot 'snow'
   $dshDirectory = Join-Path $FixtureRoot 'dsh'
   $snowExe = Join-Path $snowDirectory 'node.exe'
   $snowScript = Join-Path $snowDirectory 'index.mjs'
   $dshScript = Join-Path $dshDirectory 'bin.mjs'
   Copy-Item -LiteralPath $NodePath -Destination $snowExe
-  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle-fake-resident.mjs') -Destination $snowScript
-  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle-fake-resident.mjs') -Destination $dshScript
+  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle\lifecycle-fake-resident.mjs') -Destination $snowScript
+  Copy-Item -LiteralPath (Join-Path $source 'scripts\lifecycle\lifecycle-fake-resident.mjs') -Destination $dshScript
   $listeners = @(1..3 | ForEach-Object { $item = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $item.Start(); $item })
   $port = $listeners[0].LocalEndpoint.Port; $snowPort = $listeners[1].LocalEndpoint.Port; $dshPort = $listeners[2].LocalEndpoint.Port
   $listeners | ForEach-Object { $_.Stop() }
@@ -206,9 +206,9 @@ try {
     [void][IO.Directory]::CreateDirectory($curlDirectory)
     # The MCP policy accepts this public literal, but this transport adapter never
     # connects to it: the actual system curl receives only our loopback fake URL.
-    Add-Type -OutputType ConsoleApplication -OutputAssembly (Join-Path $curlDirectory 'curl.exe') -Path (Join-Path $source 'scripts\lifecycle-curl-adapter.cs')
+    Add-Type -OutputType ConsoleApplication -OutputAssembly (Join-Path $curlDirectory 'curl.exe') -Path (Join-Path $source 'scripts\lifecycle\lifecycle-curl-adapter.cs')
     Copy-Item -LiteralPath (Join-Path $curlDirectory 'curl.exe') -Destination (Join-Path (Split-Path -Parent $target) 'curl.exe')
-    $extraArguments = '"' + (Join-Path $source 'scripts\lifecycle-extra-chains.mjs') + '" "' + $target + '" "' + $runtime + '" "' + $FixtureRoot + '" "' + $DigestSupportRoot + '" ' + $port
+    $extraArguments = '"' + (Join-Path $source 'scripts\lifecycle\lifecycle-extra-chains.mjs') + '" "' + $target + '" "' + $runtime + '" "' + $FixtureRoot + '" "' + $DigestSupportRoot + '" ' + $port
     $extra = Start-Process $NodePath -ArgumentList $extraArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $FixtureRoot 'chains.out.log') -RedirectStandardError (Join-Path $FixtureRoot 'chains.err.log')
     $null=$extra.Handle
     if (-not $extra.WaitForExit(60000)) { $extra.Kill(); $extra.WaitForExit(); throw 'Extended chains timed out.' }

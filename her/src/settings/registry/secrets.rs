@@ -29,6 +29,18 @@ pub(crate) const CLI_MODEL_API_KEY: Setting = Setting {
     secret: true,
 };
 
+pub(crate) const HARNESS_API_KEY: Setting = Setting {
+    key: "harness.apiKey",
+    pointer: "/harness/apiKey",
+    kind: &ApiKey,
+    applies: "live",
+    group: "endpoint credentials",
+    label: "Harness model API key",
+    hint: "Used for the current model endpoint. Set it again after changing that endpoint; when using the default dependencies.json endpoint without a stored key, config/harness-api-key applies.",
+    chat: false,
+    secret: true,
+};
+
 pub(crate) const ADMINISTRATOR_PASSWORD: Setting = Setting {
     key: "console.administratorPassword",
     pointer: "/console/administratorPassword",
@@ -44,5 +56,6 @@ pub(crate) const ADMINISTRATOR_PASSWORD: Setting = Setting {
 pub(super) const SETTINGS: &[Setting] = &[
     WEB_SEARCH_API_KEY,
     CLI_MODEL_API_KEY,
+    HARNESS_API_KEY,
     ADMINISTRATOR_PASSWORD,
 ];

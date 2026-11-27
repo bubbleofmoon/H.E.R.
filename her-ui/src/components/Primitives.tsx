@@ -165,9 +165,21 @@ export const Tabs: React.FC<{
 
 function formatSettingDisplay(item: SettingItemView): string {
   if (item.kind.type === 'password') {
-    return item.isSet ? '已设置' : '未设置';
+    if (item.isSet) return '已设置（设置库绑定）';
+    if (item.source === 'file') return '已设置（配置文件兜底）';
+    if (item.boundElsewhere) return '端点已变更，需重新输入';
+    return '未设置';
   }
-  if (item.value === null || item.value === undefined) return '（未配置）';
+  if (item.value === null || item.value === undefined) {
+    if (
+      item.kind.type === 'model endpoint' &&
+      typeof item.fallback?.value === 'string' &&
+      item.fallback.value
+    ) {
+      return `跟随默认：${item.fallback.value}`;
+    }
+    return '（未配置）';
+  }
   if (typeof item.value === 'string') return item.value;
   return JSON.stringify(item.value);
 }
@@ -175,9 +187,10 @@ function formatSettingDisplay(item: SettingItemView): string {
 export const SettingField: React.FC<{
   setting: SettingItemView;
   draftValue?: unknown;
+  disabled?: boolean;
   onDraftChange?: (value: unknown) => void;
   onReset?: () => void;
-}> = ({ setting, draftValue, onDraftChange, onReset }) => {
+}> = ({ setting, draftValue, disabled = false, onDraftChange, onReset }) => {
   const effective = draftValue !== undefined ? draftValue : setting.value;
   const readOnly = setting.managedBy === 'consoleAuth';
   const kind = setting.kind;
@@ -204,8 +217,9 @@ export const SettingField: React.FC<{
         {onReset && (
           <button
             type="button"
+            disabled={disabled}
             onClick={onReset}
-            className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)]"
+            className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <RotateCcw className="h-3 w-3" />
             恢复默认
@@ -218,6 +232,7 @@ export const SettingField: React.FC<{
         <div className="flex items-center gap-2 pt-0.5">
           <Switch
             checked={effective === true}
+            disabled={disabled}
             onChange={(next) => onDraftChange?.(next)}
             label={setting.label}
           />
@@ -228,6 +243,7 @@ export const SettingField: React.FC<{
       ) : kind.type === 'text' || kind.type === 'route list' ? (
         <textarea
           rows={5}
+          disabled={disabled}
           value={
             kind.type === 'route list'
               ? draftValue === undefined && setting.redacted
@@ -251,20 +267,58 @@ export const SettingField: React.FC<{
                 ? '[{"id": "primary", "model": "..."}]'
                 : ''
           }
-          className="w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 font-mono text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 font-mono text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : kind.type === 'password' ? (
         <input
           type="password"
+          aria-label={setting.label}
           autoComplete="new-password"
+          disabled={disabled}
           value={typeof draftValue === 'string' ? draftValue : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
-          placeholder={setting.isSet ? '已设置（输入新值以更新）' : '输入凭据…'}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          placeholder={
+            setting.isSet
+              ? '已设置（输入新值以更新）'
+              : setting.source === 'file'
+                ? '已设置（配置文件兜底，输入新值以覆盖）'
+                : setting.boundElsewhere
+                  ? '端点已变更，请重新输入凭据…'
+                  : '输入凭据…'
+          }
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
+      ) : kind.type === 'model endpoint' ? (
+        <div className="space-y-1">
+          <input
+            type="text"
+            aria-label={setting.label}
+            disabled={disabled}
+            maxLength={kind.maxChars}
+            value={typeof effective === 'string' ? effective : ''}
+            onChange={(e) => {
+              onDraftChange?.(e.target.value);
+            }}
+            placeholder={
+              typeof setting.fallback?.value === 'string' && setting.fallback.value
+                ? `跟随默认：${setting.fallback.value}`
+                : 'https://api.example.com/v1 或 http://127.0.0.1:8317'
+            }
+            className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
+          />
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+            {setting.value === null && typeof setting.fallback?.value === 'string' && (
+              <Badge tone="neutral">
+                当前生效：跟随默认 ({setting.fallback.source || 'dependencies.json'})
+              </Badge>
+            )}
+            {typeof kind.maxChars === 'number' && <span>最多 {kind.maxChars} 字符</span>}
+          </div>
+        </div>
       ) : kind.type === 'integer' || kind.type === 'number' || kind.type === 'probability' ? (
         <input
           type="number"
+          disabled={disabled}
           min={kind.min}
           max={kind.max}
           step={kind.type === 'integer' ? 1 : 'any'}
@@ -274,13 +328,14 @@ export const SettingField: React.FC<{
             const raw = e.target.value.trim();
             onDraftChange(raw === '' ? null : Number(raw));
           }}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : kind.type === 'choice' && Array.isArray(kind.options) ? (
         <select
+          disabled={disabled}
           value={typeof effective === 'string' ? effective : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         >
           {typeof effective !== 'string' && <option value="">（请选择）</option>}
           {kind.options.map((opt) => (
@@ -292,13 +347,15 @@ export const SettingField: React.FC<{
       ) : kind.type === 'daily time' ? (
         <input
           type="time"
+          disabled={disabled}
           value={typeof effective === 'string' ? effective : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : (
         <input
           type="text"
+          disabled={disabled}
           value={
             (kind.type === 'id list' || kind.type === 'conversation list') &&
             typeof draftValue === 'string'
@@ -313,7 +370,7 @@ export const SettingField: React.FC<{
             onDraftChange?.(e.target.value);
           }}
           placeholder={formatSettingDisplay(setting)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       )}
 

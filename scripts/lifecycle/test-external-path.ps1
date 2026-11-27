@@ -5,7 +5,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('path-entry-' + [guid]::NewGuid().
 Assert-HerDevelopmentRoot -Path $root
 try {
   [IO.Directory]::CreateDirectory((Join-Path $root 'runtime')) | Out-Null
-  $shared = Join-Path $PSScriptRoot '..\external-path.ps1'
+  $shared = Join-Path $PSScriptRoot '..\..\external-path.ps1'
   if (Test-Path -LiteralPath $shared) { Copy-Item -LiteralPath $shared -Destination $root }
   . $shared
   if ((ConvertTo-ExternalPath ('\\?\' + (Join-Path $root 'runtime'))) -cne (Join-Path $root 'runtime')) { throw 'Canonical runtime conversion failed' }

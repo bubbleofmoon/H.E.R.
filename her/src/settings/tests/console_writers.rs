@@ -421,6 +421,7 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         json!("dsh"),
         json!(["group:1"]),
         json!({"primary": 2_000}),
+        json!("https://probe-endpoint.example.test/v1"),
     ];
     for setting in crate::settings::registry().filter(|setting| !setting.secret) {
         let (root, context) = settings_fixture("settings direct write refused");
@@ -494,7 +495,11 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
 fn settings_console_writer_leaves_endpoint_keys_in_the_store() {
     let (root, context) = settings_fixture("settings credential config writer");
     let credential = "fixture-stored-console-probe";
-    for setting in [crate::settings::WEB_SEARCH_API_KEY, crate::settings::CLI_MODEL_API_KEY] {
+    for setting in [
+        crate::settings::WEB_SEARCH_API_KEY,
+        crate::settings::CLI_MODEL_API_KEY,
+        crate::settings::HARNESS_API_KEY,
+    ] {
         let (status, reply) = post(&context, "/api/settings/set", json!({"setting": setting.key, "value": credential}));
         assert_eq!((status, &reply["isSet"]), (200, &json!(true)), "{}", setting.key);
     }
@@ -508,8 +513,13 @@ fn settings_console_writer_leaves_endpoint_keys_in_the_store() {
     let file = stored_config(&root);
     assert_eq!(file["webSearch"]["apiKey"], "fixture-legacy-console-probe");
     assert!(file.pointer("/cliModel/apiKey").is_none());
+    assert!(file.pointer("/harness/apiKey").is_none());
     assert!(!file.to_string().contains(credential));
-    for setting in [crate::settings::WEB_SEARCH_API_KEY, crate::settings::CLI_MODEL_API_KEY] {
+    for setting in [
+        crate::settings::WEB_SEARCH_API_KEY,
+        crate::settings::CLI_MODEL_API_KEY,
+        crate::settings::HARNESS_API_KEY,
+    ] {
         assert_eq!(setting_view(&context, setting.key)["isSet"], true, "{}", setting.key);
     }
 

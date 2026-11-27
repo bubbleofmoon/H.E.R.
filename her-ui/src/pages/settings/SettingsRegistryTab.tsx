@@ -37,7 +37,7 @@ function groupLabel(group: string): string {
 
 function isSettingNonDefault(item: SettingItemView): boolean {
   if (item.kind.type === 'password') {
-    return Boolean(item.isSet);
+    return Boolean(item.isSet || item.boundElsewhere);
   }
   return !settingValuesEqual(item.value, item.default);
 }

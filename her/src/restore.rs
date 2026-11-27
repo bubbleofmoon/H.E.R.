@@ -47,10 +47,12 @@ impl Drop for Staging {
 struct Prepared {
     _staging: Staging,
     zip: PathBuf,
+    scrubbed_settings_db: Option<PathBuf>,
     files: BTreeMap<String, (RuntimeArea, String)>,
     state_included: bool,
     config: Option<Vec<u8>>,
     configured_token: Option<String>,
+    expected_live_endpoint: Option<String>,
     view: Value,
 }
 
@@ -168,7 +170,7 @@ impl Prepared {
         let mut warnings = Vec::new();
         if !memory_only {
             if !credentials.has_endpoints {
-                warnings.push("整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。");
+                warnings.push("整库覆写恢复将会抹掉本地保存的联网搜索密钥、直连服务商密钥与模型接口密钥。");
             }
             let password_warning = if credentials.has_password {
                 "完全恢复会使用备份中的管理员密码，并退出所有浏览器会话。"
@@ -180,6 +182,10 @@ impl Prepared {
         let mut state_included = true;
         let mut config_bytes = None;
         let mut configured_token = None;
+        let mut scrubbed_settings_db = None;
+        let mut live_effective_endpoint: Option<String> = None;
+        let mut archive_effective_endpoint: Option<String> = None;
+        let mut endpoint_switch_warning = false;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -189,7 +195,71 @@ impl Prepared {
                 .map_err(|e| e.to_string())?
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            let raw = crate::backup::parse_archive_config(&bytes)?;
+            let mut raw = crate::backup::parse_archive_config(&bytes)?;
+            let live_snap = crate::settings::resolve_model_endpoint_and_key(context);
+            let host_disk_key = live_snap
+                .as_ref()
+                .ok()
+                .and_then(|snap| snap.harness_disk_key.clone())
+                .or_else(|| crate::settings::harness_credential(context));
+            let archive_model_endpoint = crate::settings::classify_archive_model_endpoint_override(
+                verified.archive_model_endpoint.clone(),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            )
+            .map_err(|error| format!("backup settings verification: {error}"))?;
+            let archive_endpoint = crate::settings::archive_effective_model_endpoint(
+                archive_model_endpoint.clone(),
+                &raw,
+                context.dependency_url("model"),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            );
+            archive_effective_endpoint = archive_endpoint;
+            if let Ok(live_snap) = &live_snap {
+                live_effective_endpoint = live_snap.effective_endpoint.clone();
+                if let (Some(e_archive), Some(e_live)) = (
+                    archive_effective_endpoint.as_deref(),
+                    live_effective_endpoint.as_deref(),
+                ) {
+                    if e_live != e_archive {
+                        endpoint_switch_warning = true;
+                        warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
+                    }
+                }
+            }
+            if crate::settings::scrub_archived_config_endpoint(
+                &mut raw,
+                archive_model_endpoint.as_ref(),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            ) {
+                bytes = serde_json::to_vec_pretty(&raw)
+                    .map_err(|e| format!("backup config is invalid: {e}"))?;
+            }
+            if manifest.files.contains_key("settings.db") {
+                let staged_db = staging.0.join("settings.db");
+                {
+                    let mut source = archive.by_name("settings.db").map_err(|e| e.to_string())?;
+                    let mut out = File::create(&staged_db).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut source, &mut out).map_err(|e| e.to_string())?;
+                    out.sync_all().map_err(|e| e.to_string())?;
+                }
+                let known_secrets = crate::settings::archive_known_secrets(
+                    &verified.archive_secrets,
+                    host_disk_key.as_deref(),
+                );
+                if crate::settings::scrub_restored_settings_db(
+                    &staged_db,
+                    &known_secrets,
+                    &verified.archive_scrubbed_hashes,
+                )? {
+                    scrubbed_settings_db = Some(staged_db);
+                }
+            }
             let (config, _) = crate::backup::validate_archive_config(
                 context.runtime_root(),
                 raw,
@@ -241,8 +311,16 @@ impl Prepared {
         let scope = if memory_only { "memory" } else { "everything" };
         // Bind both the bytes selected by the administrator and the replacement plan.
         hash.update(
-            serde_json::to_vec(&json!([context.runtime_root(), scope, replaces, removes]))
-                .map_err(|e| e.to_string())?,
+            serde_json::to_vec(&json!([
+                context.runtime_root(),
+                scope,
+                replaces,
+                removes,
+                live_effective_endpoint,
+                archive_effective_endpoint,
+                endpoint_switch_warning,
+            ]))
+            .map_err(|e| e.to_string())?,
         );
         let confirmation = format!("{:x}", hash.finalize());
         let time = metadata
@@ -255,10 +333,12 @@ impl Prepared {
         Ok(Self {
             _staging: staging,
             zip,
+            scrubbed_settings_db,
             files,
             state_included,
             config: config_bytes,
             configured_token,
+            expected_live_endpoint: live_effective_endpoint,
             view,
         })
     }
@@ -897,6 +977,14 @@ fn stop_and_replace(
         let staged;
         let pair = match publication {
             FullPublication::Forward(rollback) => {
+                let current_live = crate::settings::resolve_model_endpoint_and_key(context)
+                    .map_err(Step::Refused)?
+                    .effective_endpoint;
+                if current_live != prepared.expected_live_endpoint {
+                    return Err(Step::Refused(
+                        "confirmation is missing or the archive/replacement plan changed; preview again".into(),
+                    ));
+                }
                 staged = stage_full_restore(context, prepared, rollback)
                     .map_err(|e| if recovery_pending(context) { Step::Failed(e) } else { Step::Refused(e) })?;
                 &staged
@@ -949,6 +1037,20 @@ fn apply(
         .map_err(|e| e.to_string())?;
     for (name, (area, relative)) in &prepared.files {
         if name == "config.json" { continue; }
+        if name == "settings.db" {
+            if let Some(staged_db) = &prepared.scrubbed_settings_db {
+                let mut source = File::open(staged_db).map_err(|e| e.to_string())?;
+                control
+                    .replace(context, *area, relative, &mut source, authority)
+                    .map_err(|e| {
+                        format!(
+                            "restore replacement failed for {}: {e}",
+                            label(*area, relative)
+                        )
+                    })?;
+                continue;
+            }
+        }
         let mut source = archive.by_name(name).map_err(|e| e.to_string())?;
         control
             .replace(context, *area, relative, &mut source, authority)
@@ -1744,6 +1846,18 @@ mod tests {
         );
     }
 
+    fn write_stale_settings_sidecars(context: &RuntimeContext) {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(
+                context
+                    .runtime_root()
+                    .join(format!("data/settings.db{suffix}")),
+                b"stale settings sidecar",
+            )
+            .unwrap();
+        }
+    }
+
     #[derive(Default)]
     struct FakeControl {
         stops: usize,
@@ -1756,6 +1870,7 @@ mod tests {
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
         leave_settings_sidecars: bool,
+        leave_settings_sidecars_on_publish: bool,
         settings_sidecars_after_replace: Option<[bool; 3]>,
         fail_relative: Option<&'static str>,
         replaced: Vec<String>,
@@ -1819,7 +1934,7 @@ mod tests {
             Ok(())
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
-            if self.leave_settings_sidecars {
+            if self.leave_settings_sidecars || self.leave_settings_sidecars_on_publish {
                 let root = context.runtime_root();
                 self.settings_sidecars_after_replace = Some(
                     ["-wal", "-shm", "-journal"]
@@ -1850,15 +1965,7 @@ mod tests {
                 }
             }
             if self.leave_settings_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .join(format!("data/settings.db{suffix}")),
-                        b"stale settings sidecar",
-                    )
-                    .unwrap();
-                }
+                write_stale_settings_sidecars(context);
             }
             if let Some(hook) = self.on_after_snapshot.as_mut() {
                 hook(context)?;
@@ -1866,6 +1973,9 @@ mod tests {
             Ok(())
         }
         fn publish_generation(&mut self, context: &RuntimeContext) -> Result<console_auth::Generation, GenerationWriteError> {
+            if self.leave_settings_sidecars_on_publish && self.stops == 1 {
+                write_stale_settings_sidecars(context);
+            }
             let Some(fault) = self.generation_fault.take() else {
                 return console_auth::rotate_restore_generation(context);
             };

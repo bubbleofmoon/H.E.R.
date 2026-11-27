@@ -13,8 +13,8 @@ pub(crate) use conversation::{
 };
 
 use super::{
-    find, find_conversation, registry, Setting, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER,
-    WEB_SEARCH_API_KEY,
+    find, find_conversation, registry, Setting, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY,
+    HARNESS_API_BASE_URL, HARNESS_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY,
 };
 use super::registry::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 use crate::guarded_fs::file_link_count;
@@ -22,6 +22,7 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -31,6 +32,8 @@ pub(crate) const STORE_SIDECARS: [&str; 3] = SIDECARS;
 /// Global settings start at v1, conversation settings need v2, and durable console authentication needs v3.
 const SCHEMA_VERSION: i64 = 3;
 const SECRET_MARKER: &str = "(hidden)";
+const SCRUBBED_ENDPOINT_HASHES_KEY: &str = "__scrubbed.harness.apiBaseUrl";
+const SCRUB_CLEANUP_PENDING_KEY: &str = "__scrubbed.pendingCleanup";
 const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
 pub(crate) const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
@@ -63,6 +66,8 @@ thread_local! {
     /// Makes the next clear of unadmitted conversations' values on this thread fail after it removed them and before
     /// the commit, as a crash there would (#218).
     pub(crate) static FAIL_AFTER_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the post-delete second `checkpoint_wal_truncate` inside `write_store_scrubbable` fail on this thread.
+    pub(crate) static FAIL_SECOND_WAL_TRUNCATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -689,6 +694,16 @@ fn inspect_attempt(
     }
 }
 
+fn read_snapshot_tx<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T, InspectError>,
+) -> Result<T, InspectError> {
+    let tx = conn.unchecked_transaction().map_err(InspectError::from_sqlite)?;
+    let value = read(&tx)?;
+    tx.rollback().map_err(InspectError::from_sqlite)?;
+    Ok(value)
+}
+
 pub(crate) fn read_store<T>(
     context: &RuntimeContext,
     mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
@@ -810,7 +825,7 @@ fn secrets_in_checked(
     conn: &Connection,
 ) -> Result<Vec<(&'static str, String, String)>, InspectError> {
     let mut secrets = Vec::new();
-    for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY] {
+    for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY, &HARNESS_API_KEY] {
         if let Some((endpoint, credential)) = secret_row_checked(conn, setting)? {
             secrets.push((setting.key, endpoint, credential));
         }
@@ -827,24 +842,592 @@ pub(crate) fn secret_value(
     setting: &Setting,
     endpoint: &str,
 ) -> Result<Option<String>, String> {
-    if setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key {
+    if setting.key != WEB_SEARCH_API_KEY.key
+        && setting.key != CLI_MODEL_API_KEY.key
+        && setting.key != HARNESS_API_KEY.key
+    {
         return Ok(None);
     }
+    let is_model = setting.key != WEB_SEARCH_API_KEY.key;
+    let target = if is_model {
+        crate::runtime::canonical_model_endpoint(endpoint)
+    } else {
+        endpoint.to_string()
+    };
     read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(None) };
         Ok(secret_row_checked(conn, setting)?
-            .filter(|(bound, _)| bound == endpoint)
+            .filter(|(bound, _)| {
+                if is_model {
+                    crate::runtime::canonical_model_endpoint(bound) == target
+                } else {
+                    bound == &target
+                }
+            })
             .map(|(_, credential)| credential))
     })
 }
 
 pub(crate) fn has_endpoint_credentials(conn: &Connection) -> Result<bool, String> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
-        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2, ?3) AND value <> 'null')",
+        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key, HARNESS_API_KEY.key],
         |row| row.get(0),
     )
     .map_err(|_| STORAGE_ERROR.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelEndpointSource {
+    Settings,
+    Config,
+    Dependencies,
+}
+
+impl ModelEndpointSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+            Self::Config => "config",
+            Self::Dependencies => "dependencies.json",
+        }
+    }
+}
+
+pub(crate) struct ModelEndpointSnapshot {
+    pub default_endpoint: Option<String>,
+    pub effective_endpoint: Option<String>,
+    pub effective_source: Option<ModelEndpointSource>,
+    pub stored_url_suppressed: bool,
+    pub harness_db_key: Option<String>,
+    pub harness_disk_key: Option<String>,
+    pub harness_bound_elsewhere: bool,
+    pub cli_model_key: Option<String>,
+    pub cli_bound_elsewhere: bool,
+    pub all_secrets: Vec<String>,
+}
+
+impl ModelEndpointSnapshot {
+    pub(crate) fn matches_default(&self) -> bool {
+        matches!(
+            (&self.effective_endpoint, &self.default_endpoint),
+            (Some(e), Some(d)) if e == d
+        )
+    }
+
+    /// Resolves the active `HARNESS_API_KEY` from the snapshot:
+    /// 1. Stored `harness.apiKey` row bound to `canonical(E)`
+    /// 2. Else if `canonical(E) == canonical(D)` and non-empty `config/harness-api-key` exists on disk
+    /// 3. Else `None` (fail closed)
+    pub(crate) fn harness_api_key(&self) -> Option<&str> {
+        if let Some(key) = self.harness_db_key.as_deref() {
+            return Some(key);
+        }
+        if self.matches_default() {
+            return self.harness_disk_key.as_deref();
+        }
+        None
+    }
+
+    pub(crate) fn harness_key_source(&self) -> Option<&'static str> {
+        if self.harness_db_key.is_some() {
+            Some("settings")
+        } else if self.matches_default() && self.harness_disk_key.is_some() {
+            Some("file")
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StoredEndpointOverride {
+    Reset,
+    Suppressed,
+    Value { raw_text: String, raw: String, canonical: String },
+    Malformed { raw_text: String, parsed: Option<Value> },
+}
+
+fn stored_model_endpoint_override(
+    conn: &Connection,
+) -> Result<Option<StoredEndpointOverride>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, HARNESS_API_BASE_URL.key).map_err(InspectError::from_sqlite)?
+    else {
+        return Ok(None);
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: None,
+        }));
+    };
+    if parsed.is_null() {
+        return Ok(Some(StoredEndpointOverride::Reset));
+    }
+    let Some(raw) = parsed.as_str().map(str::to_string) else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: Some(parsed),
+        }));
+    };
+    if raw == SECRET_MARKER {
+        return Ok(Some(StoredEndpointOverride::Suppressed));
+    }
+    let Some(canonical) = HARNESS_API_BASE_URL
+        .normalize(&parsed)
+        .and_then(|v| v.as_str().map(str::to_string))
+    else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: Some(parsed),
+        }));
+    };
+    Ok(Some(StoredEndpointOverride::Value { raw_text: text, raw, canonical }))
+}
+
+fn value_override_is_scrubbed(
+    raw_text: &str,
+    raw: &str,
+    canonical: &str,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> bool {
+    endpoint_value_is_scrubbed(raw_text, Some(known_secrets), Some(scrubbed_hashes))
+        || endpoint_value_is_scrubbed(raw, Some(known_secrets), Some(scrubbed_hashes))
+        || endpoint_value_is_scrubbed(canonical, Some(known_secrets), Some(scrubbed_hashes))
+}
+
+fn malformed_override_is_scrubbed(
+    raw_text: &str,
+    parsed: Option<&Value>,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> bool {
+    endpoint_value_is_scrubbed(raw_text, Some(known_secrets), Some(scrubbed_hashes))
+        || parsed.is_some_and(|value| {
+            value_has_leaked_endpoint(value, Some(known_secrets), Some(scrubbed_hashes))
+        })
+}
+
+fn classify_stored_endpoint_override(
+    stored: Option<StoredEndpointOverride>,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> Result<Option<StoredEndpointOverride>, InspectError> {
+    match stored {
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            if value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                known_secrets,
+                scrubbed_hashes,
+            ) {
+                Ok(Some(StoredEndpointOverride::Suppressed))
+            } else {
+                Ok(Some(StoredEndpointOverride::Value {
+                    raw_text,
+                    raw,
+                    canonical,
+                }))
+            }
+        }
+        Some(StoredEndpointOverride::Malformed { raw_text, parsed }) => {
+            if malformed_override_is_scrubbed(
+                &raw_text,
+                parsed.as_ref(),
+                known_secrets,
+                scrubbed_hashes,
+            ) {
+                Ok(Some(StoredEndpointOverride::Suppressed))
+            } else {
+                Err(InspectError::Fatal(STORAGE_ERROR.to_string()))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+pub(crate) fn classify_archive_model_endpoint_override(
+    stored: Option<StoredEndpointOverride>,
+    archive_secrets: &[String],
+    archive_scrubbed_hashes: &[String],
+    host_disk_key: Option<&str>,
+) -> Result<Option<StoredEndpointOverride>, String> {
+    let known_secrets = archive_known_secrets(archive_secrets, host_disk_key);
+    classify_stored_endpoint_override(stored, &known_secrets, archive_scrubbed_hashes)
+        .map_err(InspectError::into_message)
+}
+
+pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, String> {
+    Ok(secrets_in(conn)?.into_iter().map(|(_, _, credential)| credential).collect())
+}
+
+pub(crate) fn read_archive_scrubbed_hashes(conn: &Connection) -> Result<Vec<String>, String> {
+    read_scrubbed_endpoint_hashes(conn).map_err(InspectError::into_message)
+}
+
+pub(crate) fn archive_model_endpoint_override(
+    conn: &Connection,
+) -> Result<Option<StoredEndpointOverride>, String> {
+    stored_model_endpoint_override(conn).map_err(InspectError::into_message)
+}
+
+fn config_model_endpoint_override(document: &Value) -> Option<(String, String)> {
+    let found = HARNESS_API_BASE_URL.found_in(document)?;
+    let raw = found.as_str()?.to_string();
+    let canonical = HARNESS_API_BASE_URL
+        .normalize(found)
+        .and_then(|v| v.as_str().map(str::to_string))?;
+    Some((raw, canonical))
+}
+
+fn collect_known_secrets(
+    secrets: &[(&'static str, String, String)],
+    harness_key: Option<&str>,
+) -> Vec<String> {
+    let mut known: Vec<String> = secrets
+        .iter()
+        .map(|(_, _, credential)| credential.clone())
+        .chain(harness_key.map(str::to_string))
+        .collect();
+    known.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    known.dedup();
+    known
+}
+
+fn text_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
+    known_secrets.iter().any(|key| text.contains(key))
+}
+
+fn endpoint_text_matches_secret(text: &str, secret: &str) -> bool {
+    if text.contains(secret) {
+        return true;
+    }
+    let stripped = secret.trim_end_matches('/');
+    !stripped.is_empty() && stripped != secret && text.contains(stripped)
+}
+
+fn endpoint_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
+    known_secrets
+        .iter()
+        .any(|key| endpoint_text_matches_secret(text, key))
+}
+
+fn collect_known_secrets_and_hashes(
+    conn: &Connection,
+    harness_key: Option<&str>,
+) -> Result<(Vec<String>, Vec<String>), InspectError> {
+    let secrets = secrets_in_checked(conn)?;
+    let known_secrets = collect_known_secrets(&secrets, harness_key);
+    let scrubbed_hashes = read_scrubbed_endpoint_hashes(conn)?;
+    Ok((known_secrets, scrubbed_hashes))
+}
+
+pub(crate) fn redact_route_array(value: &mut Value, credentials: Option<&[String]>) -> bool {
+    let mut redacted = false;
+    if let Some(routes) = value.as_array_mut() {
+        for route in routes {
+            for field in ["id", "model"] {
+                let Some(slot) = route.get_mut(field) else { continue };
+                if let Some(text) = slot.as_str() {
+                    let safe = match credentials {
+                        Some(keys) => keys
+                            .iter()
+                            .fold(text.to_string(), |acc, key| crate::harness::redact_credential(&acc, key)),
+                        None => "[REDACTED]".to_string(),
+                    };
+                    if safe != text {
+                        *slot = json!(safe);
+                        redacted = true;
+                    }
+                }
+            }
+        }
+    }
+    redacted
+}
+
+fn endpoint_value_is_scrubbed(
+    raw: &str,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    if raw == SECRET_MARKER {
+        return true;
+    }
+    let normalized = HARNESS_API_BASE_URL
+        .normalize(&Value::String(raw.to_string()))
+        .and_then(|v| v.as_str().map(str::to_string));
+    let matches_secrets = known_secrets.is_some_and(|secrets| {
+        endpoint_contains_any_secret(raw, secrets)
+            || normalized
+                .as_deref()
+                .is_some_and(|canonical| endpoint_contains_any_secret(canonical, secrets))
+    });
+    let matches_hashes = scrubbed_hashes.is_some_and(|hashes| {
+        hashes.iter().any(|h| *h == endpoint_text_hash(raw))
+            || normalized
+                .as_deref()
+                .is_some_and(|canonical| hashes.iter().any(|h| *h == endpoint_text_hash(canonical)))
+    });
+    matches_secrets || matches_hashes
+}
+
+fn safe_config_model_endpoint_override(
+    document: &Value,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> Option<String> {
+    let (raw, canonical) = config_model_endpoint_override(document)?;
+    (!endpoint_value_is_scrubbed(&raw, Some(known_secrets), Some(scrubbed_hashes))
+        && !endpoint_value_is_scrubbed(&canonical, Some(known_secrets), Some(scrubbed_hashes)))
+    .then_some(canonical)
+}
+
+fn effective_endpoint_from_overrides(
+    stored_override: Option<StoredEndpointOverride>,
+    document: Option<&Value>,
+    default_endpoint: Option<String>,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> (Option<String>, Option<ModelEndpointSource>) {
+    let override_ep = match stored_override {
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            (!value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                known_secrets,
+                scrubbed_hashes,
+            ))
+            .then_some((canonical, ModelEndpointSource::Settings))
+        }
+        Some(
+            StoredEndpointOverride::Reset
+            | StoredEndpointOverride::Suppressed
+            | StoredEndpointOverride::Malformed { .. },
+        ) => None,
+        None => document
+            .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets, scrubbed_hashes))
+            .map(|url| (url, ModelEndpointSource::Config)),
+    };
+    match override_ep {
+        Some((url, source)) => (Some(url), Some(source)),
+        None => (
+            default_endpoint.clone(),
+            default_endpoint.map(|_| ModelEndpointSource::Dependencies),
+        ),
+    }
+}
+
+pub(crate) fn archive_known_secrets(
+    archive_secrets: &[String],
+    host_disk_key: Option<&str>,
+) -> Vec<String> {
+    let mut known_secrets = archive_secrets.to_vec();
+    if let Some(key) = host_disk_key {
+        known_secrets.push(key.to_string());
+    }
+    known_secrets
+}
+
+pub(crate) fn archive_effective_model_endpoint(
+    archive_stored_override: Option<StoredEndpointOverride>,
+    archive_config: &Value,
+    default_raw: Option<&str>,
+    archive_secrets: &[String],
+    archive_scrubbed_hashes: &[String],
+    host_disk_key: Option<&str>,
+) -> Option<String> {
+    let known_secrets = archive_known_secrets(archive_secrets, host_disk_key);
+    let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
+    effective_endpoint_from_overrides(
+        archive_stored_override,
+        Some(archive_config),
+        default_endpoint,
+        &known_secrets,
+        archive_scrubbed_hashes,
+    )
+    .0
+}
+
+pub(crate) fn scrub_archived_config_endpoint(
+    raw: &mut Value,
+    archive_stored_override: Option<&StoredEndpointOverride>,
+    archive_secrets: &[String],
+    archive_scrubbed_hashes: &[String],
+    host_disk_key: Option<&str>,
+) -> bool {
+    let known_secrets = archive_known_secrets(archive_secrets, host_disk_key);
+    let stored_suppressed = match archive_stored_override {
+        Some(StoredEndpointOverride::Suppressed) => true,
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            value_override_is_scrubbed(
+                raw_text,
+                raw,
+                canonical,
+                &known_secrets,
+                archive_scrubbed_hashes,
+            )
+        }
+        _ => false,
+    };
+    let has_clean_stored =
+        matches!(archive_stored_override, Some(StoredEndpointOverride::Value { .. }))
+            && !stored_suppressed;
+    let should_scrub = (!has_clean_stored
+        && stored_suppressed
+        && raw.pointer(HARNESS_API_BASE_URL.pointer).is_some())
+        || config_has_leaked_endpoint(raw, Some(&known_secrets), Some(archive_scrubbed_hashes));
+    if should_scrub {
+        remove_at(raw, HARNESS_API_BASE_URL.pointer);
+        true
+    } else {
+        false
+    }
+}
+
+fn resolve_model_endpoint_from_parts(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+    secrets: Vec<(&'static str, String, String)>,
+    extra_secret: Option<&str>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
+    let mut all_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+    if let Some(extra) = extra_secret.filter(|s| !s.is_empty()) {
+        all_secrets.push(extra.to_string());
+        all_secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+        all_secrets.dedup();
+    }
+    let (raw_stored_override, scrubbed_hashes) = match conn {
+        Some(conn) => (
+            stored_model_endpoint_override(conn)?,
+            read_scrubbed_endpoint_hashes(conn)?,
+        ),
+        None => (None, Vec::new()),
+    };
+    let stored_override = classify_stored_endpoint_override(
+        raw_stored_override,
+        &all_secrets,
+        &scrubbed_hashes,
+    )?;
+    let stored_url_suppressed = matches!(
+        &stored_override,
+        Some(StoredEndpointOverride::Suppressed)
+    ) || matches!(
+        &stored_override,
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical })
+            if value_override_is_scrubbed(
+                raw_text,
+                raw,
+                canonical,
+                &all_secrets,
+                &scrubbed_hashes,
+            )
+    );
+    let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
+    let (effective_endpoint, effective_source) = effective_endpoint_from_overrides(
+        stored_override,
+        document,
+        default_endpoint.clone(),
+        &all_secrets,
+        &scrubbed_hashes,
+    );
+
+    let mut harness_db_key = None;
+    let mut harness_bound_elsewhere = false;
+    let mut cli_model_key = None;
+    let mut cli_bound_elsewhere = false;
+    for (key, bound, credential) in secrets {
+        let matches_effective = effective_endpoint
+            .as_deref()
+            .is_some_and(|e| crate::runtime::canonical_model_endpoint(&bound) == e);
+        if key == HARNESS_API_KEY.key {
+            if matches_effective {
+                harness_db_key = Some(credential);
+            } else {
+                harness_bound_elsewhere = true;
+            }
+        } else if key == CLI_MODEL_API_KEY.key {
+            if matches_effective {
+                cli_model_key = Some(credential);
+            } else {
+                cli_bound_elsewhere = true;
+            }
+        }
+    }
+
+    Ok(ModelEndpointSnapshot {
+        default_endpoint,
+        effective_endpoint,
+        effective_source,
+        stored_url_suppressed,
+        harness_db_key,
+        harness_disk_key,
+        harness_bound_elsewhere,
+        cli_model_key,
+        cli_bound_elsewhere,
+        all_secrets,
+    })
+}
+
+fn resolve_model_endpoint_in_conn(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
+    resolve_model_endpoint_in_conn_with_pending(conn, document, default_raw, harness_disk_key, None)
+}
+
+fn resolve_model_endpoint_in_conn_with_pending(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+    extra_secret: Option<&str>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
+    let secrets = match conn {
+        Some(conn) => secrets_in_checked(conn)?,
+        None => Vec::new(),
+    };
+    resolve_model_endpoint_from_parts(
+        conn,
+        document,
+        default_raw,
+        harness_disk_key,
+        secrets,
+        extra_secret,
+    )
+}
+
+pub(crate) fn resolve_model_endpoint_and_key(
+    context: &RuntimeContext,
+) -> Result<ModelEndpointSnapshot, String> {
+    let document = raw_config(context)?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    read_store(context, |conn| match conn {
+        None => resolve_model_endpoint_from_parts(
+            None,
+            Some(&document),
+            default_raw,
+            harness_disk_key.clone(),
+            Vec::new(),
+            None,
+        ),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            resolve_model_endpoint_in_conn(
+                Some(tx),
+                Some(&document),
+                default_raw,
+                harness_disk_key.clone(),
+            )
+        }),
+    })
 }
 
 pub(crate) fn has_stored_setting(conn: &Connection, key: &str) -> Result<bool, (u16, String)> {
@@ -880,19 +1463,42 @@ pub(crate) fn harness_credential(context: &RuntimeContext) -> Option<String> {
 }
 
 fn reject_credential_text(
-    conn: &Connection, setting: &Setting, value: &Value, harness_key: Option<&str>,
+    conn: &Connection,
+    setting: &Setting,
+    raw_value: Option<&Value>,
+    value: &Value,
+    harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
     let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
+    let is_endpoint = setting.key == HARNESS_API_BASE_URL.key;
     let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
-    if prompt_text.is_none() && routes.is_none() {
+    if prompt_text.is_none() && !is_endpoint && routes.is_none() {
         return Ok(());
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
+    let known_secrets = collect_known_secrets(&secrets, harness_key);
+    let scrubbed_hashes = if is_endpoint {
+        read_scrubbed_endpoint_hashes(conn).map_err(|error| (503, error.into_message()))?
+    } else {
+        Vec::new()
+    };
     let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
-    if prompt_text.is_some_and(|text| harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text))
-        || routes.is_some_and(|routes| routes.iter().any(|route| {
-            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
-        }))
+    let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
+    let endpoint_has_credential = |v: &Value| {
+        value_has_leaked_endpoint(v, Some(&known_secrets), Some(&scrubbed_hashes))
+    };
+    if prompt_text.is_some_and(has_any_credential)
+        || (is_endpoint
+            && (endpoint_has_credential(value)
+                || raw_value.is_some_and(endpoint_has_credential)))
+        || routes.is_some_and(|routes| {
+            routes.iter().any(|route| {
+                ["id", "model"]
+                    .iter()
+                    .filter_map(|field| route[*field].as_str())
+                    .any(has_endpoint_key)
+            })
+        })
     {
         return Err((400, "setting text contains a credential".to_string()));
     }
@@ -991,6 +1597,9 @@ fn enable_wal(conn: &Connection) -> Result<(), String> {
     }
 }
 
+const SETTINGS_AUDIT_NO_UPDATE_SQL: &str = "CREATE TRIGGER settings_audit_no_update BEFORE UPDATE ON settings_audit \
+ BEGIN SELECT RAISE(ABORT,'settings audit is append only'); END";
+
 /// Schema version 1 as (type, name, table, CREATE text): the statements this release runs, in order.
 const SCHEMA_V1: [(&str, &str, &str, &str); 4] = [
     (
@@ -1012,8 +1621,7 @@ const SCHEMA_V1: [(&str, &str, &str, &str); 4] = [
         "trigger",
         "settings_audit_no_update",
         "settings_audit",
-        "CREATE TRIGGER settings_audit_no_update BEFORE UPDATE ON settings_audit \
-         BEGIN SELECT RAISE(ABORT,'settings audit is append only'); END",
+        SETTINGS_AUDIT_NO_UPDATE_SQL,
     ),
     (
         "trigger",
@@ -1159,7 +1767,8 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // The same checks again, for a store changed since the inspection.
     retry_until(deadline, || check_schema_checked(&conn))?;
     enable_wal(&conn)?;
-    conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
     // BEGIN IMMEDIATE opens and pins the Windows WAL and its index before any row is written.
     // The journal used for switching to WAL carries SQLite's database header page only.
@@ -1271,7 +1880,7 @@ fn seed(
             }
             continue;
         };
-        if reject_credential_text(conn, setting, &value, harness_key).is_err() {
+        if reject_credential_text(conn, setting, Some(found), &value, harness_key).is_err() {
             continue;
         }
         let text = value.to_string();
@@ -1297,8 +1906,186 @@ fn seed(
 /// `config.json.pre-settings` is kept. Returns the keys whose pointer passes through a non-object in the file (left in
 /// place); a file `canonical_config` refuses is not written. No store, no schema yet and no stored value write
 /// nothing; a store that cannot be read is an error.
+struct EndpointWriteGuard {
+    known_secrets: Vec<String>,
+    scrubbed_hashes: Vec<String>,
+    endpoint_suppressed: bool,
+}
+
+impl EndpointWriteGuard {
+    fn from_disk_key(harness_disk_key: Option<&str>) -> Self {
+        Self {
+            known_secrets: harness_disk_key.map(str::to_string).into_iter().collect(),
+            scrubbed_hashes: Vec::new(),
+            endpoint_suppressed: false,
+        }
+    }
+
+    fn can_scrub(&self) -> bool {
+        self.endpoint_suppressed || !self.known_secrets.is_empty() || !self.scrubbed_hashes.is_empty()
+    }
+}
+
+fn read_endpoint_write_guard(
+    conn: &Connection,
+    harness_disk_key: Option<&str>,
+    fail_on_unscrubbed_malformed: bool,
+) -> Result<EndpointWriteGuard, InspectError> {
+    let secrets = secrets_in_checked(conn)?;
+    let known_secrets = collect_known_secrets(&secrets, harness_disk_key);
+    let scrubbed_hashes = read_scrubbed_endpoint_hashes(conn)?;
+    let endpoint_suppressed = match stored_model_endpoint_override(conn)? {
+        Some(StoredEndpointOverride::Suppressed) => true,
+        Some(StoredEndpointOverride::Value { raw_text, raw, canonical }) => {
+            value_override_is_scrubbed(
+                &raw_text,
+                &raw,
+                &canonical,
+                &known_secrets,
+                &scrubbed_hashes,
+            )
+        }
+        Some(StoredEndpointOverride::Malformed { raw_text, parsed }) => {
+            if malformed_override_is_scrubbed(
+                &raw_text,
+                parsed.as_ref(),
+                &known_secrets,
+                &scrubbed_hashes,
+            ) {
+                true
+            } else if fail_on_unscrubbed_malformed {
+                return Err(InspectError::Fatal(STORAGE_ERROR.to_string()));
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    Ok(EndpointWriteGuard {
+        known_secrets,
+        scrubbed_hashes,
+        endpoint_suppressed,
+    })
+}
+
+fn filter_stored_for_config(
+    stored: Vec<(&'static Setting, Value)>,
+    guard: &EndpointWriteGuard,
+) -> (Vec<(&'static Setting, Value)>, bool) {
+    let mut scrubbed = guard.endpoint_suppressed;
+    let filtered = stored
+        .into_iter()
+        .filter(|(setting, value)| {
+            if setting.key != HARNESS_API_BASE_URL.key {
+                return true;
+            }
+            let leaked = scrubbed
+                || value.as_str().is_some_and(|raw| {
+                    endpoint_value_is_scrubbed(
+                        raw,
+                        Some(&guard.known_secrets),
+                        Some(&guard.scrubbed_hashes),
+                    )
+                });
+            if leaked {
+                scrubbed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (filtered, scrubbed)
+}
+
+fn should_scrub_config_endpoint(
+    document: &Value,
+    has_stored_endpoint: bool,
+    scrubbed: bool,
+    guard: &EndpointWriteGuard,
+) -> bool {
+    !has_stored_endpoint
+        && document.pointer(HARNESS_API_BASE_URL.pointer).is_some()
+        && (scrubbed
+            || config_has_leaked_endpoint(
+                document,
+                Some(&guard.known_secrets),
+                Some(&guard.scrubbed_hashes),
+            ))
+}
+
+fn apply_stored_for_config(
+    document: &mut Value,
+    stored: Vec<(&'static Setting, Value)>,
+    guard: &EndpointWriteGuard,
+) -> (bool, Vec<&'static str>) {
+    let (filtered_stored, scrubbed) = filter_stored_for_config(stored, guard);
+    let has_stored_endpoint = filtered_stored
+        .iter()
+        .any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
+    let scrub_endpoint = should_scrub_config_endpoint(document, has_stored_endpoint, scrubbed, guard);
+    let (mut changed, blocked) = place(document, filtered_stored);
+    if scrub_endpoint {
+        remove_at(document, HARNESS_API_BASE_URL.pointer);
+        changed = true;
+    }
+    (changed, blocked)
+}
+
 pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
-    write_back_values(context, stored_values(context)?)
+    let harness_key = harness_credential(context);
+    let (stored, guard) = read_store(context, |conn| match conn {
+        None => Ok((Vec::new(), EndpointWriteGuard::from_disk_key(harness_key.as_deref()))),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            Ok((
+                read_stored_values_checked(tx)?,
+                read_endpoint_write_guard(tx, harness_key.as_deref(), true)?,
+            ))
+        }),
+    })?;
+    write_back_values(context, stored, &guard)
+}
+
+fn collect_value_strings<'a>(value: &'a Value, out: &mut Vec<std::borrow::Cow<'a, str>>) {
+    match value {
+        Value::String(s) => out.push(std::borrow::Cow::Borrowed(s.as_str())),
+        Value::Number(n) => out.push(std::borrow::Cow::Owned(n.to_string())),
+        Value::Array(items) => {
+            for item in items {
+                collect_value_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                out.push(std::borrow::Cow::Borrowed(k.as_str()));
+                collect_value_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn value_has_leaked_endpoint(
+    value: &Value,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    let mut strings = Vec::new();
+    collect_value_strings(value, &mut strings);
+    strings
+        .into_iter()
+        .any(|s| endpoint_value_is_scrubbed(s.as_ref(), known_secrets, scrubbed_hashes))
+}
+
+fn config_has_leaked_endpoint(
+    document: &Value,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    HARNESS_API_BASE_URL
+        .found_in(document)
+        .filter(|v| !v.is_null())
+        .is_some_and(|value| value_has_leaked_endpoint(value, known_secrets, scrubbed_hashes))
 }
 
 /// `write_back` of stored values already read: by a writer, on its own read-write connection before it closed, so that
@@ -1307,15 +2094,16 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
 fn write_back_values(
     context: &RuntimeContext,
     stored: Vec<(&'static Setting, Value)>,
+    guard: &EndpointWriteGuard,
 ) -> Result<Vec<&'static str>, String> {
-    if stored.is_empty() {
+    if stored.is_empty() && !guard.endpoint_suppressed && !guard.can_scrub() {
         return Ok(Vec::new());
     }
     let mut document = raw_config(context)?;
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    let (changed, blocked) = place(&mut document, stored);
+    let (changed, blocked) = apply_stored_for_config(&mut document, stored, guard);
     if changed {
         #[cfg(test)]
         if FAIL_WRITE_BACK.with(|fail| fail.replace(false)) {
@@ -1334,11 +2122,16 @@ fn write_back_values(
 fn mirror_after_commit(
     context: &RuntimeContext,
     stored: Result<Vec<(&'static Setting, Value)>, String>,
+    guard: Result<&EndpointWriteGuard, &str>,
 ) -> Option<String> {
-    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored)) {
-        Ok(blocked) if blocked.is_empty() => None,
-        Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
-        Err(error) => Some(error),
+    let mirror_error = match (stored, guard) {
+        (Ok(stored), Ok(guard)) => match write_back_values(context, stored, guard) {
+            Ok(blocked) if blocked.is_empty() => None,
+            Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
+            Err(error) => Some(error),
+        },
+        (Err(error), _) => Some(error),
+        (_, Err(error)) => Some(error.to_string()),
     };
     if let Some(error) = &mirror_error {
         crate::safe_eprintln!("[settings] config.json does not hold the stored settings: {error}");
@@ -1347,15 +2140,25 @@ fn mirror_after_commit(
 }
 
 /// Puts every stored value into `document`, a `config.json` a console writer is about to write, so the writer never
-/// puts back an older value of a stored setting. Returns whether `document` changed; a change keeps
-/// `config.json.pre-settings` first, and a copy that cannot be kept is an error. A document that is
-/// not an object and a store that cannot be read (the overlay reports it) change nothing.
+/// puts back an older value of a stored setting and never leaves a leaked `harness.apiBaseUrl` behind. Returns whether
+/// `document` changed; a change keeps `config.json.pre-settings` first, and a copy that cannot be kept is an error.
+/// A document that is not an object changes nothing; store-read errors fail closed so a caller never publishes an
+/// unscrubbed `config.json`.
 pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Result<bool, String> {
     if !document.is_object() {
         return Ok(false);
     }
-    let Ok(stored) = stored_values(context) else { return Ok(false) };
-    let (changed, _) = place(document, stored);
+    let harness_key = harness_credential(context);
+    let (stored, guard) = read_store(context, |conn| match conn {
+        None => Ok((Vec::new(), EndpointWriteGuard::from_disk_key(harness_key.as_deref()))),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            Ok((
+                read_stored_values_checked(tx)?,
+                read_endpoint_write_guard(tx, harness_key.as_deref(), true)?,
+            ))
+        }),
+    })?;
+    let (changed, _) = apply_stored_for_config(document, stored, &guard);
     if changed {
         keep_pre_settings_copy(context)?;
     }
@@ -1387,15 +2190,40 @@ pub(crate) fn create_store(context: &RuntimeContext) -> Result<(), String> {
 /// inside the undo's transaction, before the commit: a failure refuses the undo and rolls it back, and a commit that
 /// fails after it leaves the stored value, which the overlay still applies and the next write-back puts back into the
 /// file. A missing member writes nothing. The caller holds the configuration gate.
-fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(), String> {
+fn remove_from_config(
+    context: &RuntimeContext,
+    setting: &Setting,
+    guard: &EndpointWriteGuard,
+    has_clean_stored_endpoint: bool,
+) -> Result<(), String> {
     let mut document = raw_config(context)?;
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    if document.pointer(setting.pointer).is_none() {
+    let mut changed = false;
+    if document.pointer(setting.pointer).is_some() {
+        remove_at(&mut document, setting.pointer);
+        changed = true;
+    }
+    let config_leaked = config_has_leaked_endpoint(
+        &document,
+        Some(&guard.known_secrets),
+        Some(&guard.scrubbed_hashes),
+    );
+    if config_leaked
+        || should_scrub_config_endpoint(
+            &document,
+            has_clean_stored_endpoint,
+            guard.endpoint_suppressed,
+            guard,
+        )
+    {
+        remove_at(&mut document, HARNESS_API_BASE_URL.pointer);
+        changed = true;
+    }
+    if !changed {
         return Ok(());
     }
-    remove_at(&mut document, setting.pointer);
     #[cfg(test)]
     if FAIL_WRITE_BACK.with(|fail| fail.replace(false)) {
         return Err(CONFIG_ERROR.to_string());
@@ -1441,9 +2269,51 @@ fn write_store_with<T>(
     conversations: bool,
     write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
+    write_store_scrubbable(context, existing_only, written, conversations, |conn, doc| {
+        write(conn, doc).map(|result| (result, false))
+    })
+}
+
+pub(crate) fn checkpoint_wal_truncate(
+    conn: &Connection,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    retry_until(deadline, || {
+        let (busy, log, checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(InspectError::from_sqlite)?;
+        if busy == 0 && (log == 0 || checkpointed >= log) {
+            Ok(())
+        } else {
+            Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+        }
+    })
+}
+
+fn upsert_scrub_cleanup_pending(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+        params![SCRUB_CLEANUP_PENDING_KEY, "true", 1_i64, now_ms(), SEED_ACTOR],
+    )
+    .map(|_| ())
+    .map_err(|_| STORAGE_ERROR.to_string())
+}
+
+fn write_store_scrubbable<T>(
+    context: &RuntimeContext,
+    existing_only: bool,
+    written: &[&'static str],
+    conversations: bool,
+    write: impl FnOnce(&Connection, &Value) -> Result<(T, bool), (u16, String)>,
+) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
-    let (result, stored) = {
+    let mut cleanup_failed = false;
+    let (result, stored, guard) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
@@ -1460,7 +2330,12 @@ fn write_store_with<T>(
         }
         seed(&tx, &document, now_ms(), written, harness_key.as_deref())?;
         let access_before = access_rows(&tx)?;
-        let result = write(&tx, &document)?;
+        let pending_before = stored_row(&tx, SCRUB_CLEANUP_PENDING_KEY)?;
+        let (result, scrubbed) = write(&tx, &document)?;
+        let needs_cleanup = scrubbed || pending_before.is_some();
+        if scrubbed && pending_before.is_none() {
+            upsert_scrub_cleanup_pending(&tx).map_err(unavailable)?;
+        }
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -1470,11 +2345,51 @@ fn write_store_with<T>(
         }
         tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
-        // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
+        // its index; reading before cleanup also lets us mirror scrubbed config.json if cleanup hits 503.
         let stored = read_stored_values(&conn);
-        (result, stored)
+        let guard = read_endpoint_write_guard(&conn, harness_key.as_deref(), false)
+            .map_err(InspectError::into_message);
+        if needs_cleanup {
+            let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+            let pre_delete = conn
+                .execute_batch("VACUUM;")
+                .map_err(|_| STORAGE_ERROR.to_string())
+                .and_then(|_| checkpoint_wal_truncate(&conn, deadline))
+                .and_then(|_| {
+                    conn.execute(
+                        "DELETE FROM settings WHERE key=?1",
+                        [SCRUB_CLEANUP_PENDING_KEY],
+                    )
+                    .map(|_| ())
+                    .map_err(|_| STORAGE_ERROR.to_string())
+                });
+            if pre_delete.is_err() {
+                cleanup_failed = true;
+            } else {
+                let second_truncate = {
+                    #[cfg(test)]
+                    if FAIL_SECOND_WAL_TRUNCATE.with(|fail| fail.replace(false)) {
+                        Err(STORAGE_ERROR.to_string())
+                    } else {
+                        checkpoint_wal_truncate(&conn, deadline)
+                    }
+                    #[cfg(not(test))]
+                    checkpoint_wal_truncate(&conn, deadline)
+                };
+                if second_truncate.is_err() {
+                    let _ = upsert_scrub_cleanup_pending(&conn);
+                    cleanup_failed = true;
+                }
+            }
+        }
+        (result, stored, guard)
     };
-    Ok((result, mirror_after_commit(context, stored)))
+    let mirror_error =
+        mirror_after_commit(context, stored, guard.as_ref().map_err(String::as_str));
+    if cleanup_failed {
+        return Err(unavailable(STORAGE_ERROR.to_string()));
+    }
+    Ok((result, mirror_error))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -1707,9 +2622,21 @@ pub(crate) fn apply(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
+    apply_checked_endpoint(context, key, value, actor, source, None)
+}
+
+/// Like `apply`, additionally enforcing `expected_endpoint` inside the write transaction for model endpoint credentials.
+pub(crate) fn apply_checked_endpoint(
+    context: &RuntimeContext,
+    key: &str,
+    value: &Value,
+    actor: &str,
+    source: &str,
+    expected_endpoint: Option<&str>,
+) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
-    let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
-    store(context, setting, value, actor, source)
+    let normalized = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
+    store(context, setting, Some(value), normalized, actor, source, expected_endpoint)
 }
 
 /// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
@@ -1731,13 +2658,282 @@ fn check_schedule_change(
     super::registry::check_schedule(&document)
 }
 
+fn endpoint_text_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn read_scrubbed_endpoint_hashes(conn: &Connection) -> Result<Vec<String>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, SCRUBBED_ENDPOINT_HASHES_KEY)
+        .map_err(InspectError::from_sqlite)?
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))
+}
+
+fn record_scrubbed_endpoint_hashes(
+    conn: &Connection,
+    new_hashes: Vec<String>,
+    actor: &str,
+) -> Result<(), (u16, String)> {
+    if new_hashes.is_empty() {
+        return Ok(());
+    }
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let (mut hashes, revision) = match stored_row(conn, SCRUBBED_ENDPOINT_HASHES_KEY)? {
+        Some((text, rev)) => {
+            let parsed = serde_json::from_str::<Vec<String>>(&text)
+                .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+            (parsed, rev + 1)
+        }
+        None => (Vec::new(), 1),
+    };
+    let mut added = false;
+    for hash in new_hashes {
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+            added = true;
+        }
+    }
+    if !added {
+        return Ok(());
+    }
+    let payload = json!(hashes).to_string();
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+        params![SCRUBBED_ENDPOINT_HASHES_KEY, payload, revision, now_ms(), actor],
+    )
+    .map_err(failed)?;
+    Ok(())
+}
+
+fn push_endpoint_hashes(hashes: &mut Vec<String>, text: &str) {
+    hashes.push(endpoint_text_hash(text));
+    if let Some(canonical) = HARNESS_API_BASE_URL
+        .normalize(&Value::String(text.to_string()))
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        if canonical != text {
+            hashes.push(endpoint_text_hash(&canonical));
+        }
+    }
+}
+
+fn extract_leaked_endpoint_texts(
+    text: &str,
+    mut should_scrub: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    let marker = json!(SECRET_MARKER).to_string();
+    let parsed = serde_json::from_str::<Value>(text)
+        .unwrap_or_else(|_| Value::String(text.to_string()));
+    let mut strings = Vec::new();
+    collect_value_strings(&parsed, &mut strings);
+    let mut matched: Vec<String> = strings
+        .into_iter()
+        .filter(|s| s.as_ref() != SECRET_MARKER && should_scrub(s.as_ref()))
+        .map(|s| s.into_owned())
+        .collect();
+    if text != marker && should_scrub(text) && !matched.iter().any(|m| m == text) {
+        matched.push(text.to_string());
+    }
+    matched
+}
+
+fn scrub_endpoint_in_tx(
+    conn: &Connection,
+    actor: &str,
+    mut should_scrub: impl FnMut(&str) -> bool,
+) -> Result<bool, (u16, String)> {
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let marker = json!(SECRET_MARKER).to_string();
+    let mut scrubbed = false;
+    let mut hashes = Vec::new();
+    if let Some((row_text, revision)) = stored_row(conn, HARNESS_API_BASE_URL.key)? {
+        let leaked = extract_leaked_endpoint_texts(&row_text, &mut should_scrub);
+        if !leaked.is_empty() {
+            for s in &leaked {
+                push_endpoint_hashes(&mut hashes, s);
+            }
+            conn.execute(
+                "UPDATE settings SET value=?1, revision=?2, updated_ms=?3, updated_by=?4 WHERE key=?5",
+                params![marker, revision + 1, now_ms(), actor, HARNESS_API_BASE_URL.key],
+            )
+            .map_err(failed)?;
+            scrubbed = true;
+        }
+    }
+    let mut statement = conn
+        .prepare("SELECT id, old_value, new_value FROM settings_audit WHERE scope='global' AND key=?1")
+        .map_err(failed)?;
+    let rows = statement
+        .query_map([HARNESS_API_BASE_URL.key], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(failed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    drop(statement);
+    let mut audit_updates = Vec::new();
+    for (id, old_val, new_val) in rows {
+        let mut row_changed = false;
+        let mut scrub_col = |col: Option<String>| -> Option<String> {
+            col.map(|text| {
+                let leaked = extract_leaked_endpoint_texts(&text, &mut should_scrub);
+                if !leaked.is_empty() {
+                    for s in &leaked {
+                        push_endpoint_hashes(&mut hashes, s);
+                    }
+                    row_changed = true;
+                    marker.clone()
+                } else {
+                    text
+                }
+            })
+        };
+        let next_old = scrub_col(old_val);
+        let next_new = scrub_col(new_val);
+        if row_changed {
+            audit_updates.push((id, next_old, next_new));
+        }
+    }
+    if !audit_updates.is_empty() {
+        scrubbed = true;
+        conn.execute("DROP TRIGGER IF EXISTS settings_audit_no_update", [])
+            .map_err(failed)?;
+        for (id, next_old, next_new) in audit_updates {
+            conn.execute(
+                "UPDATE settings_audit SET old_value=?1, new_value=?2 WHERE id=?3",
+                params![next_old, next_new, id],
+            )
+            .map_err(failed)?;
+        }
+        conn.execute(SETTINGS_AUDIT_NO_UPDATE_SQL, [])
+            .map_err(failed)?;
+    }
+    record_scrubbed_endpoint_hashes(conn, hashes, actor)?;
+    Ok(scrubbed)
+}
+
+fn scrub_old_endpoint_before_write(
+    conn: &Connection,
+    old: &mut Option<(String, i64)>,
+    harness_key: Option<&str>,
+    actor: &str,
+) -> Result<bool, (u16, String)> {
+    let Some((old_text, old_rev)) = old.as_mut() else {
+        return Ok(false);
+    };
+    let (known_secrets, scrubbed_hashes) = collect_known_secrets_and_hashes(conn, harness_key)
+        .map_err(|error| (503, error.into_message()))?;
+    let matched = extract_leaked_endpoint_texts(old_text, |s| {
+        endpoint_value_is_scrubbed(s, Some(&known_secrets), Some(&scrubbed_hashes))
+    });
+    if matched.is_empty() {
+        return Ok(false);
+    }
+    let mut hashes = Vec::new();
+    for s in &matched {
+        push_endpoint_hashes(&mut hashes, s);
+    }
+    record_scrubbed_endpoint_hashes(conn, hashes, actor)?;
+    let _ = scrub_endpoint_in_tx(conn, actor, |s| {
+        endpoint_value_is_scrubbed(s, Some(&known_secrets), Some(&scrubbed_hashes))
+    })?;
+    *old_text = json!(SECRET_MARKER).to_string();
+    *old_rev += 1;
+    Ok(true)
+}
+
+/// Permanently tombstones stored `harness.apiBaseUrl` and records scrubbed audit-text hashes when they contain `secret`.
+fn scrub_leaked_endpoint_for_secret(
+    conn: &Connection,
+    secret: &str,
+    actor: &str,
+) -> Result<bool, (u16, String)> {
+    scrub_endpoint_in_tx(conn, actor, |s| endpoint_text_matches_secret(s, secret))
+}
+
+/// Scrubs any credential-bearing or tombstoned `harness.apiBaseUrl` rows and audit entries in a staged restore
+/// `settings.db` before publishing it to the live runtime.
+pub(crate) fn scrub_restored_settings_db(
+    path: &std::path::Path,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> Result<bool, String> {
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let has_settings: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    if !has_settings {
+        conn.close().map_err(|(_, _)| STORAGE_ERROR.to_string())?;
+        return Ok(false);
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let changed = scrub_endpoint_in_tx(&tx, "restore", |s| {
+        endpoint_value_is_scrubbed(s, Some(known_secrets), Some(scrubbed_hashes))
+    })
+    .map_err(|(_, error)| error)?;
+    if changed {
+        tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
+    } else {
+        drop(tx);
+    }
+    conn.execute_batch("PRAGMA journal_mode=DELETE; VACUUM;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.close().map_err(|(_, _)| STORAGE_ERROR.to_string())?;
+    for name in SIDECARS {
+        if path
+            .with_file_name(name)
+            .try_exists()
+            .map_err(|_| STORAGE_ERROR.to_string())?
+        {
+            return Err(STORAGE_ERROR.to_string());
+        }
+    }
+    Ok(true)
+}
+
+type StoreOutcome = Result<Applied, (u16, String)>;
+
+fn fail_preserving_scrub(
+    err: (u16, String),
+    scrubbed_before: bool,
+) -> Result<(StoreOutcome, bool), (u16, String)> {
+    if scrubbed_before {
+        Ok((Err(err), true))
+    } else {
+        Err(err)
+    }
+}
+
 /// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
     setting: &'static Setting,
+    raw_value: Option<&Value>,
     value: Value,
     actor: &str,
     source: &str,
+    expected_endpoint: Option<&str>,
 ) -> Result<Applied, (u16, String)> {
     if super::registry::checks_schedule(setting.key) {
         let unavailable = |error| (503, error);
@@ -1747,33 +2943,149 @@ fn store(
             [(setting, Some(value.clone()))],
         )?;
     }
-    let harness_key = setting.kind.text_default().and_then(|_| harness_credential(context));
-    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
+    let harness_key = harness_credential(context);
+    let (applied, mirror_error) = write_store_scrubbable(context, false, &[setting.key], false, |conn, document| {
+        let old = stored_row(conn, setting.key)?;
+        let raw_secret = setting
+            .secret
+            .then(|| value.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            .flatten();
+        let previous_secret = if setting.secret {
+            old.as_ref().and_then(|(old_text, _)| {
+                serde_json::from_str::<Value>(old_text).ok().and_then(|parsed| match parsed {
+                    Value::Array(items) => items
+                        .get(1)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    Value::String(s) if !s.is_empty() => Some(s),
+                    _ => None,
+                })
+            })
+        } else {
+            None
+        };
+        let mut secrets_to_scrub: Vec<String> = Vec::new();
+        for candidate in [raw_secret.as_deref(), previous_secret.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !secrets_to_scrub.iter().any(|s| s == candidate) {
+                secrets_to_scrub.push(candidate.to_string());
+            }
+        }
+        let mut scrubbed_before = false;
+        for secret in &secrets_to_scrub {
+            if scrub_leaked_endpoint_for_secret(conn, secret, actor)? {
+                scrubbed_before = true;
+            }
+            if let Some(cfg_endpoint) = document.pointer(HARNESS_API_BASE_URL.pointer) {
+                let mut strings = Vec::new();
+                collect_value_strings(cfg_endpoint, &mut strings);
+                let mut cfg_hashes = Vec::new();
+                for s in strings {
+                    if endpoint_text_matches_secret(s.as_ref(), secret) {
+                        push_endpoint_hashes(&mut cfg_hashes, s.as_ref());
+                    }
+                }
+                if !cfg_hashes.is_empty() {
+                    record_scrubbed_endpoint_hashes(conn, cfg_hashes, actor)?;
+                    scrubbed_before = true;
+                }
+            }
+        }
+        let is_model_secret =
+            setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key;
+        let snapshot = if expected_endpoint.is_some() || (setting.secret && !value.is_null() && is_model_secret) {
+            match resolve_model_endpoint_in_conn_with_pending(
+                Some(conn),
+                Some(document),
+                context.dependency_url("model"),
+                harness_key.clone(),
+                raw_secret.as_deref(),
+            ) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    return fail_preserving_scrub((503, error.into_message()), scrubbed_before);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(expected) = expected_endpoint {
+            let expected = crate::runtime::canonical_model_endpoint(expected);
+            let actual = snapshot.as_ref().and_then(|s| s.effective_endpoint.as_deref());
+            if actual != Some(expected.as_str()) {
+                return fail_preserving_scrub(
+                    (
+                        409,
+                        "model endpoint changed before credential save; refresh and re-enter the key".to_string(),
+                    ),
+                    scrubbed_before,
+                );
+            }
+        }
         // The configuration gate keeps the endpoint stable until the store commits.
         let text = if setting.secret && !value.is_null() {
-            let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
+            let Some(endpoint) = (if setting.key == WEB_SEARCH_API_KEY.key {
                 crate::aux_search::settings_endpoint(document)
             } else {
-                context.dependency_url("model").map(str::to_string)
+                snapshot.and_then(|s| s.effective_endpoint)
+            }) else {
+                return fail_preserving_scrub(
+                    (400, "the credential endpoint is unavailable".to_string()),
+                    scrubbed_before,
+                );
+            };
+            if let Some(secret) = raw_secret.as_deref() {
+                if endpoint_text_matches_secret(&endpoint, secret) {
+                    return fail_preserving_scrub(
+                        (400, "credential endpoint contains the secret".to_string()),
+                        scrubbed_before,
+                    );
+                }
             }
-            .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
             json!([endpoint, value]).to_string()
         } else {
             value.to_string()
         };
-        reject_credential_text(conn, setting, &value, harness_key.as_deref())?;
+        if let Err(err) = reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref()) {
+            return fail_preserving_scrub(err, scrubbed_before);
+        }
         let value = if setting.secret { json!(!value.is_null()) } else { value };
-        let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
-                return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
+                let scrubbed_after = if let Some(secret) = raw_secret.as_deref() {
+                    scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+                } else {
+                    false
+                };
+                return Ok((
+                    Ok(Applied { value, revision: *revision, changed: false, mirror_error: None }),
+                    scrubbed_before || scrubbed_after,
+                ));
             }
         }
         validate_rollout_change(conn, document, [(setting, Some(&value))])?;
+        let mut old = old;
+        if setting.key == HARNESS_API_BASE_URL.key
+            && scrub_old_endpoint_before_write(conn, &mut old, harness_key.as_deref(), actor)?
+        {
+            scrubbed_before = true;
+        }
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        let scrubbed_after = if let Some(secret) = raw_secret.as_deref() {
+            scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+        } else {
+            false
+        };
         validate_timing(conn, document, &[setting.key], None)?;
-        Ok(Applied { value, revision, changed: true, mirror_error: None })
+        Ok((
+            Ok(Applied { value, revision, changed: true, mirror_error: None }),
+            scrubbed_before || scrubbed_after,
+        ))
     })?;
+    let applied = applied?;
     Ok(Applied { mirror_error, ..applied })
 }
 
@@ -1783,7 +3095,7 @@ fn store(
 /// empty one included. A stored default already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
-    store(context, setting, setting.default_value(), actor, "reset")
+    store(context, setting, None, setting.default_value(), actor, "reset", None)
 }
 
 const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
@@ -1837,6 +3149,34 @@ pub(crate) fn undo(
         if scope != "global" {
             return conversation::undo_entry(conn, context, entry, (scope, key, source, old_text, new_text), actor);
         }
+        let raw_old = old_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        if key == HARNESS_API_BASE_URL.key {
+            if let Some(setting) = find(&key) {
+                permit(setting)?;
+            }
+            let scrubbed_hashes =
+                read_scrubbed_endpoint_hashes(conn).map_err(|e| (503, e.into_message()))?;
+            let secrets = secrets_in(conn).map_err(|error| (503, error))?;
+            let known_secrets = collect_known_secrets(&secrets, harness_key.as_deref());
+            let is_scrubbed = [old_text.as_deref(), new_text.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|raw_text| {
+                    let parsed = serde_json::from_str::<Value>(raw_text)
+                        .unwrap_or_else(|_| Value::String(raw_text.to_string()));
+                    value_has_leaked_endpoint(&parsed, Some(&known_secrets), Some(&scrubbed_hashes))
+                        || endpoint_value_is_scrubbed(
+                            raw_text,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        )
+                });
+            if is_scrubbed {
+                return Err((400, "setting text contains a credential".to_string()));
+            }
+        }
         let setting = find(&key)
             .filter(|setting| !setting.secret && scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
@@ -1867,7 +3207,13 @@ pub(crate) fn undo(
             ));
         }
         if let Some(restored) = &restored {
-            reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
+            reject_credential_text(
+                conn,
+                setting,
+                raw_old.as_ref(),
+                restored,
+                harness_key.as_deref(),
+            )?;
         }
         if super::registry::checks_schedule(setting.key) {
             let unavailable = |error| (503, error);
@@ -1882,7 +3228,21 @@ pub(crate) fn undo(
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
         validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
         if restored.is_none() {
-            remove_from_config(context, setting).map_err(|error| (503, error))?;
+            let guard = read_endpoint_write_guard(conn, harness_key.as_deref(), true)
+                .map_err(|error| (503, error.into_message()))?;
+            let has_clean_stored_endpoint = matches!(
+                stored_model_endpoint_override(conn).map_err(|error| (503, error.into_message()))?,
+                Some(StoredEndpointOverride::Value { ref raw_text, ref raw, ref canonical })
+                    if !value_override_is_scrubbed(
+                        raw_text,
+                        raw,
+                        canonical,
+                        &guard.known_secrets,
+                        &guard.scrubbed_hashes,
+                    )
+            );
+            remove_from_config(context, setting, &guard, has_clean_stored_endpoint)
+                .map_err(|error| (503, error))?;
         }
         Ok(Undone { key: setting.key, conversation: None, stored: restored, mirror_error: None })
     })?;
@@ -1918,48 +3278,75 @@ pub(crate) fn history(
             conversation::is_canonical(conversation).then_some(conversation).ok_or((400, CONVERSATION_ERROR.to_string()))
         })
         .transpose()?;
+    let harness_disk_key = harness_credential(context);
     let entries = read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(Vec::new()) };
-        let shown = |text: Option<String>| {
-            text.map_or(Value::Null, |text| {
-                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
-            })
-        };
-        let mut statement = conn
-            .prepare(
-                "SELECT id, at_ms, actor, source, scope, key, old_value, new_value
-                 FROM settings_audit
-                 WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4)
-                 ORDER BY id DESC LIMIT ?3",
-            )
-            .map_err(InspectError::from_sqlite)?;
-        let entries = statement
-            .query_map(
-                params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
-                |row| {
-                    let id: i64 = row.get(0)?;
-                    let at: i64 = row.get(1)?;
-                    let actor: String = row.get(2)?;
-                    let source: String = row.get(3)?;
-                    let scope: String = row.get(4)?;
-                    let key: String = row.get(5)?;
-                    let old: Option<String> = row.get(6)?;
-                    let new: Option<String> = row.get(7)?;
-                    let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
-                        (json!(SECRET_MARKER), json!(SECRET_MARKER))
+        read_snapshot_tx(conn, |tx| {
+            let secrets = secrets_in_checked(tx)?;
+            let known_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+            let scrubbed_hashes = read_scrubbed_endpoint_hashes(tx)?;
+            let shown = |entry_key: &str, text: Option<String>| {
+                text.map_or(Value::Null, |raw_text| {
+                    let parsed = serde_json::from_str::<Value>(&raw_text)
+                        .unwrap_or_else(|_| Value::String(raw_text.clone()));
+                    if entry_key == HARNESS_API_BASE_URL.key
+                        && (value_has_leaked_endpoint(
+                            &parsed,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        ) || endpoint_value_is_scrubbed(
+                            &raw_text,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        ))
+                    {
+                        json!(SECRET_MARKER)
                     } else {
-                        (shown(old), shown(new))
-                    };
-                    Ok(json!({
-                        "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
-                        "setting": key, "old": old, "new": new,
-                    }))
-                },
-            )
-            .map_err(InspectError::from_sqlite)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(InspectError::from_sqlite)?;
-        Ok(entries)
+                        parsed
+                    }
+                })
+            };
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, at_ms, actor, source, scope, key, old_value, new_value
+                     FROM settings_audit
+                     WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4)
+                     ORDER BY id DESC LIMIT ?3",
+                )
+                .map_err(InspectError::from_sqlite)?;
+            let entries = statement
+                .query_map(
+                    params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
+                    |row| {
+                        let id: i64 = row.get(0)?;
+                        let at: i64 = row.get(1)?;
+                        let actor: String = row.get(2)?;
+                        let source: String = row.get(3)?;
+                        let scope: String = row.get(4)?;
+                        let key: String = row.get(5)?;
+                        let old: Option<String> = row.get(6)?;
+                        let new: Option<String> = row.get(7)?;
+                        let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
+                            (json!(SECRET_MARKER), json!(SECRET_MARKER))
+                        } else {
+                            let (mut old, mut new) = (shown(&key, old), shown(&key, new));
+                            if key == HARNESS_ROUTES.key {
+                                redact_route_array(&mut old, Some(&known_secrets));
+                                redact_route_array(&mut new, Some(&known_secrets));
+                            }
+                            (old, new)
+                        };
+                        Ok(json!({
+                            "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
+                            "setting": key, "old": old, "new": new,
+                        }))
+                    },
+                )
+                .map_err(InspectError::from_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(InspectError::from_sqlite)?;
+            Ok(entries)
+        })
     })
     .map_err(|error| (503, error))?;
     let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
@@ -2012,6 +3399,22 @@ pub(crate) fn console_changes(
     for setting in registry().filter(|setting| !setting.secret) {
         // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
         let Some(posted) = setting.found_in(carried).filter(|value| !value.is_null()) else { continue };
+        if setting.key == HARNESS_API_BASE_URL.key {
+            let harness_key = harness_credential(context);
+            let (known, scrubbed_hashes) = read_store(context, |conn| match conn {
+                None => Ok((
+                    collect_known_secrets(&[], harness_key.as_deref()),
+                    Vec::new(),
+                )),
+                Some(conn) => read_snapshot_tx(conn, |tx| {
+                    collect_known_secrets_and_hashes(tx, harness_key.as_deref())
+                }),
+            })
+            .map_err(|error| (503, error))?;
+            if value_has_leaked_endpoint(posted, Some(&known), Some(&scrubbed_hashes)) {
+                return Err((400, "setting text contains a credential".to_string()));
+            }
+        }
         let Some(value) = setting.normalize(posted) else {
             if setting.found_in(base) == Some(posted) {
                 continue;
@@ -2060,19 +3463,25 @@ pub(crate) fn apply_changes(
     }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
     let harness_key = harness_credential(context);
-    let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
+    let ((), mirror_error) = write_store_scrubbable(context, false, &written, false, |conn, document| {
         validate_rollout_change(conn, document, changes.iter().map(|(setting, value)| (*setting, Some(value))))?;
+        let mut scrubbed = false;
         for (setting, value) in &changes {
-            reject_credential_text(conn, setting, value, harness_key.as_deref())?;
+            reject_credential_text(conn, setting, Some(value), value, harness_key.as_deref())?;
             let text = value.to_string();
-            let old = stored_row(conn, setting.key)?;
+            let mut old = stored_row(conn, setting.key)?;
             if old.as_ref().is_some_and(|(old_text, _)| *old_text == text) {
                 continue;
+            }
+            if setting.key == HARNESS_API_BASE_URL.key
+                && scrub_old_endpoint_before_write(conn, &mut old, harness_key.as_deref(), actor)?
+            {
+                scrubbed = true;
             }
             record_change(conn, setting, old, Some(&text), actor, source)?;
         }
         validate_timing(conn, document, &written, None)?;
-        Ok(())
+        Ok(((), scrubbed))
     })?;
     Ok(mirror_error)
 }
@@ -2168,22 +3577,60 @@ fn sorted(value: Value) -> Value {
 /// values are not applied. While the admin agent mode puts another owner in force (`RuntimeContext::load_config`), the
 /// owner's entry has `overriddenBy` with that owner.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let mut document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let raw_doc = raw_config(context).map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    let snapshot_read = read_store(context, |conn| match conn {
+        None => {
+            let snapshot = resolve_model_endpoint_from_parts(
+                None,
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                Vec::new(),
+                None,
+            )?;
+            Ok((Vec::new(), Vec::new(), Some(snapshot), false))
+        }
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            let stored = read_stored_values_checked(tx)?;
+            let secrets = secrets_in_checked(tx)?;
+            let snapshot = resolve_model_endpoint_from_parts(
+                Some(tx),
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                secrets.clone(),
+                None,
+            )?;
+            let password_is_set = crate::console_auth::administrator_password_is_set_in(tx)?;
+            Ok((stored, secrets, Some(snapshot), password_is_set))
+        }),
+    });
+    let (stored, secrets, endpoint_snapshot, password_is_set, store_error) = match snapshot_read {
+        Ok((stored, secrets, snapshot, password_is_set)) => {
+            (stored, secrets, snapshot, password_is_set, None)
+        }
+        Err(error) => (Vec::new(), Vec::new(), None, false, Some(error)),
+    };
+    let mut document = raw_doc;
+    overlay_values(&mut document, &stored);
     complete_timing(&mut document);
-    let (stored, store_error) = match stored_values(context) {
-        Ok(stored) => (stored, None),
-        Err(error) => (Vec::new(), Some(error)),
+    let effective_owner = context.normalized_config(&document).ok().map(|effective| OWNER.read(&effective));
+    let search_endpoint = crate::aux_search::settings_endpoint(&document);
+    let known_secrets = endpoint_snapshot
+        .as_ref()
+        .map(|snap| snap.all_secrets.clone())
+        .unwrap_or_else(|| collect_known_secrets(&secrets, harness_disk_key.as_deref()));
+    let route_credentials = if store_error.is_none() {
+        Some(known_secrets.as_slice())
+    } else {
+        None
     };
-    let (secrets, store_error) = match read_secrets(context) {
-        Ok(secrets) => (secrets, store_error),
-        Err(error) => (Vec::new(), store_error.or(Some(error))),
-    };
-    let (password_is_set, store_error) =
-        match crate::console_auth::administrator_password_is_set(context) {
-            Ok(is_set) => (is_set, store_error),
-            Err(error) => (false, store_error.or(Some(error))),
-        };
-    let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
+    let model_fallback = endpoint_snapshot
+        .as_ref()
+        .and_then(|snap| snap.default_endpoint.clone())
+        .or_else(|| default_raw.map(crate::runtime::canonical_model_endpoint));
     let settings: Vec<Value> = registry()
         .map(|setting| {
             let mut entry = json!({
@@ -2201,18 +3648,85 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 return entry;
             }
             if setting.secret {
-                entry["isSet"] = json!(secrets.iter().any(|(key, _, _)| *key == setting.key));
+                if setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key {
+                    let is_harness = setting.key == HARNESS_API_KEY.key;
+                    if let Some(snap) = &endpoint_snapshot {
+                        let (is_set, bound_elsewhere, source) = if is_harness {
+                            (
+                                snap.harness_db_key.is_some(),
+                                snap.harness_bound_elsewhere,
+                                snap.harness_key_source(),
+                            )
+                        } else {
+                            (
+                                snap.cli_model_key.is_some(),
+                                snap.cli_bound_elsewhere,
+                                snap.cli_model_key.as_ref().map(|_| "settings"),
+                            )
+                        };
+                        entry["isSet"] = json!(is_set);
+                        if bound_elsewhere {
+                            entry["boundElsewhere"] = json!(true);
+                        }
+                        entry["source"] = json!(source);
+                    } else {
+                        entry["isSet"] = json!(false);
+                        entry["source"] = Value::Null;
+                    }
+                } else {
+                    let matching = secrets.iter().any(|(key, bound, _)| {
+                        *key == setting.key && search_endpoint.as_deref() == Some(bound.as_str())
+                    });
+                    let bound_elsewhere =
+                        !matching && secrets.iter().any(|(key, _, _)| *key == setting.key);
+                    entry["isSet"] = json!(matching);
+                    if bound_elsewhere {
+                        entry["boundElsewhere"] = json!(true);
+                    }
+                }
                 return entry;
             }
-            let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = if setting.key == ROLLOUT_GROUPS.key {
+            let mut stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
+            if setting.key == HARNESS_API_BASE_URL.key
+                && (endpoint_snapshot.as_ref().is_some_and(|s| s.stored_url_suppressed)
+                    || stored_value
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| endpoint_contains_any_secret(s, &known_secrets)))
+            {
+                stored_value = Some(json!(SECRET_MARKER));
+            }
+            let mut value = if setting.key == HARNESS_API_BASE_URL.key {
+                match &endpoint_snapshot {
+                    Some(snap)
+                        if matches!(
+                            snap.effective_source,
+                            Some(ModelEndpointSource::Settings | ModelEndpointSource::Config)
+                        ) =>
+                    {
+                        json!(snap.effective_endpoint)
+                    }
+                    _ => Value::Null,
+                }
+            } else if setting.key == ROLLOUT_GROUPS.key {
                 setting.found_in(&document).cloned().unwrap_or(Value::Null)
             } else {
                 setting.read(&document)
             };
+            if setting.key == HARNESS_ROUTES.key {
+                if let Some(stored_routes) = stored_value.as_mut() {
+                    redact_route_array(stored_routes, route_credentials);
+                }
+                if redact_route_array(&mut value, route_credentials) {
+                    entry["redacted"] = json!(true);
+                }
+            }
             entry["default"] = setting.default_value();
             entry["stored"] = json!(stored_value);
             entry["value"] = value.clone();
+            if setting.key == HARNESS_API_BASE_URL.key {
+                entry["fallback"] = json!({"source": "dependencies.json", "value": model_fallback});
+            }
             if setting.confirmed() {
                 entry["confirm"] = json!(true);
             }
@@ -2227,6 +3741,69 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         reply["storeError"] = json!(error);
     }
     Ok(reply)
+}
+
+pub(crate) struct ModelsSnapshot {
+    pub cfg: Value,
+    pub endpoint_snapshot: Option<ModelEndpointSnapshot>,
+    pub conversations: Value,
+    pub store_error: Option<String>,
+}
+
+/// Reads effective runtime config, model endpoint/secrets snapshot, and conversation routes in one SQLite read transaction.
+pub(crate) fn models_snapshot(
+    context: &RuntimeContext,
+    admitted: impl FnOnce(&Value) -> Vec<String>,
+) -> Result<ModelsSnapshot, (u16, String)> {
+    let raw_doc = raw_config(context).map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    let snapshot_read = read_store(context, |conn| match conn {
+        None => {
+            let endpoint_snapshot = resolve_model_endpoint_from_parts(
+                None,
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                Vec::new(),
+                None,
+            )?;
+            Ok((Vec::new(), Some(endpoint_snapshot), Vec::new()))
+        }
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            let stored = read_stored_values_checked(tx)?;
+            let secrets = secrets_in_checked(tx)?;
+            let endpoint_snapshot = resolve_model_endpoint_from_parts(
+                Some(tx),
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                secrets,
+                None,
+            )?;
+            let conv_values = conversation::read_values_checked(tx)?;
+            Ok((stored, Some(endpoint_snapshot), conv_values))
+        }),
+    });
+    let (stored, endpoint_snapshot, conv_values, store_error) = match snapshot_read {
+        Ok((stored, endpoint_snapshot, conv_values)) => (stored, endpoint_snapshot, conv_values, None),
+        Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
+    };
+    let mut effective_doc = raw_doc;
+    overlay_values(&mut effective_doc, &stored);
+    complete_timing(&mut effective_doc);
+    resolve_live_batch(&mut effective_doc);
+    let cfg = context
+        .normalized_config(&effective_doc)
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let admitted_list = admitted(&cfg);
+    let conversations = conversation::build_view(&cfg, &conv_values, &admitted_list, store_error.clone());
+    Ok(ModelsSnapshot {
+        cfg,
+        endpoint_snapshot,
+        conversations,
+        store_error,
+    })
 }
 
 /// #154: the security settings a console audit undo restores from `restored`, the whole `config.json` of a backup:
