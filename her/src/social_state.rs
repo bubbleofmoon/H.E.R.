@@ -1859,33 +1859,43 @@ pub(crate) fn claim_reserved2_wake(
 fn clear_reserved2_deadline(
     context: &RuntimeContext,
     key: &str,
-    expected_token: &str,
+    expected_token: Option<&str>,
     at: i64,
     previous: &Value,
     mark_retired: bool,
 ) -> Result<(), SocialError> {
-    ConversationState::for_runtime(context)
-        .update(key, |conv| {
-            if !credential_eq(conv.token().unwrap_or(""), expected_token) {
+    let state = ConversationState::for_runtime(context);
+    let retire_wc = |conv: &mut Conversation| {
+        if let Some(expected) = expected_token {
+            if !credential_eq(conv.token().unwrap_or(""), expected) {
                 return Err((403, "queued wake token invalidated".into()));
             }
-            if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-                let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
-                    || (mark_retired && wc["infinite"] != true && wc["sleepUntil"].is_null());
-                if wc["lastWakeAt"].as_i64() == Some(at)
-                    && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                    && owns_deadline
-                {
-                    wc["sleepUntil"] = Value::Null;
-                    if mark_retired {
-                        wc["sleepRetired"] = json!(true);
-                    }
-                    conv.set_field("wakeConfig", wc);
+        }
+        if let Some(mut wc) = conv.field("wakeConfig").cloned() {
+            let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                || (mark_retired && wc["sleepUntil"].is_null());
+            if wc["lastWakeAt"].as_i64() == Some(at)
+                && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+                && wc["infinite"] != true
+                && owns_deadline
+            {
+                wc["sleepUntil"] = Value::Null;
+                if mark_retired {
+                    wc["sleepRetired"] = json!(true);
                 }
+                conv.set_field("wakeConfig", wc);
             }
-            Ok(())
-        })
-        .map_err(SocialError::from_http)
+        }
+        Ok(())
+    };
+    if expected_token.is_some() {
+        state.update(key, retire_wc).map_err(SocialError::from_http)
+    } else {
+        state
+            .update_existing(key, retire_wc)
+            .map(|_| ())
+            .map_err(SocialError::from_http)
+    }
 }
 
 pub(crate) fn consume_reserved2_deadline(
@@ -1895,7 +1905,7 @@ pub(crate) fn consume_reserved2_deadline(
     at: i64,
     previous: &Value,
 ) -> Result<(), SocialError> {
-    clear_reserved2_deadline(context, key, expected_token, at, previous, false)
+    clear_reserved2_deadline(context, key, Some(expected_token), at, previous, false)
 }
 
 pub(crate) fn retire_reserved2_deadline(
@@ -1905,7 +1915,16 @@ pub(crate) fn retire_reserved2_deadline(
     at: i64,
     previous: &Value,
 ) -> Result<(), SocialError> {
-    clear_reserved2_deadline(context, key, expected_token, at, previous, true)
+    clear_reserved2_deadline(context, key, Some(expected_token), at, previous, true)
+}
+
+pub(crate) fn retire_reserved2_deadline_for_recovery(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, None, at, previous, true)
 }
 
 fn rollback_reserved2_wake_inner(

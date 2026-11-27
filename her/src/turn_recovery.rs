@@ -654,6 +654,23 @@ fn is_expired_timeout_before_admission(turn: &Turn) -> bool {
         && turn.notes.iter().any(|note| note["verdict"] == "expired-before-admission")
 }
 
+fn retire_expired_timeout_if_needed(context: &RuntimeContext, turn: &Turn) -> Result<(), String> {
+    if is_expired_timeout_before_admission(turn) {
+        if let Some(claim) = &turn.wake_claim {
+            if claim["previous"]["wakeConfig"]["sleepUntil"].is_string() {
+                return crate::social_state::retire_reserved2_deadline_for_recovery(
+                    context,
+                    &turn.key,
+                    claim["at"].as_i64().unwrap_or(0),
+                    &claim["previous"],
+                )
+                .map_err(String::from);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rearm_reserved2_if_needed(
     context: &RuntimeContext,
     cfg: &Value,
@@ -857,6 +874,9 @@ fn apply_at(
             );
         }
         Verdict::Cancel(why) => {
+            if !commit(retire_expired_timeout_if_needed(context, turn)) {
+                return;
+            }
             if turn.notes.iter().any(|note| note["verdict"] == "expired-before-admission")
                 && !commit(
                     crate::social_state::rotate_if_epoch(context, &turn.key, &turn.epochs)
@@ -1439,6 +1459,25 @@ pub(crate) fn rearm_startup_terminal_sleeps(
         let expired_timeout_before_admission = is_expired_timeout_before_admission(turn)
             && turn.state == State::Cancelled
             && turn.outcome_reason == "turnTimeout";
+        if !keys_with_live_turn.contains(key)
+            && expired_timeout_before_admission
+            && (turn.reserved2 || turn.wake_claim.is_some())
+            && turn.backend == "harness"
+        {
+            match retire_expired_timeout_if_needed(context, turn) {
+                Ok(()) => {
+                    done.insert(key.to_string());
+                }
+                Err(error) => {
+                    crate::safe_println!(
+                        "[recovery] startup expired timeout retirement failed for {}: {error}",
+                        turn.key
+                    );
+                    ok = false;
+                }
+            }
+            continue;
+        }
         let eligible = !keys_with_live_turn.contains(key)
             && !expired_timeout_before_admission
             && (turn.reserved2 || turn.wake_claim.is_some())
@@ -3850,6 +3889,255 @@ mod tests {
         );
         assert_eq!(conv["wakeConfig"]["sleepRetired"], json!(true));
         assert_ne!(conv["agentToken"].as_str(), Some(old_token));
+    }
+
+    #[tokio::test]
+    async fn ticket297_recovery_retires_unconsumed_expired_timeout_deadline() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1, 2]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let operator_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() + 120_000);
+        let previous = json!({
+            "wakeConfig": {
+                "confirmedAt": 2,
+                "infinite": false,
+                "sleepUntil": due_iso,
+                "lastWakeAt": 0,
+                "wakeCount": 0
+            },
+            "lastWakeReason": ""
+        });
+
+        // 1. Open-turn checkpoint: expired-before-admission timeout turn still open while
+        // social-v2.json still holds the unconsumed sleepUntil: due_iso and no sleepRetired.
+        let open_root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-open-uncons-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(open_root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let open_token = "tok-297-open-unconsumed";
+        std::fs::write(
+            open_root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": open_token,
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": due_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let open_ctx = RuntimeContext::from_root(&open_root.0).unwrap();
+        let open_cfg = open_ctx.load_config().unwrap();
+        let open_journal = Journal::open(&open_ctx).unwrap();
+        let rec = Recorder::begin_reserved2(
+            &open_ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch(open_token),
+            &[],
+        )
+        .unwrap();
+        rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+        rec.verified("expired-before-admission", "turnTimeout").unwrap();
+
+        let open_turns = fold(&turn_ledger::read_records(&open_ctx).unwrap()).0;
+        assert_eq!(open_turns.len(), 1);
+        assert_eq!(open_turns[0].state, State::Begun);
+        assert!(open_turns[0].attempts.is_empty());
+        let outbox = crate::send_outbox::read_records(&open_ctx);
+        Pass { context: &open_ctx, cfg: &open_cfg }
+            .reconcile(&open_journal, &open_turns[0], &open_turns, &outbox)
+            .await;
+
+        let ended = fold(&turn_ledger::read_records(&open_ctx).unwrap()).0.remove(0);
+        assert_eq!(ended.state, State::Cancelled);
+        assert_eq!(ended.outcome_reason, "turnTimeout");
+        let open_conv = open_ctx.read_social_state().unwrap()["conversations"]["group:1"].clone();
+        assert!(
+            open_conv["wakeConfig"]["sleepUntil"].is_null(),
+            "open expired-before-admission timeout recovery must clear unconsumed sleepUntil, got {}",
+            open_conv["wakeConfig"]
+        );
+        assert_eq!(open_conv["wakeConfig"]["sleepRetired"], json!(true));
+        let mut driver = crate::session::Driver::new(
+            crate::session::scheduler_from_state(crate::wake_cfg_of(&open_cfg), &open_conv),
+            1,
+        );
+        driver.adopt_wake_config(
+            crate::session::wake_config_from_json(Some(&open_conv["wakeConfig"])),
+            crate::turn_ledger::now_ms(),
+        );
+        assert_eq!(
+            driver.sched.sleep_at, None,
+            "driver adopting retired wakeConfig must not arm sleep_at"
+        );
+
+        // 2. Already-cancelled checkpoint: turn already ended cancelled/turnTimeout while
+        // social-v2.json still holds unconsumed sleepUntil: due_iso (and token already rotated).
+        let term_root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-term-uncons-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(term_root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            term_root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": "tok-297-term-rotated",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": due_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let term_ctx = RuntimeContext::from_root(&term_root.0).unwrap();
+        let term_cfg = term_ctx.load_config().unwrap();
+        let _term_journal = Journal::open(&term_ctx).unwrap();
+        let term_rec = Recorder::begin_reserved2(
+            &term_ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-term-orig"),
+            &[],
+        )
+        .unwrap();
+        term_rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+        term_rec.verified("expired-before-admission", "turnTimeout").unwrap();
+        term_rec.end("cancelled", "turnTimeout").unwrap();
+
+        let term_turns = fold(&turn_ledger::read_records(&term_ctx).unwrap()).0;
+        let cutoff = crate::turn_ledger::now_ms() + 1_000;
+        let mut done = HashSet::new();
+        assert!(rearm_startup_terminal_sleeps(&term_ctx, &term_cfg, &term_turns, cutoff, &HashSet::new(), &mut done));
+        assert!(done.contains("group:1"));
+        let term_wc = term_ctx.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"].clone();
+        assert!(
+            term_wc["sleepUntil"].is_null(),
+            "startup terminal recovery must retire unconsumed expired timeout sleepUntil, got {term_wc}"
+        );
+        assert_eq!(term_wc["sleepRetired"], json!(true));
+
+        // 3. Operator schedule edit preservation: newer operator /schedule sleepUntil != due_iso
+        // (both same lastWakeAt/confirmedAt and newer confirmedAt) must stay unretired.
+        let sched_root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-sched-pres-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(sched_root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let sched_tok_one = "tok-297-sched-one";
+        let sched_tok_two = "tok-297-sched-two";
+        std::fs::write(
+            sched_root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": sched_tok_one,
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": operator_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    },
+                    "group:2": {
+                        "agentToken": sched_tok_two,
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 3,
+                            "infinite": false,
+                            "sleepUntil": operator_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let sched_ctx = RuntimeContext::from_root(&sched_root.0).unwrap();
+        let sched_cfg = sched_ctx.load_config().unwrap();
+        let sched_journal = Journal::open(&sched_ctx).unwrap();
+        let rec1 = Recorder::begin_reserved2(
+            &sched_ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch(sched_tok_one),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+        rec1.verified("expired-before-admission", "turnTimeout").unwrap();
+        let rec2 = Recorder::begin_reserved2(
+            &sched_ctx,
+            "group:2",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch(sched_tok_two),
+            &[],
+        )
+        .unwrap();
+        rec2.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+        rec2.verified("expired-before-admission", "turnTimeout").unwrap();
+        rec2.end("cancelled", "turnTimeout").unwrap();
+
+        let sched_turns = fold(&turn_ledger::read_records(&sched_ctx).unwrap()).0;
+        let sched_outbox = crate::send_outbox::read_records(&sched_ctx);
+        Pass { context: &sched_ctx, cfg: &sched_cfg }
+            .reconcile(&sched_journal, &sched_turns[0], &sched_turns, &sched_outbox)
+            .await;
+        let mut sched_done = HashSet::new();
+        let sched_turns_after = fold(&turn_ledger::read_records(&sched_ctx).unwrap()).0;
+        assert!(rearm_startup_terminal_sleeps(
+            &sched_ctx,
+            &sched_cfg,
+            &sched_turns_after,
+            crate::turn_ledger::now_ms() + 1_000,
+            &HashSet::new(),
+            &mut sched_done,
+        ));
+        let sched_convs = sched_ctx.read_social_state().unwrap()["conversations"].clone();
+        for g in ["group:1", "group:2"] {
+            assert_eq!(
+                sched_convs[g]["wakeConfig"]["sleepUntil"],
+                json!(operator_iso),
+                "{g} operator /schedule deadline must be preserved"
+            );
+            assert!(
+                sched_convs[g]["wakeConfig"].get("sleepRetired").is_none(),
+                "{g} operator /schedule deadline must not be marked sleepRetired"
+            );
+        }
     }
 
     #[test]
