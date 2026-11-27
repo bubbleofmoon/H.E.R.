@@ -334,6 +334,19 @@ export const ModelRoutesTab: React.FC = () => {
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
 
+  const modelSaveTargetEndpoint = useMemo<string | null>(() => {
+    if (dirtyKeys.includes(MODEL_ENDPOINT_KEY)) {
+      const urlToSave = normalizeEndpointDraftValue(
+        apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
+        drafts[MODEL_ENDPOINT_KEY],
+      );
+      return typeof urlToSave === 'string'
+        ? canonicalModelEndpoint(urlToSave) ?? urlToSave
+        : (resolveActiveModelEndpoint(settings, null) ?? null);
+    }
+    return activeEndpointInfo.endpoint;
+  }, [dirtyKeys, apiBaseUrlItem, drafts, settings, activeEndpointInfo.endpoint]);
+
   const handleSaveSecret = useCallback(
     async (item: SettingItemView) => {
       if (secretBusyKey !== null || saving) return;
@@ -345,6 +358,10 @@ export const ModelRoutesTab: React.FC = () => {
       }
       const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
       const shouldSaveEndpoint = isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY);
+      if (isModelSecret && !shouldSaveEndpoint && !activeEndpointInfo.endpoint) {
+        pushToast('当前模型接口地址不可用，请刷新后再保存密钥', 'warn');
+        return;
+      }
       const rawEndpointDraft = shouldSaveEndpoint ? draftsRef.current[MODEL_ENDPOINT_KEY] : undefined;
       const urlToSave = shouldSaveEndpoint
         ? normalizeEndpointDraftValue(
@@ -353,7 +370,7 @@ export const ModelRoutesTab: React.FC = () => {
           )
         : undefined;
       const defaultEndpoint = resolveActiveModelEndpoint(settings, null);
-      let targetEndpoint = isModelSecret ? activeEndpointInfo.endpoint ?? undefined : undefined;
+      let targetEndpoint = isModelSecret ? (activeEndpointInfo.endpoint ?? '') : undefined;
       setSecretBusyKey(item.key);
       try {
         let endpointSaved = false;
@@ -381,7 +398,7 @@ export const ModelRoutesTab: React.FC = () => {
           targetEndpoint =
             typeof urlToSave === 'string'
               ? canonicalModelEndpoint(urlToSave) ?? urlToSave
-              : defaultEndpoint;
+              : (defaultEndpoint ?? '');
         }
         try {
           await persistValidatedSecret(item, raw, targetEndpoint);
@@ -835,7 +852,11 @@ export const ModelRoutesTab: React.FC = () => {
                     <Button
                       size="sm"
                       variant="primary"
-                      disabled={anySecretBusy || draft.length === 0}
+                      disabled={
+                        anySecretBusy ||
+                        draft.length === 0 ||
+                        (MODEL_CREDENTIAL_KEYS.has(item.key) && modelSaveTargetEndpoint === null)
+                      }
                       onClick={() => void handleSaveSecret(item)}
                     >
                       保存密钥

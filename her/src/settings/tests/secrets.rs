@@ -1539,3 +1539,169 @@ fn ticket443_r14_malformed_credential_stored_url_suppressed_live() {
         "non-credential malformed stored harness.apiBaseUrl must fail closed"
     );
 }
+
+#[test]
+fn ticket443_r15_replacing_or_resetting_leaked_endpoint_masks_old_audit_and_vacuums() {
+    let latest_audit_old = |root_path: &std::path::Path| -> Option<String> {
+        let db = rusqlite::Connection::open(root_path.join("data/settings.db")).unwrap();
+        db.query_row(
+            "SELECT old_value FROM settings_audit WHERE scope='global' AND key='harness.apiBaseUrl' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // Case 1: replacing a leaked endpoint via POST /api/settings/set.
+    let (root1, ctx1) = settings_fixture("ticket443 r15 replace set");
+    let tok1 = "sk-r15-rep-tok";
+    let host1 = "old-replace-r15.example.test";
+    let leaked1 = format!("https://{host1}/{tok1}/v1");
+    assert_eq!(post(&ctx1, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked1})).0, 200);
+    std::fs::write(root1.0.join("config/harness-api-key"), tok1).unwrap();
+    assert_eq!(
+        post(&ctx1, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": "https://clean-r15-set.example.test/v1"})).0,
+        200
+    );
+    assert_eq!(latest_audit_old(&root1.0).as_deref(), Some("\"(hidden)\""));
+    let db_bytes1 = std::fs::read(root1.0.join("data/settings.db")).unwrap();
+    assert!(!db_bytes1.windows(host1.len()).any(|w| w == host1.as_bytes()));
+    assert_eq!(post(&ctx1, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked1})).0, 400);
+
+    // Case 2: resetting a leaked endpoint via POST /api/settings/reset.
+    let (root2, ctx2) = settings_fixture("ticket443 r15 reset");
+    let tok2 = "sk-r15-rst-tok";
+    let host2 = "old-reset-r15.example.test";
+    let leaked2 = format!("https://{host2}/{tok2}/v1");
+    assert_eq!(post(&ctx2, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked2})).0, 200);
+    std::fs::write(root2.0.join("config/harness-api-key"), tok2).unwrap();
+    assert_eq!(post(&ctx2, "/api/settings/reset", json!({"setting": "harness.apiBaseUrl"})).0, 200);
+    assert_eq!(latest_audit_old(&root2.0).as_deref(), Some("\"(hidden)\""));
+    let db_bytes2 = std::fs::read(root2.0.join("data/settings.db")).unwrap();
+    assert!(!db_bytes2.windows(host2.len()).any(|w| w == host2.as_bytes()));
+    assert_eq!(post(&ctx2, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked2})).0, 400);
+
+    // Case 3: replacing a leaked endpoint via apply_changes.
+    let (root3, ctx3) = settings_fixture("ticket443 r15 apply_changes");
+    let tok3 = "sk-r15-bat-tok";
+    let host3 = "old-batch-r15.example.test";
+    let leaked3 = format!("https://{host3}/{tok3}/v1");
+    assert_eq!(post(&ctx3, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked3})).0, 200);
+    std::fs::write(root3.0.join("config/harness-api-key"), tok3).unwrap();
+    crate::settings::apply_changes(
+        &ctx3,
+        vec![(&crate::settings::HARNESS_API_BASE_URL, json!("https://clean-r15-bat.example.test/v1"))],
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    assert_eq!(latest_audit_old(&root3.0).as_deref(), Some("\"(hidden)\""));
+    let db_bytes3 = std::fs::read(root3.0.join("data/settings.db")).unwrap();
+    assert!(!db_bytes3.windows(host3.len()).any(|w| w == host3.as_bytes()));
+    assert_eq!(post(&ctx3, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked3})).0, 400);
+}
+
+#[test]
+fn ticket443_r15_serialized_json_string_credential_is_scrubbed_on_rotation_and_restore() {
+    let tok = r#"\"r15-esc"#;
+    let esc_host = "esc-r15.example.test";
+    let serialized_row = serde_json::to_string(&format!("https://{esc_host}/tok\"r15-esc")).unwrap();
+    assert!(serialized_row.contains(tok), "test setup requires escaped substring only in serialized form");
+
+    // (a) Secret rotation (store()) tombstones row, records hash, and purges raw bytes.
+    let (root, context) = settings_fixture("ticket443 r15 escaped json string rotation");
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    StoreProbe::at(&root.0).edit(&format!(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+        serialized_row.replace('\'', "''")
+    ));
+    assert_eq!(put(&context, CLI, "sk-r15-rotated-clean").0, 200);
+    assert_eq!(StoreProbe::at(&root.0).value("harness.apiBaseUrl").as_deref(), Some("\"(hidden)\""));
+    assert!(StoreProbe::at(&root.0).value("__scrubbed.harness.apiBaseUrl").is_some());
+    let db_bytes = std::fs::read(root.0.join("data/settings.db")).unwrap();
+    assert!(!db_bytes.windows(esc_host.len()).any(|w| w == esc_host.as_bytes()));
+
+    // (b) Staged restore scrub_restored_settings_db also tombstones and purges raw bytes.
+    let (root2, context2) = settings_fixture("ticket443 r15 escaped json string restore");
+    assert_eq!(set_quiet(&context2, json!(4500)).0, 200);
+    StoreProbe::at(&root2.0).edit(&format!(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+        serialized_row.replace('\'', "''")
+    ));
+    let staged_db = root2.0.join("data/staged-restore-r15.db");
+    std::fs::copy(root2.0.join("data/settings.db"), &staged_db).unwrap();
+    assert!(
+        crate::settings::scrub_restored_settings_db(&staged_db, &[tok.to_string()], &[]).unwrap()
+    );
+    let conn = rusqlite::Connection::open(&staged_db).unwrap();
+    let val: String = conn
+        .query_row("SELECT value FROM settings WHERE key='harness.apiBaseUrl'", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    assert_eq!(val, "\"(hidden)\"");
+    let staged_bytes = std::fs::read(&staged_db).unwrap();
+    assert!(!staged_bytes.windows(esc_host.len()).any(|w| w == esc_host.as_bytes()));
+}
+
+#[test]
+fn ticket443_r15_numeric_credential_in_malformed_config_scrubbed_and_rejected() {
+    let tok = format!("{}{}", 123456, 789012);
+    let tok_num: u64 = tok.parse().unwrap();
+
+    // (a) console_changes rejects unchanged malformed arrays/objects holding numeric credential.
+    let (_root, context) = settings_fixture("ticket443 r15 numeric console_changes");
+    assert_eq!(put(&context, CLI, &tok).0, 200);
+    for malformed in [
+        json!({"harness": {"apiBaseUrl": [tok_num]}}),
+        json!({"harness": {"apiBaseUrl": {"k": tok_num}}}),
+    ] {
+        let err = match crate::settings::console_changes(&context, &malformed, &malformed) {
+            Err(err) => err,
+            Ok(changes) => panic!("console_changes must reject numeric credential in {malformed}: {} changes", changes.len()),
+        };
+        assert_eq!(err.0, 400);
+    }
+
+    // (b) Saving numeric credential scrubs malformed numeric /harness/apiBaseUrl from config.json.
+    let (root2, context2) = settings_fixture("ticket443 r15 numeric config scrub");
+    write_config(&root2, |cfg| {
+        cfg["harness"]["apiBaseUrl"] = json!([tok_num]);
+    });
+    assert_eq!(put(&context2, CLI, &tok).0, 200);
+    assert!(
+        stored_config(&root2).pointer("/harness/apiBaseUrl").is_none(),
+        "saving numeric secret must scrub malformed numeric /harness/apiBaseUrl from config.json"
+    );
+}
+
+#[test]
+fn ticket443_r15_corrupt_db_endpoint_still_scrubs_leaked_config_on_503() {
+    let (root, context) = settings_fixture("ticket443 r15 corrupt db scrubs config");
+    let tok = "sk-r15-corrupt-cfg-tok";
+    let leaked_url = format!("https://corrupt-r15.example.test/{tok}");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    StoreProbe::at(&root.0).edit(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '12345', 1, 1, 'fixture')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;"
+    );
+    write_config(&root, |cfg| {
+        cfg["harness"]["apiBaseUrl"] = json!(leaked_url);
+    });
+
+    let (st, _) = put(&context, "harness.apiKey", tok);
+    assert_eq!(st, 503, "corrupt non-credential DB endpoint must fail credential resolution with 503");
+    assert!(
+        StoreProbe::at(&root.0).value("harness.apiKey").is_none(),
+        "harness.apiKey must not be saved on 503"
+    );
+    assert!(
+        StoreProbe::at(&root.0).value("__scrubbed.harness.apiBaseUrl").is_some(),
+        "__scrubbed.harness.apiBaseUrl hash must be committed on 503"
+    );
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "leaked config/harness.apiBaseUrl must still be scrubbed even when DB endpoint is corrupt (503)"
+    );
+}
