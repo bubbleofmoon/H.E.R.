@@ -18,18 +18,21 @@ pub(crate) fn wake_needs_dsh(context: &RuntimeContext, cfg: &Value, key: &str) -
     }
 }
 
-/// Re-arm a finite sleep timer when a provisional wake that carried no remaining `sleepUntil`
-/// is dropped without scheduling a retry or hold, provided the conversation's token still
-/// matches the dropped wake's epoch.
+/// Re-arm a finite sleep timer when a provisional wake (or non-timeout wake whose remaining
+/// `sleepUntil` was consumed before failure) is dropped without scheduling a retry or hold,
+/// provided the conversation's token still matches the dropped wake's epoch.
 fn rearm_dropped_provisional_sleep(
     context: &RuntimeContext,
     cfg: &Value,
     key: &str,
     at: i64,
+    reason: &str,
     previous: &Value,
     expected_token: &str,
 ) -> Result<(), String> {
-    if previous["wakeConfig"]["infinite"] != false || !previous["wakeConfig"]["sleepUntil"].is_null() {
+    if previous["wakeConfig"]["infinite"] != false
+        || (reason == "timeout" && previous["wakeConfig"]["sleepUntil"].is_string())
+    {
         return Ok(());
     }
     let current = social_state::token(context, key)
@@ -38,16 +41,22 @@ fn rearm_dropped_provisional_sleep(
     if current != expected_token {
         return Ok(());
     }
-    let records = crate::turn_ledger::read_records(context)?;
-    let (turns, _) = crate::turn_ledger::fold(&records);
     let fallback = json!({ "at": at, "previous": previous });
-    let claim = crate::turn_recovery::wake_claim_for_rearm(
-        &turns,
-        key,
-        Some(&previous["wakeConfig"]["confirmedAt"]),
-        None,
-    )
-    .unwrap_or(&fallback);
+    let claim_from_ledger;
+    let claim = if previous["wakeConfig"]["sleepUntil"].is_string() {
+        &fallback
+    } else {
+        let records = crate::turn_ledger::read_records(context)?;
+        let (turns, _) = crate::turn_ledger::fold(&records);
+        claim_from_ledger = crate::turn_recovery::wake_claim_for_rearm(
+            &turns,
+            key,
+            Some(&previous["wakeConfig"]["confirmedAt"]),
+            None,
+        )
+        .cloned();
+        claim_from_ledger.as_ref().unwrap_or(&fallback)
+    };
     social_state::rearm_interrupted_reserved2_wake_for_token(
         context,
         cfg,
@@ -1624,7 +1633,7 @@ mod tests {
             }));
         });
 
-        rearm_dropped_provisional_sleep(&context, &cfg, key, 100, &previous, old_token).unwrap();
+        rearm_dropped_provisional_sleep(&context, &cfg, key, 100, "atMention", &previous, old_token).unwrap();
 
         let state = context.read_social_state().unwrap();
         assert_ne!(
@@ -1727,6 +1736,121 @@ mod tests {
         })
         .await
         .expect("the multi-hop claim fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_expired_mention_preserves_recovered_future_deadline() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, _console) = harness_cap_fixture("harness-cap-expired-mention", None).await;
+            let key = HARNESS_CAP_KEY;
+            let future_ms = crate::turn_ledger::now_ms() + 500_000;
+            let future_iso = crate::sticker::iso_at(future_ms);
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(future_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            assert_eq!(hub.active[key].previous["wakeConfig"]["sleepUntil"], json!(future_iso));
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                json!(future_iso),
+                "expiring an atMention wake before admission must preserve the recovered future sleepUntil"
+            );
+            assert_eq!(
+                hub.drivers[key].sched.wc.sleep_until.as_deref(),
+                Some(future_iso.as_str()),
+                "live driver must keep the preserved future deadline"
+            );
+        })
+        .await
+        .expect("the expired mention fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_malformed_mode_preserves_rearm_pending() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (root, mut hub, _console) = harness_cap_fixture("harness-cap-malformed-mode", None).await;
+            let key = HARNESS_CAP_KEY;
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            let mode_path = root.0.join("data/mode.json");
+            let (snapshot, observed) = tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+            let (finished, observed_finish) = tokio::sync::oneshot::channel();
+            hub.tick_snapshot_hook = Some(snapshot);
+            hub.collector_finished_hook = Some(observed_finish);
+            let mode_path_task = mode_path.clone();
+            let inject = tokio::spawn(async move {
+                let done = observed.await.unwrap();
+                done.send(()).unwrap();
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                std::fs::write(&mode_path_task, "{bad").unwrap();
+                finished.send(()).unwrap();
+            });
+
+            // Tick 1: mode.json becomes malformed mid-tick so mode_checked fails and queues rearm_pending.
+            hub.tick("bot", 9001).await.unwrap();
+            inject.await.unwrap();
+
+            // Tick 2: mode.json stays malformed while adopt_mode runs.
+            let _ = hub.tick("bot", 9001).await;
+
+            // Tick 3: restore valid mode.json and verify rearm_pending survived and re-arms sleepUntil.
+            std::fs::write(&mode_path, r#"{"mode":"reserved2"}"#).unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some(),
+                "malformed mode.json across ticks must not wipe rearm_pending before mode.json recovers"
+            );
+            assert!(
+                hub.drivers[key].sched.wc.sleep_until.is_some(),
+                "live driver must adopt re-armed sleep_until after mode.json recovers"
+            );
+        })
+        .await
+        .expect("the malformed mode fixture must settle");
     }
 
     async fn wait_for_harness_cap_wake(hub: &Hub) {
@@ -3607,7 +3731,7 @@ pub struct Hub {
     tokens: HashMap<String, String>,
     retries: HashMap<String, (i64, String)>,
     rollback_pending: HashMap<String, (i64, Value)>,
-    rearm_pending: HashMap<String, (i64, Value, String)>,
+    rearm_pending: HashMap<String, (i64, String, Value, String)>,
     failures: HashMap<String, u32>,
     closing_seen: HashMap<String, Value>,
     closing_misses: HashMap<String, u32>,
@@ -3818,10 +3942,10 @@ impl Hub {
     fn drain_rearm_pending(&mut self, cfg: &Value) {
         let keys: Vec<String> = self.rearm_pending.keys().cloned().collect();
         for key in keys {
-            let Some((at, previous, expected_token)) = self.rearm_pending.get(&key).cloned() else {
+            let Some((at, reason, previous, expected_token)) = self.rearm_pending.get(&key).cloned() else {
                 continue;
             };
-            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &previous, &expected_token) {
+            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &reason, &previous, &expected_token) {
                 Ok(()) => {
                     self.rearm_pending.remove(&key);
                 }
@@ -4058,6 +4182,7 @@ impl Hub {
     }
 
     async fn adopt_mode(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
+        social_state::mode_checked(&self.context).map_err(|e| e.to_string())?;
         let stamp = self
             .context
             .read_optional_text(RuntimeArea::Data, "mode.json")
@@ -4683,7 +4808,7 @@ impl Hub {
             let (state, owned) = self.observe_turn_epoch(&key)?;
             let active = &self.active[&key];
             if owned && active.route() == pipeline::Reserved2Route::ExpiredBeforeAdmission
-                && active.reason != "wakeReminder" && active.previous["wakeConfig"]["sleepUntil"].is_string()
+                && active.reason == "timeout" && active.previous["wakeConfig"]["sleepUntil"].is_string()
             {
                 // A wake refused at the gate never got to consume its durable timer claim.
                 let token = crate::conversation_state::SocialDocument::from_value(state.clone())
@@ -4781,12 +4906,13 @@ impl Hub {
             let needs_provisional_rearm = !access_refused
                 && !is_reminder
                 && active.previous["wakeConfig"]["infinite"] == false
-                && active.previous["wakeConfig"]["sleepUntil"].is_null()
+                && (active.previous["wakeConfig"]["sleepUntil"].is_null()
+                    || active.reason != "timeout")
                 && ((still_valid && dropped_unadmitted) || transient_read_drop);
             if needs_provisional_rearm {
                 self.rearm_pending.insert(
                     key.clone(),
-                    (active.at, active.previous.clone(), admitted_token.clone()),
+                    (active.at, active.reason.clone(), active.previous.clone(), admitted_token.clone()),
                 );
             }
             if held || retry {
@@ -4855,9 +4981,17 @@ impl Hub {
             }
             if let Some(d) = self.drivers.get_mut(&key) {
                 let conv = &completed_state["conversations"][&key];
+                let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
                 if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
-                    d.adopt_wake_config(session::wake_config_from_json(Some(&conv["wakeConfig"])), now);
+                    d.adopt_wake_config(persisted_wake, now);
                     self.synced.insert(key.clone(), next);
+                } else if !self.held.contains_key(&key)
+                    && !self.failures.contains_key(&key)
+                    && !persisted_wake.infinite
+                    && persisted_wake.sleep_until.is_some()
+                    && persisted_wake.sleep_until != d.sched.wc.sleep_until
+                {
+                    d.adopt_wake_config(persisted_wake, now);
                 }
                 d.refresh_observed_state(conv, now);
                 d.sched.prompt_running = false;
@@ -5069,9 +5203,9 @@ impl Hub {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
                     } else if let Some((previous, dispatch_token)) = claimed.as_ref() {
                         if previous["wakeConfig"]["infinite"] == false
-                            && previous["wakeConfig"]["sleepUntil"].is_null()
+                            && (previous["wakeConfig"]["sleepUntil"].is_null() || reason != "timeout")
                         {
-                            self.rearm_pending.insert(key, (now, previous.clone(), dispatch_token.clone()));
+                            self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
                             self.drain_rearm_pending(&cfg);
                         }
                     }
