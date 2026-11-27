@@ -84,7 +84,7 @@ pub(crate) use registry::{
 };
 #[cfg(test)]
 pub(crate) use store::{
-    checkpoint_wal_truncate, create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION,
+    create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_SECOND_WAL_TRUNCATE,
     FAIL_UNDO_LOOK, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{

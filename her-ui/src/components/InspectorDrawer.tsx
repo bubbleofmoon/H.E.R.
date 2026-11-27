@@ -235,6 +235,7 @@ export const InspectorDrawer: React.FC = () => {
               <SettingField
                 setting={settingItem}
                 draftValue={draftValue}
+                disabled={busy}
                 onDraftChange={handleDraftChange}
                 onReset={() => void handleResetSetting()}
               />

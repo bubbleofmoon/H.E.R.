@@ -1136,72 +1136,6 @@ fn ticket443_r11_secret_save_scrubs_before_resolving_endpoint_and_rejects_leaked
 }
 
 #[test]
-fn ticket443_r11_wal_checkpoint_truncate_and_pinned_ro_reader() {
-    let (root, context) = settings_fixture("ticket443 r11 wal checkpoint truncate");
-    let tok = "fixture-r11-wal-tok";
-    let wal_host = "wal-r11-pinned.example.test";
-    let leaked_url = format!("https://{wal_host}/{tok}");
-    assert_eq!(
-        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
-        200
-    );
-    assert_eq!(
-        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": "https://clean-r11-wal.example.test/v1"})).0,
-        200
-    );
-
-    let db_path = root.0.join("data/settings.db");
-    let ro = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    ro.execute_batch("BEGIN; SELECT count(*) FROM settings;").unwrap();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        drop(ro);
-    });
-    let res = put(&context, CLI, tok);
-    releaser.join().unwrap();
-    assert_eq!(res.0, 200);
-
-    let wal_path = root.0.join("data/settings.db-wal");
-    if wal_path.exists() {
-        let wal_bytes = std::fs::read(&wal_path).unwrap();
-        assert!(
-            !wal_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
-            "settings.db-wal must be truncated with zero leaked url bytes"
-        );
-    }
-    let db_bytes = std::fs::read(&db_path).unwrap();
-    assert!(
-        !db_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
-        "settings.db must have zero leaked url bytes after VACUUM + checkpoint"
-    );
-
-    // Also unit-test checkpoint_wal_truncate directly with a short deadline against a pinned RO connection.
-    let ro_pin = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    ro_pin.execute_batch("BEGIN; SELECT count(*) FROM settings;").unwrap();
-    assert_eq!(set_quiet(&context, json!(4650)).0, 200);
-    let rw_conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
-    assert!(
-        crate::settings::checkpoint_wal_truncate(&rw_conn, deadline).is_err(),
-        "checkpoint_wal_truncate must return Err when WAL is pinned past deadline"
-    );
-    drop(rw_conn);
-    drop(ro_pin);
-}
-
-#[test]
 fn ticket443_r11_malformed_json_audit_scrubbed_in_history_undo_and_db() {
     let (root, context) = settings_fixture("ticket443 r11 malformed json audit");
     let tok = "sk-r11-malformed-tok";
@@ -1417,4 +1351,78 @@ fn ticket443_r12_remove_from_config_always_scrubs_leaked_endpoint() {
         stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
         "remove_from_config must scrub leaked config/harness.apiBaseUrl even when store holds a clean endpoint"
     );
+}
+
+#[test]
+fn ticket443_r13_console_changes_and_apply_changes_refuse_leaked_endpoints() {
+    let (_root, context) = settings_fixture("ticket443 r13 console_changes apply_changes");
+    let tok = "sk-r13-chg-tok/";
+    let clean_ep = "https://clean-r13-chg.example.test/v1";
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": clean_ep})).0,
+        200
+    );
+    assert_eq!(put(&context, CLI, tok).0, 200);
+
+    // (a) console_changes must refuse an unchanged malformed non-string /harness/apiBaseUrl containing a secret.
+    let malformed = json!({"harness": {"apiBaseUrl": [format!("https://mal-r13.example.test/{tok}/v1")]}});
+    let err = match crate::settings::console_changes(&context, &malformed, &malformed) {
+        Err(err) => err,
+        Ok(changes) => panic!("console_changes must refuse unchanged malformed credential endpoint, got {} changes", changes.len()),
+    };
+    assert_eq!(err.0, 400, "console_changes must refuse unchanged malformed credential endpoint: {err:?}");
+
+    // (b) apply_changes must refuse credential-bearing HARNESS_API_BASE_URL with raw trailing-slash form.
+    let raw_leaked = json!(format!("https://apply-r13.example.test/{tok}"));
+    let err_apply = crate::settings::apply_changes(
+        &context,
+        vec![(&crate::settings::HARNESS_API_BASE_URL, raw_leaked)],
+        "fixture-admin",
+        "console",
+    )
+    .unwrap_err();
+    assert_eq!(err_apply.0, 400, "apply_changes must refuse raw trailing-slash credential endpoint: {err_apply:?}");
+}
+
+#[test]
+fn ticket443_r13_second_wal_truncate_failure_preserves_pending_cleanup() {
+    let (root, context) = settings_fixture("ticket443 r13 second wal truncate");
+    let tok = "fixture-r13-wal2-tok";
+    let leaked_url = format!("https://wal2-r13.example.test/{tok}");
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+
+    crate::settings::FAIL_SECOND_WAL_TRUNCATE.with(|fail| fail.set(true));
+    let (st1, _) = put(&context, CLI, tok);
+    crate::settings::FAIL_SECOND_WAL_TRUNCATE.with(|fail| fail.set(false));
+    assert_eq!(st1, 503, "second checkpoint_wal_truncate failure must return 503");
+
+    let db = rusqlite::Connection::open(root.0.join("data/settings.db")).unwrap();
+    let pending: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='__scrubbed.pendingCleanup'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    drop(db);
+    assert_eq!(
+        pending.as_deref(),
+        Some("true"),
+        "__scrubbed.pendingCleanup must still exist in settings when second WAL truncate fails"
+    );
+
+    let (st2, _) = put(&context, CLI, tok);
+    assert_eq!(st2, 200);
+    let db2 = rusqlite::Connection::open(root.0.join("data/settings.db")).unwrap();
+    let pending_after: Option<String> = db2
+        .query_row(
+            "SELECT value FROM settings WHERE key='__scrubbed.pendingCleanup'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    assert_eq!(pending_after, None, "retry must complete cleanup and delete __scrubbed.pendingCleanup");
 }

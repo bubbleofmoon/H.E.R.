@@ -52,6 +52,7 @@ struct Prepared {
     state_included: bool,
     config: Option<Vec<u8>>,
     configured_token: Option<String>,
+    expected_live_endpoint: Option<String>,
     view: Value,
 }
 
@@ -330,6 +331,7 @@ impl Prepared {
             state_included,
             config: config_bytes,
             configured_token,
+            expected_live_endpoint: live_effective_endpoint,
             view,
         })
     }
@@ -968,6 +970,14 @@ fn stop_and_replace(
         let staged;
         let pair = match publication {
             FullPublication::Forward(rollback) => {
+                let current_live = crate::settings::resolve_model_endpoint_and_key(context)
+                    .map_err(Step::Refused)?
+                    .effective_endpoint;
+                if current_live != prepared.expected_live_endpoint {
+                    return Err(Step::Refused(
+                        "confirmation is missing or the archive/replacement plan changed; preview again".into(),
+                    ));
+                }
                 staged = stage_full_restore(context, prepared, rollback)
                     .map_err(|e| if recovery_pending(context) { Step::Failed(e) } else { Step::Refused(e) })?;
                 &staged
@@ -1829,6 +1839,18 @@ mod tests {
         );
     }
 
+    fn write_stale_settings_sidecars(context: &RuntimeContext) {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(
+                context
+                    .runtime_root()
+                    .join(format!("data/settings.db{suffix}")),
+                b"stale settings sidecar",
+            )
+            .unwrap();
+        }
+    }
+
     #[derive(Default)]
     struct FakeControl {
         stops: usize,
@@ -1841,6 +1863,7 @@ mod tests {
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
         leave_settings_sidecars: bool,
+        leave_settings_sidecars_on_publish: bool,
         settings_sidecars_after_replace: Option<[bool; 3]>,
         fail_relative: Option<&'static str>,
         replaced: Vec<String>,
@@ -1904,7 +1927,7 @@ mod tests {
             Ok(())
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
-            if self.leave_settings_sidecars {
+            if self.leave_settings_sidecars || self.leave_settings_sidecars_on_publish {
                 let root = context.runtime_root();
                 self.settings_sidecars_after_replace = Some(
                     ["-wal", "-shm", "-journal"]
@@ -1935,15 +1958,7 @@ mod tests {
                 }
             }
             if self.leave_settings_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .join(format!("data/settings.db{suffix}")),
-                        b"stale settings sidecar",
-                    )
-                    .unwrap();
-                }
+                write_stale_settings_sidecars(context);
             }
             if let Some(hook) = self.on_after_snapshot.as_mut() {
                 hook(context)?;
@@ -1951,6 +1966,9 @@ mod tests {
             Ok(())
         }
         fn publish_generation(&mut self, context: &RuntimeContext) -> Result<console_auth::Generation, GenerationWriteError> {
+            if self.leave_settings_sidecars_on_publish && self.stops == 1 {
+                write_stale_settings_sidecars(context);
+            }
             let Some(fault) = self.generation_fault.take() else {
                 return console_auth::rotate_restore_generation(context);
             };

@@ -100,7 +100,11 @@ fn restore_settings_full_restore_brings_the_store_back_and_memory_only_leaves_it
         let listed = plan["replaces"].as_array().unwrap().iter().any(|v| v == "data/settings.db");
         assert_eq!(listed, !memory_only, "only a full restore replaces settings.db: {plan}");
         let current = fs::read(f.0.join("data/settings.db")).unwrap();
-        let mut control = FakeControl { leave_settings_sidecars: true, ..Default::default() };
+        let mut control = FakeControl {
+            leave_settings_sidecars: memory_only,
+            leave_settings_sidecars_on_publish: !memory_only,
+            ..Default::default()
+        };
         let result = execute_with(
             &f.context(),
             &archive,
@@ -174,7 +178,11 @@ fn restore_settings_archive_without_the_store_restores_and_only_a_full_restore_r
             assert_eq!(quiet(&f), Some(5000));
         }
         let current = fs::read(f.0.join("data/settings.db")).unwrap();
-        let mut control = FakeControl { leave_settings_sidecars: true, ..Default::default() };
+        let mut control = FakeControl {
+            leave_settings_sidecars: memory_only,
+            leave_settings_sidecars_on_publish: !memory_only,
+            ..Default::default()
+        };
         let result = execute_with(
             &f.context(),
             &archive,
@@ -1713,4 +1721,65 @@ fn ticket443_r12_full_restore_rejects_stale_confirmation_when_live_endpoint_chan
     )
     .unwrap_err();
     assert!(!err.is_empty(), "full restore must reject stale confirmation after live endpoint change");
+}
+
+#[test]
+fn ticket443_r13_full_restore_refuses_live_endpoint_change_after_snapshot() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-r13.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive = f.backup();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-before-r13.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let plan = preview(&context, &archive, false).unwrap();
+    let confirmation = plan["confirmation"].as_str().unwrap().to_string();
+
+    let mut control = FakeControl {
+        on_after_snapshot: Some(Box::new(|ctx| {
+            crate::settings::apply(
+                ctx,
+                "harness.apiBaseUrl",
+                &json!("https://live-after-r13.example.test/v1"),
+                "fixture-admin",
+                "console",
+            )
+            .map(|_| ())
+            .map_err(|(_, msg)| msg)
+        })),
+        ..Default::default()
+    };
+    let err = execute_with(
+        &context,
+        &archive,
+        false,
+        &confirmation,
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("preview again"),
+        "full restore must refuse live endpoint change inside stop_and_replace: {err}"
+    );
+    assert_eq!(
+        crate::settings::resolve_model_endpoint_and_key(&context)
+            .unwrap()
+            .effective_endpoint
+            .as_deref(),
+        Some("https://live-after-r13.example.test/v1")
+    );
 }

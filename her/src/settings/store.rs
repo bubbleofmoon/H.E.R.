@@ -66,6 +66,8 @@ thread_local! {
     /// Makes the next clear of unadmitted conversations' values on this thread fail after it removed them and before
     /// the commit, as a crash there would (#218).
     pub(crate) static FAIL_AFTER_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the post-delete second `checkpoint_wal_truncate` inside `write_store_scrubbable` fail on this thread.
+    pub(crate) static FAIL_SECOND_WAL_TRUNCATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -2172,6 +2174,17 @@ pub(crate) fn checkpoint_wal_truncate(
     })
 }
 
+fn upsert_scrub_cleanup_pending(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+        params![SCRUB_CLEANUP_PENDING_KEY, "true", 1_i64, now_ms(), SEED_ACTOR],
+    )
+    .map(|_| ())
+    .map_err(|_| STORAGE_ERROR.to_string())
+}
+
 fn write_store_scrubbable<T>(
     context: &RuntimeContext,
     existing_only: bool,
@@ -2203,13 +2216,7 @@ fn write_store_scrubbable<T>(
         let (result, scrubbed) = write(&tx, &document)?;
         let needs_cleanup = scrubbed || pending_before.is_some();
         if scrubbed && pending_before.is_none() {
-            tx.execute(
-                "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
-                 updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
-                params![SCRUB_CLEANUP_PENDING_KEY, "true", 1_i64, now_ms(), SEED_ACTOR],
-            )
-            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+            upsert_scrub_cleanup_pending(&tx).map_err(unavailable)?;
         }
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
@@ -2226,7 +2233,7 @@ fn write_store_scrubbable<T>(
             .map_err(InspectError::into_message);
         if needs_cleanup {
             let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
-            let cleaned = conn
+            let pre_delete = conn
                 .execute_batch("VACUUM;")
                 .map_err(|_| STORAGE_ERROR.to_string())
                 .and_then(|_| checkpoint_wal_truncate(&conn, deadline))
@@ -2237,10 +2244,24 @@ fn write_store_scrubbable<T>(
                     )
                     .map(|_| ())
                     .map_err(|_| STORAGE_ERROR.to_string())
-                })
-                .and_then(|_| checkpoint_wal_truncate(&conn, deadline));
-            if cleaned.is_err() {
+                });
+            if pre_delete.is_err() {
                 cleanup_failed = true;
+            } else {
+                let second_truncate = {
+                    #[cfg(test)]
+                    if FAIL_SECOND_WAL_TRUNCATE.with(|fail| fail.replace(false)) {
+                        Err(STORAGE_ERROR.to_string())
+                    } else {
+                        checkpoint_wal_truncate(&conn, deadline)
+                    }
+                    #[cfg(not(test))]
+                    checkpoint_wal_truncate(&conn, deadline)
+                };
+                if second_truncate.is_err() {
+                    let _ = upsert_scrub_cleanup_pending(&conn);
+                    cleanup_failed = true;
+                }
             }
         }
         (result, stored, guard)
@@ -3193,30 +3214,28 @@ pub(crate) fn console_changes(
     for setting in registry().filter(|setting| !setting.secret) {
         // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
         let Some(posted) = setting.found_in(carried).filter(|value| !value.is_null()) else { continue };
+        if setting.key == HARNESS_API_BASE_URL.key {
+            let harness_key = harness_credential(context);
+            let (known, scrubbed_hashes) = read_store(context, |conn| match conn {
+                None => Ok((
+                    collect_known_secrets(&[], harness_key.as_deref()),
+                    Vec::new(),
+                )),
+                Some(conn) => read_snapshot_tx(conn, |tx| {
+                    collect_known_secrets_and_hashes(tx, harness_key.as_deref())
+                }),
+            })
+            .map_err(|error| (503, error))?;
+            if value_has_leaked_endpoint(posted, Some(&known), Some(&scrubbed_hashes)) {
+                return Err((400, "setting text contains a credential".to_string()));
+            }
+        }
         let Some(value) = setting.normalize(posted) else {
             if setting.found_in(base) == Some(posted) {
                 continue;
             }
             return Err((400, setting.refusal(posted)));
         };
-        if setting.key == HARNESS_API_BASE_URL.key {
-            if let Some(raw_url) = posted.as_str() {
-                let harness_key = harness_credential(context);
-                let (known, scrubbed_hashes) = read_store(context, |conn| match conn {
-                    None => Ok((
-                        collect_known_secrets(&[], harness_key.as_deref()),
-                        Vec::new(),
-                    )),
-                    Some(conn) => read_snapshot_tx(conn, |tx| {
-                        collect_known_secrets_and_hashes(tx, harness_key.as_deref())
-                    }),
-                })
-                .map_err(|error| (503, error))?;
-                if endpoint_value_is_scrubbed(raw_url, Some(&known), Some(&scrubbed_hashes)) {
-                    return Err((400, "setting text contains a credential".to_string()));
-                }
-            }
-        }
         let unchanged = if setting.key == ROLLOUT_GROUPS.key {
             setting.found_in(&now) == Some(&value)
         } else {
@@ -3262,7 +3281,7 @@ pub(crate) fn apply_changes(
     let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
         validate_rollout_change(conn, document, changes.iter().map(|(setting, value)| (*setting, Some(value))))?;
         for (setting, value) in &changes {
-            reject_credential_text(conn, setting, None, value, harness_key.as_deref())?;
+            reject_credential_text(conn, setting, Some(value), value, harness_key.as_deref())?;
             let text = value.to_string();
             let old = stored_row(conn, setting.key)?;
             if old.as_ref().is_some_and(|(old_text, _)| *old_text == text) {

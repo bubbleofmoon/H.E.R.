@@ -57,6 +57,7 @@ function isValidSecretValue(value: string): string | null {
 export const ModelRoutesTab: React.FC = () => {
   const {
     settings,
+    settingsMutationSeq,
     conversations,
     saveSetting,
     resetSetting,
@@ -69,6 +70,7 @@ export const ModelRoutesTab: React.FC = () => {
   } = useConsole();
 
   const [modelsData, setModelsData] = useState<DetailedModelsResponse | null>(null);
+  const [modelsSyncedSeq, setModelsSyncedSeq] = useState(0);
   const [legacyChain, setLegacyChain] = useState<LegacyModelChainResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [reordering, setReordering] = useState(false);
@@ -78,12 +80,16 @@ export const ModelRoutesTab: React.FC = () => {
 
   const mountedRef = useRef(true);
   const loadSeqRef = useRef(0);
+  const settingsMutationSeqRef = useRef(settingsMutationSeq);
+  settingsMutationSeqRef.current = settingsMutationSeq;
+  const lastObservedMutationSeqRef = useRef(settingsMutationSeq);
   const secretDraftsRef = useRef(secretDrafts);
   secretDraftsRef.current = secretDrafts;
 
   const loadModels = useCallback(
     async (opts?: { syncSettings?: boolean }): Promise<DetailedModelsResponse | null> => {
       const seq = ++loadSeqRef.current;
+      const capturedMutationSeq = settingsMutationSeqRef.current;
       setLoading(true);
       try {
         const [modelsRes, legacyRes] = await Promise.allSettled([
@@ -95,6 +101,7 @@ export const ModelRoutesTab: React.FC = () => {
         let fetchedModels: DetailedModelsResponse | null = null;
         if (modelsRes.status === 'fulfilled') {
           setModelsData(modelsRes.value);
+          setModelsSyncedSeq(capturedMutationSeq);
           fetchedModels = modelsRes.value;
         } else {
           pushToast(formatErrorMessage(modelsRes.reason, '加载模型路由详情失败'), 'danger');
@@ -121,6 +128,13 @@ export const ModelRoutesTab: React.FC = () => {
       mountedRef.current = false;
     };
   }, [loadModels]);
+
+  useEffect(() => {
+    if (settingsMutationSeq > lastObservedMutationSeqRef.current) {
+      lastObservedMutationSeqRef.current = settingsMutationSeq;
+      void loadModels();
+    }
+  }, [settingsMutationSeq, loadModels]);
 
   const harnessRoutesItem = useMemo(
     () => settings.find((s) => s.key === 'harness.routes') ?? null,
@@ -162,7 +176,12 @@ export const ModelRoutesTab: React.FC = () => {
   );
 
   const activeEndpointInfo = useMemo(() => {
-    if (typeof modelsData?.effectiveModelEndpoint === 'string' && modelsData.effectiveModelEndpoint) {
+    const staleModelsEndpoint = modelsSyncedSeq < settingsMutationSeq;
+    if (
+      !staleModelsEndpoint &&
+      typeof modelsData?.effectiveModelEndpoint === 'string' &&
+      modelsData.effectiveModelEndpoint
+    ) {
       return {
         endpoint:
           canonicalModelEndpoint(modelsData.effectiveModelEndpoint) ??
@@ -185,9 +204,9 @@ export const ModelRoutesTab: React.FC = () => {
     }
     return {
       endpoint: null,
-      source: modelsData?.effectiveModelEndpointSource ?? null,
+      source: staleModelsEndpoint ? null : (modelsData?.effectiveModelEndpointSource ?? null),
     };
-  }, [settings, apiBaseUrlItem, modelsData]);
+  }, [settings, apiBaseUrlItem, modelsData, modelsSyncedSeq, settingsMutationSeq]);
 
   const dirtySecretKeys = useMemo(
     () => Object.entries(secretDrafts).filter(([, v]) => v.length > 0).map(([k]) => k),

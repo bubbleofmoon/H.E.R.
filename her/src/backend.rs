@@ -219,7 +219,7 @@ impl Backend for CliBackend {
             }
             cmd.env(k, v);
         }
-        let credentials = configure_cli_model_with_snapshot(&mut cmd, &self.cmd, model_snapshot)?;
+        let credentials = configure_cli_model_with_snapshot(&mut cmd, &self.cmd, &self.args, model_snapshot)?;
         let status = run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?;
         // 进程已退出，从临时文件读结果
         let (stdout_text, stderr_text) = output_files.read_texts()?;
@@ -947,6 +947,17 @@ fn is_opencode_command(cmd: &str) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("opencode"))
 }
 
+fn is_opencode_invocation(cmd: &str, args: &[String]) -> bool {
+    if is_opencode_command(cmd) {
+        return true;
+    }
+    args.iter().any(|arg| {
+        arg.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '&' | '|' | ';'))
+            .filter(|token| !token.is_empty())
+            .any(is_opencode_command)
+    })
+}
+
 fn is_cli_model_key(name: &str) -> bool {
     CLI_MODEL_KEY_ALIASES.iter().any(|alias| {
         if cfg!(windows) { alias.eq_ignore_ascii_case(name) } else { *alias == name }
@@ -976,9 +987,18 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
     };
     let allow_explicit = snapshot.matches_default();
     if !allow_explicit
-        && cli_candidates
-            .iter()
-            .any(|item| item["cmd"].as_str().is_some_and(is_opencode_command))
+        && cli_candidates.iter().any(|item| {
+            let Some(cmd) = item["cmd"].as_str() else { return false };
+            let args: Vec<String> = item["args"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            is_opencode_invocation(cmd, &args)
+        })
     {
         return Some(OPENCODE_ENDPOINT_MISMATCH);
     }
@@ -1001,20 +1021,12 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
 fn configure_cli_model_with_snapshot(
     command: &mut Command,
     cmd_name: &str,
+    args: &[String],
     snapshot: Result<crate::settings::ModelEndpointSnapshot, String>,
 ) -> Result<Vec<String>, BackendError> {
     let snapshot = snapshot
         .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
     let matches_default = snapshot.matches_default();
-    if !matches_default && is_opencode_command(cmd_name) {
-        return Err(BackendError::Config(OPENCODE_ENDPOINT_MISMATCH.into()));
-    }
-    let model_url = snapshot
-        .effective_endpoint
-        .as_deref()
-        .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
-    command.env("ANTHROPIC_BASE_URL", model_url)
-        .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
     if !matches_default {
         let strip_keys: Vec<std::ffi::OsString> = command
             .get_envs()
@@ -1034,7 +1046,16 @@ fn configure_cli_model_with_snapshot(
         for name in strip_keys {
             command.env_remove(name);
         }
+        if is_opencode_invocation(cmd_name, args) {
+            return Err(BackendError::Config(OPENCODE_ENDPOINT_MISMATCH.into()));
+        }
     }
+    let model_url = snapshot
+        .effective_endpoint
+        .as_deref()
+        .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
+    command.env("ANTHROPIC_BASE_URL", model_url)
+        .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
     if let Some(key) = snapshot.cli_model_key {
         let extra = if matches_default { OPENCODE_CLI_KEY_ALIASES.as_slice() } else { &[] };
         for name in BASE_URL_BOUND_CLI_KEY_ALIASES.iter().chain(extra.iter()) {
@@ -1060,9 +1081,14 @@ fn configure_cli_model_with_snapshot(
 #[cfg(test)]
 fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
     let cmd_name = command.get_program().to_string_lossy().into_owned();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     configure_cli_model_with_snapshot(
         command,
         &cmd_name,
+        &args,
         crate::settings::resolve_model_endpoint_and_key(context),
     )
 }
@@ -1851,6 +1877,84 @@ mod tests {
             envs.get(OsStr::new("OPENAI_API_KEY")).copied().flatten(),
             Some(OsStr::new("fixture-r11-custom-tok"))
         );
+    }
+
+    #[test]
+    fn ticket443_r13_wrapped_opencode_invocation_fails_and_notices() {
+        let (_fixture, context) = cli_credential_fixture();
+        let custom_ep = "https://cli-r13-wrap.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(custom_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r13-wrap-tok"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        for (prog, args) in [
+            ("cmd.exe", vec!["/C", "opencode", "run"]),
+            ("cmd", vec!["/C", r"C:\tools\opencode.cmd run"]),
+            ("bash", vec!["-c", "opencode"]),
+        ] {
+            let mut cmd = std::process::Command::new(prog);
+            cmd.args(&args);
+            super::configure_isolated_cli_environment(&mut cmd, &context).unwrap();
+            let err = super::configure_cli_model(&mut cmd, &context).unwrap_err();
+            assert!(
+                matches!(err, BackendError::Config(ref msg) if msg.contains("OpenCode")),
+                "wrapped {prog} {args:?} must fail closed on E != D: {err:?}"
+            );
+        }
+
+        let cfg_wrapped = serde_json::json!({
+            "backends": [{ "id": "oc-wrap", "kind": "cli", "cmd": "cmd.exe", "args": ["/C", "opencode", "run"] }]
+        });
+        assert!(
+            super::cli_model_notice(&context, &cfg_wrapped).is_some(),
+            "cli_model_notice must warn for wrapped OpenCode args when E != D"
+        );
+    }
+
+    #[test]
+    fn ticket443_r13_opencode_rejection_strips_preset_keys_before_err() {
+        use std::ffi::OsStr;
+        let (_fixture, context) = cli_credential_fixture();
+        let custom_ep = "https://cli-r13-strip.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(custom_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r13-strip-tok"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        let mut cmd = std::process::Command::new("opencode");
+        super::configure_isolated_cli_environment(&mut cmd, &context).unwrap();
+        cmd.env("OPENCODE_GO_API_KEY", "stale-opencode-go-tok");
+        cmd.env("OPENCODE_API_KEY", "stale-opencode-tok");
+        let err = super::configure_cli_model(&mut cmd, &context).unwrap_err();
+        assert!(matches!(err, BackendError::Config(ref msg) if msg.contains("OpenCode")));
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs.get(OsStr::new("OPENCODE_GO_API_KEY")).copied().flatten(), None);
+        assert_eq!(envs.get(OsStr::new("OPENCODE_API_KEY")).copied().flatten(), None);
     }
 
     #[test]
