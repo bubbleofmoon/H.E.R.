@@ -1526,3 +1526,99 @@ fn ticket443_r9_full_restore_roundtrip_and_scrubs_suppressed_archived_config_url
     let snap2 = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
     assert_eq!(snap2.effective_endpoint.as_deref(), Some(default_ep.as_str()));
 }
+
+#[test]
+fn ticket443_r10_full_restore_scrubs_archived_settings_db_and_backup_raw_bytes() {
+    let f = Fixture::new();
+    let context = f.context();
+    let host_tok = "fixture-r10-host-disk-tok";
+    let leaked_url = format!("https://leaked-r10.example.test/{host_tok}");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    // (a) Verify backup ZIP's scrubbed settings.db has zero raw leaked/session bytes after scrub_auth_snapshot VACUUM.
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let session_marker = "vac-r10-session-origin.example.test";
+    crate::settings::StoreProbe::at(&f.0).edit(&format!(
+        "INSERT INTO console_browser_sessions VALUES \
+         (randomblob(32), 'https://{session_marker}', randomblob(32), randomblob(32), randomblob(32), 0, 0, 1, 1);"
+    ));
+    let db_tok = "fixture-r10-backup-vac-secret";
+    let vac_host = "vac-r10-freed.example.test";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://{vac_host}/{db_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://clean-vac.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(db_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_vac = f.backup();
+    let archived_db_path = extract_settings(&f, &archive_vac);
+    let archived_db_bytes = fs::read(&archived_db_path).unwrap();
+    assert!(
+        !archived_db_bytes
+            .windows(vac_host.len())
+            .any(|w| w == vac_host.as_bytes()),
+        "backup settings.db snapshot must contain zero leaked url bytes after VACUUM"
+    );
+    assert!(
+        !archived_db_bytes
+            .windows(session_marker.len())
+            .any(|w| w == session_marker.as_bytes()),
+        "backup settings.db snapshot must contain zero deleted session bytes after scrub_auth_snapshot VACUUM"
+    );
+
+    // (b) Archive contains settings.db rows embedding host_tok without knowing host_tok at backup time.
+    let f2 = Fixture::new();
+    let context2 = f2.context();
+    crate::settings::apply(
+        &context2,
+        "harness.apiBaseUrl",
+        &json!(leaked_url),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_host_leaked = f2.backup();
+
+    // Reset live store, place host_tok in config/harness-api-key, and full-restore archive_host_leaked.
+    crate::settings::reset(&context2, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    fs::write(f2.0.join("config/harness-api-key"), host_tok).unwrap();
+    auth_restore(&f2, &archive_host_leaked, false, &mut FakeControl::default()).unwrap();
+
+    // Restored data/settings.db must have zero raw host_tok bytes and tombstoned settings/audit rows.
+    let restored_db_bytes = fs::read(f2.0.join("data/settings.db")).unwrap();
+    assert!(
+        !restored_db_bytes
+            .windows(host_tok.len())
+            .any(|w| w == host_tok.as_bytes()),
+        "restored data/settings.db must contain zero raw host_tok bytes"
+    );
+    let restored_cfg: Value =
+        serde_json::from_slice(&fs::read(f2.0.join("config/config.json")).unwrap()).unwrap();
+    assert!(restored_cfg.pointer("/harness/apiBaseUrl").is_none());
+
+    // Even after removing config/harness-api-key, restored store remains suppressed and history masks it.
+    fs::remove_file(f2.0.join("config/harness-api-key")).unwrap();
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
+    assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+    assert!(snap.stored_url_suppressed);
+    let hist = crate::settings::history(&context2, Some("harness.apiBaseUrl"), None, None).unwrap();
+    assert!(!hist.to_string().contains(host_tok), "history must stay masked: {hist}");
+}

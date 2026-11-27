@@ -289,6 +289,7 @@ export function useSettingsDrafts(
         confirm: boolean;
         item?: SettingItemView;
       }[],
+      captured?: { initialEndpoint?: string; defaultEndpoint?: string },
     ): Promise<{ saved: number; failed: string[]; resolvedEndpoint?: string }> => {
       if (snapshots.length === 0) {
         return { saved: 0, failed: [] };
@@ -343,7 +344,8 @@ export function useSettingsDrafts(
       const endpointEntry = active.find((entry) => entry.key === MODEL_ENDPOINT_KEY);
       const otherEntries = active.filter((entry) => entry.key !== MODEL_ENDPOINT_KEY);
       const outcomes: Awaited<ReturnType<typeof saveOne>>[] = [];
-      let resolvedEndpoint = resolveActiveModelEndpoint(itemsRef.current);
+      const fallbackEndpoint = captured?.defaultEndpoint ?? resolveActiveModelEndpoint(itemsRef.current, null);
+      let resolvedEndpoint = captured?.initialEndpoint ?? resolveActiveModelEndpoint(itemsRef.current);
 
       if (endpointEntry) {
         const epOutcome = await saveOne(endpointEntry);
@@ -352,7 +354,12 @@ export function useSettingsDrafts(
           pushToast(`部分${labelPrefix}保存失败：${epOutcome.error}`, 'danger');
           return { saved: 0, failed: [epOutcome.error], resolvedEndpoint };
         }
-        resolvedEndpoint = resolveActiveModelEndpoint(itemsRef.current, epOutcome.value);
+        resolvedEndpoint =
+          epOutcome.value === null || epOutcome.value === undefined
+            ? fallbackEndpoint
+            : typeof epOutcome.value === 'string'
+              ? canonicalModelEndpoint(epOutcome.value) ?? epOutcome.value
+              : fallbackEndpoint;
       }
 
       // Reserve every remaining key's per-key write lock in api/client.ts synchronously on tick 0.
@@ -425,6 +432,8 @@ export function useSettingsDrafts(
       if (dirtyKeys.length === 0) {
         return { saved: 0, failed: [] };
       }
+      const capturedEndpoint = resolveActiveModelEndpoint(itemsRef.current);
+      const capturedDefaultEndpoint = resolveActiveModelEndpoint(itemsRef.current, null);
       const snapshots = dirtyKeys.map((key) => {
         const item = itemsRef.current.find((s) => s.key === key);
         return {
@@ -445,7 +454,10 @@ export function useSettingsDrafts(
           onConfirm: async () => {
             if (mountedRef.current) setSaving(true);
             try {
-              const batch = await executeSaveBatch(snapshots);
+              const batch = await executeSaveBatch(snapshots, {
+                initialEndpoint: capturedEndpoint,
+                defaultEndpoint: capturedDefaultEndpoint,
+              });
               if (batch.failed.length === 0 && afterExtraSave) {
                 await afterExtraSave(batch.resolvedEndpoint);
               }
@@ -456,7 +468,10 @@ export function useSettingsDrafts(
         });
         return { saved: 0, failed: [], deferred: true };
       }
-      return executeSaveBatch(snapshots);
+      return executeSaveBatch(snapshots, {
+        initialEndpoint: capturedEndpoint,
+        defaultEndpoint: capturedDefaultEndpoint,
+      });
     },
     [dirtyKeys, drafts, executeSaveBatch, openConfirm],
   );

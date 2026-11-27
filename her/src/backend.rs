@@ -219,7 +219,7 @@ impl Backend for CliBackend {
             }
             cmd.env(k, v);
         }
-        let credentials = configure_cli_model_with_snapshot(&mut cmd, model_snapshot)?;
+        let credentials = configure_cli_model_with_snapshot(&mut cmd, &self.cmd, model_snapshot)?;
         let status = run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?;
         // 进程已退出，从临时文件读结果
         let (stdout_text, stderr_text) = output_files.read_texts()?;
@@ -927,10 +927,25 @@ fn configure_isolated_cli_environment(
     Ok(())
 }
 
+const BASE_URL_BOUND_CLI_KEY_ALIASES: [&str; 3] = [
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+];
+const OPENCODE_CLI_KEY_ALIASES: [&str; 2] = [
+    "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY",
+];
 const CLI_MODEL_KEY_ALIASES: [&str; 5] = [
     "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
 ];
 const CLI_MODEL_KEY_MISSING: &str = "Set cliModel.apiKey in Settings before using the CLI model.";
+const OPENCODE_ENDPOINT_MISMATCH: &str = "OpenCode CLI backends require the default model endpoint because OpenCode uses its local provider profile instead of ANTHROPIC_BASE_URL/OPENAI_BASE_URL.";
+
+fn is_opencode_command(cmd: &str) -> bool {
+    let leaf = cmd.rsplit(['/', '\\']).next().unwrap_or(cmd);
+    std::path::Path::new(leaf)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("opencode"))
+}
 
 fn is_cli_model_key(name: &str) -> bool {
     CLI_MODEL_KEY_ALIASES.iter().any(|alias| {
@@ -960,6 +975,13 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
         return Some("Settings could not read cliModel.apiKey.");
     };
     let allow_explicit = snapshot.matches_default();
+    if !allow_explicit
+        && cli_candidates
+            .iter()
+            .any(|item| item["cmd"].as_str().is_some_and(is_opencode_command))
+    {
+        return Some(OPENCODE_ENDPOINT_MISMATCH);
+    }
     let needs_key = cli_candidates.iter().any(|item| {
         !(allow_explicit
             && item["env"].as_object().is_some_and(|env| {
@@ -978,10 +1000,15 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
 
 fn configure_cli_model_with_snapshot(
     command: &mut Command,
+    cmd_name: &str,
     snapshot: Result<crate::settings::ModelEndpointSnapshot, String>,
 ) -> Result<Vec<String>, BackendError> {
     let snapshot = snapshot
         .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
+    let matches_default = snapshot.matches_default();
+    if !matches_default && is_opencode_command(cmd_name) {
+        return Err(BackendError::Config(OPENCODE_ENDPOINT_MISMATCH.into()));
+    }
     let model_url = snapshot
         .effective_endpoint
         .as_deref()
@@ -989,12 +1016,13 @@ fn configure_cli_model_with_snapshot(
     command.env("ANTHROPIC_BASE_URL", model_url)
         .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
     if let Some(key) = snapshot.cli_model_key {
-        for name in CLI_MODEL_KEY_ALIASES {
+        let extra = if matches_default { OPENCODE_CLI_KEY_ALIASES.as_slice() } else { &[] };
+        for name in BASE_URL_BOUND_CLI_KEY_ALIASES.iter().chain(extra.iter()) {
             command.env(name, &key);
         }
         return Ok(vec![key]);
     }
-    if !snapshot.matches_default() {
+    if !matches_default {
         return Err(BackendError::Config(CLI_MODEL_KEY_MISSING.into()));
     }
     let mut explicit: Vec<_> = command.get_envs()
@@ -1011,8 +1039,10 @@ fn configure_cli_model_with_snapshot(
 
 #[cfg(test)]
 fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
+    let cmd_name = command.get_program().to_string_lossy().into_owned();
     configure_cli_model_with_snapshot(
         command,
+        &cmd_name,
         crate::settings::resolve_model_endpoint_and_key(context),
     )
 }
@@ -1675,6 +1705,91 @@ mod tests {
         assert!(
             cli_fallback_by_id_with_runtime(&ctx, &cfg, "stale-cli", "group:1", "hi", 5).is_err(),
             "explicitly selecting stale candidate by id must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ticket443_r10_opencode_endpoint_mismatch_and_base_url_key_filtering() {
+        use std::ffi::OsStr;
+        let (_fixture, context) = cli_credential_fixture();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r10-cli-key"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        // (c) Default E == D with opencode still injects OPENCODE_GO_API_KEY and OPENCODE_API_KEY.
+        let mut default_oc = std::process::Command::new("opencode");
+        super::configure_isolated_cli_environment(&mut default_oc, &context).unwrap();
+        super::configure_cli_model(&mut default_oc, &context).unwrap();
+        let default_envs: std::collections::HashMap<_, _> = default_oc.get_envs().collect();
+        assert_eq!(
+            default_envs.get(OsStr::new("OPENCODE_GO_API_KEY")).copied().flatten(),
+            Some(OsStr::new("fixture-r10-cli-key"))
+        );
+        assert_eq!(
+            default_envs.get(OsStr::new("OPENCODE_API_KEY")).copied().flatten(),
+            Some(OsStr::new("fixture-r10-cli-key"))
+        );
+
+        // Switch effective endpoint E != D and bind cliModel.apiKey to E.
+        let custom_ep = "https://cli-r10.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(custom_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r10-custom-key"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        // (a) Non-OpenCode CLI gets ANTHROPIC_* / OPENAI_* only, never OPENCODE_*.
+        let mut claude_cmd = std::process::Command::new("claude");
+        super::configure_isolated_cli_environment(&mut claude_cmd, &context).unwrap();
+        super::configure_cli_model(&mut claude_cmd, &context).unwrap();
+        let claude_envs: std::collections::HashMap<_, _> = claude_cmd.get_envs().collect();
+        assert_eq!(
+            claude_envs.get(OsStr::new("ANTHROPIC_AUTH_TOKEN")).copied().flatten(),
+            Some(OsStr::new("fixture-r10-custom-key"))
+        );
+        assert_eq!(
+            claude_envs.get(OsStr::new("ANTHROPIC_API_KEY")).copied().flatten(),
+            Some(OsStr::new("fixture-r10-custom-key"))
+        );
+        assert_eq!(
+            claude_envs.get(OsStr::new("OPENAI_API_KEY")).copied().flatten(),
+            Some(OsStr::new("fixture-r10-custom-key"))
+        );
+        assert!(!claude_envs.contains_key(OsStr::new("OPENCODE_GO_API_KEY")));
+        assert!(!claude_envs.contains_key(OsStr::new("OPENCODE_API_KEY")));
+
+        // (b) OpenCode commands fail closed on E != D, and cli_model_notice reports an advisory.
+        for oc in ["opencode", "opencode.cmd", "/usr/local/bin/opencode", r"C:\tools\opencode.exe"] {
+            let mut oc_cmd = std::process::Command::new(oc);
+            super::configure_isolated_cli_environment(&mut oc_cmd, &context).unwrap();
+            let err = super::configure_cli_model(&mut oc_cmd, &context).unwrap_err();
+            assert!(
+                matches!(err, BackendError::Config(ref msg) if msg.contains("OpenCode")),
+                "{oc} must fail closed with OpenCode BackendError::Config on E != D: {err:?}"
+            );
+        }
+        let cfg_oc = serde_json::json!({
+            "backends": [{ "id": "oc", "kind": "cli", "cmd": "opencode.cmd" }]
+        });
+        assert!(
+            super::cli_model_notice(&context, &cfg_oc).is_some(),
+            "cli_model_notice must warn for OpenCode when E != D"
         );
     }
 

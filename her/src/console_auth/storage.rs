@@ -1301,6 +1301,8 @@ pub(crate) fn scrub_auth_snapshot(
         check()?;
         tx.commit().map_err(storage_error)?;
     }
+    check()?;
+    conn.execute_batch("VACUUM;").map_err(storage_error)?;
     conn.close().map_err(|(_, error)| storage_error(error))?;
     for name in STORE_SIDECARS {
         if path

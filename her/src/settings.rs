@@ -89,7 +89,8 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     apply, apply_changes, apply_checked_endpoint, apply_conversation, apply_switch_choice,
-    archive_effective_model_endpoint, archive_model_endpoint_override, backup_source,
+    archive_effective_model_endpoint, archive_known_secrets, archive_model_endpoint_override,
+    backup_source,
     canonical_conversation, check_store_schema, complete_timing, console_changes,
     conversation_admitted, conversation_value, conversation_view, direct_change_error,
     engine_choice, harness_credential, has_endpoint_credentials, has_legacy_engine_choices,
@@ -101,6 +102,7 @@ pub(crate) use store::{
     record_setting_change, redact_route_array, registry_free, reset, reset_conversation,
     resolve_config, resolve_live_batch, resolve_model_endpoint_and_key, restore_gate,
     restore_switch_choice, schema_version_checked, scrub_archived_config_endpoint,
+    scrub_restored_settings_db,
     secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
     stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
     Applied, Change, InspectError, ModelEndpointSnapshot, ModelEndpointSource, StoreInspection,

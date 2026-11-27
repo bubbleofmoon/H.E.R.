@@ -82,7 +82,7 @@ export const ModelRoutesTab: React.FC = () => {
   secretDraftsRef.current = secretDrafts;
 
   const loadModels = useCallback(
-    async (opts?: { syncSettings?: boolean }) => {
+    async (opts?: { syncSettings?: boolean }): Promise<DetailedModelsResponse | null> => {
       const seq = ++loadSeqRef.current;
       setLoading(true);
       try {
@@ -91,9 +91,11 @@ export const ModelRoutesTab: React.FC = () => {
           fetchLegacyModelChain(),
           ...(opts?.syncSettings ? [refreshLiveData()] : []),
         ]);
-        if (!mountedRef.current || seq !== loadSeqRef.current) return;
+        if (!mountedRef.current || seq !== loadSeqRef.current) return null;
+        let fetchedModels: DetailedModelsResponse | null = null;
         if (modelsRes.status === 'fulfilled') {
           setModelsData(modelsRes.value);
+          fetchedModels = modelsRes.value;
         } else {
           pushToast(formatErrorMessage(modelsRes.reason, '加载模型路由详情失败'), 'danger');
         }
@@ -102,6 +104,7 @@ export const ModelRoutesTab: React.FC = () => {
         } else {
           setLegacyChain(null);
         }
+        return fetchedModels;
       } finally {
         if (mountedRef.current && seq === loadSeqRef.current) {
           setLoading(false);
@@ -113,7 +116,7 @@ export const ModelRoutesTab: React.FC = () => {
 
   useEffect(() => {
     mountedRef.current = true;
-    void loadModels();
+    void loadModels({ syncSettings: true });
     return () => {
       mountedRef.current = false;
     };
@@ -159,27 +162,29 @@ export const ModelRoutesTab: React.FC = () => {
   );
 
   const activeEndpointInfo = useMemo(() => {
-    const itemEndpoint = resolveActiveModelEndpoint(settings);
+    if (typeof modelsData?.effectiveModelEndpoint === 'string' && modelsData.effectiveModelEndpoint) {
+      return {
+        endpoint:
+          canonicalModelEndpoint(modelsData.effectiveModelEndpoint) ??
+          modelsData.effectiveModelEndpoint,
+        source: modelsData.effectiveModelEndpointSource ?? null,
+      };
+    }
     if (typeof apiBaseUrlItem?.value === 'string' && apiBaseUrlItem.value) {
       return {
         endpoint: canonicalModelEndpoint(apiBaseUrlItem.value) ?? apiBaseUrlItem.value,
-        source:
-          modelsData?.effectiveModelEndpoint === canonicalModelEndpoint(apiBaseUrlItem.value)
-            ? modelsData?.effectiveModelEndpointSource ?? 'settings'
-            : 'settings',
+        source: 'settings' as const,
       };
     }
+    const itemEndpoint = resolveActiveModelEndpoint(settings);
     if (itemEndpoint) {
       return {
         endpoint: itemEndpoint,
-        source:
-          modelsData?.effectiveModelEndpoint === itemEndpoint
-            ? modelsData?.effectiveModelEndpointSource ?? 'dependencies.json'
-            : 'dependencies.json',
+        source: 'dependencies.json' as const,
       };
     }
     return {
-      endpoint: canonicalModelEndpoint(modelsData?.effectiveModelEndpoint) ?? null,
+      endpoint: null,
       source: modelsData?.effectiveModelEndpointSource ?? null,
     };
   }, [settings, apiBaseUrlItem, modelsData]);
@@ -345,8 +350,14 @@ export const ModelRoutesTab: React.FC = () => {
           if (draftsRef.current[MODEL_ENDPOINT_KEY] === rawEndpointDraft) {
             clearDraft(MODEL_ENDPOINT_KEY);
           }
-          await loadModels();
-          targetEndpoint = resolveActiveModelEndpoint(settings, urlToSave);
+          const freshModels = await loadModels({ syncSettings: true });
+          targetEndpoint =
+            typeof urlToSave === 'string'
+              ? canonicalModelEndpoint(urlToSave) ?? urlToSave
+              : canonicalModelEndpoint(freshModels?.effectiveModelEndpoint) ??
+                (typeof freshModels?.effectiveModelEndpoint === 'string'
+                  ? freshModels.effectiveModelEndpoint
+                  : resolveActiveModelEndpoint(settings, null));
         }
         await persistValidatedSecret(item, raw, targetEndpoint);
       } finally {
@@ -802,7 +813,7 @@ export const ModelRoutesTab: React.FC = () => {
                     <Button
                       size="sm"
                       variant="ghost"
-                      disabled={anySecretBusy || !item.isSet}
+                      disabled={anySecretBusy || (!item.isSet && !item.boundElsewhere)}
                       onClick={() => handleClearSecret(item)}
                     >
                       清空凭据

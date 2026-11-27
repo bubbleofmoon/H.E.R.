@@ -1127,7 +1127,10 @@ fn effective_endpoint_from_overrides(
     }
 }
 
-fn archive_known_secrets(archive_secrets: &[String], host_disk_key: Option<&str>) -> Vec<String> {
+pub(crate) fn archive_known_secrets(
+    archive_secrets: &[String],
+    host_disk_key: Option<&str>,
+) -> Vec<String> {
     let mut known_secrets = archive_secrets.to_vec();
     if let Some(key) = host_disk_key {
         known_secrets.push(key.to_string());
@@ -1636,7 +1639,8 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // The same checks again, for a store changed since the inspection.
     retry_until(deadline, || check_schema_checked(&conn))?;
     enable_wal(&conn)?;
-    conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
     // BEGIN IMMEDIATE opens and pins the Windows WAL and its index before any row is written.
     // The journal used for switching to WAL carries SQLite's database header page only.
@@ -1898,21 +1902,33 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
     write_back_values(context, stored, &guard)
 }
 
+fn value_has_leaked_endpoint(
+    value: &Value,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    match value {
+        Value::String(raw) => endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_has_leaked_endpoint(item, known_secrets, scrubbed_hashes)),
+        Value::Object(map) => map.iter().any(|(k, v)| {
+            endpoint_value_is_scrubbed(k, known_secrets, scrubbed_hashes)
+                || value_has_leaked_endpoint(v, known_secrets, scrubbed_hashes)
+        }),
+        _ => false,
+    }
+}
+
 fn config_has_leaked_endpoint(
     document: &Value,
     known_secrets: Option<&[String]>,
     scrubbed_hashes: Option<&[String]>,
 ) -> bool {
-    let Some(value) = HARNESS_API_BASE_URL.found_in(document).filter(|v| !v.is_null()) else {
-        return false;
-    };
-    if let Some(raw) = value.as_str() {
-        endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes)
-    } else if let Ok(serialized) = serde_json::to_string(value) {
-        endpoint_value_is_scrubbed(&serialized, known_secrets, scrubbed_hashes)
-    } else {
-        false
-    }
+    HARNESS_API_BASE_URL
+        .found_in(document)
+        .filter(|v| !v.is_null())
+        .is_some_and(|value| value_has_leaked_endpoint(value, known_secrets, scrubbed_hashes))
 }
 
 /// `write_back` of stored values already read: by a writer, on its own read-write connection before it closed, so that
@@ -2017,15 +2033,33 @@ pub(crate) fn create_store(context: &RuntimeContext) -> Result<(), String> {
 /// inside the undo's transaction, before the commit: a failure refuses the undo and rolls it back, and a commit that
 /// fails after it leaves the stored value, which the overlay still applies and the next write-back puts back into the
 /// file. A missing member writes nothing. The caller holds the configuration gate.
-fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(), String> {
+fn remove_from_config(
+    context: &RuntimeContext,
+    setting: &Setting,
+    guard: &EndpointWriteGuard,
+    has_clean_stored_endpoint: bool,
+) -> Result<(), String> {
     let mut document = raw_config(context)?;
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    if document.pointer(setting.pointer).is_none() {
+    let mut changed = false;
+    if document.pointer(setting.pointer).is_some() {
+        remove_at(&mut document, setting.pointer);
+        changed = true;
+    }
+    if should_scrub_config_endpoint(
+        &document,
+        has_clean_stored_endpoint,
+        guard.endpoint_suppressed,
+        guard,
+    ) {
+        remove_at(&mut document, HARNESS_API_BASE_URL.pointer);
+        changed = true;
+    }
+    if !changed {
         return Ok(());
     }
-    remove_at(&mut document, setting.pointer);
     #[cfg(test)]
     if FAIL_WRITE_BACK.with(|fail| fail.replace(false)) {
         return Err(CONFIG_ERROR.to_string());
@@ -2071,6 +2105,18 @@ fn write_store_with<T>(
     conversations: bool,
     write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
+    write_store_scrubbable(context, existing_only, written, conversations, |conn, doc| {
+        write(conn, doc).map(|result| (result, false))
+    })
+}
+
+fn write_store_scrubbable<T>(
+    context: &RuntimeContext,
+    existing_only: bool,
+    written: &[&'static str],
+    conversations: bool,
+    write: impl FnOnce(&Connection, &Value) -> Result<(T, bool), (u16, String)>,
+) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
     let (result, stored, guard) = {
@@ -2090,7 +2136,7 @@ fn write_store_with<T>(
         }
         seed(&tx, &document, now_ms(), written, harness_key.as_deref())?;
         let access_before = access_rows(&tx)?;
-        let result = write(&tx, &document)?;
+        let (result, scrubbed) = write(&tx, &document)?;
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -2099,6 +2145,10 @@ fn write_store_with<T>(
             panic!("settings: simulated crash before the store commit");
         }
         tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+        if scrubbed {
+            conn.execute_batch("VACUUM;")
+                .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+        }
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
         // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
         let stored = read_stored_values(&conn);
@@ -2430,29 +2480,42 @@ fn record_scrubbed_endpoint_hashes(
     Ok(())
 }
 
-/// Permanently tombstones stored `harness.apiBaseUrl` and records scrubbed audit-text hashes when they contain `secret`.
-fn scrub_leaked_endpoint_for_secret(
+fn push_endpoint_hashes(hashes: &mut Vec<String>, text: &str) {
+    hashes.push(endpoint_text_hash(text));
+    if let Some(canonical) = HARNESS_API_BASE_URL
+        .normalize(&Value::String(text.to_string()))
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        if canonical != text {
+            hashes.push(endpoint_text_hash(&canonical));
+        }
+    }
+}
+
+fn scrub_endpoint_in_tx(
     conn: &Connection,
-    secret: &str,
     actor: &str,
-) -> Result<(), (u16, String)> {
+    mut should_scrub: impl FnMut(&str) -> bool,
+) -> Result<bool, (u16, String)> {
     let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let marker = json!(SECRET_MARKER).to_string();
-    let extract_leaked = |text: &str| -> Option<String> {
+    let mut extract_leaked = |text: &str| -> Option<String> {
         serde_json::from_str::<Value>(text)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|s| s != SECRET_MARKER && endpoint_text_matches_secret(s, secret))
+            .filter(|s| s != SECRET_MARKER && should_scrub(s))
     };
+    let mut scrubbed = false;
     let mut hashes = Vec::new();
     if let Some((row_text, revision)) = stored_row(conn, HARNESS_API_BASE_URL.key)? {
         if let Some(leaked) = extract_leaked(&row_text) {
-            hashes.push(endpoint_text_hash(&leaked));
+            push_endpoint_hashes(&mut hashes, &leaked);
             conn.execute(
                 "UPDATE settings SET value=?1, revision=?2, updated_ms=?3, updated_by=?4 WHERE key=?5",
                 params![marker, revision + 1, now_ms(), actor, HARNESS_API_BASE_URL.key],
             )
             .map_err(failed)?;
+            scrubbed = true;
         }
     }
     let mut statement = conn
@@ -2476,7 +2539,7 @@ fn scrub_leaked_endpoint_for_secret(
         let mut scrub_col = |col: Option<String>| -> Option<String> {
             col.map(|text| {
                 if let Some(leaked) = extract_leaked(&text) {
-                    hashes.push(endpoint_text_hash(&leaked));
+                    push_endpoint_hashes(&mut hashes, &leaked);
                     row_changed = true;
                     marker.clone()
                 } else {
@@ -2491,6 +2554,7 @@ fn scrub_leaked_endpoint_for_secret(
         }
     }
     if !audit_updates.is_empty() {
+        scrubbed = true;
         conn.execute("DROP TRIGGER IF EXISTS settings_audit_no_update", [])
             .map_err(failed)?;
         for (id, next_old, next_new) in audit_updates {
@@ -2503,7 +2567,69 @@ fn scrub_leaked_endpoint_for_secret(
         conn.execute(SETTINGS_AUDIT_NO_UPDATE_SQL, [])
             .map_err(failed)?;
     }
-    record_scrubbed_endpoint_hashes(conn, hashes, actor)
+    record_scrubbed_endpoint_hashes(conn, hashes, actor)?;
+    Ok(scrubbed)
+}
+
+/// Permanently tombstones stored `harness.apiBaseUrl` and records scrubbed audit-text hashes when they contain `secret`.
+fn scrub_leaked_endpoint_for_secret(
+    conn: &Connection,
+    secret: &str,
+    actor: &str,
+) -> Result<bool, (u16, String)> {
+    scrub_endpoint_in_tx(conn, actor, |s| endpoint_text_matches_secret(s, secret))
+}
+
+/// Scrubs any credential-bearing or tombstoned `harness.apiBaseUrl` rows and audit entries in a staged restore
+/// `settings.db` before publishing it to the live runtime.
+pub(crate) fn scrub_restored_settings_db(
+    path: &std::path::Path,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> Result<bool, String> {
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let has_settings: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    if !has_settings {
+        conn.close().map_err(|(_, _)| STORAGE_ERROR.to_string())?;
+        return Ok(false);
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    let changed = scrub_endpoint_in_tx(&tx, "restore", |s| {
+        endpoint_value_is_scrubbed(s, Some(known_secrets), Some(scrubbed_hashes))
+    })
+    .map_err(|(_, error)| error)?;
+    if changed {
+        tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
+        conn.execute_batch("VACUUM; PRAGMA journal_mode=DELETE;")
+            .map_err(|_| STORAGE_ERROR.to_string())?;
+    } else {
+        drop(tx);
+    }
+    conn.close().map_err(|(_, _)| STORAGE_ERROR.to_string())?;
+    for name in SIDECARS {
+        if path
+            .with_file_name(name)
+            .try_exists()
+            .map_err(|_| STORAGE_ERROR.to_string())?
+        {
+            return Err(STORAGE_ERROR.to_string());
+        }
+    }
+    Ok(changed)
 }
 
 /// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
@@ -2525,7 +2651,7 @@ fn store(
         )?;
     }
     let harness_key = harness_credential(context);
-    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
+    let (applied, mirror_error) = write_store_scrubbable(context, false, &[setting.key], false, |conn, document| {
         let is_model_secret =
             setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key;
         let snapshot = if expected_endpoint.is_some() || (setting.secret && !value.is_null() && is_model_secret) {
@@ -2572,19 +2698,26 @@ fn store(
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
-                if let Some(secret) = raw_secret.as_deref() {
-                    scrub_leaked_endpoint_for_secret(conn, secret, actor)?;
-                }
-                return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
+                let scrubbed = if let Some(secret) = raw_secret.as_deref() {
+                    scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+                } else {
+                    false
+                };
+                return Ok((
+                    Applied { value, revision: *revision, changed: false, mirror_error: None },
+                    scrubbed,
+                ));
             }
         }
         validate_rollout_change(conn, document, [(setting, Some(&value))])?;
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
-        if let Some(secret) = raw_secret.as_deref() {
-            scrub_leaked_endpoint_for_secret(conn, secret, actor)?;
-        }
+        let scrubbed = if let Some(secret) = raw_secret.as_deref() {
+            scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+        } else {
+            false
+        };
         validate_timing(conn, document, &[setting.key], None)?;
-        Ok(Applied { value, revision, changed: true, mirror_error: None })
+        Ok((Applied { value, revision, changed: true, mirror_error: None }, scrubbed))
     })?;
     Ok(Applied { mirror_error, ..applied })
 }
@@ -2723,7 +2856,23 @@ pub(crate) fn undo(
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
         validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
         if restored.is_none() {
-            remove_from_config(context, setting).map_err(|error| (503, error))?;
+            let guard = read_endpoint_write_guard(conn, harness_key.as_deref())
+                .map_err(|error| (503, error.into_message()))?;
+            let has_clean_stored_endpoint = matches!(
+                stored_model_endpoint_override(conn).map_err(|error| (503, error.into_message()))?,
+                Some(StoredEndpointOverride::Value { ref raw, ref canonical })
+                    if !endpoint_value_is_scrubbed(
+                        raw,
+                        Some(&guard.known_secrets),
+                        Some(&guard.scrubbed_hashes),
+                    ) && !endpoint_value_is_scrubbed(
+                        canonical,
+                        Some(&guard.known_secrets),
+                        Some(&guard.scrubbed_hashes),
+                    )
+            );
+            remove_from_config(context, setting, &guard, has_clean_stored_endpoint)
+                .map_err(|error| (503, error))?;
         }
         Ok(Undone { key: setting.key, conversation: None, stored: restored, mirror_error: None })
     })?;

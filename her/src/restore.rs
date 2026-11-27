@@ -47,6 +47,7 @@ impl Drop for Staging {
 struct Prepared {
     _staging: Staging,
     zip: PathBuf,
+    scrubbed_settings_db: Option<PathBuf>,
     files: BTreeMap<String, (RuntimeArea, String)>,
     state_included: bool,
     config: Option<Vec<u8>>,
@@ -180,6 +181,7 @@ impl Prepared {
         let mut state_included = true;
         let mut config_bytes = None;
         let mut configured_token = None;
+        let mut scrubbed_settings_db = None;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -223,6 +225,26 @@ impl Prepared {
             ) {
                 bytes = serde_json::to_vec_pretty(&raw)
                     .map_err(|e| format!("backup config is invalid: {e}"))?;
+            }
+            if manifest.files.contains_key("settings.db") {
+                let staged_db = staging.0.join("settings.db");
+                {
+                    let mut source = archive.by_name("settings.db").map_err(|e| e.to_string())?;
+                    let mut out = File::create(&staged_db).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut source, &mut out).map_err(|e| e.to_string())?;
+                    out.sync_all().map_err(|e| e.to_string())?;
+                }
+                let known_secrets = crate::settings::archive_known_secrets(
+                    &verified.archive_secrets,
+                    host_disk_key.as_deref(),
+                );
+                if crate::settings::scrub_restored_settings_db(
+                    &staged_db,
+                    &known_secrets,
+                    &verified.archive_scrubbed_hashes,
+                )? {
+                    scrubbed_settings_db = Some(staged_db);
+                }
             }
             let (config, _) = crate::backup::validate_archive_config(
                 context.runtime_root(),
@@ -289,6 +311,7 @@ impl Prepared {
         Ok(Self {
             _staging: staging,
             zip,
+            scrubbed_settings_db,
             files,
             state_included,
             config: config_bytes,
@@ -983,6 +1006,20 @@ fn apply(
         .map_err(|e| e.to_string())?;
     for (name, (area, relative)) in &prepared.files {
         if name == "config.json" { continue; }
+        if name == "settings.db" {
+            if let Some(staged_db) = &prepared.scrubbed_settings_db {
+                let mut source = File::open(staged_db).map_err(|e| e.to_string())?;
+                control
+                    .replace(context, *area, relative, &mut source, authority)
+                    .map_err(|e| {
+                        format!(
+                            "restore replacement failed for {}: {e}",
+                            label(*area, relative)
+                        )
+                    })?;
+                continue;
+            }
+        }
         let mut source = archive.by_name(name).map_err(|e| e.to_string())?;
         control
             .replace(context, *area, relative, &mut source, authority)

@@ -943,3 +943,134 @@ fn ticket443_r9_non_string_malformed_config_endpoint_scrubbed_by_write_back_and_
         "mirror_into must scrub non-string object credential-bearing /harness/apiBaseUrl"
     );
 }
+
+#[test]
+fn ticket443_r10_raw_sqlite_bytes_scrubbed_after_secret_save() {
+    let (root, context) = settings_fixture("ticket443 r10 raw sqlite bytes");
+    let tok = "fixture-r10-raw-bytes-secret-99";
+    let leaked_host = "secret-r10-freed-page.example.test";
+    let leaked_url = format!("https://{leaked_host}/{tok}/v1");
+    assert_eq!(
+        post(
+            &context,
+            "/api/settings/set",
+            json!({"setting": "harness.apiBaseUrl", "value": leaked_url}),
+        )
+        .0,
+        200
+    );
+    // Move active endpoint to a clean URL so `leaked_host` lives only in settings_audit before scrub.
+    assert_eq!(
+        post(
+            &context,
+            "/api/settings/set",
+            json!({"setting": "harness.apiBaseUrl", "value": "https://clean-r10.example.test/v1"}),
+        )
+        .0,
+        200
+    );
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    let raw_db = std::fs::read(root.0.join("data/settings.db")).unwrap();
+    assert!(
+        !raw_db
+            .windows(leaked_host.len())
+            .any(|w| w == leaked_host.as_bytes()),
+        "raw settings.db bytes must contain zero freed-page or WAL-remnant leaked url bytes"
+    );
+}
+
+#[test]
+fn ticket443_r10_legacy_trailing_slash_scrub_records_canonical_hash() {
+    let (root, context) = settings_fixture("ticket443 r10 legacy trailing slash");
+    let tok = "fixture-r10-legacy-slash";
+    let raw_with_slash = format!("https://api.example.com/{tok}/");
+    let canonical = format!("https://api.example.com/{tok}");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    StoreProbe::at(&root.0).insert_value("harness.apiBaseUrl", &json!(raw_with_slash).to_string());
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    // Rotate key so `tok` is no longer in active secrets.
+    assert_eq!(put(&context, CLI, "fixture-r10-rotated-key").0, 200);
+    assert_eq!(post(&context, "/api/settings/reset", json!({"setting": "harness.apiBaseUrl"})).0, 200);
+
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({"setting": "harness.apiBaseUrl", "value": canonical}),
+    );
+    assert_eq!(
+        st, 400,
+        "reposting canonicalized form of scrubbed legacy trailing-slash url must return 400: {reply}"
+    );
+    assert_eq!(reply["error"], "setting text contains a credential");
+}
+
+#[test]
+fn ticket443_r10_json_escape_bypass_and_undo_scrubs_config_when_write_back_blocked() {
+    let (root, context) = settings_fixture("ticket443 r10 json escape and undo");
+    let esc_tok = "fixture-r10-esc\"tok";
+    assert_eq!(put(&context, CLI, esc_tok).0, 200);
+    // (a) JSON escape inside non-string object/array must still be scrubbed.
+    let mut doc = stored_config(&root);
+    doc["harness"] = json!({"apiBaseUrl": {"nested": [esc_tok]}});
+    assert!(crate::settings::mirror_into(&context, &mut doc).unwrap());
+    assert!(
+        doc.pointer("/harness/apiBaseUrl").is_none(),
+        "mirror_into must scrub non-string object/array containing escaped secret"
+    );
+
+    // (b) When write_back_values fails (blocked parent), undo() restoring None on another setting
+    // still scrubs leaked /harness/apiBaseUrl from config.json via remove_from_config.
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.maxSteps", "value": 12})).0,
+        200
+    );
+    let (entries, _) = history_page(&context, "?setting=harness.maxSteps");
+    let max_steps_entry = entries[0]["entry"].clone();
+    write_config(&root, |cfg| {
+        cfg["socialV2"] = json!({"reply": "not-an-object"});
+        cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{esc_tok}")});
+    });
+    let (st, reply) = post(&context, "/api/settings/undo", json!({"entry": max_steps_entry}));
+    assert_eq!(st, 200, "undo must succeed with mirrorError warning: {reply}");
+    assert!(reply["mirrorError"].as_str().is_some());
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "remove_from_config inside undo must scrub leaked /harness/apiBaseUrl even when post-commit write_back is blocked"
+    );
+}
+
+#[test]
+fn ticket443_r10_models_api_redacts_price_label() {
+    let (root, context) = settings_fixture("ticket443 r10 models price label");
+    let tok = "fixture-r10-price-tok";
+    std::fs::write(root.0.join("config/harness-api-key"), tok).unwrap();
+    let route_model = format!("custom-{tok}-model");
+    write_config(&root, |cfg| {
+        cfg["pricing"] = json!({
+            "models": {
+                route_model.clone(): {}
+            }
+        });
+    });
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({
+            "setting": "harness.routes",
+            "value": [{"id": "primary", "model": route_model}]
+        }),
+    );
+    assert_eq!(st, 200, "{reply}");
+    let (m_st, models_reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(m_st, 200, "{models_reply}");
+    let route = &models_reply["routes"][0];
+    assert!(
+        !route["model"].as_str().unwrap_or("").contains(tok),
+        "route.model must be redacted: {route}"
+    );
+    assert!(
+        !route["price"]["label"].as_str().unwrap_or("").contains(tok),
+        "route.price.label must be redacted: {route}"
+    );
+}
