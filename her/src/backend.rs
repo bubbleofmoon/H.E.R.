@@ -952,9 +952,15 @@ fn is_opencode_invocation(cmd: &str, args: &[String]) -> bool {
         return true;
     }
     args.iter().any(|arg| {
-        arg.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '&' | '|' | ';'))
-            .filter(|token| !token.is_empty())
-            .any(is_opencode_command)
+        arg.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\'' | '"' | '`' | '&' | '|' | ';' | '(' | ')' | '{' | '}' | '<' | '>' | '$' | '!'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .any(is_opencode_command)
     })
 }
 
@@ -1955,6 +1961,53 @@ mod tests {
         let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(envs.get(OsStr::new("OPENCODE_GO_API_KEY")).copied().flatten(), None);
         assert_eq!(envs.get(OsStr::new("OPENCODE_API_KEY")).copied().flatten(), None);
+    }
+
+    #[test]
+    fn ticket443_r14_grouped_shell_opencode_invocation_fails_and_notices() {
+        let (_fixture, context) = cli_credential_fixture();
+        let custom_ep = "https://cli-r14-grp.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(custom_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r14-grp-tok"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        for (prog, args) in [
+            ("bash", vec!["-c", "(opencode run)"]),
+            ("sh", vec!["-c", "{opencode;}"]),
+            ("sh", vec!["-c", "$(opencode run)"]),
+            ("sh", vec!["-c", "`opencode run`"]),
+            ("cmd", vec!["/C", r"(C:\tools\opencode.cmd run)"]),
+        ] {
+            let mut cmd = std::process::Command::new(prog);
+            cmd.args(&args);
+            super::configure_isolated_cli_environment(&mut cmd, &context).unwrap();
+            let err = super::configure_cli_model(&mut cmd, &context).unwrap_err();
+            assert!(
+                matches!(err, BackendError::Config(ref msg) if msg.contains("OpenCode")),
+                "grouped shell {prog} {args:?} must fail closed on E != D: {err:?}"
+            );
+            let cfg = serde_json::json!({
+                "backends": [{ "id": "oc-grp", "kind": "cli", "cmd": prog, "args": args }]
+            });
+            assert!(
+                super::cli_model_notice(&context, &cfg)
+                    .is_some_and(|msg| msg.contains("OpenCode")),
+                "cli_model_notice must warn for grouped shell {prog} {args:?} on E != D"
+            );
+        }
     }
 
     #[test]

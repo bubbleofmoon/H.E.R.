@@ -1783,3 +1783,58 @@ fn ticket443_r13_full_restore_refuses_live_endpoint_change_after_snapshot() {
         Some("https://live-after-r13.example.test/v1")
     );
 }
+
+#[test]
+fn ticket443_r14_malformed_credential_stored_url_suppressed_live_and_in_restore() {
+    let tok = "sk-r14-rest-mal-tok";
+    let mal_host = "mal-arr-r14.example.test";
+    for (case_name, raw_val) in [
+        ("array", json!([format!("https://{mal_host}/{tok}")]).to_string()),
+        ("invalid_str", json!(format!("not-a-url/{mal_host}/{tok}")).to_string()),
+    ] {
+        let f = Fixture::new();
+        let context = f.context();
+        let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+        crate::settings::apply(
+            &context,
+            "cliModel.apiKey",
+            &json!(tok),
+            "fixture-admin",
+            "console",
+        )
+        .unwrap();
+        crate::settings::StoreProbe::at(&f.0).edit(&format!(
+            "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+            raw_val.replace('\'', "''")
+        ));
+
+        let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+        assert!(snap.stored_url_suppressed, "{case_name}: live resolver must suppress credential-bearing malformed URL");
+        assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+
+        let archive = f.backup();
+        let plan = preview(&context, &archive, false).unwrap();
+        let reply = auth_restore(&f, &archive, false, &mut FakeControl::default()).unwrap();
+        assert_eq!(reply["result"], "succeeded", "{case_name}: full restore must succeed (plan={plan})");
+
+        let restored_db = fs::read(f.0.join("data/settings.db")).unwrap();
+        assert!(
+            !restored_db.windows(mal_host.len()).any(|w| w == mal_host.as_bytes()),
+            "{case_name}: restored settings.db must contain zero raw leaked host bytes"
+        );
+        let restored_cfg: Value = serde_json::from_slice(&fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+        assert!(restored_cfg.pointer("/harness/apiBaseUrl").is_none());
+    }
+
+    // Non-secret malformed value 12345 still fails closed in live resolver and archive preview.
+    let f_bad = Fixture::new();
+    let ctx_bad = f_bad.context();
+    crate::settings::apply(&ctx_bad, "cliModel.apiKey", &json!(tok), "fixture-admin", "console").unwrap();
+    crate::settings::StoreProbe::at(&f_bad.0).edit(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '12345', 1, 1, 'fixture');"
+    );
+    assert!(crate::settings::resolve_model_endpoint_and_key(&ctx_bad).is_err());
+    let bad_archive = f_bad.backup();
+    assert!(preview(&ctx_bad, &bad_archive, false).is_err());
+}

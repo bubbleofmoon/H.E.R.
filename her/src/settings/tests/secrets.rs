@@ -1426,3 +1426,116 @@ fn ticket443_r13_second_wal_truncate_failure_preserves_pending_cleanup() {
         .ok();
     assert_eq!(pending_after, None, "retry must complete cleanup and delete __scrubbed.pendingCleanup");
 }
+
+#[test]
+fn ticket443_r14_guarded_409_commits_leaked_endpoint_scrub() {
+    let (root, context) = settings_fixture("ticket443 r14 guarded 409 commits scrub");
+    let tok = "sk-guard409-r14-tok";
+    let leaked_host = "guarded-409-r14.example.test";
+    let leaked_url = format!("https://{leaked_host}/{tok}/v1");
+
+    // Leaked URL present in settings.db AND config.json.
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+    assert_eq!(stored_config(&root).pointer("/harness/apiBaseUrl"), Some(&json!(leaked_url)));
+
+    // Guarded save with mismatched expectedEndpoint must return 409 without saving harness.apiKey,
+    // yet MUST commit the scrub, scrub config.json, purge raw settings.db bytes, and block repost.
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({
+            "setting": "harness.apiKey",
+            "value": tok,
+            "expectedEndpoint": "https://wrong-endpoint-r14.example.test/v1"
+        }),
+    );
+    assert_eq!(st, 409, "mismatched expectedEndpoint must return 409: {reply}");
+    assert_eq!(setting_view(&context, "harness.apiKey")["isSet"], json!(false), "409 must not save harness.apiKey");
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "409 must still commit scrub of config/harness.apiBaseUrl"
+    );
+    let raw_db = std::fs::read(root.0.join("data/settings.db")).unwrap();
+    assert!(
+        !raw_db.windows(leaked_host.len()).any(|w| w == leaked_host.as_bytes()),
+        "409 scrub must purge raw leaked URL bytes from settings.db"
+    );
+    let wal_path = root.0.join("data/settings.db-wal");
+    if wal_path.exists() {
+        let raw_wal = std::fs::read(&wal_path).unwrap();
+        assert!(
+            !raw_wal.windows(leaked_host.len()).any(|w| w == leaked_host.as_bytes()),
+            "409 scrub must purge raw leaked URL bytes from settings.db-wal"
+        );
+    }
+    let (st_repost, _) = post(
+        &context,
+        "/api/settings/set",
+        json!({"setting": "harness.apiBaseUrl", "value": leaked_url}),
+    );
+    assert_eq!(st_repost, 400, "reposting URL scrubbed during 409 must be refused with 400");
+}
+
+#[test]
+fn ticket443_r14_apply_changes_rejects_credential_bearing_non_string_endpoint() {
+    let (root, context) = settings_fixture("ticket443 r14 apply_changes non-string");
+    let tok = "sk-r14-batch-tok";
+    let clean_ep = "https://clean-r14-batch.example.test/v1";
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": clean_ep})).0,
+        200
+    );
+    assert_eq!(put(&context, CLI, tok).0, 200);
+
+    for bad in [
+        json!([format!("https://host/{tok}")]),
+        json!({"url": format!("https://host/{tok}")}),
+    ] {
+        let err = crate::settings::apply_changes(
+            &context,
+            vec![(&crate::settings::HARNESS_API_BASE_URL, bad.clone())],
+            "fixture-admin",
+            "console",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 400, "apply_changes must reject credential-bearing non-string {bad}: {err:?}");
+    }
+    assert_eq!(
+        StoreProbe::at(&root.0).value("harness.apiBaseUrl").as_deref(),
+        Some("\"https://clean-r14-batch.example.test/v1\"")
+    );
+}
+
+#[test]
+fn ticket443_r14_malformed_credential_stored_url_suppressed_live() {
+    let (root, context) = settings_fixture("ticket443 r14 malformed stored url live");
+    let tok = "sk-r14-live-mal-tok";
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    assert_eq!(put(&context, CLI, tok).0, 200);
+
+    for raw_val in [
+        json!([format!("https://x/{tok}")]).to_string(),
+        json!(format!("not-a-url/{tok}")).to_string(),
+    ] {
+        StoreProbe::at(&root.0).edit(&format!(
+            "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.apiBaseUrl', '{}', 1, 1, 'fixture')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=revision+1;",
+            raw_val.replace('\'', "''")
+        ));
+        let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+        assert!(snap.stored_url_suppressed, "credential-bearing malformed stored URL must be suppressed: {raw_val}");
+        assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+    }
+
+    // Non-secret malformed value must still fail closed.
+    StoreProbe::at(&root.0).edit(
+        "UPDATE settings SET value='12345', revision=revision+1 WHERE key='harness.apiBaseUrl';"
+    );
+    assert!(
+        crate::settings::resolve_model_endpoint_and_key(&context).is_err(),
+        "non-credential malformed stored harness.apiBaseUrl must fail closed"
+    );
+}

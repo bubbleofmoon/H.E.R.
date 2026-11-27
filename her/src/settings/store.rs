@@ -945,6 +945,7 @@ pub(crate) enum StoredEndpointOverride {
     Reset,
     Suppressed,
     Value { raw: String, canonical: String },
+    Malformed { raw_text: String, parsed: Option<Value> },
 }
 
 fn stored_model_endpoint_override(
@@ -954,23 +955,79 @@ fn stored_model_endpoint_override(
     else {
         return Ok(None);
     };
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: None,
+        }));
+    };
     if parsed.is_null() {
         return Ok(Some(StoredEndpointOverride::Reset));
     }
-    let raw = parsed
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
+    let Some(raw) = parsed.as_str().map(str::to_string) else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: Some(parsed),
+        }));
+    };
     if raw == SECRET_MARKER {
         return Ok(Some(StoredEndpointOverride::Suppressed));
     }
-    let canonical = HARNESS_API_BASE_URL
+    let Some(canonical) = HARNESS_API_BASE_URL
         .normalize(&parsed)
         .and_then(|v| v.as_str().map(str::to_string))
-        .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
+    else {
+        return Ok(Some(StoredEndpointOverride::Malformed {
+            raw_text: text,
+            parsed: Some(parsed),
+        }));
+    };
     Ok(Some(StoredEndpointOverride::Value { raw, canonical }))
+}
+
+fn malformed_override_is_scrubbed(
+    raw_text: &str,
+    parsed: Option<&Value>,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> bool {
+    endpoint_value_is_scrubbed(raw_text, Some(known_secrets), Some(scrubbed_hashes))
+        || parsed.is_some_and(|value| {
+            value_has_leaked_endpoint(value, Some(known_secrets), Some(scrubbed_hashes))
+        })
+}
+
+fn classify_stored_endpoint_override(
+    stored: Option<StoredEndpointOverride>,
+    known_secrets: &[String],
+    scrubbed_hashes: &[String],
+) -> Result<Option<StoredEndpointOverride>, InspectError> {
+    match stored {
+        Some(StoredEndpointOverride::Malformed { raw_text, parsed }) => {
+            if malformed_override_is_scrubbed(
+                &raw_text,
+                parsed.as_ref(),
+                known_secrets,
+                scrubbed_hashes,
+            ) {
+                Ok(Some(StoredEndpointOverride::Suppressed))
+            } else {
+                Err(InspectError::Fatal(STORAGE_ERROR.to_string()))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+pub(crate) fn classify_archive_model_endpoint_override(
+    stored: Option<StoredEndpointOverride>,
+    archive_secrets: &[String],
+    archive_scrubbed_hashes: &[String],
+    host_disk_key: Option<&str>,
+) -> Result<Option<StoredEndpointOverride>, String> {
+    let known_secrets = archive_known_secrets(archive_secrets, host_disk_key);
+    classify_stored_endpoint_override(stored, &known_secrets, archive_scrubbed_hashes)
+        .map_err(InspectError::into_message)
 }
 
 pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, String> {
@@ -1116,7 +1173,11 @@ fn effective_endpoint_from_overrides(
                 ))
             .then_some((canonical, ModelEndpointSource::Settings))
         }
-        Some(StoredEndpointOverride::Reset | StoredEndpointOverride::Suppressed) => None,
+        Some(
+            StoredEndpointOverride::Reset
+            | StoredEndpointOverride::Suppressed
+            | StoredEndpointOverride::Malformed { .. },
+        ) => None,
         None => document
             .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets, scrubbed_hashes))
             .map(|url| (url, ModelEndpointSource::Config)),
@@ -1210,13 +1271,18 @@ fn resolve_model_endpoint_from_parts(
         all_secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
         all_secrets.dedup();
     }
-    let (stored_override, scrubbed_hashes) = match conn {
+    let (raw_stored_override, scrubbed_hashes) = match conn {
         Some(conn) => (
             stored_model_endpoint_override(conn)?,
             read_scrubbed_endpoint_hashes(conn)?,
         ),
         None => (None, Vec::new()),
     };
+    let stored_override = classify_stored_endpoint_override(
+        raw_stored_override,
+        &all_secrets,
+        &scrubbed_hashes,
+    )?;
     let stored_url_suppressed = matches!(
         &stored_override,
         Some(StoredEndpointOverride::Suppressed)
@@ -1368,36 +1434,35 @@ fn reject_credential_text(
     harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
     let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
-    let endpoint_url = value.as_str().filter(|_| setting.key == HARNESS_API_BASE_URL.key);
-    let raw_endpoint_url = raw_value
-        .and_then(Value::as_str)
-        .filter(|_| setting.key == HARNESS_API_BASE_URL.key);
+    let is_endpoint = setting.key == HARNESS_API_BASE_URL.key;
     let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
-    if prompt_text.is_none()
-        && endpoint_url.is_none()
-        && raw_endpoint_url.is_none()
-        && routes.is_none()
-    {
+    if prompt_text.is_none() && !is_endpoint && routes.is_none() {
         return Ok(());
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
     let known_secrets = collect_known_secrets(&secrets, harness_key);
-    let scrubbed_hashes = if endpoint_url.is_some() || raw_endpoint_url.is_some() {
+    let scrubbed_hashes = if is_endpoint {
         read_scrubbed_endpoint_hashes(conn).map_err(|error| (503, error.into_message()))?
     } else {
         Vec::new()
     };
     let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
     let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
-    let has_endpoint_credential = |text: &str| {
-        endpoint_value_is_scrubbed(text, Some(&known_secrets), Some(&scrubbed_hashes))
+    let endpoint_has_credential = |v: &Value| {
+        value_has_leaked_endpoint(v, Some(&known_secrets), Some(&scrubbed_hashes))
     };
     if prompt_text.is_some_and(has_any_credential)
-        || endpoint_url.is_some_and(has_endpoint_credential)
-        || raw_endpoint_url.is_some_and(has_endpoint_credential)
-        || routes.is_some_and(|routes| routes.iter().any(|route| {
-            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
-        }))
+        || (is_endpoint
+            && (endpoint_has_credential(value)
+                || raw_value.is_some_and(endpoint_has_credential)))
+        || routes.is_some_and(|routes| {
+            routes.iter().any(|route| {
+                ["id", "model"]
+                    .iter()
+                    .filter_map(|field| route[*field].as_str())
+                    .any(has_endpoint_key)
+            })
+        })
     {
         return Err((400, "setting text contains a credential".to_string()));
     }
@@ -1832,7 +1897,12 @@ fn read_endpoint_write_guard(
     let secrets = secrets_in_checked(conn)?;
     let known_secrets = collect_known_secrets(&secrets, harness_disk_key);
     let scrubbed_hashes = read_scrubbed_endpoint_hashes(conn)?;
-    let endpoint_suppressed = match stored_model_endpoint_override(conn)? {
+    let endpoint_override = classify_stored_endpoint_override(
+        stored_model_endpoint_override(conn)?,
+        &known_secrets,
+        &scrubbed_hashes,
+    )?;
+    let endpoint_suppressed = match endpoint_override {
         Some(StoredEndpointOverride::Suppressed) => true,
         Some(StoredEndpointOverride::Value { raw, canonical }) => {
             endpoint_value_is_scrubbed(&raw, Some(&known_secrets), Some(&scrubbed_hashes))
@@ -2759,6 +2829,19 @@ pub(crate) fn scrub_restored_settings_db(
     Ok(true)
 }
 
+type StoreOutcome = Result<Applied, (u16, String)>;
+
+fn fail_preserving_scrub(
+    err: (u16, String),
+    scrubbed_before: bool,
+) -> Result<(StoreOutcome, bool), (u16, String)> {
+    if scrubbed_before {
+        Ok((Err(err), true))
+    } else {
+        Err(err)
+    }
+}
+
 /// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
@@ -2831,16 +2914,18 @@ fn store(
         let is_model_secret =
             setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key;
         let snapshot = if expected_endpoint.is_some() || (setting.secret && !value.is_null() && is_model_secret) {
-            Some(
-                resolve_model_endpoint_in_conn_with_pending(
-                    Some(conn),
-                    Some(document),
-                    context.dependency_url("model"),
-                    harness_key.clone(),
-                    raw_secret.as_deref(),
-                )
-                .map_err(|error| (503, error.into_message()))?,
-            )
+            match resolve_model_endpoint_in_conn_with_pending(
+                Some(conn),
+                Some(document),
+                context.dependency_url("model"),
+                harness_key.clone(),
+                raw_secret.as_deref(),
+            ) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    return fail_preserving_scrub((503, error.into_message()), scrubbed_before);
+                }
+            }
         } else {
             None
         };
@@ -2848,30 +2933,42 @@ fn store(
             let expected = crate::runtime::canonical_model_endpoint(expected);
             let actual = snapshot.as_ref().and_then(|s| s.effective_endpoint.as_deref());
             if actual != Some(expected.as_str()) {
-                return Err((
-                    409,
-                    "model endpoint changed before credential save; refresh and re-enter the key".to_string(),
-                ));
+                return fail_preserving_scrub(
+                    (
+                        409,
+                        "model endpoint changed before credential save; refresh and re-enter the key".to_string(),
+                    ),
+                    scrubbed_before,
+                );
             }
         }
         // The configuration gate keeps the endpoint stable until the store commits.
         let text = if setting.secret && !value.is_null() {
-            let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
+            let Some(endpoint) = (if setting.key == WEB_SEARCH_API_KEY.key {
                 crate::aux_search::settings_endpoint(document)
             } else {
                 snapshot.and_then(|s| s.effective_endpoint)
-            }
-            .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
+            }) else {
+                return fail_preserving_scrub(
+                    (400, "the credential endpoint is unavailable".to_string()),
+                    scrubbed_before,
+                );
+            };
             if let Some(secret) = raw_secret.as_deref() {
                 if endpoint_text_matches_secret(&endpoint, secret) {
-                    return Err((400, "credential endpoint contains the secret".to_string()));
+                    return fail_preserving_scrub(
+                        (400, "credential endpoint contains the secret".to_string()),
+                        scrubbed_before,
+                    );
                 }
             }
             json!([endpoint, value]).to_string()
         } else {
             value.to_string()
         };
-        reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref())?;
+        if let Err(err) = reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref()) {
+            return fail_preserving_scrub(err, scrubbed_before);
+        }
         let value = if setting.secret { json!(!value.is_null()) } else { value };
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -2881,7 +2978,7 @@ fn store(
                     false
                 };
                 return Ok((
-                    Applied { value, revision: *revision, changed: false, mirror_error: None },
+                    Ok(Applied { value, revision: *revision, changed: false, mirror_error: None }),
                     scrubbed_before || scrubbed_after,
                 ));
             }
@@ -2895,10 +2992,11 @@ fn store(
         };
         validate_timing(conn, document, &[setting.key], None)?;
         Ok((
-            Applied { value, revision, changed: true, mirror_error: None },
+            Ok(Applied { value, revision, changed: true, mirror_error: None }),
             scrubbed_before || scrubbed_after,
         ))
     })?;
+    let applied = applied?;
     Ok(Applied { mirror_error, ..applied })
 }
 

@@ -177,15 +177,17 @@ export const ModelRoutesTab: React.FC = () => {
 
   const activeEndpointInfo = useMemo(() => {
     const staleModelsEndpoint = modelsSyncedSeq < settingsMutationSeq;
-    if (
-      !staleModelsEndpoint &&
-      typeof modelsData?.effectiveModelEndpoint === 'string' &&
-      modelsData.effectiveModelEndpoint
-    ) {
+    if (!staleModelsEndpoint && modelsData && 'effectiveModelEndpoint' in modelsData) {
+      if (typeof modelsData.effectiveModelEndpoint === 'string' && modelsData.effectiveModelEndpoint) {
+        return {
+          endpoint:
+            canonicalModelEndpoint(modelsData.effectiveModelEndpoint) ??
+            modelsData.effectiveModelEndpoint,
+          source: modelsData.effectiveModelEndpointSource ?? null,
+        };
+      }
       return {
-        endpoint:
-          canonicalModelEndpoint(modelsData.effectiveModelEndpoint) ??
-          modelsData.effectiveModelEndpoint,
+        endpoint: null,
         source: modelsData.effectiveModelEndpointSource ?? null,
       };
     }
@@ -204,7 +206,7 @@ export const ModelRoutesTab: React.FC = () => {
     }
     return {
       endpoint: null,
-      source: staleModelsEndpoint ? null : (modelsData?.effectiveModelEndpointSource ?? null),
+      source: null,
     };
   }, [settings, apiBaseUrlItem, modelsData, modelsSyncedSeq, settingsMutationSeq]);
 

@@ -202,8 +202,15 @@ impl Prepared {
                 .ok()
                 .and_then(|snap| snap.harness_disk_key.clone())
                 .or_else(|| crate::settings::harness_credential(context));
-            let archive_endpoint = crate::settings::archive_effective_model_endpoint(
+            let archive_model_endpoint = crate::settings::classify_archive_model_endpoint_override(
                 verified.archive_model_endpoint.clone(),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            )
+            .map_err(|error| format!("backup settings verification: {error}"))?;
+            let archive_endpoint = crate::settings::archive_effective_model_endpoint(
+                archive_model_endpoint.clone(),
                 &raw,
                 context.dependency_url("model"),
                 &verified.archive_secrets,
@@ -225,7 +232,7 @@ impl Prepared {
             }
             if crate::settings::scrub_archived_config_endpoint(
                 &mut raw,
-                verified.archive_model_endpoint.as_ref(),
+                archive_model_endpoint.as_ref(),
                 &verified.archive_secrets,
                 &verified.archive_scrubbed_hashes,
                 host_disk_key.as_deref(),
