@@ -655,7 +655,9 @@ fn is_expired_timeout_before_admission(turn: &Turn) -> bool {
 }
 
 fn retire_expired_timeout_if_needed(context: &RuntimeContext, turn: &Turn) -> Result<(), String> {
-    if is_expired_timeout_before_admission(turn) {
+    if is_expired_timeout_before_admission(turn)
+        || is_cancelled_expired_timeout_before_admission(turn)
+    {
         if let Some(claim) = &turn.wake_claim {
             if claim["previous"]["wakeConfig"]["sleepUntil"].is_string() {
                 return crate::social_state::retire_reserved2_deadline_for_recovery(
@@ -1425,9 +1427,14 @@ pub fn spawn(context: RuntimeContext) {
 }
 
 fn is_cancelled_expired_timeout_before_admission(turn: &Turn) -> bool {
-    is_expired_timeout_before_admission(turn)
+    turn.reason == "timeout"
         && turn.state == State::Cancelled
         && turn.outcome_reason == "turnTimeout"
+        && (is_expired_timeout_before_admission(turn)
+            || !turn
+                .notes
+                .iter()
+                .any(|note| note["verdict"] == "cancel-requested"))
 }
 
 /// Retire an unconsumed `expired-before-admission` `"timeout"` deadline on demand when the live
@@ -4166,6 +4173,244 @@ mod tests {
                 "{g} operator /schedule deadline must not be marked sleepRetired"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ticket297_concurrent_mention_does_not_defeat_startup_timeout_retirement() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1, 2, 3]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-conc-mention-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let operator_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() + 120_000);
+        let previous = json!({
+            "wakeConfig": {
+                "confirmedAt": 2,
+                "infinite": false,
+                "sleepUntil": due_iso,
+                "lastWakeAt": 0,
+                "wakeCount": 0
+            },
+            "lastWakeReason": ""
+        });
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": "tok-r24-cm-1",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": due_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    },
+                    "group:2": {
+                        "agentToken": "tok-r24-cm-2",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": due_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    },
+                    "group:3": {
+                        "agentToken": "tok-r24-cm-3",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": due_iso,
+                            "lastWakeAt": 10,
+                            "wakeCount": 1
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&root.0).unwrap();
+        let cfg = ctx.load_config().unwrap();
+        let journal = Journal::open(&ctx).unwrap();
+
+        for (key, tok) in [
+            ("group:1", "tok-r24-cm-1"),
+            ("group:2", "tok-r24-cm-2"),
+            ("group:3", "tok-r24-cm-3"),
+        ] {
+            let rec = Recorder::begin_reserved2(
+                &ctx,
+                key,
+                "harness",
+                "timeout",
+                &crate::send_outbox::token_epoch(tok),
+                &[],
+            )
+            .unwrap();
+            rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+            rec.verified("expired-before-admission", "turnTimeout").unwrap();
+            // Direct claim_reserved2_wake bumps lastWakeAt ahead of background recovery.
+            crate::social_state::claim_reserved2_wake(&ctx, key, "atMention", 200, Some(tok))
+                .unwrap();
+        }
+        // Simulate concurrent /schedule edits on group:2 (same confirmedAt) and group:3 (newer confirmedAt).
+        crate::conversation_state::update_raw(&ctx, |state| {
+            state["conversations"]["group:2"]["wakeConfig"]["sleepUntil"] = json!(operator_iso);
+            state["conversations"]["group:3"]["wakeConfig"]["confirmedAt"] = json!(3);
+            state["conversations"]["group:3"]["wakeConfig"]["sleepUntil"] = json!(operator_iso);
+            Ok(())
+        })
+        .unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&ctx).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&ctx);
+        for turn in &turns {
+            Pass { context: &ctx, cfg: &cfg }
+                .reconcile(&journal, turn, &turns, &outbox)
+                .await;
+        }
+
+        let convs = ctx.read_social_state().unwrap()["conversations"].clone();
+        let wc1 = &convs["group:1"]["wakeConfig"];
+        assert!(
+            wc1["sleepUntil"].is_null(),
+            "Verdict::Cancel must retire matching sleepUntil even after claim_reserved2_wake bumped lastWakeAt, got {wc1}"
+        );
+        assert_eq!(wc1["sleepRetired"], json!(true));
+        assert_eq!(wc1["lastWakeAt"], json!(200));
+
+        for g in ["group:2", "group:3"] {
+            assert_eq!(
+                convs[g]["wakeConfig"]["sleepUntil"],
+                json!(operator_iso),
+                "{g} newer /schedule edit must be preserved"
+            );
+            assert!(
+                convs[g]["wakeConfig"].get("sleepRetired").is_none(),
+                "{g} newer /schedule edit must not be marked sleepRetired"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket297_upgrade_legacy_cancelled_turn_timeout_does_not_revive_sleep() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1, 2]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-legacy-up-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": "tok-r24-leg-1",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "lastWakeAt": 10
+                        }
+                    },
+                    "group:2": {
+                        "agentToken": "tok-r24-leg-2",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "lastWakeAt": 10
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&root.0).unwrap();
+        let cfg = ctx.load_config().unwrap();
+        let _journal = Journal::open(&ctx).unwrap();
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let claim = json!({
+            "at": 10,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": due_iso}}
+        });
+
+        // Merge-base 6fdf924e legacy pre-admission cancelled timeout: no expired-before-admission or cancel-requested note.
+        let rec1 = Recorder::begin_reserved2(
+            &ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-r24-leg-1"),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&claim).unwrap();
+        rec1.end("cancelled", "turnTimeout").unwrap();
+
+        // Control admitted-cap turn WITH cancel-requested note.
+        let rec2 = Recorder::begin_reserved2(
+            &ctx,
+            "group:2",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-r24-leg-2"),
+            &[],
+        )
+        .unwrap();
+        rec2.wake_claim(&claim).unwrap();
+        rec2.verified("cancel-requested", "turnTimeout").unwrap();
+        rec2.end("cancelled", "turnTimeout").unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&ctx).unwrap()).0;
+        let cutoff = crate::turn_ledger::now_ms() + 1_000;
+        let mut done = HashSet::new();
+        assert!(rearm_startup_terminal_sleeps(
+            &ctx,
+            &cfg,
+            &turns,
+            cutoff,
+            &HashSet::new(),
+            &mut done
+        ));
+        assert!(done.contains("group:1"));
+        assert!(done.contains("group:2"));
+
+        let convs = ctx.read_social_state().unwrap()["conversations"].clone();
+        let wc1 = &convs["group:1"]["wakeConfig"];
+        assert!(
+            wc1["sleepUntil"].is_null(),
+            "legacy pre-admission cancelled turnTimeout must not revive sleepUntil, got {wc1}"
+        );
+        let wc2 = &convs["group:2"]["wakeConfig"];
+        assert!(
+            wc2["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "control admitted-cap turn with cancel-requested note must still re-arm sleepUntil, got {wc2}"
+        );
     }
 
     #[test]

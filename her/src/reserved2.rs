@@ -2988,6 +2988,332 @@ mod tests {
         .expect("the queued timeout revalidation fixture must settle");
     }
 
+    #[tokio::test]
+    async fn ticket297_timeout_preflight_retry_exhaustion_rearms_after_ledger_recovers() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r24-preflight-exhaust", None).await;
+            drop(console);
+            let key = HARNESS_CAP_KEY;
+            let due_ms = (crate::now_ms() as i64) - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            struct ClearIoHook;
+            impl Drop for ClearIoHook {
+                fn drop(&mut self) {
+                    crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+                }
+            }
+            let fail_ledger = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let fail_flag = fail_ledger.clone();
+            let clear_guard = ClearIoHook;
+            crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |stage| {
+                    if stage == "turn-read-all"
+                        && fail_flag.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(std::io::Error::other("synthetic turn ledger read error"));
+                    }
+                    Ok(())
+                }));
+            });
+
+            for attempt in 1..=(MAX_WAKE_RETRIES + 1) {
+                for (at, _) in hub.retries.values_mut() {
+                    *at = 0;
+                }
+                hub.tick("bot", 9001).await.unwrap();
+                assert!(
+                    !hub.active.contains_key(key),
+                    "attempt {attempt}: preflight ledger read failure must block timeout dispatch"
+                );
+                if attempt <= MAX_WAKE_RETRIES {
+                    assert_eq!(hub.failures[key], attempt);
+                    assert!(hub.retries.contains_key(key));
+                } else {
+                    assert!(!hub.failures.contains_key(key));
+                }
+            }
+
+            assert!(hub.retries.is_empty(), "retries must be empty after exhaustion");
+            assert_eq!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"],
+                json!(due_iso),
+                "unclaimed timeout sleepUntil must remain persisted after preflight exhaustion"
+            );
+
+            fail_ledger.store(false, std::sync::atomic::Ordering::Release);
+            drop(clear_guard);
+
+            hub.tick("bot", 9001).await.unwrap();
+            let _abort = hub
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                hub.active.contains_key(key),
+                "live hub must re-adopt persisted sleepUntil and dispatch timeout after ledger recovers"
+            );
+            assert_eq!(hub.active[key].reason, "timeout");
+        })
+        .await
+        .expect("the preflight retry exhaustion fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_gate_refused_expired_timeout_retires_before_hub_tick() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r24-gate-refused", None).await;
+            drop(console);
+            let key = HARNESS_CAP_KEY;
+            let due_ms = (crate::now_ms() as i64) - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key)
+                .await
+                .unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "timeout");
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::PendingHarness);
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            assert!(
+                !crate::turn_ledger::read_records(&hub.context)
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["k"] == "begun" && r["key"] == key),
+                "gate-refused wake must not open a durable turn"
+            );
+            let pre_tick_wc = hub.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(
+                pre_tick_wc["sleepUntil"].is_null(),
+                "gate-refused expired timeout must retire sleepUntil before Hub::tick, got {pre_tick_wc}"
+            );
+            assert_eq!(
+                pre_tick_wc["sleepRetired"],
+                json!(true),
+                "gate-refused expired timeout must persist sleepRetired before Hub::tick, got {pre_tick_wc}"
+            );
+
+            // Simulate crash before Hub::tick runs completion retirement.
+            let context = hub.context.clone();
+            let journal = hub.journal.clone();
+            let active = hub.active.remove(key).unwrap();
+            drop(_task);
+            let _ = active.task.await;
+            drop(hub);
+
+            let mut restarted = Hub::new(&context, journal, vec![], true);
+            restarted.tick("bot", 9001).await.unwrap();
+            let _abort = restarted
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                !restarted.active.contains_key(key),
+                "fresh Hub must not re-fire retired gate-refused timeout"
+            );
+
+            // Also cover direct dispatch_expired() before begin_ledger_turn_as (no route + Held).
+            let (_root2, hub2, console2) =
+                harness_cap_fixture("harness-cap-r24-dispatch-expired", None).await;
+            drop(console2);
+            conversation_state::update_raw(&hub2.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+            let cfg2 = hub2.context.load_config().unwrap();
+            let tok2 = social_state::token(&hub2.context, key).unwrap().unwrap();
+            let now2 = crate::turn_ledger::now_ms();
+            let (prev2, tok2) = social_state::claim_reserved2_wake_for_deadline(
+                &hub2.context,
+                key,
+                "timeout",
+                now2,
+                Some(&tok2),
+                Some(&due_iso),
+            )
+            .unwrap();
+            let mut pipe_no_route =
+                pipeline::Pipeline::new_without_dsh(&hub2.context, &cfg2, true).unwrap();
+            pipe_no_route.expect_dispatch_token(tok2.clone());
+            pipe_no_route.expect_dispatch_deadline(now2 - 1);
+            pipe_no_route.expect_dispatch_wake(now2, prev2);
+            pipe_no_route.note_turn("timeout", &[]);
+            let res_no_route = pipe_no_route
+                .run_turn(&crate::onebot::Target::Group(420042), "timeout", "", &cfg2)
+                .await;
+            assert!(res_no_route.is_err());
+            let wc_no_route = hub2.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(
+                wc_no_route["sleepUntil"].is_null(),
+                "no-route dispatch_expired timeout must clear sleepUntil, got {wc_no_route}"
+            );
+            assert_eq!(wc_no_route["sleepRetired"], json!(true));
+
+            // Held ledger turn + dispatch_expired() before admission.
+            conversation_state::update_raw(&hub2.context, |state| {
+                let wc = state["conversations"][key]["wakeConfig"]
+                    .as_object_mut()
+                    .unwrap();
+                wc.insert("sleepUntil".into(), json!(due_iso));
+                wc.remove("sleepRetired");
+                Ok(())
+            })
+            .unwrap();
+            let now_held = now2 + 1;
+            let (prev_held, tok_held) = social_state::claim_reserved2_wake_for_deadline(
+                &hub2.context,
+                key,
+                "timeout",
+                now_held,
+                Some(&tok2),
+                Some(&due_iso),
+            )
+            .unwrap();
+            let rec_paused = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub2.context,
+                key,
+                "harness",
+                "atMention",
+                &crate::send_outbox::token_epoch(&tok_held),
+                &[],
+            )
+            .unwrap();
+            rec_paused.unknown("send-unresolved", "held fixture").unwrap();
+
+            let mut pipe_held =
+                pipeline::Pipeline::new_without_dsh(&hub2.context, &cfg2, true).unwrap();
+            pipe_held.expect_dispatch_token(tok_held);
+            pipe_held.expect_dispatch_deadline(now_held - 1);
+            pipe_held.expect_dispatch_wake(now_held, prev_held);
+            pipe_held.note_turn("timeout", &[]);
+            let res_held = pipe_held
+                .run_turn(&crate::onebot::Target::Group(420042), "timeout", "", &cfg2)
+                .await;
+            assert!(res_held.is_err());
+            let wc_held = hub2.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(
+                wc_held["sleepUntil"].is_null(),
+                "held dispatch_expired timeout must clear sleepUntil, got {wc_held}"
+            );
+            assert_eq!(wc_held["sleepRetired"], json!(true));
+        })
+        .await
+        .expect("the gate-refused expired timeout fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_concurrent_mention_does_not_defeat_startup_timeout_retirement() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r24-concurrent-mention", None).await;
+            drop(console);
+            hub.awaiting.clear();
+            let key = HARNESS_CAP_KEY;
+            let due_ms = crate::turn_ledger::now_ms() - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            let tok = "tok-r24-concurrent-mention";
+            let previous = json!({
+                "wakeConfig": {
+                    "confirmedAt": 2,
+                    "infinite": false,
+                    "sleepUntil": due_iso,
+                    "lastWakeAt": 0,
+                    "wakeCount": 0
+                },
+                "lastWakeReason": ""
+            });
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["agentToken"] = json!(tok);
+                conv["engagedAt"] = json!(0);
+                conv["wakeTimes"] = json!([10]);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                conv["wakeConfig"]["lastWakeAt"] = json!(10);
+                conv["wakeConfig"]["wakeCount"] = json!(1);
+                Ok(())
+            })
+            .unwrap();
+            let rec = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "timeout",
+                &crate::send_outbox::token_epoch(tok),
+                &[],
+            )
+            .unwrap();
+            rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+            rec.verified("expired-before-admission", "turnTimeout").unwrap();
+            rec.end("cancelled", "turnTimeout").unwrap();
+
+            let context = hub.context.clone();
+            let journal = hub.journal.clone();
+            drop(hub);
+
+            let mut restarted = Hub::new(&context, journal, vec![], true);
+            restarted.ready.push((key.into(), "atMention".into()));
+            restarted.tick("bot", 9001).await.unwrap();
+            let _abort = restarted
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(restarted.active.contains_key(key));
+            assert_eq!(restarted.active[key].reason, "atMention");
+            assert!(
+                restarted.active[key].previous["wakeConfig"]["sleepUntil"].is_null(),
+                "live Hub must retire pending startup expired timeout before atMention claim, got {}",
+                restarted.active[key].previous["wakeConfig"]
+            );
+            assert_eq!(
+                restarted.active[key].previous["wakeConfig"]["sleepRetired"],
+                json!(true)
+            );
+            let wc = restarted.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(wc["sleepUntil"].is_null());
+            assert_eq!(wc["sleepRetired"], json!(true));
+        })
+        .await
+        .expect("the concurrent mention Hub retirement fixture must settle");
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -6389,8 +6715,8 @@ impl Hub {
                     }
                     (conv, token)
                 } else {
+                    crate::turn_recovery::retire_pending_startup_timeout(&self.context, &key)?;
                     let claim = if reason == "timeout" {
-                        crate::turn_recovery::retire_pending_startup_timeout(&self.context, &key)?;
                         social_state::claim_reserved2_wake_for_deadline(
                             &self.context,
                             &key,
@@ -6512,10 +6838,13 @@ impl Hub {
                         self.ready.push((key, reason));
                         continue;
                     }
-                    let failures = self.failures.entry(key.clone()).or_default();
-                    *failures += 1;
-                    if *failures <= MAX_WAKE_RETRIES {
-                        self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
+                    let count = {
+                        let failures = self.failures.entry(key.clone()).or_default();
+                        *failures += 1;
+                        *failures
+                    };
+                    if count <= MAX_WAKE_RETRIES {
+                        self.retries.insert(key, (now + 5_000 * (1_i64 << (count - 1)), reason));
                     } else {
                         self.timeout_deadlines.remove(&key);
                         if let Some((previous, dispatch_token)) = claimed.as_ref() {
@@ -6525,6 +6854,14 @@ impl Hub {
                             if !retire_timeout && previous["wakeConfig"]["infinite"] == false {
                                 self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
                                 self.drain_rearm_pending(&cfg);
+                            }
+                        } else if reason == "timeout" {
+                            // Preflight never claimed the deadline: clear retry count and cached
+                            // sleep state so the next Hub::tick re-adopts any persisted sleepUntil.
+                            self.failures.remove(&key);
+                            if let Some(d) = self.drivers.get_mut(&key) {
+                                d.sched.wc.sleep_until = None;
+                                d.sched.sleep_at = None;
                             }
                         }
                     }

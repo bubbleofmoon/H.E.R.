@@ -1922,10 +1922,18 @@ fn clear_reserved2_deadline(
             }
         }
         if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-            let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
-                || (mark_retired && wc["sleepUntil"].is_null());
-            if wc["lastWakeAt"].as_i64() == Some(at)
-                && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+            let same_wake_at = wc["lastWakeAt"].as_i64() == Some(at);
+            let same_deadline = previous["wakeConfig"]["sleepUntil"].is_string()
+                && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"];
+            let owns_deadline = if same_wake_at {
+                wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                    || (mark_retired && wc["sleepUntil"].is_null())
+            } else {
+                expected_token.is_none()
+                    && wc["lastWakeAt"].as_i64().is_some_and(|live| live >= at)
+                    && same_deadline
+            };
+            if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
                 && wc["infinite"] != true
                 && owns_deadline
             {

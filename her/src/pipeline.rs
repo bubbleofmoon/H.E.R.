@@ -1141,6 +1141,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 || ((admission.is_ok() || *route == Reserved2Route::PendingHarness) && self.dispatch_expired())
             {
                 *route = Reserved2Route::ExpiredBeforeAdmission;
+                drop(route);
+                self.retire_expired_timeout_before_admission(
+                    &key,
+                    &self.next_reason,
+                    self.dispatch_token.as_deref(),
+                    self.dispatch_wake.as_ref(),
+                );
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
             }
             if let Ok((adapter, _, admitted_cfg)) = &admission {
@@ -1154,11 +1161,18 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 };
             }
         } else if admission.is_ok() && self.dispatch_expired() {
+            self.retire_expired_timeout_before_admission(
+                &key,
+                &self.next_reason,
+                self.dispatch_token.as_deref(),
+                self.dispatch_wake.as_ref(),
+            );
             return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
         }
         let (adapter, _admission, admitted_cfg) = admission?;
         let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
         let harness = matches!(&adapter, crate::turn_engine::Adapter::Harness);
+        let wake_token = self.dispatch_token.clone();
         let token = match self.begin_ledger_turn_as(&key, adapter.id(), true) {
             Err(error) if (harness || matches!(error, LedgerAdmissionError::Held { .. })) && self.dispatch_expired() => {
                 if let LedgerAdmissionError::Held { message, mut record } = error {
@@ -1172,6 +1186,12 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                         .map_err(|error| format!("{message}: {error}"))?;
                 }
                 self.publish_expired_route();
+                self.retire_expired_timeout_before_admission(
+                    &key,
+                    &self.current_reason,
+                    wake_token.as_deref(),
+                    self.dispatch_wake.as_ref(),
+                );
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
             }
             result => result?,
@@ -1863,23 +1883,43 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         }
     }
 
-    fn expire_unadmitted_harness(&mut self, key: &str) -> String {
-        self.publish_expired_route();
-        if self.current_reason == "timeout" {
-            if let Some((at, previous)) = self.claimed_wake.as_ref() {
-                if previous["wakeConfig"]["sleepUntil"].is_string() {
-                    if let Err(error) = crate::social_state::retire_reserved2_deadline(
-                        &self.context,
-                        key,
-                        &self.turn_token,
-                        *at,
-                        previous,
-                    ) {
-                        eprintln!("[turn] expired timeout retirement failed: {error}");
-                    }
-                }
+    fn retire_expired_timeout_before_admission(
+        &self,
+        key: &str,
+        reason: &str,
+        token: Option<&str>,
+        wake: Option<&(i64, serde_json::Value)>,
+    ) {
+        if reason != "timeout" {
+            return;
+        }
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let Some((at, previous)) = wake else {
+            return;
+        };
+        if previous["wakeConfig"]["sleepUntil"].is_string() {
+            if let Err(error) = crate::social_state::retire_reserved2_deadline(
+                &self.context,
+                key,
+                token,
+                *at,
+                previous,
+            ) {
+                eprintln!("[turn] expired timeout retirement failed: {error}");
             }
         }
+    }
+
+    fn expire_unadmitted_harness(&mut self, key: &str) -> String {
+        self.publish_expired_route();
+        self.retire_expired_timeout_before_admission(
+            key,
+            &self.current_reason,
+            Some(self.turn_token.as_str()),
+            self.claimed_wake.as_ref().or(self.dispatch_wake.as_ref()),
+        );
         if let Some(turn) = &self.cur_turn {
             if let Err(error) = turn.verified("expired-before-admission", "turnTimeout") {
                 eprintln!("[turn] expired wake note failed: {error}");
