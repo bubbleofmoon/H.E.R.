@@ -1908,6 +1908,28 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 previous,
             ) {
                 eprintln!("[turn] expired timeout retirement failed: {error}");
+                if self.cur_turn.is_none() && self.context.is_isolated() {
+                    let epoch = crate::send_outbox::token_epoch(token);
+                    let claim = serde_json::json!({"at": *at, "previous": previous});
+                    let fallback = (|| -> Result<(), String> {
+                        let rec = crate::turn_ledger::Recorder::begin_reserved2(
+                            &self.context,
+                            key,
+                            "harness",
+                            "timeout",
+                            &epoch,
+                            &[],
+                        )?;
+                        rec.wake_claim(&claim)?;
+                        rec.verified("expired-before-admission", "turnTimeout")?;
+                        rec.end("cancelled", "turnTimeout")
+                    })();
+                    if let Err(fallback_error) = fallback {
+                        eprintln!(
+                            "[turn] expired timeout fallback ledger checkpoint failed: {fallback_error}"
+                        );
+                    }
+                }
             }
         }
     }

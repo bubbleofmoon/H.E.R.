@@ -3314,6 +3314,142 @@ mod tests {
         .expect("the concurrent mention Hub retirement fixture must settle");
     }
 
+    #[tokio::test]
+    async fn ticket297_gate_refused_expired_timeout_retires_after_social_write_failure_and_restart() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            struct ClearAuthorityHook;
+            impl Drop for ClearAuthorityHook {
+                fn drop(&mut self) {
+                    crate::runtime::AUTHORITY_WRITE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+                }
+            }
+            let (root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r25-gate-social-fail", None).await;
+            drop(console);
+            hub.awaiting.clear();
+            let key = HARNESS_CAP_KEY;
+            let due_ms = (crate::now_ms() as i64) - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key)
+                .await
+                .unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "timeout");
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::PendingHarness);
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+
+            // Inject a write failure on social-v2.json when retire_reserved2_deadline commits.
+            let social_path = root.0.join("data/social-v2.json");
+            let social_backup = root.0.join("data/social-v2.json.r25bak");
+            let blocked = social_path.clone();
+            let saved = social_backup.clone();
+            let mut fired = false;
+            let _clear = ClearAuthorityHook;
+            crate::runtime::AUTHORITY_WRITE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    if !fired {
+                        fired = true;
+                        std::fs::rename(&blocked, &saved).unwrap();
+                        std::fs::create_dir(&blocked).unwrap();
+                    }
+                }));
+            });
+
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            // Clear the write fault and restore the unretired social-v2.json snapshot.
+            crate::runtime::AUTHORITY_WRITE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+            std::fs::remove_dir(&social_path).unwrap();
+            std::fs::rename(&social_backup, &social_path).unwrap();
+
+            let pre_restart_social = std::fs::read(&social_path).unwrap();
+            let pre_restart_wc = hub.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert_eq!(
+                pre_restart_wc["sleepUntil"],
+                json!(due_iso),
+                "injected write failure must leave sleepUntil unretired before restart, got {pre_restart_wc}"
+            );
+
+            // Simulate crash before Hub::tick runs completion retirement (reserved2.rs:6323).
+            let context = hub.context.clone();
+            let journal = hub.journal.clone();
+            let active = hub.active.remove(key).unwrap();
+            drop(_task);
+            let _ = active.task.await;
+            drop(hub);
+
+            // Restart a fresh Hub: durable turn_ledger fallback checkpoint must retire sleepUntil
+            // via retire_pending_startup_timeout and not re-fire the timeout.
+            let mut restarted = Hub::new(&context, journal, vec![], true);
+            restarted.tick("bot", 9001).await.unwrap();
+            let _abort = restarted
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                !restarted.active.contains_key(key),
+                "restarted Hub must not re-fire expired timeout after social write failure"
+            );
+            let wc = restarted.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(
+                wc["sleepUntil"].is_null(),
+                "durable fallback checkpoint must retire sleepUntil on restart, got {wc}"
+            );
+            assert_eq!(
+                wc["sleepRetired"],
+                json!(true),
+                "durable fallback checkpoint must set sleepRetired on restart, got {wc}"
+            );
+
+            // Also verify rearm_startup_terminal_sleeps retires that same fallback checkpoint if
+            // startup recovery runs ahead of Hub::tick.
+            std::fs::write(&social_path, &pre_restart_social).unwrap();
+            let turns = crate::turn_ledger::fold(
+                &crate::turn_ledger::read_records(&context).unwrap(),
+            )
+            .0;
+            let mut done = std::collections::HashSet::new();
+            assert!(crate::turn_recovery::rearm_startup_terminal_sleeps(
+                &context,
+                &cfg,
+                &turns,
+                crate::turn_ledger::now_ms() + 1_000,
+                &std::collections::HashSet::new(),
+                &mut done,
+            ));
+            assert!(done.contains(key));
+            let wc_rec = restarted.state().unwrap()["conversations"][key]["wakeConfig"].clone();
+            assert!(
+                wc_rec["sleepUntil"].is_null(),
+                "startup recovery must retire sleepUntil from fallback checkpoint, got {wc_rec}"
+            );
+            assert_eq!(
+                wc_rec["sleepRetired"],
+                json!(true),
+                "startup recovery must set sleepRetired from fallback checkpoint, got {wc_rec}"
+            );
+        })
+        .await
+        .expect("the gate-refused social write failure restart fixture must settle");
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

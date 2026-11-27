@@ -34,6 +34,12 @@ const UNREACHABLE_RETRY_MS: i64 = 10_000;
 const DEFAULT_WAIT_SECS: u64 = 900;
 const MAX_CONCURRENT_DSH_PROBES: usize = 4;
 
+/// Bound concurrent startup DSH probes.
+///
+/// Lock acquisition order: `dsh_probe_semaphore` -> `active_turns` -> `resolution_gate` ->
+/// `turn_ledger` finalization gate. `dsh_probe_semaphore` is released before `Pass::reattach`
+/// re-acquires `active_turns`; no path acquires `dsh_probe_semaphore` while holding
+/// `active_turns`, `resolution_gate`, or any store lock.
 fn dsh_probe_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
     static DSH_PROBE_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     DSH_PROBE_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DSH_PROBES)))
@@ -1431,10 +1437,14 @@ fn is_cancelled_expired_timeout_before_admission(turn: &Turn) -> bool {
         && turn.state == State::Cancelled
         && turn.outcome_reason == "turnTimeout"
         && (is_expired_timeout_before_admission(turn)
-            || !turn
-                .notes
-                .iter()
-                .any(|note| note["verdict"] == "cancel-requested"))
+            || (!turn.attempts.iter().any(|a| a.accepted)
+                && turn.tools.is_empty()
+                && !turn.notes.iter().any(|note| {
+                    matches!(
+                        note["verdict"].as_str(),
+                        Some("cancel-requested" | "cancellation-ready" | "completion-observed")
+                    )
+                })))
 }
 
 /// Retire an unconsumed `expired-before-admission` `"timeout"` deadline on demand when the live
@@ -4410,6 +4420,86 @@ mod tests {
                 .and_then(crate::wake::parse_iso_ms)
                 .is_some(),
             "control admitted-cap turn with cancel-requested note must still re-arm sleepUntil, got {wc2}"
+        );
+    }
+
+    #[test]
+    fn ticket297_admitted_cancelled_turn_timeout_without_cancel_note_still_rearms() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-admitted-nocancel-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": "tok-r25-adm-1",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "lastWakeAt": 10
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&root.0).unwrap();
+        let cfg = ctx.load_config().unwrap();
+        let _journal = Journal::open(&ctx).unwrap();
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let claim = json!({
+            "at": 10,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": due_iso}}
+        });
+
+        // Admitted timeout turn whose cancel-requested note failed to write (pipeline.rs:2116).
+        let rec = Recorder::begin_reserved2(
+            &ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-r25-adm-1"),
+            &[],
+        )
+        .unwrap();
+        rec.wake_claim(&claim).unwrap();
+        rec.attempt("rpc-r25-admitted", "sess-r25-admitted").unwrap();
+        rec.accepted("rpc-r25-admitted").unwrap();
+        rec.end("cancelled", "turnTimeout").unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&ctx).unwrap()).0;
+        let cutoff = crate::turn_ledger::now_ms() + 1_000;
+        let mut done = HashSet::new();
+        assert!(rearm_startup_terminal_sleeps(
+            &ctx,
+            &cfg,
+            &turns,
+            cutoff,
+            &HashSet::new(),
+            &mut done
+        ));
+        assert!(done.contains("group:1"));
+
+        let convs = ctx.read_social_state().unwrap()["conversations"].clone();
+        let wc = &convs["group:1"]["wakeConfig"];
+        assert!(
+            wc["sleepUntil"]
+                .as_str()
+                .and_then(crate::wake::parse_iso_ms)
+                .is_some(),
+            "admitted cancelled turnTimeout without cancel-requested note must still re-arm sleepUntil, got {wc}"
         );
     }
 
