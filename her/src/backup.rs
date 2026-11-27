@@ -1596,6 +1596,7 @@ pub(crate) struct VerifiedArchive {
     pub manifest: Manifest,
     pub credentials: crate::console_auth::ArchivedCredentials,
     pub archive_model_endpoint: Option<Option<String>>,
+    pub archive_secrets: Vec<String>,
     pub settings_overlay: Vec<(&'static crate::settings::Setting, serde_json::Value)>,
 }
 
@@ -1720,6 +1721,7 @@ fn verify_payload(
     }
     let mut credentials = crate::console_auth::ArchivedCredentials::default();
     let mut archive_model_endpoint = None;
+    let mut archive_secrets = Vec::new();
     let mut settings_overlay = Vec::new();
     for &name in ArchiveScope::for_restore(false).databases() {
         if !manifest.files.contains_key(name) {
@@ -1754,6 +1756,8 @@ fn verify_payload(
                 .map_err(|error| format!("backup settings verification: {error}"))?;
             archive_model_endpoint = crate::settings::archive_model_endpoint_override(&db)
                 .map_err(|error| format!("backup settings verification: {error}"))?;
+            archive_secrets = crate::settings::read_archive_secrets(&db)
+                .map_err(|error| format!("backup settings verification: {error}"))?;
             settings_overlay = crate::settings::read_archive_values(&db)
                 .map_err(|error| format!("backup settings overlay: {error}"))?;
         }
@@ -1763,6 +1767,7 @@ fn verify_payload(
         manifest,
         credentials,
         archive_model_endpoint,
+        archive_secrets,
         settings_overlay,
     })
 }

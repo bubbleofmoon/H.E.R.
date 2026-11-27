@@ -495,3 +495,82 @@ fn ticket443_r2_credential_url_hidden_cli_source_and_blank_expected_endpoint() {
     }
     let _ = (root, default_ep);
 }
+
+#[test]
+fn ticket443_r3_stored_url_and_routes_credential_suppression() {
+    // 1. Stored harness.apiBaseUrl containing a post-saved DB credential is suppressed across resolver,
+    // GET /api/settings (value + stored), GET /api/settings/models, and GET /api/settings/history.
+    let (_root, context) = settings_fixture("ticket443 r3 stored url suppression");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let post_tok = "fixture-r3-post-tok";
+    let leaked_url = format!("https://api.example.com/{post_tok}");
+    assert_eq!(put(&context, "harness.apiBaseUrl", &leaked_url).0, 200);
+    assert_eq!(put(&context, CLI, post_tok).0, 200);
+
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(
+        snap.effective_endpoint.as_deref(),
+        Some(default_ep.as_str()),
+        "resolver must suppress stored harness.apiBaseUrl containing a post-saved credential"
+    );
+    let url_view = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(url_view["value"], Value::Null, "GET /api/settings value must hide leaked stored url: {url_view}");
+    assert!(
+        !url_view["stored"].to_string().contains(post_tok),
+        "GET /api/settings stored must not expose leaked stored url: {url_view}"
+    );
+    let (m_status, models_reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(m_status, 200);
+    assert_eq!(
+        models_reply["effectiveModelEndpoint"],
+        json!(default_ep),
+        "GET /api/settings/models must suppress leaked stored url: {models_reply}"
+    );
+    assert_eq!(models_reply["effectiveModelEndpointSource"], json!("dependencies.json"));
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert!(!entries.is_empty());
+    for entry in &entries {
+        assert!(
+            !entry.to_string().contains(post_tok),
+            "history must mask leaked harness.apiBaseUrl entry: {entry}"
+        );
+    }
+    assert_eq!(entries[0]["new"], json!("(hidden)"));
+
+    // Replacing stored URL with a clean one leaves the leaked history entry masked and blocks undo back to it.
+    let clean_url = "https://clean-r3.example.test/v1";
+    assert_eq!(put(&context, "harness.apiBaseUrl", clean_url).0, 200);
+    let (entries_after, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert_eq!(entries_after[0]["old"], json!("(hidden)"));
+    assert_eq!(entries_after[0]["new"], json!(clean_url));
+    let (undo_status, _) = post(&context, "/api/settings/undo", json!({"entry": entries_after[0]["entry"]}));
+    assert_eq!(undo_status, 400);
+
+    // 2. harness.routes reject_credential_text and seed() check config/harness-api-key.
+    let (route_root, route_ctx) = settings_fixture("ticket443 r3 routes disk credential");
+    let disk_val = "fixture-r3-disk-alpha";
+    std::fs::write(route_root.0.join("config/harness-api-key"), disk_val).unwrap();
+    for bad_routes in [
+        json!([{"id": "r1", "model": disk_val}]),
+        json!([{"id": disk_val, "model": "m1"}]),
+    ] {
+        let (st, reply) = post(
+            &route_ctx,
+            "/api/settings/set",
+            json!({"setting": "harness.routes", "value": bad_routes}),
+        );
+        assert_eq!(st, 400, "harness.routes write containing disk key must fail: {reply}");
+        assert_eq!(reply["error"], "setting text contains a credential");
+    }
+
+    let (seed_root, seed_ctx) = settings_fixture("ticket443 r3 routes seed disk credential");
+    std::fs::write(seed_root.0.join("config/harness-api-key"), disk_val).unwrap();
+    write_config(&seed_root, |cfg| {
+        cfg["harness"] = json!({"routes": [{"id": "r1", "model": disk_val}]});
+    });
+    assert_eq!(set_quiet(&seed_ctx, json!(4600)).0, 200);
+    assert!(
+        history_page(&seed_ctx, "?setting=harness.routes").0.is_empty(),
+        "seed must skip harness.routes containing config/harness-api-key"
+    );
+}

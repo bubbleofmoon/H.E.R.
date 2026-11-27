@@ -25,6 +25,7 @@ import {
   MODEL_ENDPOINT_KEY,
   canonicalModelEndpoint,
   localizeSettingItem,
+  normalizeEndpointDraftValue,
   resolveActiveModelEndpoint,
   useSettingsDrafts,
 } from '../../utils/herHelpers';
@@ -294,7 +295,11 @@ export const ModelRoutesTab: React.FC = () => {
       setSecretBusyKey(item.key);
       try {
         if (isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY)) {
-          const urlToSave = draftsRef.current[MODEL_ENDPOINT_KEY];
+          const rawEndpointDraft = draftsRef.current[MODEL_ENDPOINT_KEY];
+          const urlToSave = normalizeEndpointDraftValue(
+            apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
+            rawEndpointDraft,
+          );
           try {
             await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
           } catch (err) {
@@ -307,14 +312,11 @@ export const ModelRoutesTab: React.FC = () => {
             return;
           }
           if (!mountedRef.current) return;
-          if (draftsRef.current[MODEL_ENDPOINT_KEY] === urlToSave) {
+          if (draftsRef.current[MODEL_ENDPOINT_KEY] === rawEndpointDraft) {
             clearDraft(MODEL_ENDPOINT_KEY);
           }
           await loadModels();
-          targetEndpoint =
-            canonicalModelEndpoint(urlToSave) ??
-            resolveActiveModelEndpoint(settings, urlToSave) ??
-            targetEndpoint;
+          targetEndpoint = resolveActiveModelEndpoint(settings, urlToSave);
         }
         await persistValidatedSecret(item, raw, targetEndpoint);
       } finally {
@@ -327,6 +329,7 @@ export const ModelRoutesTab: React.FC = () => {
       secretBusyKey,
       activeEndpointInfo.endpoint,
       dirtyKeys,
+      apiBaseUrlItem,
       saveSetting,
       clearDraft,
       loadModels,

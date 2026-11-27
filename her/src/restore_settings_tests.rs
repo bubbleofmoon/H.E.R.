@@ -1309,3 +1309,57 @@ fn ticket443_cross_endpoint_restore_preview_warns_and_three_key_warning_applies(
         "cross-endpoint restore preview must warn about endpoint switch: {cross_warnings:?}"
     );
 }
+
+#[test]
+fn ticket443_r3_restore_preview_ignores_credential_bearing_archived_url() {
+    let f = Fixture::new();
+    let context = f.context();
+    let disk_val = "fixture-r3-restore-disk";
+    std::fs::write(f.0.join("config/harness-api-key"), disk_val).unwrap();
+
+    // Archive 1: config.json /harness/apiBaseUrl contains config/harness-api-key (unseeded).
+    let cfg_path = f.0.join("config/config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{disk_val}")});
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    let archive_cred_config = f.backup();
+
+    let warnings = preview(&context, &archive_cred_config, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "restore preview must ignore credential-bearing archived config url when live uses D: {warnings:?}"
+    );
+
+    // Archive 2: stored settings.db harness.apiBaseUrl contains a post-saved archive DB credential.
+    let db_tok = "fixture-r3-restore-db-tok";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://api.example.com/{db_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(db_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_cred_stored = f.backup();
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let stored_warnings = preview(&context, &archive_cred_stored, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !stored_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "restore preview must suppress credential-bearing stored url in archive: {stored_warnings:?}"
+    );
+}

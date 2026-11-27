@@ -951,37 +951,92 @@ fn stored_model_endpoint_override(conn: &Connection) -> Result<Option<Option<Str
     Ok(Some(Some(normalized)))
 }
 
+pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, String> {
+    Ok(secrets_in(conn)?.into_iter().map(|(_, _, credential)| credential).collect())
+}
+
 pub(crate) fn archive_model_endpoint_override(conn: &Connection) -> Result<Option<Option<String>>, String> {
     stored_model_endpoint_override(conn).map_err(InspectError::into_message)
 }
 
-pub(crate) fn config_model_endpoint_override(document: &Value) -> Option<String> {
+fn config_model_endpoint_override(document: &Value) -> Option<String> {
     HARNESS_API_BASE_URL
         .found_in(document)
         .and_then(|v| HARNESS_API_BASE_URL.normalize(v))
         .and_then(|v| v.as_str().map(str::to_string))
 }
 
-fn text_contains_credential(
-    text: &str,
+fn collect_known_secrets(
     secrets: &[(&'static str, String, String)],
     harness_key: Option<&str>,
-) -> bool {
-    harness_key.is_some_and(|key| text.contains(key))
-        || secrets.iter().any(|(_, _, key)| text.contains(key))
+) -> Vec<String> {
+    let mut known: Vec<String> = secrets
+        .iter()
+        .map(|(_, _, credential)| credential.clone())
+        .chain(harness_key.map(str::to_string))
+        .collect();
+    known.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    known.dedup();
+    known
+}
+
+fn text_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
+    known_secrets.iter().any(|key| text.contains(key))
 }
 
 fn safe_config_model_endpoint_override(
     document: &Value,
-    secrets: &[(&'static str, String, String)],
-    harness_disk_key: Option<&str>,
+    known_secrets: &[String],
 ) -> Option<String> {
     let url = config_model_endpoint_override(document)?;
     let raw_has_cred = HARNESS_API_BASE_URL
         .found_in(document)
         .and_then(Value::as_str)
-        .is_some_and(|raw| text_contains_credential(raw, secrets, harness_disk_key));
-    (!raw_has_cred && !text_contains_credential(&url, secrets, harness_disk_key)).then_some(url)
+        .is_some_and(|raw| text_contains_any_secret(raw, known_secrets));
+    (!raw_has_cred && !text_contains_any_secret(&url, known_secrets)).then_some(url)
+}
+
+fn effective_endpoint_from_overrides(
+    stored_override: Option<Option<String>>,
+    document: Option<&Value>,
+    default_endpoint: Option<String>,
+    known_secrets: &[String],
+) -> (Option<String>, Option<ModelEndpointSource>) {
+    let override_ep = match stored_override {
+        Some(Some(url)) => (!text_contains_any_secret(&url, known_secrets))
+            .then_some((url, ModelEndpointSource::Settings)),
+        Some(None) => None,
+        None => document
+            .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets))
+            .map(|url| (url, ModelEndpointSource::Config)),
+    };
+    match override_ep {
+        Some((url, source)) => (Some(url), Some(source)),
+        None => (
+            default_endpoint.clone(),
+            default_endpoint.map(|_| ModelEndpointSource::Dependencies),
+        ),
+    }
+}
+
+pub(crate) fn archive_effective_model_endpoint(
+    archive_stored_override: Option<Option<String>>,
+    archive_config: &Value,
+    default_raw: Option<&str>,
+    archive_secrets: &[String],
+    live_secrets: &[String],
+) -> Option<String> {
+    let mut known_secrets = Vec::with_capacity(archive_secrets.len() + live_secrets.len());
+    known_secrets.extend(archive_secrets.iter().cloned());
+    known_secrets.extend(live_secrets.iter().cloned());
+    let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
+    effective_endpoint_from_overrides(
+        archive_stored_override,
+        Some(archive_config),
+        default_endpoint,
+        &known_secrets,
+    )
+    .0
 }
 
 fn resolve_model_endpoint_from_parts(
@@ -991,34 +1046,18 @@ fn resolve_model_endpoint_from_parts(
     harness_disk_key: Option<String>,
     secrets: Vec<(&'static str, String, String)>,
 ) -> Result<ModelEndpointSnapshot, InspectError> {
+    let all_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
     let stored_override = match conn {
         Some(conn) => stored_model_endpoint_override(conn)?,
         None => None,
     };
-    let override_ep = match stored_override {
-        Some(Some(url)) => Some((url, ModelEndpointSource::Settings)),
-        Some(None) => None,
-        None => document
-            .and_then(|doc| {
-                safe_config_model_endpoint_override(doc, &secrets, harness_disk_key.as_deref())
-            })
-            .map(|url| (url, ModelEndpointSource::Config)),
-    };
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
-    let (effective_endpoint, effective_source) = match override_ep {
-        Some((url, source)) => (Some(url), Some(source)),
-        None => (
-            default_endpoint.clone(),
-            default_endpoint.as_ref().map(|_| ModelEndpointSource::Dependencies),
-        ),
-    };
-    let mut all_secrets: Vec<String> = secrets
-        .iter()
-        .map(|(_, _, credential)| credential.clone())
-        .chain(harness_disk_key.clone())
-        .collect();
-    all_secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
-    all_secrets.dedup();
+    let (effective_endpoint, effective_source) = effective_endpoint_from_overrides(
+        stored_override,
+        document,
+        default_endpoint.clone(),
+        &all_secrets,
+    );
 
     let mut harness_db_key = None;
     let mut harness_bound_elsewhere = false;
@@ -1136,12 +1175,12 @@ fn reject_credential_text(
         return Ok(());
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
-    let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
-    let has_any_credential = |text: &str| text_contains_credential(text, &secrets, harness_key);
+    let known_secrets = collect_known_secrets(&secrets, harness_key);
+    let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
     if prompt_text.is_some_and(has_any_credential)
         || endpoint_url.is_some_and(has_any_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
-            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
+            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_any_credential)
         }))
     {
         return Err((400, "setting text contains a credential".to_string()));
@@ -2206,48 +2245,62 @@ pub(crate) fn history(
             conversation::is_canonical(conversation).then_some(conversation).ok_or((400, CONVERSATION_ERROR.to_string()))
         })
         .transpose()?;
+    let harness_disk_key = harness_credential(context);
     let entries = read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(Vec::new()) };
-        let shown = |text: Option<String>| {
-            text.map_or(Value::Null, |text| {
-                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
-            })
-        };
-        let mut statement = conn
-            .prepare(
-                "SELECT id, at_ms, actor, source, scope, key, old_value, new_value
-                 FROM settings_audit
-                 WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4)
-                 ORDER BY id DESC LIMIT ?3",
-            )
-            .map_err(InspectError::from_sqlite)?;
-        let entries = statement
-            .query_map(
-                params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
-                |row| {
-                    let id: i64 = row.get(0)?;
-                    let at: i64 = row.get(1)?;
-                    let actor: String = row.get(2)?;
-                    let source: String = row.get(3)?;
-                    let scope: String = row.get(4)?;
-                    let key: String = row.get(5)?;
-                    let old: Option<String> = row.get(6)?;
-                    let new: Option<String> = row.get(7)?;
-                    let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
-                        (json!(SECRET_MARKER), json!(SECRET_MARKER))
-                    } else {
-                        (shown(old), shown(new))
-                    };
-                    Ok(json!({
-                        "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
-                        "setting": key, "old": old, "new": new,
-                    }))
-                },
-            )
-            .map_err(InspectError::from_sqlite)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(InspectError::from_sqlite)?;
-        Ok(entries)
+        read_snapshot_tx(conn, |tx| {
+            let secrets = secrets_in_checked(tx)?;
+            let known_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+            let shown = |entry_key: &str, text: Option<String>| {
+                text.map_or(Value::Null, |text| {
+                    let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+                    match &parsed {
+                        Value::String(s)
+                            if entry_key == HARNESS_API_BASE_URL.key
+                                && text_contains_any_secret(s, &known_secrets) =>
+                        {
+                            json!(SECRET_MARKER)
+                        }
+                        _ => parsed,
+                    }
+                })
+            };
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, at_ms, actor, source, scope, key, old_value, new_value
+                     FROM settings_audit
+                     WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4)
+                     ORDER BY id DESC LIMIT ?3",
+                )
+                .map_err(InspectError::from_sqlite)?;
+            let entries = statement
+                .query_map(
+                    params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope],
+                    |row| {
+                        let id: i64 = row.get(0)?;
+                        let at: i64 = row.get(1)?;
+                        let actor: String = row.get(2)?;
+                        let source: String = row.get(3)?;
+                        let scope: String = row.get(4)?;
+                        let key: String = row.get(5)?;
+                        let old: Option<String> = row.get(6)?;
+                        let new: Option<String> = row.get(7)?;
+                        let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
+                            (json!(SECRET_MARKER), json!(SECRET_MARKER))
+                        } else {
+                            (shown(&key, old), shown(&key, new))
+                        };
+                        Ok(json!({
+                            "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
+                            "setting": key, "old": old, "new": new,
+                        }))
+                    },
+                )
+                .map_err(InspectError::from_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(InspectError::from_sqlite)?;
+            Ok(entries)
+        })
     })
     .map_err(|error| (503, error))?;
     let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
@@ -2495,6 +2548,10 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     complete_timing(&mut document);
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let search_endpoint = crate::aux_search::settings_endpoint(&document);
+    let known_secrets = endpoint_snapshot
+        .as_ref()
+        .map(|snap| snap.all_secrets.clone())
+        .unwrap_or_else(|| collect_known_secrets(&secrets, harness_disk_key.as_deref()));
     let model_fallback = endpoint_snapshot
         .as_ref()
         .and_then(|snap| snap.default_endpoint.clone())
@@ -2554,7 +2611,15 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 }
                 return entry;
             }
-            let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
+            let mut stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
+            if setting.key == HARNESS_API_BASE_URL.key
+                && stored_value
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| text_contains_any_secret(s, &known_secrets))
+            {
+                stored_value = Some(json!(SECRET_MARKER));
+            }
             let value = if setting.key == HARNESS_API_BASE_URL.key {
                 match &endpoint_snapshot {
                     Some(snap)

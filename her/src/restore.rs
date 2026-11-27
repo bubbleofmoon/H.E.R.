@@ -190,24 +190,21 @@ impl Prepared {
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             let raw = crate::backup::parse_archive_config(&bytes)?;
-            let host_default = context
-                .dependency_url("model")
-                .map(crate::runtime::canonical_model_endpoint);
-            let archive_endpoint = match verified.archive_model_endpoint {
-                Some(Some(url)) => Some(url),
-                Some(None) => host_default.clone(),
-                None => crate::settings::config_model_endpoint_override(&raw).or(host_default),
-            };
-            if let (Some(e_archive), Ok(live_snap)) = (
-                archive_endpoint.as_deref(),
-                crate::settings::resolve_model_endpoint_and_key(context),
-            ) {
-                if live_snap
-                    .effective_endpoint
-                    .as_deref()
-                    .is_some_and(|e_live| e_live != e_archive)
-                {
-                    warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
+            if let Ok(live_snap) = crate::settings::resolve_model_endpoint_and_key(context) {
+                let archive_endpoint = crate::settings::archive_effective_model_endpoint(
+                    verified.archive_model_endpoint,
+                    &raw,
+                    context.dependency_url("model"),
+                    &verified.archive_secrets,
+                    &live_snap.all_secrets,
+                );
+                if let (Some(e_archive), Some(e_live)) = (
+                    archive_endpoint.as_deref(),
+                    live_snap.effective_endpoint.as_deref(),
+                ) {
+                    if e_live != e_archive {
+                        warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
+                    }
                 }
             }
             let (config, _) = crate::backup::validate_archive_config(

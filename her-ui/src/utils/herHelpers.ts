@@ -84,8 +84,25 @@ function containsRedactedMarker(value: unknown): boolean {
   return false;
 }
 
+export function normalizeEndpointDraftValue(
+  item: Pick<SettingItemView, 'key' | 'kind'> | undefined,
+  rawValue: unknown,
+): unknown {
+  if (
+    (item?.kind.type === 'model endpoint' || item?.key === MODEL_ENDPOINT_KEY) &&
+    typeof rawValue === 'string' &&
+    rawValue.trim() === ''
+  ) {
+    return null;
+  }
+  return rawValue;
+}
+
 export function parseSettingDraftForSave(item: SettingItemView | undefined, rawValue: unknown): unknown {
   if (!item) return rawValue;
+  if (item.kind.type === 'model endpoint' || item.key === MODEL_ENDPOINT_KEY) {
+    return normalizeEndpointDraftValue(item, rawValue);
+  }
   if (item.kind.type === 'route list') {
     let resolved: unknown = rawValue;
     if (typeof rawValue === 'string') {
