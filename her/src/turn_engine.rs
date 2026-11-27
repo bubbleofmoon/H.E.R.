@@ -46,7 +46,7 @@ impl Engine {
     }
 
     pub(crate) fn supports(self, mode: &str) -> bool {
-        self == Self::Dsh || matches!(mode, "chat" | "closed-agent" | "reserved2")
+        self == Self::Dsh || matches!(mode, "chat" | "closed-agent" | "reserved" | "reserved2")
     }
 
     pub fn id(self) -> &'static str {
@@ -64,7 +64,7 @@ impl Engine {
 
 /// Refusal of a participation mode the harness does not run yet.
 pub(crate) const UNSUPPORTED_MODE: &str =
-    "harness supports chat, owner-private closed-agent and reserved2 modes only";
+    "harness supports chat, owner-private closed-agent, reserved and reserved2 modes only";
 
 pub(crate) const ADMISSION_CHANGED: &str = "turn engine changed before admission";
 
@@ -239,11 +239,11 @@ mod tests {
         assert_eq!((dsh.id(), harness.id()), ("dsh", "harness"));
         for mode in ["chat", "closed-agent", "reserved", "reserved2"] {
             assert!(dsh.supports(mode), "DSH runs {mode}");
+            assert!(harness.supports(mode), "the harness runs {mode}");
         }
-        assert!(harness.supports("chat") && harness.supports("closed-agent"));
         assert!(
-            !harness.supports("reserved") && harness.supports("reserved2"),
-            "the harness runs second-generation simulation and refuses first-generation reserved"
+            !harness.supports("simulation") && !harness.supports("") && !harness.supports("Chat"),
+            "unknown or unnormalized mode spellings are refused"
         );
         assert!(dsh.uses_dsh() && !harness.uses_dsh(), "only the DSH adapter needs DSH");
         let scripted = Adapter::Scripted(Script::answering("ok"));

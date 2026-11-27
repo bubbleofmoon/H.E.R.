@@ -892,7 +892,9 @@ mod tests {
             ("closed-agent", "private:7707", None),
             ("reserved2", GROUP_KEY, Some(Profile::Reserved2)),
             ("reserved2", OWNER_KEY, Some(Profile::Reserved2Owner)),
-            ("reserved", GROUP_KEY, None),
+            ("reserved", GROUP_KEY, Some(Profile::Chat)),
+            ("reserved", "private:7707", Some(Profile::Chat)),
+            ("reserved", OWNER_KEY, Some(Profile::OwnerPrivate)),
             ("simulation", GROUP_KEY, None),
             ("", GROUP_KEY, None),
             ("Chat", GROUP_KEY, None),
@@ -931,8 +933,9 @@ mod tests {
         fixture.set_mode("reserved2");
         assert!(fixture.capture("reserved2", GROUP_KEY).is_ok());
         fixture.set_mode("reserved");
+        assert!(fixture.capture("reserved", GROUP_KEY).is_ok());
         assert_eq!(
-            refused("reserved", GROUP_KEY),
+            refused("simulation", GROUP_KEY),
             crate::turn_engine::UNSUPPORTED_MODE
         );
         std::fs::write(fixture.root.join("data/mode.json"), "not json").unwrap();

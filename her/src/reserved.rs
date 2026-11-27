@@ -18,6 +18,18 @@ use std::time::{Duration, Instant};
 
 const SPLIT_HINT: &str = "需要拆发多段时请以空格隔开；若整段发送请勿留空格，改用标点衔接（中英文或数字间的空格同样会触发分段）。";
 const DIRECTION: &str = "提示：消息中的 [引用 某人：...] 代表该句在回应所引之人；只有引用了你才是在对你说话，引用他人请勿误以为找你。";
+
+/// Harness jobs can run during a DSH outage if admission needs no DSH handover.
+pub(crate) fn job_needs_dsh(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
+    match crate::turn_engine::Engine::selected(context, cfg, key, "reserved") {
+        Ok(engine) => {
+            engine.uses_dsh()
+                || crate::engine_switch::handover_needs_dsh(context, key, engine).unwrap_or(true)
+        }
+        Err(_) => true,
+    }
+}
+
 fn now() -> i64 {
     crate::parity_clock::now_ms()
 }
@@ -380,6 +392,20 @@ impl Authority {
         }
         Ok(())
     }
+    pub fn refresh_for_engine_switch(&mut self, context: &RuntimeContext, key: &str) -> Result<(), String> {
+        self.check_generation(context, key)?;
+        let current = crate::social_state::token(context, key)?;
+        if current.as_deref() == Some(self.token.as_str()) {
+            return Ok(());
+        }
+        if let Some(next) = current {
+            if crate::engine_switch::is_switched_token(context, key, &self.token, &next)? {
+                self.token = next;
+                return Ok(());
+            }
+        }
+        Err("reserved token changed".into())
+    }
 }
 /// The current authority of `key` as the hub would capture it (tests outside this module).
 #[cfg(test)]
@@ -430,6 +456,16 @@ fn push_bounded(pending: &mut VecDeque<Job>, job: Job) -> Vec<Job> {
 struct Active {
     job: Job,
     task: tokio::task::JoinHandle<(Result<(), String>, bool, Option<bool>)>,
+    minted: crate::pipeline::MintedEpoch,
+}
+impl Active {
+    fn admitted_token(&self) -> String {
+        self.minted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.job.authority.token.clone())
+    }
 }
 pub struct Hub {
     context: RuntimeContext,
@@ -913,17 +949,35 @@ impl Hub {
     async fn sync_mode(&mut self) -> Result<(), String> {
         let stamp = mode_stamp(&self.context)?;
         if stamp != self.stamp {
-            self.stamp = stamp;
-            self.pending.clear();
-            retire_mode_state(&self.context)?;
-            for (key, active) in std::mem::take(&mut self.active) {
-                let context = self.context.clone();
-                let cfg = context.load_config().map_err(|e| e.to_string())?;
-                if let Ok(p) = Pipeline::new_with_runtime(&context, &cfg, true) {
-                    let _ = p.cancel_reserved_epoch(&key, &active.job.authority.token);
-                }
-                active.task.abort();
+            for job in std::mem::take(&mut self.pending) {
+                self.journal.mark_handled(job.inbound, now()).await?;
             }
+            retire_mode_state(&self.context)?;
+            let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+            let mut retained = BTreeMap::new();
+            for (key, active) in std::mem::take(&mut self.active) {
+                let token = active.admitted_token();
+                let keep_attached = match Pipeline::new_without_dsh(&self.context, &cfg, true)
+                    .and_then(|p| p.cancel_reserved_epoch(&key, &token))
+                {
+                    Ok(outcome) => {
+                        outcome.open_harness
+                            || (!outcome.cancelled_non_harness
+                                && matches!(
+                                    crate::turn_engine::Engine::read_choice(&self.context, &cfg, &key, "reserved"),
+                                    Ok(crate::turn_engine::Engine::Harness)
+                                ))
+                    }
+                    Err(_) => true,
+                };
+                if keep_attached {
+                    retained.insert(key, active);
+                } else {
+                    active.task.abort();
+                }
+            }
+            self.active = retained;
+            self.stamp = stamp;
         }
         Ok(())
     }
@@ -954,10 +1008,15 @@ impl Hub {
             .collect::<Vec<_>>();
         for key in done {
             let active = self.active.remove(&key).unwrap();
-            let job = active.job;
+            let admitted = active.admitted_token();
+            let mut job = active.job;
+            job.authority.token = admitted;
             let (result, unsubmitted, failure_parks) = active.task.await.map_err(|e| e.to_string())?;
-            if result.is_err() && unsubmitted && job.authority.check(&self.context, &key).is_ok() {
-                if failure_parks.unwrap_or_else(|| crate::dsh_health::is_down(&self.context)) {
+            if result.is_err() && unsubmitted && job.authority.refresh_for_engine_switch(&self.context, &key).is_ok() {
+                if failure_parks.unwrap_or_else(|| {
+                    crate::dsh_health::is_down(&self.context)
+                        && self.context.load_config().ok().is_none_or(|c| job_needs_dsh(&self.context, &c, &key))
+                }) {
                     // The prompt never reached DSH and DSH is known down: the message waits for it (JS queues while
                     // dshReady is false and replays on recovery) instead of burning its retries and being lost. No attempt
                     // is used; the dispatch below holds it until DSH is back, then re-checks its authority.
@@ -1175,9 +1234,10 @@ impl Hub {
         }
         let count = self.pending.len();
         for _ in 0..count {
-            let job = self.pending.pop_front().unwrap();
-            if let Err(why) = job.authority.check(&context, &job.key) {
+            let mut job = self.pending.pop_front().unwrap();
+            if let Err(why) = job.authority.refresh_for_engine_switch(&context, &job.key) {
                 println!("[reserved] {} queued work cancelled: {why}", job.key);
+                self.settle_state(&job.key, &job, true)?;
                 self.journal.mark_handled(job.inbound, now()).await?;
                 continue;
             }
@@ -1193,7 +1253,7 @@ impl Hub {
                 self.pending.push_back(job);
                 continue;
             }
-            if crate::dsh_health::is_down(&context) {
+            if crate::dsh_health::is_down(&context) && job_needs_dsh(&context, &cfg, &job.key) {
                 // DSH is known down: no call is made for waiting work. Its authority was re-checked just above; it is
                 // checked again, with everything else, on the pass that finds DSH back.
                 if self.waiting_noted.insert(job.key.clone()) {
@@ -1214,11 +1274,14 @@ impl Hub {
             let ctx = context.clone();
             let cfg = cfg.clone();
             let work = job.clone();
+            let minted = crate::pipeline::MintedEpoch::default();
+            let minted_shared = minted.clone();
             let task = tokio::spawn(async move {
-                let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg, true) {
+                let mut pipe = match Pipeline::new_without_dsh(&ctx, &cfg, true) {
                     Ok(p) => p,
                     Err(e) => return (Err(e), true, None),
                 };
+                pipe.share_minted_epoch(minted_shared);
                 pipe.set_reserved_retry_budget(work.attempt < 3);
                 let result = pipe
                     .run_reserved_turn(
@@ -1233,7 +1296,7 @@ impl Hub {
                     .await;
                 (result, pipe.dispatch_definitely_unsubmitted(), pipe.reserved_failure_parks())
             });
-            self.active.insert(job.key.clone(), Active { job, task });
+            self.active.insert(job.key.clone(), Active { job, task, minted });
         }
         Ok(())
     }
@@ -1510,7 +1573,7 @@ mod tests {
         .unwrap();
         old.session("old-reserved-session").unwrap();
         let task = tokio::spawn(std::future::pending());
-        hub.active.insert(key.into(), Active { job, task });
+        hub.active.insert(key.into(), Active { job, task, minted: Default::default() });
 
         // Mode retirement happened, then new chat ingress replaced the mapping/epoch.
         context
@@ -1631,5 +1694,270 @@ mod tests {
             assert!(push_bounded(&mut pending, waiting_job(&format!("group:{n}"), "x")).is_empty());
         }
         assert_eq!(pending.len(), 300);
+    }
+
+    #[test]
+    fn reserved_job_needs_dsh_tracks_selected_engine_and_handover() {
+        let (root, context) = fixture();
+        let dsh_cfg = json!({"allow":{"groups":[42]},"consoleToken":"synthetic-console-token"});
+        assert!(job_needs_dsh(&context, &dsh_cfg, "group:42"), "DSH engine needs DSH");
+        let harness_cfg = json!({"allow":{"groups":[42]},"consoleToken":"synthetic-console-token","engineDefault":"harness"});
+        assert!(!job_needs_dsh(&context, &harness_cfg, "group:42"), "pure harness conversation does not need DSH");
+        crate::session_map::bind(&context, "group:42", "old-dsh-sid", None).unwrap();
+        assert!(job_needs_dsh(&context, &harness_cfg, "group:42"), "harness conversation with live DSH mapping needs DSH for handover");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_r2_sync_mode_uses_minted_switched_token_and_preserves_replacement_chat() {
+        let (root, context) = fixture();
+        let key = "group:42";
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let journal = SharedJournal::new(crate::inbound::Journal::open(&context).unwrap());
+        let mut hub = Hub::new(&context, journal, vec![key.into()], false).unwrap();
+        let state = mutate(&context, |s| {
+            s.conversations.insert(key.into(), Conversation::default());
+            Ok(s.clone())
+        }).unwrap();
+        hub.job(&state, key, "old reserved".into(), vec![], false, vec![], String::new(), 0, vec![]).unwrap();
+        let job = hub.pending.pop_front().unwrap();
+        // Simulate an automatic engine switch rotating the token during run_reserved_turn.
+        let switched_token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        let minted = crate::pipeline::MintedEpoch::default();
+        *minted.lock().unwrap() = Some(switched_token.clone());
+        let old = Recorder::begin(
+            &context, key, "dsh", "reserved", &crate::send_outbox::token_epoch(&switched_token), &[], None,
+        ).unwrap();
+        old.session("switched-dsh-session").unwrap();
+        hub.active.insert(key.into(), Active { job, task: tokio::spawn(std::future::pending()), minted });
+
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"chat"}"#).unwrap();
+        let chat_token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        crate::session_map::bind(&context, key, "replacement-chat-session", None).unwrap();
+        let chat = Recorder::begin(
+            &context, key, "dsh", "chat", &crate::send_outbox::token_epoch(&chat_token), &["new-chat".into()], None,
+        ).unwrap();
+        chat.session("replacement-chat-session").unwrap();
+        hub.tick("bot").await.unwrap();
+
+        let (turns, _) = turn_ledger::fold(&turn_ledger::read_records(&context).unwrap());
+        assert_eq!(
+            turns.iter().find(|t| t.id == old.id).unwrap().state,
+            turn_ledger::State::Cancelled,
+            "sync_mode must cancel the switched T2 DSH turn via minted token"
+        );
+        assert!(turns.iter().find(|t| t.id == chat.id).unwrap().state.is_open(), "replacement chat turn stays open");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_r2_sync_mode_keeps_active_harness_turn_attached_without_premature_end() {
+        let (root, context) = fixture();
+        let key = "group:42";
+        std::fs::write(
+            root.join("config/config.json"),
+            json!({"allow":{"groups":[42]},"consoleToken":"synthetic-console-token","engineDefault":"harness"}).to_string(),
+        ).unwrap();
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let journal = SharedJournal::new(crate::inbound::Journal::open(&context).unwrap());
+        let mut hub = Hub::new(&context, journal, vec![key.into()], false).unwrap();
+        let state = mutate(&context, |s| {
+            s.conversations.insert(key.into(), Conversation::default());
+            Ok(s.clone())
+        }).unwrap();
+        hub.job(&state, key, "live harness".into(), vec![], false, vec![], String::new(), 0, vec![]).unwrap();
+        let job = hub.pending.pop_front().unwrap();
+        // Simulate switched DSH->harness token in active.minted as well as pure harness open turn.
+        let active_token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        let minted = crate::pipeline::MintedEpoch::default();
+        *minted.lock().unwrap() = Some(active_token.clone());
+        let rec = Recorder::begin(
+            &context, key, "harness", "reserved", &crate::send_outbox::token_epoch(&active_token), &[], None,
+        ).unwrap();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiter = release.clone();
+        let task = tokio::spawn(async move {
+            waiter.notified().await;
+            (Ok(()), false, None)
+        });
+        hub.active.insert(key.into(), Active { job, task, minted });
+
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"chat"}"#).unwrap();
+        hub.sync_mode().await.unwrap();
+        assert!(hub.active.contains_key(key), "live Gen-1 harness turn must stay attached during mode exit");
+        let (turns, _) = turn_ledger::fold(&turn_ledger::read_records(&context).unwrap());
+        assert!(
+            turns.iter().find(|t| t.id == rec.id).unwrap().state.is_open(),
+            "sync_mode must not prematurely end an open harness turn"
+        );
+        // If send verification later marks this turn send-unresolved, it must remain Paused rather than dropped after ended.
+        rec.unknown("send-unresolved", "ambiguous outbox item").unwrap();
+        let (turns, _) = turn_ledger::fold(&turn_ledger::read_records(&context).unwrap());
+        assert_eq!(turns.iter().find(|t| t.id == rec.id).unwrap().state, turn_ledger::State::Paused);
+
+        release.notify_one();
+        while !hub.active[key].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        hub.tick("bot").await.unwrap();
+        assert!(!hub.active.contains_key(key), "finished turn drains cleanly on subsequent tick");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_r2_pending_jobs_survive_engine_switch_and_cancel_on_reset() {
+        let (root, context) = fixture();
+        let key = "group:42";
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-harness-key").unwrap();
+        std::fs::write(
+            root.join("config/config.json"),
+            json!({
+                "allow":{"groups":[42]},
+                "consoleToken":"synthetic-console-token",
+                "harness":{"model":"fake-chat"},
+                "conversationEngines":{key:"dsh"}
+            }).to_string(),
+        ).unwrap();
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let journal = SharedJournal::new(crate::inbound::Journal::open(&context).unwrap());
+        journal.record_received("ev-r2-1".into(), key.into(), "{}".into(), 1).await.unwrap();
+        let mut hub = Hub::new(&context, journal, vec![key.into()], false).unwrap();
+        let state = mutate(&context, |s| {
+            s.conversations.insert(key.into(), Conversation::default());
+            s.flush.insert("f1".into(), Flush { key: key.into(), status: "running".into(), remaining: 1 });
+            Ok(s.clone())
+        }).unwrap();
+        hub.job(&state, key, "flush".into(), vec![], false, vec![], "f1".into(), 60_000, vec!["ev-r2-1".into()]).unwrap();
+        let t1 = hub.pending[0].authority.token.clone();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            conv.set_field("engineHandover", json!({"engine": "dsh", "epoch": crate::send_outbox::token_epoch(&t1)}));
+            Ok(())
+        }).unwrap();
+
+        // 1) Engine switch DSH -> Harness (rotates T1 -> T2).
+        crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
+        crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
+        let t2 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t2, t1);
+        hub.tick("bot").await.unwrap();
+        assert_eq!(hub.pending.len(), 1, "queued job/flush must survive engine switch");
+        assert_eq!(hub.pending[0].authority.token, t2);
+        assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r2-1").unwrap().as_deref(), Some("received"));
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "running");
+
+        // 2) Back-to-back console switch Harness -> DSH (rotates T2 -> T3; clear prior summary to stay offline).
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            if let Some(mut h) = conv.field("engineHandover").cloned() {
+                if let Some(obj) = h.as_object_mut() { obj.remove("summary"); }
+                conv.set_field("engineHandover", h);
+            }
+            Ok(())
+        }).unwrap();
+        crate::settings::apply_switch_choice(&context, key, &json!("dsh")).unwrap();
+        crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Dsh).unwrap();
+        let t3 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t3, t2);
+        hub.tick("bot").await.unwrap();
+        assert_eq!(hub.pending.len(), 1, "queued job must survive back-to-back engine switch");
+        assert_eq!(hub.pending[0].authority.token, t3);
+
+        // 3) Non-switch rotation (T3 -> T4), even followed by an engine switch (T4 -> T5), must cancel & settle flush failed.
+        crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            if let Some(mut h) = conv.field("engineHandover").cloned() {
+                if let Some(obj) = h.as_object_mut() { obj.remove("summary"); }
+                conv.set_field("engineHandover", h);
+            }
+            Ok(())
+        }).unwrap();
+        crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
+        crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
+        hub.tick("bot").await.unwrap();
+        assert!(hub.pending.is_empty(), "non-switch token rotation breaks handover chain and cancels queued job");
+        assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r2-1").unwrap().as_deref(), Some("handled"));
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "failed");
+
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_r3_active_unsubmitted_job_refreshes_on_concurrent_console_switch() {
+        let (root, context) = fixture();
+        let key = "group:42";
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-harness-key").unwrap();
+        std::fs::write(
+            root.join("config/config.json"),
+            json!({
+                "allow":{"groups":[42]},
+                "consoleToken":"synthetic-console-token",
+                "harness":{"model":"fake-chat"},
+                "conversationEngines":{key:"dsh"}
+            }).to_string(),
+        ).unwrap();
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let journal = SharedJournal::new(crate::inbound::Journal::open(&context).unwrap());
+        journal.record_received("ev-r3-1".into(), key.into(), "{}".into(), 1).await.unwrap();
+        journal.record_received("ev-r3-2".into(), key.into(), "{}".into(), 2).await.unwrap();
+        let mut hub = Hub::new(&context, journal, vec![key.into()], false).unwrap();
+        let state = mutate(&context, |s| {
+            s.conversations.insert(key.into(), Conversation::default());
+            s.flush.insert("f1".into(), Flush { key: key.into(), status: "running".into(), remaining: 1 });
+            Ok(s.clone())
+        }).unwrap();
+
+        // 1) Active unsubmitted job (minted == None) undergoes concurrent console switch (T1 -> T2).
+        hub.job(&state, key, "retry-work".into(), vec![], false, vec![], "f1".into(), 0, vec!["ev-r3-1".into()]).unwrap();
+        let job = hub.pending.pop_front().unwrap();
+        let t1 = job.authority.token.clone();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            conv.set_field("engineHandover", json!({"engine": "dsh", "epoch": crate::send_outbox::token_epoch(&t1)}));
+            Ok(())
+        }).unwrap();
+        hub.active.insert(
+            key.into(),
+            Active {
+                job,
+                task: tokio::spawn(async { (Err("transient failure".into()), true, None) }),
+                minted: Default::default(),
+            },
+        );
+        while !hub.active[key].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
+        crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
+        let t2 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t2, t1);
+        hub.tick("bot").await.unwrap();
+        assert_eq!(hub.pending.len(), 1, "active unsubmitted job must refresh on concurrent console switch");
+        assert_eq!(hub.pending[0].authority.token, t2);
+        assert_eq!(hub.pending[0].attempt, 1);
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "running");
+
+        // 2) Active unsubmitted job whose token undergoes a non-switch rotation must still drop & settle failed.
+        let mut job2 = hub.pending.pop_front().unwrap();
+        job2.inbound = vec!["ev-r3-2".into()];
+        hub.active.insert(
+            key.into(),
+            Active {
+                job: job2,
+                task: tokio::spawn(async { (Err("transient failure".into()), true, None) }),
+                minted: Default::default(),
+            },
+        );
+        while !hub.active[key].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        hub.tick("bot").await.unwrap();
+        assert!(hub.pending.is_empty(), "non-switch token rotation must drop active unsubmitted job");
+        assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r3-2").unwrap().as_deref(), Some("handled"));
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "failed");
+
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

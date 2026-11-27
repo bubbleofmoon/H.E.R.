@@ -125,7 +125,7 @@ pub(super) fn switch(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16,
         if mode == "reserved2" && !crate::social_state::inbound_admitted(&cfg, &key) {
             return Err((409, NOT_ADMITTED_ERROR.into()));
         }
-        if !matches!(mode.as_str(), "chat" | "closed-agent" | "reserved2") {
+        if !Engine::Harness.supports(&mode) {
             return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
         }
         let (applied, rollback) = crate::settings::apply_switch_choice(context, &key, value)?;
