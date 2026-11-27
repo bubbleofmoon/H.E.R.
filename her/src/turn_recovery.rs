@@ -1383,7 +1383,7 @@ pub fn spawn(context: RuntimeContext) {
 /// Re-arm interrupted terminal `reserved2` harness wakes once per conversation per startup when
 /// the previous process committed a terminal outcome before the hub could schedule or re-arm the
 /// next wake deadline.
-fn rearm_startup_terminal_sleeps(
+pub(crate) fn rearm_startup_terminal_sleeps(
     context: &RuntimeContext,
     cfg: &Value,
     turns: &[Turn],

@@ -1651,7 +1651,8 @@ pub(crate) fn rearm_interrupted_reserved2_wake_for_token(
             if !same_wake || !same_config {
                 return Ok(());
             }
-            if wake["infinite"] == true
+            if wake["sleepRetired"] == true
+                || wake["infinite"] == true
                 || wake["sleepUntil"]
                     .as_str()
                     .and_then(crate::wake::parse_iso_ms)
@@ -1665,6 +1666,7 @@ pub(crate) fn rearm_interrupted_reserved2_wake_for_token(
                     .filter(|iso| crate::wake::parse_iso_ms(iso).is_some_and(|at| at > now));
                 if let Some(iso) = restored_future {
                     wake["sleepUntil"] = json!(iso);
+                    crate::wake::clear_sleep_retired(&mut wake);
                 } else {
                     crate::wake::draw_default_sleep(&mut wake, cfg, now, rand01());
                 }
@@ -1854,12 +1856,13 @@ pub(crate) fn claim_reserved2_wake(
         .map_err(SocialError::from_http)
 }
 
-pub(crate) fn consume_reserved2_deadline(
+fn clear_reserved2_deadline(
     context: &RuntimeContext,
     key: &str,
     expected_token: &str,
     at: i64,
     previous: &Value,
+    mark_retired: bool,
 ) -> Result<(), SocialError> {
     ConversationState::for_runtime(context)
         .update(key, |conv| {
@@ -1872,6 +1875,79 @@ pub(crate) fn consume_reserved2_deadline(
                     && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
                 {
                     wc["sleepUntil"] = Value::Null;
+                    if mark_retired {
+                        wc["sleepRetired"] = json!(true);
+                    }
+                    conv.set_field("wakeConfig", wc);
+                }
+            }
+            Ok(())
+        })
+        .map_err(SocialError::from_http)
+}
+
+pub(crate) fn consume_reserved2_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    expected_token: &str,
+    at: i64,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, expected_token, at, previous, false)
+}
+
+pub(crate) fn retire_reserved2_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    expected_token: &str,
+    at: i64,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, expected_token, at, previous, true)
+}
+
+fn rollback_reserved2_wake_inner(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    previous: &Value,
+    retire_token: Option<&str>,
+) -> Result<(), SocialError> {
+    ConversationState::for_runtime(context)
+        .update(key, |conv| {
+            if let Some(expected_token) = retire_token {
+                if !credential_eq(conv.token().unwrap_or(""), expected_token) {
+                    return Ok(());
+                }
+            }
+            if let Some(mut times) = conv.field("wakeTimes").and_then(Value::as_array).cloned() {
+                if let Some(i) = times.iter().rposition(|v| v.as_i64() == Some(at)) {
+                    times.remove(i);
+                }
+                conv.set_field("wakeTimes", Value::Array(times));
+            }
+            if let Some(mut wc) = conv.field("wakeConfig").cloned() {
+                if wc["lastWakeAt"].as_i64() == Some(at) {
+                    for field in ["lastWakeAt", "wakeCount"] {
+                        wc[field] = previous["wakeConfig"][field].clone();
+                    }
+                    conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
+                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"] {
+                        if retire_token.is_some() {
+                            wc["sleepUntil"] = Value::Null;
+                            wc["sleepRetired"] = json!(true);
+                        } else if wc["infinite"] != true
+                            && wc["sleepUntil"]
+                                .as_str()
+                                .and_then(crate::wake::parse_iso_ms)
+                                .is_none()
+                        {
+                            wc["sleepUntil"] = previous["wakeConfig"]["sleepUntil"].clone();
+                            if wc["sleepUntil"].is_string() {
+                                crate::wake::clear_sleep_retired(&mut wc);
+                            }
+                        }
+                    }
                     conv.set_field("wakeConfig", wc);
                 }
             }
@@ -1886,35 +1962,17 @@ pub(crate) fn rollback_reserved2_wake(
     at: i64,
     previous: &Value,
 ) -> Result<(), SocialError> {
-    ConversationState::for_runtime(context)
-        .update(key, |conv| {
-            if let Some(mut times) = conv.field("wakeTimes").and_then(Value::as_array).cloned() {
-                if let Some(i) = times.iter().rposition(|v| v.as_i64() == Some(at)) {
-                    times.remove(i);
-                }
-                conv.set_field("wakeTimes", Value::Array(times));
-            }
-            if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-                if wc["lastWakeAt"].as_i64() == Some(at) {
-                    for field in ["lastWakeAt", "wakeCount"] {
-                        wc[field] = previous["wakeConfig"][field].clone();
-                    }
-                    conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
-                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                        && wc["infinite"] != true
-                        && wc["sleepUntil"]
-                            .as_str()
-                            .and_then(crate::wake::parse_iso_ms)
-                            .is_none()
-                    {
-                        wc["sleepUntil"] = previous["wakeConfig"]["sleepUntil"].clone();
-                    }
-                    conv.set_field("wakeConfig", wc);
-                }
-            }
-            Ok(())
-        })
-        .map_err(SocialError::from_http)
+    rollback_reserved2_wake_inner(context, key, at, previous, None)
+}
+
+pub(crate) fn rollback_and_retire_reserved2_wake(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    expected_token: &str,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    rollback_reserved2_wake_inner(context, key, at, previous, Some(expected_token))
 }
 
 pub(crate) fn complete_reserved2_turn(
@@ -2557,6 +2615,7 @@ pub(crate) fn reconcile_default_wake_configs(
             if let Some(fields) = plan.as_object_mut() {
                 fields.remove("sleepUntil");
                 fields.remove("sleepRangeMs");
+                fields.remove("sleepRetired");
             }
         } else if !target.infinite && (current.infinite || range_changed) {
             crate::wake::draw_default_sleep(plan, &cfg, now_ms(), rand01());
