@@ -1301,12 +1301,27 @@ pub fn spawn(context: RuntimeContext) {
     });
 }
 
-/// Re-arm interrupted terminal `reserved2` harness wakes once per startup when the previous process
-/// committed a terminal outcome before the hub could schedule or re-arm the next wake deadline.
-fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &[Turn], cutoff: i64) -> bool {
+/// Re-arm interrupted terminal `reserved2` harness wakes once per conversation per startup when
+/// the previous process committed a terminal outcome before the hub could schedule or re-arm the
+/// next wake deadline.
+fn rearm_startup_terminal_sleeps(
+    context: &RuntimeContext,
+    cfg: &Value,
+    turns: &[Turn],
+    cutoff: i64,
+    startup: &HashSet<String>,
+    done: &mut HashSet<String>,
+) -> bool {
     let mut latest_by_key: std::collections::HashMap<&str, &Turn> = Default::default();
     let mut keys_with_live_turn: std::collections::HashSet<&str> = Default::default();
+    let mut keys_with_unsettled_startup: std::collections::HashSet<&str> = Default::default();
     for turn in turns {
+        if startup.contains(&turn.id)
+            && (turn.state.is_open()
+                || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"))
+        {
+            keys_with_unsettled_startup.insert(turn.key.as_str());
+        }
         if turn.begun_at <= cutoff {
             latest_by_key.insert(turn.key.as_str(), turn);
         } else {
@@ -1315,24 +1330,32 @@ fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &
     }
     let mut ok = true;
     for (key, turn) in latest_by_key {
-        if keys_with_live_turn.contains(key) {
+        if done.contains(key) || keys_with_unsettled_startup.contains(key) {
             continue;
         }
-        if (turn.reserved2 || turn.wake_claim.is_some())
+        let eligible = !keys_with_live_turn.contains(key)
+            && (turn.reserved2 || turn.wake_claim.is_some())
             && turn.backend == "harness"
             && matches!(
                 turn.state,
                 State::Completed | State::Failed | State::Cancelled | State::Abandoned | State::Resumed
-            )
-        {
-            if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake(
-                context,
-                cfg,
-                &turn.key,
-                turn.wake_claim.as_ref(),
-                Some(turn.begun_at),
-                Some(cutoff),
-            ) {
+            );
+        if !eligible {
+            done.insert(key.to_string());
+            continue;
+        }
+        match crate::social_state::rearm_interrupted_reserved2_wake(
+            context,
+            cfg,
+            &turn.key,
+            turn.wake_claim.as_ref(),
+            Some(turn.begun_at),
+            Some(cutoff),
+        ) {
+            Ok(()) => {
+                done.insert(key.to_string());
+            }
+            Err(error) => {
                 crate::safe_println!("[recovery] startup terminal sleep rearm failed for {}: {error}", turn.key);
                 ok = false;
             }
@@ -1344,7 +1367,7 @@ fn rearm_startup_terminal_sleeps(context: &RuntimeContext, cfg: &Value, turns: &
 async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<String>>, started_at: i64) {
     {
         let mut last_try: std::collections::HashMap<String, i64> = Default::default();
-        let mut terminal_rearm_done = false;
+        let mut terminal_rearm_done: HashSet<String> = HashSet::new();
         let mut abandoned_closed: HashSet<String> = HashSet::new();
         loop {
             if let (Ok(cfg), Ok(journal), Ok(records)) =
@@ -1423,18 +1446,14 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                 } else {
                     (records, turns)
                 };
+                rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
                 pass.resolutions(&journal, &turns, &records);
                 pass.release_held(&journal, &turns, &records);
                 pass.finished_with_cache(&journal, &turns, &mut abandoned_closed);
                 pass.report_stuck_resumed(&journal, &turns);
-                // Orphans and terminal startup rearms only after every startup turn has settled.
+                // Orphans run only after every startup turn has settled.
                 let unsettled = turns.iter().any(|t| startup.contains(&t.id) && t.state.is_open());
                 if !unsettled {
-                    if !terminal_rearm_done
-                        && rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at)
-                    {
-                        terminal_rearm_done = true;
-                    }
                     pass.orphans(&journal, &turns, &records);
                 }
             }
@@ -2133,7 +2152,7 @@ mod tests {
             })
             .unwrap();
         let turns = fold(&turn_ledger::read_records(&fx_obs.context).unwrap()).0;
-        assert!(rearm_startup_terminal_sleeps(&fx_obs.context, &fx_obs.cfg, &turns, crate::turn_ledger::now_ms() + 1000));
+        assert!(rearm_startup_terminal_sleeps(&fx_obs.context, &fx_obs.cfg, &turns, crate::turn_ledger::now_ms() + 1000, &HashSet::new(), &mut HashSet::new()));
         let sleep_until = fx_obs.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
             .as_str()
             .and_then(crate::wake::parse_iso_ms);
@@ -2159,7 +2178,7 @@ mod tests {
             })
             .unwrap();
         let ok_turns = fold(&turn_ledger::read_records(&fx_ok.context).unwrap()).0;
-        assert!(rearm_startup_terminal_sleeps(&fx_ok.context, &fx_ok.cfg, &ok_turns, crate::turn_ledger::now_ms() + 1000));
+        assert!(rearm_startup_terminal_sleeps(&fx_ok.context, &fx_ok.cfg, &ok_turns, crate::turn_ledger::now_ms() + 1000, &HashSet::new(), &mut HashSet::new()));
         assert!(
             fx_ok.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
                 .as_str()
@@ -2262,7 +2281,7 @@ mod tests {
             .unwrap();
         let unclaimed_turns = fold(&turn_ledger::read_records(&fx_unclaimed_abandoned.context).unwrap()).0;
         assert!(unclaimed_turns[0].wake_claim.is_none());
-        assert!(rearm_startup_terminal_sleeps(&fx_unclaimed_abandoned.context, &fx_unclaimed_abandoned.cfg, &unclaimed_turns, unclaimed_cutoff));
+        assert!(rearm_startup_terminal_sleeps(&fx_unclaimed_abandoned.context, &fx_unclaimed_abandoned.cfg, &unclaimed_turns, unclaimed_cutoff, &HashSet::new(), &mut HashSet::new()));
         let mut closed_cache = HashSet::new();
         Pass { context: &fx_unclaimed_abandoned.context, cfg: &fx_unclaimed_abandoned.cfg }
             .finished_with_cache(&fx_unclaimed_abandoned.journal, &unclaimed_turns, &mut closed_cache);
@@ -2329,7 +2348,7 @@ mod tests {
             })
             .unwrap();
         let prov_turns = fold(&turn_ledger::read_records(&fx_prov.context).unwrap()).0;
-        assert!(rearm_startup_terminal_sleeps(&fx_prov.context, &fx_prov.cfg, &prov_turns, startup_cutoff));
+        assert!(rearm_startup_terminal_sleeps(&fx_prov.context, &fx_prov.cfg, &prov_turns, startup_cutoff, &HashSet::new(), &mut HashSet::new()));
         assert!(
             fx_prov.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
                 .as_str()
@@ -2390,13 +2409,110 @@ mod tests {
 
         // Next process restarts after that live wake died before recording a ledger turn.
         let next_cutoff = live_cutoff + 100;
-        assert!(rearm_startup_terminal_sleeps(&fx.context, &fx.cfg, &after_resume, next_cutoff));
+        assert!(rearm_startup_terminal_sleeps(&fx.context, &fx.cfg, &after_resume, next_cutoff, &HashSet::new(), &mut HashSet::new()));
         assert!(
             fx.context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"]
                 .as_str()
                 .and_then(crate::wake::parse_iso_ms)
                 .is_some(),
             "next startup must re-arm stranded finite sleepUntil on State::Resumed turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket297_startup_rearm_not_blocked_by_unrelated_open_turn() {
+        struct ActiveGuard(String);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                active_turns().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+            }
+        }
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1, 2]},
+            "harness": {"model": "fake-chat"},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-per-conv-sweep-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let future_iso = crate::sticker::iso_at(now() + 300_000);
+        let wake_cfg = json!({
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": null,
+            "triggers": {"atMention": true},
+            "confirmedAt": 1,
+            "lastWakeAt": 10,
+            "wakeCount": 1
+        });
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {"agentToken": "tok-297-g1", "wakeTimes": [10], "wakeConfig": wake_cfg},
+                    "group:2": {"agentToken": "tok-297-g2", "wakeTimes": [10], "wakeConfig": wake_cfg}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let _journal = Journal::open(&context).unwrap();
+
+        let rec1 = Recorder::begin_reserved2(
+            &context,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g1"),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "infinite": false, "sleepUntil": future_iso}
+            }
+        }))
+        .unwrap();
+        rec1.end("completed", "ok").unwrap();
+
+        let rec2 = Recorder::begin_reserved2(
+            &context,
+            "group:2",
+            "harness",
+            "atMention",
+            &crate::send_outbox::token_epoch("tok-297-g2"),
+            &[],
+        )
+        .unwrap();
+        active_turns().lock().unwrap_or_else(|p| p.into_inner()).insert(rec2.id.clone());
+        let _active_guard = ActiveGuard(rec2.id.clone());
+
+        let cutoff = now() + 500;
+        let startup = startup_turns(&turn_ledger::read_records(&context).unwrap(), cutoff);
+        assert!(startup.contains(&rec2.id));
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            recovery_loop(context.clone(), Some(startup), cutoff),
+        )
+        .await;
+
+        let state = context.read_social_state().unwrap();
+        assert_eq!(
+            state["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "settled group:1 must re-arm its stranded finite sleep even while unrelated group:2 has an open startup turn"
+        );
+        assert!(
+            state["conversations"]["group:2"]["wakeConfig"]["sleepUntil"].is_null(),
+            "unrelated open startup turn group:2 must not be re-armed before settling"
         );
     }
 

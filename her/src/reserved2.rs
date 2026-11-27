@@ -19,15 +19,23 @@ pub(crate) fn wake_needs_dsh(context: &RuntimeContext, cfg: &Value, key: &str) -
 }
 
 /// Re-arm a finite sleep timer when a provisional wake that carried no remaining `sleepUntil`
-/// is dropped without scheduling a retry or hold.
+/// is dropped without scheduling a retry or hold, provided the conversation's token still
+/// matches the dropped wake's epoch.
 fn rearm_dropped_provisional_sleep(
     context: &RuntimeContext,
     cfg: &Value,
     key: &str,
     at: i64,
     previous: &Value,
+    expected_token: &str,
 ) -> Result<(), String> {
     if previous["wakeConfig"]["infinite"] != false || !previous["wakeConfig"]["sleepUntil"].is_null() {
+        return Ok(());
+    }
+    let current = social_state::token(context, key)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if current != expected_token {
         return Ok(());
     }
     let records = crate::turn_ledger::read_records(context)?;
@@ -1483,6 +1491,74 @@ mod tests {
                 "live driver must adopt re-armed sleep_until after retry succeeds"
             );
         }).await.expect("the transient rearm retry fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_transient_token_read_error_retains_rearm() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (root, mut hub, _console) = harness_cap_fixture("harness-cap-transient-token-err", None).await;
+            let key = HARNESS_CAP_KEY;
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = Value::Null;
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.ready.push((key.into(), "atMention".into()));
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "atMention");
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            let social_path = root.0.join("data/social-v2.json");
+            let social_backup = root.0.join("data/social-v2.json.bak");
+            let (snapshot, observed) = tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+            let (finished, observed_finish) = tokio::sync::oneshot::channel();
+            hub.tick_snapshot_hook = Some(snapshot);
+            hub.collector_finished_hook = Some(observed_finish);
+            let social_path_task = social_path.clone();
+            let social_backup_task = social_backup.clone();
+            let inject = tokio::spawn(async move {
+                let done = observed.await.unwrap();
+                done.send(()).unwrap();
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                std::fs::rename(&social_path_task, &social_backup_task).unwrap();
+                finished.send(()).unwrap();
+            });
+
+            hub.tick("bot", 9001).await.unwrap();
+            inject.await.unwrap();
+            assert!(
+                !social_path.exists(),
+                "transient fault must have moved social-v2.json away before token read"
+            );
+
+            std::fs::rename(&social_backup, &social_path).unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some(),
+                "next tick must retry and re-arm finite sleepUntil after transient token read error clears"
+            );
+            assert!(
+                hub.drivers[key].sched.wc.sleep_until.is_some(),
+                "live driver must adopt re-armed sleep_until after retry succeeds"
+            );
+        }).await.expect("the transient token read error fixture must settle");
     }
 
     async fn wait_for_harness_cap_wake(hub: &Hub) {
@@ -3363,7 +3439,7 @@ pub struct Hub {
     tokens: HashMap<String, String>,
     retries: HashMap<String, (i64, String)>,
     rollback_pending: HashMap<String, (i64, Value)>,
-    rearm_pending: HashMap<String, (i64, Value)>,
+    rearm_pending: HashMap<String, (i64, Value, String)>,
     failures: HashMap<String, u32>,
     closing_seen: HashMap<String, Value>,
     closing_misses: HashMap<String, u32>,
@@ -3574,10 +3650,10 @@ impl Hub {
     fn drain_rearm_pending(&mut self, cfg: &Value) {
         let keys: Vec<String> = self.rearm_pending.keys().cloned().collect();
         for key in keys {
-            let Some((at, previous)) = self.rearm_pending.get(&key).cloned() else {
+            let Some((at, previous, expected_token)) = self.rearm_pending.get(&key).cloned() else {
                 continue;
             };
-            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &previous) {
+            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &previous, &expected_token) {
                 Ok(()) => {
                     self.rearm_pending.remove(&key);
                 }
@@ -4463,8 +4539,15 @@ impl Hub {
             println!("[reserved2] {key} turn ended: {result:?}");
             // The pipeline already wrote the turn-error line and told the administrator when the turn ended in a model error.
             let model_error = pipeline::take_model_error(&self.context, &key);
-            let current_token = social_state::token(&self.context, &key).ok().flatten().unwrap_or_default();
-            let in_scope = social_state::mode(&self.context) == "reserved2"
+            let token_res = social_state::token(&self.context, &key);
+            let mode_res = social_state::mode_checked(&self.context);
+            let current_token = token_res
+                .as_ref()
+                .ok()
+                .and_then(|t| t.as_deref())
+                .unwrap_or("")
+                .to_string();
+            let in_scope = mode_res.as_ref().is_ok_and(|m| m == "reserved2")
                 && social_state::inbound_admitted(&cfg, &key)
                 && self.mode_stamp == active.mode_stamp;
             let still_valid = in_scope && current_token == admitted_token;
@@ -4522,15 +4605,21 @@ impl Hub {
             let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
                 || retry_exhausted
                 || (held && had_inbound);
-            let needs_provisional_rearm = still_valid
-                && !access_refused
+            let transient_read_drop = (token_res.is_err() || mode_res.is_err())
+                && self.mode_stamp == active.mode_stamp
+                && social_state::inbound_admitted(&cfg, &key)
+                && result.is_err()
+                && unsubmitted;
+            let needs_provisional_rearm = !access_refused
                 && !is_reminder
-                && dropped_unadmitted
                 && active.previous["wakeConfig"]["infinite"] == false
-                && active.previous["wakeConfig"]["sleepUntil"].is_null();
+                && active.previous["wakeConfig"]["sleepUntil"].is_null()
+                && ((still_valid && dropped_unadmitted) || transient_read_drop);
             if needs_provisional_rearm {
-                self.rearm_pending
-                    .insert(key.clone(), (active.at, active.previous.clone()));
+                self.rearm_pending.insert(
+                    key.clone(),
+                    (active.at, active.previous.clone(), admitted_token.clone()),
+                );
             }
             if held || retry {
                 social_state::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
@@ -4759,7 +4848,7 @@ impl Hub {
                     (conv, token)
                 } else {
                     let claim = social_state::claim_reserved2_wake(&self.context, &key, &reason, now, expected.as_deref())?;
-                    claimed = Some(claim.0.clone());
+                    claimed = Some(claim.clone());
                     claim
                 };
                 let prompt = if reason == "wakeReminder" {
@@ -4784,7 +4873,7 @@ impl Hub {
                 }
                 Err(error) => {
                     println!("[reserved2] {key} dispatch preparation failed: {error}");
-                    if let Some(previous) = claimed.as_ref() {
+                    if let Some((previous, _)) = claimed.as_ref() {
                         if let Err(error) = social_state::rollback_reserved2_wake(&self.context, &key, now, previous) {
                             println!("[reserved2] {key} dispatch rollback failed: {error}");
                             self.rollback_pending.insert(key.clone(), (now, previous.clone()));
@@ -4810,11 +4899,11 @@ impl Hub {
                     *failures += 1;
                     if *failures <= MAX_WAKE_RETRIES {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
-                    } else if let Some(previous) = claimed.as_ref() {
+                    } else if let Some((previous, dispatch_token)) = claimed.as_ref() {
                         if previous["wakeConfig"]["infinite"] == false
                             && previous["wakeConfig"]["sleepUntil"].is_null()
                         {
-                            self.rearm_pending.insert(key, (now, previous.clone()));
+                            self.rearm_pending.insert(key, (now, previous.clone(), dispatch_token.clone()));
                             self.drain_rearm_pending(&cfg);
                         }
                     }
