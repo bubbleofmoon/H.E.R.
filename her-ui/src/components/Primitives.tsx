@@ -187,9 +187,10 @@ function formatSettingDisplay(item: SettingItemView): string {
 export const SettingField: React.FC<{
   setting: SettingItemView;
   draftValue?: unknown;
+  disabled?: boolean;
   onDraftChange?: (value: unknown) => void;
   onReset?: () => void;
-}> = ({ setting, draftValue, onDraftChange, onReset }) => {
+}> = ({ setting, draftValue, disabled = false, onDraftChange, onReset }) => {
   const effective = draftValue !== undefined ? draftValue : setting.value;
   const readOnly = setting.managedBy === 'consoleAuth';
   const kind = setting.kind;
@@ -270,6 +271,7 @@ export const SettingField: React.FC<{
           type="password"
           aria-label={setting.label}
           autoComplete="new-password"
+          disabled={disabled}
           value={typeof draftValue === 'string' ? draftValue : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
           placeholder={
@@ -281,13 +283,14 @@ export const SettingField: React.FC<{
                   ? '端点已变更，请重新输入凭据…'
                   : '输入凭据…'
           }
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : kind.type === 'model endpoint' ? (
         <div className="space-y-1">
           <input
             type="text"
             aria-label={setting.label}
+            disabled={disabled}
             maxLength={kind.maxChars}
             value={typeof effective === 'string' ? effective : ''}
             onChange={(e) => {
@@ -298,7 +301,7 @@ export const SettingField: React.FC<{
                 ? `跟随默认：${setting.fallback.value}`
                 : 'https://api.example.com/v1 或 http://127.0.0.1:8317'
             }
-            className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+            className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
           />
           <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
             {setting.value === null && typeof setting.fallback?.value === 'string' && (

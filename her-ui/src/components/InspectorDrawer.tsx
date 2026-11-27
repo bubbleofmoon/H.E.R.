@@ -4,6 +4,7 @@ import { useConsole } from '../stores/consoleStore';
 import { formatAppliesLabel } from '../utils/format';
 import {
   MODEL_CREDENTIAL_KEYS,
+  MODEL_ENDPOINT_KEY,
   localizeSettingItem,
   parseSettingDraftForSave,
   resolveActiveModelEndpoint,
@@ -99,10 +100,17 @@ export const InspectorDrawer: React.FC = () => {
     const expectedEndpoint = MODEL_CREDENTIAL_KEYS.has(settingItem.key)
       ? resolveActiveModelEndpoint(settings)
       : undefined;
+    const isClearedEndpoint =
+      (settingItem.kind.type === 'model endpoint' || settingItem.key === MODEL_ENDPOINT_KEY) &&
+      parsedValue === null;
     const executeSave = async (confirm: boolean) => {
       setBusy(true);
       try {
-        await saveSetting(settingItem.key, parsedValue, confirm, expectedEndpoint);
+        if (isClearedEndpoint) {
+          await resetSetting(settingItem.key, confirm);
+        } else {
+          await saveSetting(settingItem.key, parsedValue, confirm, expectedEndpoint);
+        }
         if (draftRevRef.current === saveRev) {
           setDraftValue(undefined);
         }

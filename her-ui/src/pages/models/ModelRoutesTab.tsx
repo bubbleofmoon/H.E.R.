@@ -212,26 +212,24 @@ export const ModelRoutesTab: React.FC = () => {
     [saveSetting, pushToast, loadModels],
   );
 
-  const validateDirtySecrets = useCallback((): boolean => {
+  const prepareSecretSave = useCallback((): ((resolvedEndpoint?: string) => Promise<void>) | null => {
+    if (secretBusyKey !== null) return null;
+    const frozenEntries: { item: SettingItemView; raw: string }[] = [];
     for (const key of dirtySecretKeys) {
+      const item = secretSettings.find((s) => s.key === key);
+      if (!item) continue;
       const raw = secretDraftsRef.current[key] ?? '';
       const validationErr = isValidSecretValue(raw);
       if (validationErr) {
         pushToast(`${key}: ${validationErr}`, 'warn');
-        return false;
+        return null;
       }
+      frozenEntries.push({ item, raw });
     }
-    return true;
-  }, [dirtySecretKeys, pushToast]);
-
-  const saveAllSecrets = useCallback(
-    async (resolvedEndpoint?: string) => {
-      if (secretBusyKey !== null || !validateDirtySecrets()) return;
+    return async (resolvedEndpoint?: string) => {
       const targetEndpoint = resolvedEndpoint ?? activeEndpointInfo.endpoint ?? undefined;
-      for (const key of dirtySecretKeys) {
-        const item = secretSettings.find((s) => s.key === key);
-        if (!item) continue;
-        const raw = secretDraftsRef.current[item.key] ?? '';
+      for (const { item, raw } of frozenEntries) {
+        if (!mountedRef.current) break;
         setSecretBusyKey(item.key);
         let ok = false;
         try {
@@ -247,15 +245,24 @@ export const ModelRoutesTab: React.FC = () => {
         }
         if (!ok) break;
       }
+    };
+  }, [
+    secretBusyKey,
+    dirtySecretKeys,
+    secretSettings,
+    pushToast,
+    activeEndpointInfo.endpoint,
+    persistValidatedSecret,
+  ]);
+
+  const saveAllSecrets = useCallback(
+    async (resolvedEndpoint?: string) => {
+      const runner = prepareSecretSave();
+      if (runner) {
+        await runner(resolvedEndpoint);
+      }
     },
-    [
-      secretBusyKey,
-      validateDirtySecrets,
-      dirtySecretKeys,
-      secretSettings,
-      persistValidatedSecret,
-      activeEndpointInfo.endpoint,
-    ],
+    [prepareSecretSave],
   );
 
   const discardAllSecrets = useCallback(() => {
@@ -267,13 +274,13 @@ export const ModelRoutesTab: React.FC = () => {
     return {
       count: dirtySecretKeys.length,
       label: `${dirtySecretKeys.length} 项未保存 API 密钥草稿`,
-      validateBeforeSave: validateDirtySecrets,
+      prepareSave: prepareSecretSave,
       onSave: saveAllSecrets,
       onDiscard: discardAllSecrets,
     };
-  }, [dirtySecretKeys.length, validateDirtySecrets, saveAllSecrets, discardAllSecrets]);
+  }, [dirtySecretKeys.length, prepareSecretSave, saveAllSecrets, discardAllSecrets]);
 
-  const { drafts, dirtyKeys, setDraft, clearDraft, handleReset } = useSettingsDrafts(
+  const { drafts, dirtyKeys, saving, setDraft, clearDraft, handleReset } = useSettingsDrafts(
     curatedModelSettings,
     '模型设置',
     { extraDirty: extraSecretDirty },
@@ -283,7 +290,7 @@ export const ModelRoutesTab: React.FC = () => {
 
   const handleSaveSecret = useCallback(
     async (item: SettingItemView) => {
-      if (secretBusyKey !== null) return;
+      if (secretBusyKey !== null || saving) return;
       const raw = secretDraftsRef.current[item.key] ?? '';
       const validationErr = isValidSecretValue(raw);
       if (validationErr) {
@@ -291,17 +298,24 @@ export const ModelRoutesTab: React.FC = () => {
         return;
       }
       const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
+      const shouldSaveEndpoint = isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY);
+      const rawEndpointDraft = shouldSaveEndpoint ? draftsRef.current[MODEL_ENDPOINT_KEY] : undefined;
+      const urlToSave = shouldSaveEndpoint
+        ? normalizeEndpointDraftValue(
+            apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
+            rawEndpointDraft,
+          )
+        : undefined;
       let targetEndpoint = isModelSecret ? activeEndpointInfo.endpoint ?? undefined : undefined;
       setSecretBusyKey(item.key);
       try {
-        if (isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY)) {
-          const rawEndpointDraft = draftsRef.current[MODEL_ENDPOINT_KEY];
-          const urlToSave = normalizeEndpointDraftValue(
-            apiBaseUrlItem ?? { key: MODEL_ENDPOINT_KEY, kind: { type: 'model endpoint' } },
-            rawEndpointDraft,
-          );
+        if (shouldSaveEndpoint) {
           try {
-            await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
+            if (urlToSave === null) {
+              await resetSetting(MODEL_ENDPOINT_KEY, false);
+            } else {
+              await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
+            }
           } catch (err) {
             if (mountedRef.current) {
               pushToast(
@@ -327,9 +341,11 @@ export const ModelRoutesTab: React.FC = () => {
     },
     [
       secretBusyKey,
+      saving,
       activeEndpointInfo.endpoint,
       dirtyKeys,
       apiBaseUrlItem,
+      resetSetting,
       saveSetting,
       clearDraft,
       loadModels,
@@ -668,6 +684,7 @@ export const ModelRoutesTab: React.FC = () => {
                 <SettingField
                   setting={item}
                   draftValue={drafts[item.key]}
+                  disabled={secretBusyKey !== null || saving}
                   onDraftChange={(next) => setDraft(item.key, next)}
                   onReset={() => handleReset(item.key)}
                 />
@@ -707,7 +724,7 @@ export const ModelRoutesTab: React.FC = () => {
           <div className="space-y-3">
             {secretSettings.map((item) => {
               const draft = secretDrafts[item.key] ?? '';
-              const anySecretBusy = secretBusyKey !== null;
+              const anySecretBusy = secretBusyKey !== null || saving;
               const isFileFallback = item.key === 'harness.apiKey' && !item.isSet && item.source === 'file';
               return (
                 <div

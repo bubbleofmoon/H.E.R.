@@ -934,7 +934,9 @@ impl ModelEndpointSnapshot {
     }
 }
 
-fn stored_model_endpoint_override(conn: &Connection) -> Result<Option<Option<String>>, InspectError> {
+fn stored_model_endpoint_override(
+    conn: &Connection,
+) -> Result<Option<Option<(String, String)>>, InspectError> {
     let Some((text, _)) = stored_row_sqlite(conn, HARNESS_API_BASE_URL.key).map_err(InspectError::from_sqlite)?
     else {
         return Ok(None);
@@ -944,26 +946,34 @@ fn stored_model_endpoint_override(conn: &Connection) -> Result<Option<Option<Str
     if parsed.is_null() {
         return Ok(Some(None));
     }
+    let raw = parsed
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
     let normalized = HARNESS_API_BASE_URL
         .normalize(&parsed)
         .and_then(|v| v.as_str().map(str::to_string))
         .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
-    Ok(Some(Some(normalized)))
+    Ok(Some(Some((raw, normalized))))
 }
 
 pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(secrets_in(conn)?.into_iter().map(|(_, _, credential)| credential).collect())
 }
 
-pub(crate) fn archive_model_endpoint_override(conn: &Connection) -> Result<Option<Option<String>>, String> {
+pub(crate) fn archive_model_endpoint_override(
+    conn: &Connection,
+) -> Result<Option<Option<(String, String)>>, String> {
     stored_model_endpoint_override(conn).map_err(InspectError::into_message)
 }
 
-fn config_model_endpoint_override(document: &Value) -> Option<String> {
-    HARNESS_API_BASE_URL
-        .found_in(document)
-        .and_then(|v| HARNESS_API_BASE_URL.normalize(v))
-        .and_then(|v| v.as_str().map(str::to_string))
+fn config_model_endpoint_override(document: &Value) -> Option<(String, String)> {
+    let found = HARNESS_API_BASE_URL.found_in(document)?;
+    let raw = found.as_str()?.to_string();
+    let canonical = HARNESS_API_BASE_URL
+        .normalize(found)
+        .and_then(|v| v.as_str().map(str::to_string))?;
+    Some((raw, canonical))
 }
 
 fn collect_known_secrets(
@@ -984,27 +994,50 @@ fn text_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
     known_secrets.iter().any(|key| text.contains(key))
 }
 
+pub(crate) fn redact_route_array(value: &mut Value, credentials: Option<&[String]>) -> bool {
+    let mut redacted = false;
+    if let Some(routes) = value.as_array_mut() {
+        for route in routes {
+            for field in ["id", "model"] {
+                let Some(slot) = route.get_mut(field) else { continue };
+                if let Some(text) = slot.as_str() {
+                    let safe = match credentials {
+                        Some(keys) => keys
+                            .iter()
+                            .fold(text.to_string(), |acc, key| crate::harness::redact_credential(&acc, key)),
+                        None => "[REDACTED]".to_string(),
+                    };
+                    if safe != text {
+                        *slot = json!(safe);
+                        redacted = true;
+                    }
+                }
+            }
+        }
+    }
+    redacted
+}
+
 fn safe_config_model_endpoint_override(
     document: &Value,
     known_secrets: &[String],
 ) -> Option<String> {
-    let url = config_model_endpoint_override(document)?;
-    let raw_has_cred = HARNESS_API_BASE_URL
-        .found_in(document)
-        .and_then(Value::as_str)
-        .is_some_and(|raw| text_contains_any_secret(raw, known_secrets));
-    (!raw_has_cred && !text_contains_any_secret(&url, known_secrets)).then_some(url)
+    let (raw, canonical) = config_model_endpoint_override(document)?;
+    (!text_contains_any_secret(&raw, known_secrets)
+        && !text_contains_any_secret(&canonical, known_secrets))
+    .then_some(canonical)
 }
 
 fn effective_endpoint_from_overrides(
-    stored_override: Option<Option<String>>,
+    stored_override: Option<Option<(String, String)>>,
     document: Option<&Value>,
     default_endpoint: Option<String>,
     known_secrets: &[String],
 ) -> (Option<String>, Option<ModelEndpointSource>) {
     let override_ep = match stored_override {
-        Some(Some(url)) => (!text_contains_any_secret(&url, known_secrets))
-            .then_some((url, ModelEndpointSource::Settings)),
+        Some(Some((raw, canonical))) => (!text_contains_any_secret(&raw, known_secrets)
+            && !text_contains_any_secret(&canonical, known_secrets))
+            .then_some((canonical, ModelEndpointSource::Settings)),
         Some(None) => None,
         None => document
             .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets))
@@ -1020,15 +1053,16 @@ fn effective_endpoint_from_overrides(
 }
 
 pub(crate) fn archive_effective_model_endpoint(
-    archive_stored_override: Option<Option<String>>,
+    archive_stored_override: Option<Option<(String, String)>>,
     archive_config: &Value,
     default_raw: Option<&str>,
     archive_secrets: &[String],
-    live_secrets: &[String],
+    host_disk_key: Option<&str>,
 ) -> Option<String> {
-    let mut known_secrets = Vec::with_capacity(archive_secrets.len() + live_secrets.len());
-    known_secrets.extend(archive_secrets.iter().cloned());
-    known_secrets.extend(live_secrets.iter().cloned());
+    let mut known_secrets = archive_secrets.to_vec();
+    if let Some(key) = host_disk_key {
+        known_secrets.push(key.to_string());
+    }
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
     effective_endpoint_from_overrides(
         archive_stored_override,
@@ -1166,12 +1200,23 @@ pub(crate) fn harness_credential(context: &RuntimeContext) -> Option<String> {
 }
 
 fn reject_credential_text(
-    conn: &Connection, setting: &Setting, value: &Value, harness_key: Option<&str>,
+    conn: &Connection,
+    setting: &Setting,
+    raw_value: Option<&Value>,
+    value: &Value,
+    harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
     let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
     let endpoint_url = value.as_str().filter(|_| setting.key == HARNESS_API_BASE_URL.key);
+    let raw_endpoint_url = raw_value
+        .and_then(Value::as_str)
+        .filter(|_| setting.key == HARNESS_API_BASE_URL.key);
     let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
-    if prompt_text.is_none() && endpoint_url.is_none() && routes.is_none() {
+    if prompt_text.is_none()
+        && endpoint_url.is_none()
+        && raw_endpoint_url.is_none()
+        && routes.is_none()
+    {
         return Ok(());
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
@@ -1180,6 +1225,7 @@ fn reject_credential_text(
     let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
     if prompt_text.is_some_and(has_any_credential)
         || endpoint_url.is_some_and(has_any_credential)
+        || raw_endpoint_url.is_some_and(has_any_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
             ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
         }))
@@ -1561,7 +1607,7 @@ fn seed(
             }
             continue;
         };
-        if reject_credential_text(conn, setting, &value, harness_key).is_err() {
+        if reject_credential_text(conn, setting, Some(found), &value, harness_key).is_err() {
             continue;
         }
         let text = value.to_string();
@@ -2010,8 +2056,8 @@ pub(crate) fn apply_checked_endpoint(
     expected_endpoint: Option<&str>,
 ) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
-    let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
-    store(context, setting, value, actor, source, expected_endpoint)
+    let normalized = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
+    store(context, setting, Some(value), normalized, actor, source, expected_endpoint)
 }
 
 /// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
@@ -2037,6 +2083,7 @@ fn check_schedule_change(
 fn store(
     context: &RuntimeContext,
     setting: &'static Setting,
+    raw_value: Option<&Value>,
     value: Value,
     actor: &str,
     source: &str,
@@ -2089,7 +2136,7 @@ fn store(
         } else {
             value.to_string()
         };
-        reject_credential_text(conn, setting, &value, harness_key.as_deref())?;
+        reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref())?;
         let value = if setting.secret { json!(!value.is_null()) } else { value };
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
@@ -2111,7 +2158,7 @@ fn store(
 /// empty one included. A stored default already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
-    store(context, setting, setting.default_value(), actor, "reset", None)
+    store(context, setting, None, setting.default_value(), actor, "reset", None)
 }
 
 const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
@@ -2180,6 +2227,9 @@ pub(crate) fn undo(
         if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
             return Err((409, CHANGED_SINCE_ERROR.to_string()));
         }
+        let raw_old = old_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
         let restored = old_text
             .map(|text| {
                 serde_json::from_str::<Value>(&text)
@@ -2195,7 +2245,13 @@ pub(crate) fn undo(
             ));
         }
         if let Some(restored) = &restored {
-            reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
+            reject_credential_text(
+                conn,
+                setting,
+                raw_old.as_ref(),
+                restored,
+                harness_key.as_deref(),
+            )?;
         }
         if super::registry::checks_schedule(setting.key) {
             let unavailable = |error| (503, error);
@@ -2289,7 +2345,12 @@ pub(crate) fn history(
                         let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
                             (json!(SECRET_MARKER), json!(SECRET_MARKER))
                         } else {
-                            (shown(&key, old), shown(&key, new))
+                            let (mut old, mut new) = (shown(&key, old), shown(&key, new));
+                            if key == HARNESS_ROUTES.key {
+                                redact_route_array(&mut old, Some(&known_secrets));
+                                redact_route_array(&mut new, Some(&known_secrets));
+                            }
+                            (old, new)
                         };
                         Ok(json!({
                             "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope,
@@ -2360,6 +2421,17 @@ pub(crate) fn console_changes(
             }
             return Err((400, setting.refusal(posted)));
         };
+        if setting.key == HARNESS_API_BASE_URL.key {
+            if let Some(raw_url) = posted.as_str() {
+                let mut known = stored_secrets(context).map_err(|e| (503, e))?;
+                if let Some(hk) = harness_credential(context) {
+                    known.push(hk);
+                }
+                if text_contains_any_secret(raw_url, &known) {
+                    return Err((400, "setting text contains a credential".to_string()));
+                }
+            }
+        }
         let unchanged = if setting.key == ROLLOUT_GROUPS.key {
             setting.found_in(&now) == Some(&value)
         } else {
@@ -2405,7 +2477,7 @@ pub(crate) fn apply_changes(
     let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
         validate_rollout_change(conn, document, changes.iter().map(|(setting, value)| (*setting, Some(value))))?;
         for (setting, value) in &changes {
-            reject_credential_text(conn, setting, value, harness_key.as_deref())?;
+            reject_credential_text(conn, setting, None, value, harness_key.as_deref())?;
             let text = value.to_string();
             let old = stored_row(conn, setting.key)?;
             if old.as_ref().is_some_and(|(old_text, _)| *old_text == text) {
@@ -2547,12 +2619,17 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     let mut document = raw_doc;
     overlay_values(&mut document, &stored);
     complete_timing(&mut document);
-    let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
+    let effective_owner = context.normalized_config(&document).ok().map(|effective| OWNER.read(&effective));
     let search_endpoint = crate::aux_search::settings_endpoint(&document);
     let known_secrets = endpoint_snapshot
         .as_ref()
         .map(|snap| snap.all_secrets.clone())
         .unwrap_or_else(|| collect_known_secrets(&secrets, harness_disk_key.as_deref()));
+    let route_credentials = if store_error.is_none() {
+        Some(known_secrets.as_slice())
+    } else {
+        None
+    };
     let model_fallback = endpoint_snapshot
         .as_ref()
         .and_then(|snap| snap.default_endpoint.clone())
@@ -2621,7 +2698,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             {
                 stored_value = Some(json!(SECRET_MARKER));
             }
-            let value = if setting.key == HARNESS_API_BASE_URL.key {
+            let mut value = if setting.key == HARNESS_API_BASE_URL.key {
                 match &endpoint_snapshot {
                     Some(snap)
                         if matches!(
@@ -2638,6 +2715,14 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             } else {
                 setting.read(&document)
             };
+            if setting.key == HARNESS_ROUTES.key {
+                if let Some(stored_routes) = stored_value.as_mut() {
+                    redact_route_array(stored_routes, route_credentials);
+                }
+                if redact_route_array(&mut value, route_credentials) {
+                    entry["redacted"] = json!(true);
+                }
+            }
             entry["default"] = setting.default_value();
             entry["stored"] = json!(stored_value);
             entry["value"] = value.clone();

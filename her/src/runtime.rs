@@ -1207,7 +1207,7 @@ impl RuntimeContext {
     }
 
     /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
-    fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
+    pub(crate) fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
         if !raw.is_object() {
             return Err("runtime config is invalid");
         }

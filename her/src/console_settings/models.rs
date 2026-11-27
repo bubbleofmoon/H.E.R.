@@ -26,43 +26,30 @@ fn route_redactor(context: &RuntimeContext) -> impl Fn(&str) -> String {
 /// The global settings API applies the same credential masking as the model route list. This changes only response
 /// fields. The settings view marks a masked effective value so the editor can require a full replacement.
 pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value) {
-    let shown = route_redactor(context);
-    let redact = |value: &mut Value| {
-        let mut redacted = false;
-        if let Some(routes) = value.as_array_mut() {
-            for route in routes {
-                for field in ["id", "model"] {
-                    let Some(slot) = route.get_mut(field) else { continue };
-                    if let Some(text) = slot.as_str() {
-                        let safe = shown(text);
-                        if safe != text {
-                            *slot = json!(safe);
-                            redacted = true;
-                        }
-                    }
-                }
-            }
-        }
-        redacted
-    };
+    let credentials = crate::settings::stored_secrets(context).map(|mut keys| {
+        keys.extend(crate::settings::harness_credential(context));
+        keys.sort_unstable_by_key(|key| std::cmp::Reverse(key.len()));
+        keys
+    });
+    let creds_ref = credentials.as_deref().ok();
     if let Some(settings) = reply.get_mut("settings").and_then(Value::as_array_mut) {
         if let Some(entry) = settings.iter_mut().find(|entry| entry["key"] == HARNESS_ROUTES.key) {
-            redact(&mut entry["stored"]);
-            if redact(&mut entry["value"]) {
+            crate::settings::redact_route_array(&mut entry["stored"], creds_ref);
+            if crate::settings::redact_route_array(&mut entry["value"], creds_ref) {
                 entry["redacted"] = json!(true);
             }
         }
     }
     if let Some(entries) = reply.get_mut("entries").and_then(Value::as_array_mut) {
         for entry in entries.iter_mut().filter(|entry| entry["setting"] == HARNESS_ROUTES.key) {
-            redact(&mut entry["old"]);
-            redact(&mut entry["new"]);
+            crate::settings::redact_route_array(&mut entry["old"], creds_ref);
+            crate::settings::redact_route_array(&mut entry["new"], creds_ref);
         }
     }
     if reply["setting"] == HARNESS_ROUTES.key {
         for field in ["value", "stored"] {
             if let Some(value) = reply.get_mut(field) {
-                redact(value);
+                crate::settings::redact_route_array(value, creds_ref);
             }
         }
     }

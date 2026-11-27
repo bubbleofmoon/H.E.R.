@@ -575,3 +575,62 @@ fn ticket443_r3_stored_url_and_routes_credential_suppression() {
     }
     let _ = route_root;
 }
+
+#[test]
+fn ticket443_r4_raw_trailing_slash_secret_and_single_tx_view_consistency() {
+    // 1. Raw URL ending with '/' matching a secret ending with '/' is blocked on set, seed, and stored-row read.
+    let (_root, context) = settings_fixture("ticket443 r4 raw trailing slash set");
+    let slash_tok = "fixture-r4-slash/";
+    assert_eq!(put(&context, CLI, slash_tok).0, 200);
+    let (st, reply) = put(&context, "harness.apiBaseUrl", &format!("https://api.example.com/{slash_tok}"));
+    assert_eq!(st, 400, "raw URL ending in slash matching secret must fail: {reply}");
+    assert_eq!(reply["error"], "setting text contains a credential");
+
+    let (seed_root, seed_ctx) = settings_fixture("ticket443 r4 raw trailing slash seed");
+    let seed_default = seed_ctx.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    std::fs::write(seed_root.0.join("config/harness-api-key"), slash_tok).unwrap();
+    write_config(&seed_root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{slash_tok}")});
+    });
+    assert_eq!(set_quiet(&seed_ctx, json!(4600)).0, 200);
+    assert!(history_page(&seed_ctx, "?setting=harness.apiBaseUrl").0.is_empty());
+    assert_eq!(
+        crate::settings::resolve_model_endpoint_and_key(&seed_ctx).unwrap().effective_endpoint.as_deref(),
+        Some(seed_default.as_str())
+    );
+
+    let (stored_root, stored_ctx) = settings_fixture("ticket443 r4 stored trailing slash");
+    let stored_default = stored_ctx.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    assert_eq!(set_quiet(&stored_ctx, json!(4700)).0, 200);
+    StoreProbe::at(&stored_root.0).set_value(
+        "harness.apiBaseUrl",
+        &json!(format!("https://api.example.com/{slash_tok}")).to_string(),
+    );
+    assert_eq!(put(&stored_ctx, CLI, slash_tok).0, 200);
+    assert_eq!(
+        crate::settings::resolve_model_endpoint_and_key(&stored_ctx).unwrap().effective_endpoint.as_deref(),
+        Some(stored_default.as_str()),
+        "resolver must suppress stored raw URL ending in trailing-slash secret"
+    );
+    let slash_view = setting_view(&stored_ctx, "harness.apiBaseUrl");
+    assert_eq!(slash_view["value"], Value::Null);
+    assert_eq!(slash_view["stored"], json!("(hidden)"));
+
+    // 2. settings::view() redacts harness.routes and projects ownerQQ from the single snapshot directly.
+    let (view_root, view_ctx) = settings_fixture("ticket443 r4 single tx view");
+    let route_tok = "fixture-r4-route-tok";
+    std::fs::write(view_root.0.join("config/harness-api-key"), route_tok).unwrap();
+    write_config(&view_root, |cfg| {
+        cfg["harness"] = json!({"routes": [{"id": "r1", "model": format!("m-{route_tok}")}]});
+    });
+    std::fs::create_dir_all(view_root.0.join("data")).unwrap();
+    std::fs::write(view_root.0.join("data/mode.json"), json!({"mode": "closed-agent"}).to_string()).unwrap();
+    std::fs::write(view_root.0.join("data/closed-agent-owner.json"), json!({"ownerQQ": 9102}).to_string()).unwrap();
+    let direct_view = crate::settings::view(&view_ctx).unwrap();
+    let entries = direct_view["settings"].as_array().unwrap();
+    let routes_entry = entries.iter().find(|e| e["key"] == "harness.routes").unwrap();
+    assert_eq!(routes_entry["value"][0]["model"], json!("m-[REDACTED]"), "settings::view() must mask routes directly: {routes_entry}");
+    assert_eq!(routes_entry["redacted"], json!(true));
+    let owner_entry = entries.iter().find(|e| e["key"] == "ownerQQ").unwrap();
+    assert_eq!(owner_entry["overriddenBy"]["value"], json!(9102));
+}

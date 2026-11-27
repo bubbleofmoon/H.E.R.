@@ -1363,3 +1363,39 @@ fn ticket443_r3_restore_preview_ignores_credential_bearing_archived_url() {
         "restore preview must suppress credential-bearing stored url in archive: {stored_warnings:?}"
     );
 }
+
+#[test]
+fn ticket443_r4_restore_preview_ignores_destination_only_db_secret() {
+    let f = Fixture::new();
+    let context = f.context();
+    let dest_only_tok = "fixture-r4-dest-only";
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(format!("https://archive-r4.example.test/{dest_only_tok}")),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_without_secret = f.backup();
+
+    // Reset endpoint on live destination and store a secret ONLY in destination settings.db.
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(dest_only_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+
+    let warnings = preview(&context, &archive_without_secret, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "destination-only DB secret must not suppress archive endpoint switch warning: {warnings:?}"
+    );
+}

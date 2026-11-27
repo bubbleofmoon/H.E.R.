@@ -59,16 +59,14 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
-            match (method, path) {
-                ("GET", "/api/settings" | "/api/settings/history") => {
-                    models::redact_route_settings(context, &mut value);
-                }
-                ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
-                    if value["setting"] == crate::settings::HARNESS_ROUTES.key =>
-                {
-                    models::redact_route_settings(context, &mut value);
-                }
-                _ => {}
+            if matches!(method, "POST")
+                && matches!(
+                    path,
+                    "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo"
+                )
+                && value["setting"] == crate::settings::HARNESS_ROUTES.key
+            {
+                models::redact_route_settings(context, &mut value);
             }
             (200, JSON_TYPE, value.to_string(), import_diff)
         }

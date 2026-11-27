@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { isSettingWriteLocked, saveSettingValue, SettingItemView } from '../api/client';
+import { isSettingWriteLocked, resetSettingValue, saveSettingValue, SettingItemView } from '../api/client';
 import { useConsole } from '../stores/consoleStore';
 import { formatErrorMessage } from './format';
 
@@ -136,7 +136,7 @@ export function parseSettingDraftForSave(item: SettingItemView | undefined, rawV
 export interface ExtraDirtySource {
   count: number;
   label: string;
-  validateBeforeSave?: () => boolean;
+  prepareSave?: () => ((resolvedEndpoint?: string) => Promise<void>) | null;
   onSave: (resolvedEndpoint?: string) => Promise<void>;
   onDiscard: () => void;
 }
@@ -213,6 +213,7 @@ export function useSettingsDrafts(
 ) {
   const { resetSetting, openConfirm, pushToast, refreshLiveData, setDirtyEntry } = useConsole();
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
+  const [saving, setSaving] = useState(false);
   const mountedRef = useRef(true);
   const itemsRef = useRef(items);
   itemsRef.current = items;
@@ -309,7 +310,12 @@ export function useSettingsDrafts(
       }) => {
         try {
           const parsedValue = parseSettingDraftForSave(item, value);
-          const res = await saveSettingValue(key, parsedValue, confirm, expectedEndpoint);
+          const isClearedEndpoint =
+            (item?.kind.type === 'model endpoint' || key === MODEL_ENDPOINT_KEY) &&
+            parsedValue === null;
+          const res = isClearedEndpoint
+            ? await resetSettingValue(key, confirm)
+            : await saveSettingValue(key, parsedValue, confirm, expectedEndpoint);
           const mirrorErr =
             typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
           const wakeErr =
@@ -401,7 +407,9 @@ export function useSettingsDrafts(
   );
 
   const saveAll = useCallback(
-    async (): Promise<{
+    async (
+      afterExtraSave?: (resolvedEndpoint?: string) => Promise<void>,
+    ): Promise<{
       saved: number;
       failed: string[];
       deferred?: boolean;
@@ -428,9 +436,14 @@ export function useSettingsDrafts(
           confirmLabel: '确认保存',
           danger: true,
           onConfirm: async () => {
-            const batch = await executeSaveBatch(snapshots);
-            if (batch.failed.length === 0 && extraDirty && extraDirty.count > 0) {
-              await extraDirty.onSave(batch.resolvedEndpoint);
+            if (mountedRef.current) setSaving(true);
+            try {
+              const batch = await executeSaveBatch(snapshots);
+              if (batch.failed.length === 0 && afterExtraSave) {
+                await afterExtraSave(batch.resolvedEndpoint);
+              }
+            } finally {
+              if (mountedRef.current) setSaving(false);
             }
           },
         });
@@ -438,7 +451,7 @@ export function useSettingsDrafts(
       }
       return executeSaveBatch(snapshots);
     },
-    [dirtyKeys, drafts, executeSaveBatch, openConfirm, extraDirty],
+    [dirtyKeys, drafts, executeSaveBatch, openConfirm],
   );
 
   useEffect(() => {
@@ -456,19 +469,29 @@ export function useSettingsDrafts(
         count: totalCount,
         label,
         onSave: async () => {
-          if (extraDirty?.validateBeforeSave && !extraDirty.validateBeforeSave()) {
+          const runExtra = extraDirty?.prepareSave
+            ? extraDirty.prepareSave()
+            : extraDirty && extraDirty.count > 0
+              ? extraDirty.onSave
+              : undefined;
+          if (extraDirty?.prepareSave && !runExtra) {
             return;
           }
-          let resolvedEndpoint: string | undefined;
-          if (dirtyKeys.length > 0) {
-            const outcome = await saveAll();
-            if (outcome.deferred || outcome.failed.length > 0) {
-              return;
+          if (mountedRef.current) setSaving(true);
+          try {
+            let resolvedEndpoint: string | undefined;
+            if (dirtyKeys.length > 0) {
+              const outcome = await saveAll(runExtra ?? undefined);
+              if (outcome.deferred || outcome.failed.length > 0) {
+                return;
+              }
+              resolvedEndpoint = outcome.resolvedEndpoint;
             }
-            resolvedEndpoint = outcome.resolvedEndpoint;
-          }
-          if (extraDirty && extraDirty.count > 0) {
-            await extraDirty.onSave(resolvedEndpoint);
+            if (runExtra) {
+              await runExtra(resolvedEndpoint);
+            }
+          } finally {
+            if (mountedRef.current) setSaving(false);
           }
         },
         onDiscard: () => {
@@ -521,6 +544,7 @@ export function useSettingsDrafts(
   return {
     drafts,
     dirtyKeys,
+    saving,
     setDraft,
     clearDraft,
     discardAll,
