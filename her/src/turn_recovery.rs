@@ -827,6 +827,11 @@ impl Pass<'_> {
             Ok(Some((status, unsettled, has_tools)))
         });
         let is_reserved2 = turn.reserved2 || turn.wake_claim.is_some();
+        if is_reserved2 {
+            if let Err(error) = crate::social_state::mode_checked(self.context) {
+                return pause("send-unresolved", error.to_string(), true);
+            }
+        }
         let (status, unsettled, has_tools) = match stored {
             Ok(Some(row)) => row,
             Ok(None) if is_reserved2 && matches!(sends, SendState::None) && turn.attempts.iter().all(|a| !a.accepted) => {
@@ -1135,6 +1140,18 @@ impl Pass<'_> {
                 }
                 continue;
             }
+            if turn.backend == "harness" && turn.state == State::Abandoned {
+                if let Err(error) = close_interrupted_harness(
+                    self.context,
+                    turn,
+                    &crate::harness::Status::Cancelled,
+                    Some("abandoned"),
+                ) {
+                    crate::safe_println!("[recovery] 关闭已放弃回合 {} 失败：{error}", turn.id);
+                    continue;
+                }
+                let _ = rearm_reserved2_if_needed(self.context, self.cfg, turn);
+            }
             settle(journal, &turn.inbound, "handled");
         }
     }
@@ -1237,19 +1254,31 @@ pub fn spawn(context: RuntimeContext) {
 /// committed `end_cancellation("completed", "observationSleep")` before the hub could re-arm `sleepUntil`.
 fn rearm_startup_observation_sleeps(context: &RuntimeContext, cfg: &Value, turns: &[Turn], cutoff: i64) -> bool {
     let mut latest_by_key: std::collections::HashMap<&str, &Turn> = Default::default();
+    let mut keys_with_live_turn: std::collections::HashSet<&str> = Default::default();
     for turn in turns {
         if turn.begun_at <= cutoff {
             latest_by_key.insert(turn.key.as_str(), turn);
+        } else {
+            keys_with_live_turn.insert(turn.key.as_str());
         }
     }
     let mut ok = true;
-    for turn in latest_by_key.into_values() {
+    for (key, turn) in latest_by_key {
+        if keys_with_live_turn.contains(key) {
+            continue;
+        }
         if (turn.reserved2 || turn.wake_claim.is_some())
             && turn.backend == "harness"
             && turn.state == State::Completed
             && turn.outcome_reason == "observationSleep"
         {
-            if let Err(error) = rearm_reserved2_if_needed(context, cfg, turn) {
+            if let Err(error) = crate::social_state::rearm_interrupted_reserved2_wake_before(
+                context,
+                cfg,
+                &turn.key,
+                turn.wake_claim.as_ref(),
+                Some(cutoff),
+            ) {
                 crate::safe_println!("[recovery] observationSleep rearm failed for {}: {error}", turn.key);
                 ok = false;
             }
@@ -2043,6 +2072,27 @@ mod tests {
             .as_str()
             .and_then(crate::wake::parse_iso_ms);
         assert!(sleep_until.is_some(), "interrupted observationSleep must re-arm finite sleepUntil at startup");
+
+        // Retrying recovery after a mid-abandon crash closes the still-running SQLite turn via `finished()`.
+        let mut fx_abandoned = setup_submitted_harness_turn("her-297-abandoned-sqlite-", "reserved2", true, None, true);
+        fx_abandoned.cfg["allow"] = json!({"groups": []});
+        let abandoned_rec = turn_ledger::Recorder::attach(&fx_abandoned.context, &fx_abandoned.turn_id, "group:1");
+        abandoned_rec.end_reconciled("abandoned", "revoked before sqlite close").unwrap();
+        let turns = fold(&turn_ledger::read_records(&fx_abandoned.context).unwrap()).0;
+        Pass { context: &fx_abandoned.context, cfg: &fx_abandoned.cfg }.finished(&fx_abandoned.journal, &turns);
+        assert!(matches!(fx_abandoned.store.status(&fx_abandoned.turn_id).unwrap(), Some(crate::harness::Status::Cancelled)));
+
+        // Unreadable mode.json fails closed as send-unresolved instead of rolling back and resuming a claimed wake.
+        let fx_bad_mode = setup_submitted_harness_turn("her-297-bad-mode-", "reserved2", true, None, true);
+        std::fs::write(fx_bad_mode._root.0.join("data/mode.json"), "{broken").unwrap();
+        let bad_rec = turn_ledger::Recorder::attach(&fx_bad_mode.context, &fx_bad_mode.turn_id, "group:1");
+        bad_rec.wake_claim(&obs_claim).unwrap();
+        let turns = fold(&turn_ledger::read_records(&fx_bad_mode.context).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&fx_bad_mode.context);
+        Pass { context: &fx_bad_mode.context, cfg: &fx_bad_mode.cfg }.reconcile(&fx_bad_mode.journal, &turns[0], &turns, &outbox).await;
+        let paused = fold(&turn_ledger::read_records(&fx_bad_mode.context).unwrap()).0.remove(0);
+        assert_eq!(paused.state, State::Paused);
+        assert_eq!(paused.pause_reason, "send-unresolved");
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch

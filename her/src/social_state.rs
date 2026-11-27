@@ -1569,6 +1569,16 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
     key: &str,
     wake_claim: Option<&Value>,
 ) -> Result<(), String> {
+    rearm_interrupted_reserved2_wake_before(context, cfg, key, wake_claim, None)
+}
+
+pub(crate) fn rearm_interrupted_reserved2_wake_before(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    wake_claim: Option<&Value>,
+    max_wake_at: Option<i64>,
+) -> Result<(), String> {
     if !inbound_admitted(cfg, key)
         || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
         || mode_checked(context).map_err(String::from)? != "reserved2"
@@ -1589,9 +1599,17 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             };
             let original = wake.clone();
             let previous = wake_claim.and_then(|claim| claim.get("previous"));
+            let claim_at = wake_claim.and_then(|claim| claim.get("at")).and_then(Value::as_i64);
+            let same_wake = if let Some(at) = claim_at {
+                wake["lastWakeAt"].as_i64() == Some(at)
+            } else if let Some(cutoff) = max_wake_at {
+                wake["lastWakeAt"].as_i64().is_none_or(|last| last <= cutoff)
+            } else {
+                true
+            };
             let same_config =
                 previous.is_none_or(|prev| prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]);
-            if !same_config {
+            if !same_wake || !same_config {
                 return Ok(());
             }
             if wake["infinite"] != true
@@ -3795,6 +3813,7 @@ mod tests {
                 "wakeConfig": {
                     "mode": "diving",
                     "infinite": false,
+                    "lastWakeAt": 10,
                     "sleepUntil": null,
                     "triggers": {"atMention": true},
                     "confirmedAt": 2
@@ -3811,7 +3830,7 @@ mod tests {
             "still-future deadline from wake_claim must be restored"
         );
 
-        // Consumed past deadline draws a new default sleep.
+        // Consumed past deadline draws a new default sleep when the same wake still owns wakeConfig.
         update_raw(&context, |doc| {
             doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
             Ok(())
@@ -3825,6 +3844,19 @@ mod tests {
             .and_then(crate::wake::parse_iso_ms)
             .expect("past deadline must re-arm a new sleepUntil");
         assert!(rearmed >= before + 60_000);
+
+        // Newer wake claim (lastWakeAt changed) on the same confirmedAt must never be overwritten.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(20);
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim)).unwrap();
+        assert!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
+            "newer live wake must keep its consumed sleepUntil untouched by older claim"
+        );
 
         // Newer model/operator config (infinite: true) is left untouched.
         update_raw(&context, |doc| {
