@@ -1015,6 +1015,26 @@ fn configure_cli_model_with_snapshot(
         .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
     command.env("ANTHROPIC_BASE_URL", model_url)
         .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
+    if !matches_default {
+        let strip_keys: Vec<std::ffi::OsString> = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value?;
+                let key = name.to_str()?;
+                let is_opencode_key = OPENCODE_CLI_KEY_ALIASES.iter().any(|alias| {
+                    if cfg!(windows) {
+                        alias.eq_ignore_ascii_case(key)
+                    } else {
+                        *alias == key
+                    }
+                });
+                is_opencode_key.then(|| name.to_os_string())
+            })
+            .collect();
+        for name in strip_keys {
+            command.env_remove(name);
+        }
+    }
     if let Some(key) = snapshot.cli_model_key {
         let extra = if matches_default { OPENCODE_CLI_KEY_ALIASES.as_slice() } else { &[] };
         for name in BASE_URL_BOUND_CLI_KEY_ALIASES.iter().chain(extra.iter()) {
@@ -1790,6 +1810,46 @@ mod tests {
         assert!(
             super::cli_model_notice(&context, &cfg_oc).is_some(),
             "cli_model_notice must warn for OpenCode when E != D"
+        );
+    }
+
+    #[test]
+    fn ticket443_r11_strips_opencode_env_vars_on_custom_endpoint() {
+        use std::ffi::OsStr;
+        let (_fixture, context) = cli_credential_fixture();
+        let custom_ep = "https://cli-r11.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(custom_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r11-custom-tok"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        let mut cmd = std::process::Command::new("claude");
+        super::configure_isolated_cli_environment(&mut cmd, &context).unwrap();
+        cmd.env("OPENCODE_GO_API_KEY", "stale-opencode-go-tok");
+        cmd.env("OPENCODE_API_KEY", "stale-opencode-tok");
+        super::configure_cli_model(&mut cmd, &context).unwrap();
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(envs.get(OsStr::new("OPENCODE_GO_API_KEY")).copied().flatten(), None);
+        assert_eq!(envs.get(OsStr::new("OPENCODE_API_KEY")).copied().flatten(), None);
+        assert_eq!(
+            envs.get(OsStr::new("ANTHROPIC_AUTH_TOKEN")).copied().flatten(),
+            Some(OsStr::new("fixture-r11-custom-tok"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("OPENAI_API_KEY")).copied().flatten(),
+            Some(OsStr::new("fixture-r11-custom-tok"))
         );
     }
 

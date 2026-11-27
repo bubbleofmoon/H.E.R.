@@ -213,6 +213,7 @@ export function useSettingsDrafts(
     manageDirtyBar?: boolean;
     extraDirty?: ExtraDirtySource | null;
     onSettled?: (keys: string[]) => void | Promise<void>;
+    activeEndpoint?: string | null;
   } = {},
 ) {
   const { resetSetting, openConfirm, pushToast, refreshLiveData, setDirtyEntry } = useConsole();
@@ -221,6 +222,8 @@ export function useSettingsDrafts(
   const mountedRef = useRef(true);
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  const activeEndpointRef = useRef(options.activeEndpoint);
+  activeEndpointRef.current = options.activeEndpoint;
   const draftRevRef = useRef<Record<string, number>>({});
   const manageDirtyBar = options.manageDirtyBar !== false;
   const extraDirty = options.extraDirty ?? null;
@@ -344,8 +347,12 @@ export function useSettingsDrafts(
       const endpointEntry = active.find((entry) => entry.key === MODEL_ENDPOINT_KEY);
       const otherEntries = active.filter((entry) => entry.key !== MODEL_ENDPOINT_KEY);
       const outcomes: Awaited<ReturnType<typeof saveOne>>[] = [];
-      const fallbackEndpoint = captured?.defaultEndpoint ?? resolveActiveModelEndpoint(itemsRef.current, null);
-      let resolvedEndpoint = captured?.initialEndpoint ?? resolveActiveModelEndpoint(itemsRef.current);
+      const fallbackEndpoint = captured
+        ? captured.defaultEndpoint
+        : resolveActiveModelEndpoint(itemsRef.current, null);
+      let resolvedEndpoint = captured
+        ? captured.initialEndpoint
+        : resolveActiveModelEndpoint(itemsRef.current);
 
       if (endpointEntry) {
         const epOutcome = await saveOne(endpointEntry);
@@ -432,7 +439,8 @@ export function useSettingsDrafts(
       if (dirtyKeys.length === 0) {
         return { saved: 0, failed: [] };
       }
-      const capturedEndpoint = resolveActiveModelEndpoint(itemsRef.current);
+      const capturedEndpoint =
+        activeEndpointRef.current ?? resolveActiveModelEndpoint(itemsRef.current);
       const capturedDefaultEndpoint = resolveActiveModelEndpoint(itemsRef.current, null);
       const snapshots = dirtyKeys.map((key) => {
         const item = itemsRef.current.find((s) => s.key === key);

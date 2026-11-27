@@ -1622,3 +1622,50 @@ fn ticket443_r10_full_restore_scrubs_archived_settings_db_and_backup_raw_bytes()
     let hist = crate::settings::history(&context2, Some("harness.apiBaseUrl"), None, None).unwrap();
     assert!(!hist.to_string().contains(host_tok), "history must stay masked: {hist}");
 }
+
+#[test]
+fn ticket443_r11_full_restore_vacuums_unmatched_freed_page_remnants() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://clean-r11-restore.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let base_archive = f.backup();
+    let extracted_db = extract_settings(&f, &base_archive);
+
+    let freed_marker = "freed-r11-unmatched-remnant-xyz";
+    let conn = rusqlite::Connection::open(&extracted_db).unwrap();
+    conn.execute_batch("PRAGMA secure_delete=OFF; PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, 1, 1, 'fixture')",
+        ["freed.remnant.probe", &format!("\"https://{freed_marker}/path\"")],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM settings WHERE key='freed.remnant.probe'", [])
+        .unwrap();
+    conn.close().unwrap();
+
+    let dirty_bytes = fs::read(&extracted_db).unwrap();
+    assert!(
+        dirty_bytes
+            .windows(freed_marker.len())
+            .any(|w| w == freed_marker.as_bytes()),
+        "test setup requires freed-page bytes in archived settings.db"
+    );
+    let dirty_archive = rewrite_archive(&base_archive, "freed-remnant.zip", "settings.db", &dirty_bytes);
+
+    auth_restore(&f, &dirty_archive, false, &mut FakeControl::default()).unwrap();
+    let restored_bytes = fs::read(f.0.join("data/settings.db")).unwrap();
+    assert!(
+        !restored_bytes
+            .windows(freed_marker.len())
+            .any(|w| w == freed_marker.as_bytes()),
+        "full restore must vacuum non-empty settings.db even when no row matches"
+    );
+}

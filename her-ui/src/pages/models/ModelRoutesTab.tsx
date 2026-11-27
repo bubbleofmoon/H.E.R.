@@ -303,7 +303,11 @@ export const ModelRoutesTab: React.FC = () => {
   const { drafts, dirtyKeys, saving, setDraft, clearDraft, handleReset } = useSettingsDrafts(
     curatedModelSettings,
     '模型设置',
-    { extraDirty: extraSecretDirty, onSettled: onModelSettingSettled },
+    {
+      extraDirty: extraSecretDirty,
+      onSettled: onModelSettingSettled,
+      activeEndpoint: activeEndpointInfo.endpoint,
+    },
   );
   savingRef.current = saving;
   const draftsRef = useRef(drafts);
@@ -327,9 +331,11 @@ export const ModelRoutesTab: React.FC = () => {
             rawEndpointDraft,
           )
         : undefined;
+      const defaultEndpoint = resolveActiveModelEndpoint(settings, null);
       let targetEndpoint = isModelSecret ? activeEndpointInfo.endpoint ?? undefined : undefined;
       setSecretBusyKey(item.key);
       try {
+        let endpointSaved = false;
         if (shouldSaveEndpoint) {
           try {
             if (urlToSave === null) {
@@ -337,6 +343,7 @@ export const ModelRoutesTab: React.FC = () => {
             } else {
               await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
             }
+            endpointSaved = true;
           } catch (err) {
             if (mountedRef.current) {
               pushToast(
@@ -350,16 +357,18 @@ export const ModelRoutesTab: React.FC = () => {
           if (draftsRef.current[MODEL_ENDPOINT_KEY] === rawEndpointDraft) {
             clearDraft(MODEL_ENDPOINT_KEY);
           }
-          const freshModels = await loadModels({ syncSettings: true });
           targetEndpoint =
             typeof urlToSave === 'string'
               ? canonicalModelEndpoint(urlToSave) ?? urlToSave
-              : canonicalModelEndpoint(freshModels?.effectiveModelEndpoint) ??
-                (typeof freshModels?.effectiveModelEndpoint === 'string'
-                  ? freshModels.effectiveModelEndpoint
-                  : resolveActiveModelEndpoint(settings, null));
+              : defaultEndpoint;
         }
-        await persistValidatedSecret(item, raw, targetEndpoint);
+        try {
+          await persistValidatedSecret(item, raw, targetEndpoint);
+        } finally {
+          if (endpointSaved && mountedRef.current) {
+            await loadModels({ syncSettings: true });
+          }
+        }
       } finally {
         if (mountedRef.current) {
           setSecretBusyKey(null);

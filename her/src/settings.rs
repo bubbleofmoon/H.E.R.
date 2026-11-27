@@ -84,8 +84,8 @@ pub(crate) use registry::{
 };
 #[cfg(test)]
 pub(crate) use store::{
-    create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
-    NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
+    checkpoint_wal_truncate, create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION,
+    FAIL_UNDO_LOOK, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
     apply, apply_changes, apply_checked_endpoint, apply_conversation, apply_switch_choice,

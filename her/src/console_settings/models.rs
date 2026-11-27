@@ -96,7 +96,7 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                     None => json!({"state": "unknown"}),
                 },
                 "price": {
-                    "label": shown(&rates.label), "currency": rates.currency, "symbol": rates.symbol, "unit": rates.unit,
+                    "label": shown(&rates.label), "currency": shown(&rates.currency), "symbol": shown(&rates.symbol), "unit": rates.unit,
                     "tier": rates.tier, "estimated": rates.estimated, "cacheHit": rates.cache_hit,
                     "cacheMiss": rates.cache_miss, "cacheWrite": rates.cache_write, "output": rates.output,
                 },

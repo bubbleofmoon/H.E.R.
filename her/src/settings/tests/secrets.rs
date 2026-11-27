@@ -1074,3 +1074,198 @@ fn ticket443_r10_models_api_redacts_price_label() {
         "route.price.label must be redacted: {route}"
     );
 }
+
+#[test]
+fn ticket443_r11_secret_save_scrubs_before_resolving_endpoint_and_rejects_leaked_expected() {
+    // (a) Leaked stored harness.apiBaseUrl in settings.db is scrubbed BEFORE binding harness.apiKey.
+    let (root, context) = settings_fixture("ticket443 r11 secret save scrub before resolve");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let tok = "fixture-r11-prebind-tok";
+    let leaked_host = "leaked-r11-db.example.test";
+    let leaked_url = format!("https://{leaked_host}/{tok}");
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+    assert_eq!(put(&context, "harness.apiKey", tok).0, 200);
+
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(snap.effective_endpoint.as_deref(), Some(default_ep.as_str()));
+    assert_eq!(snap.harness_db_key.as_deref(), Some(tok));
+    let raw_key_row = StoreProbe::at(&root.0).value("harness.apiKey").unwrap();
+    assert!(
+        !raw_key_row.contains(leaked_host),
+        "stored harness.apiKey must bind to baseline D, not leaked URL: {raw_key_row}"
+    );
+    let raw_db = std::fs::read(root.0.join("data/settings.db")).unwrap();
+    assert!(
+        !raw_db.windows(leaked_host.len()).any(|w| w == leaked_host.as_bytes()),
+        "raw settings.db must contain zero bytes of leaked DB URL: {leaked_host}"
+    );
+
+    // (b) Unseeded config.json /harness/apiBaseUrl containing tok is suppressed BEFORE resolution,
+    // rejects expectedEndpoint=leaked_url with 409, binds to D without expectedEndpoint, and blocks repost.
+    let (root2, context2) = settings_fixture("ticket443 r11 unseeded leaked config before bind");
+    let default_ep2 = context2.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let tok2 = "fixture-r11-cfgbind-tok";
+    let cfg_host = "leaked-r11-cfg.example.test";
+    let cfg_leaked_url = format!("https://{cfg_host}/{tok2}");
+    write_config(&root2, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": cfg_leaked_url});
+    });
+    let (st_conflict, conflict_reply) = post(
+        &context2,
+        "/api/settings/set",
+        json!({"setting": "harness.apiKey", "value": tok2, "expectedEndpoint": cfg_leaked_url}),
+    );
+    assert_eq!(
+        st_conflict, 409,
+        "saving secret with leaked config endpoint as expectedEndpoint must return 409: {conflict_reply}"
+    );
+    assert_eq!(put(&context2, "harness.apiKey", tok2).0, 200);
+    let snap2 = crate::settings::resolve_model_endpoint_and_key(&context2).unwrap();
+    assert_eq!(snap2.effective_endpoint.as_deref(), Some(default_ep2.as_str()));
+    assert_eq!(snap2.harness_db_key.as_deref(), Some(tok2));
+    assert!(stored_config(&root2).pointer("/harness/apiBaseUrl").is_none());
+    let (st_repost, _) = post(
+        &context2,
+        "/api/settings/set",
+        json!({"setting": "harness.apiBaseUrl", "value": cfg_leaked_url}),
+    );
+    assert_eq!(st_repost, 400);
+}
+
+#[test]
+fn ticket443_r11_wal_checkpoint_truncate_and_pinned_ro_reader() {
+    let (root, context) = settings_fixture("ticket443 r11 wal checkpoint truncate");
+    let tok = "fixture-r11-wal-tok";
+    let wal_host = "wal-r11-pinned.example.test";
+    let leaked_url = format!("https://{wal_host}/{tok}");
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": "https://clean-r11-wal.example.test/v1"})).0,
+        200
+    );
+
+    let db_path = root.0.join("data/settings.db");
+    let ro = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    ro.execute_batch("BEGIN; SELECT count(*) FROM settings;").unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        drop(ro);
+    });
+    let res = put(&context, CLI, tok);
+    releaser.join().unwrap();
+    assert_eq!(res.0, 200);
+
+    let wal_path = root.0.join("data/settings.db-wal");
+    if wal_path.exists() {
+        let wal_bytes = std::fs::read(&wal_path).unwrap();
+        assert!(
+            !wal_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
+            "settings.db-wal must be truncated with zero leaked url bytes"
+        );
+    }
+    let db_bytes = std::fs::read(&db_path).unwrap();
+    assert!(
+        !db_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
+        "settings.db must have zero leaked url bytes after VACUUM + checkpoint"
+    );
+
+    // Also unit-test checkpoint_wal_truncate directly with a short deadline against a pinned RO connection.
+    let ro_pin = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    ro_pin.execute_batch("BEGIN; SELECT count(*) FROM settings;").unwrap();
+    assert_eq!(set_quiet(&context, json!(4650)).0, 200);
+    let rw_conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
+    assert!(
+        crate::settings::checkpoint_wal_truncate(&rw_conn, deadline).is_err(),
+        "checkpoint_wal_truncate must return Err when WAL is pinned past deadline"
+    );
+    drop(rw_conn);
+    drop(ro_pin);
+}
+
+#[test]
+fn ticket443_r11_malformed_json_audit_scrubbed_in_history_undo_and_db() {
+    let (root, context) = settings_fixture("ticket443 r11 malformed json audit");
+    let tok = "sk-r11-malformed-tok";
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    let malformed = json!({"nested": [format!("https://x/{tok}")]}).to_string();
+    StoreProbe::at(&root.0).insert_audit(&[crate::settings::AuditRow {
+        at_ms: 1000,
+        actor: "fixture",
+        source: "migration",
+        scope: "global",
+        key: "harness.apiBaseUrl",
+        old: None,
+        new: Some(malformed.clone()),
+        request: "r11-malformed".to_string(),
+    }]);
+    assert_eq!(put(&context, CLI, tok).0, 200);
+
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["new"], json!("(hidden)"), "{entries:?}");
+    let (st, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(st, 400, "undoing malformed scrubbed audit entry must return 400: {reply}");
+
+    let db = rusqlite::Connection::open(root.0.join("data/settings.db")).unwrap();
+    let raw_new: Option<String> = db
+        .query_row(
+            "SELECT new_value FROM settings_audit WHERE scope='global' AND key='harness.apiBaseUrl'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_new.as_deref(), Some("\"(hidden)\""));
+}
+
+#[test]
+fn ticket443_r11_models_api_redacts_price_currency_and_symbol() {
+    let (root, context) = settings_fixture("ticket443 r11 models currency symbol");
+    let tok = "fixture-r11-price-tok";
+    std::fs::write(root.0.join("config/harness-api-key"), tok).unwrap();
+    write_config(&root, |cfg| {
+        cfg["pricing"] = json!({
+            "currency": format!("USD-{tok}"),
+            "symbol": format!("SYM-{tok}"),
+            "models": { "m1": {} }
+        });
+    });
+    let (st, reply) = post(
+        &context,
+        "/api/settings/set",
+        json!({
+            "setting": "harness.routes",
+            "value": [{"id": "primary", "model": "m1"}]
+        }),
+    );
+    assert_eq!(st, 200, "{reply}");
+    let (m_st, models_reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(m_st, 200, "{models_reply}");
+    let price = &models_reply["routes"][0]["price"];
+    assert!(
+        !price["currency"].as_str().unwrap_or("").contains(tok),
+        "price.currency must be redacted: {price}"
+    );
+    assert!(
+        !price["symbol"].as_str().unwrap_or("").contains(tok),
+        "price.symbol must be redacted: {price}"
+    );
+}

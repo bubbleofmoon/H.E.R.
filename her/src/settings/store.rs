@@ -1199,8 +1199,14 @@ fn resolve_model_endpoint_from_parts(
     default_raw: Option<&str>,
     harness_disk_key: Option<String>,
     secrets: Vec<(&'static str, String, String)>,
+    extra_secret: Option<&str>,
 ) -> Result<ModelEndpointSnapshot, InspectError> {
-    let all_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+    let mut all_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+    if let Some(extra) = extra_secret.filter(|s| !s.is_empty()) {
+        all_secrets.push(extra.to_string());
+        all_secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+        all_secrets.dedup();
+    }
     let (stored_override, scrubbed_hashes) = match conn {
         Some(conn) => (
             stored_model_endpoint_override(conn)?,
@@ -1269,11 +1275,28 @@ fn resolve_model_endpoint_in_conn(
     default_raw: Option<&str>,
     harness_disk_key: Option<String>,
 ) -> Result<ModelEndpointSnapshot, InspectError> {
+    resolve_model_endpoint_in_conn_with_pending(conn, document, default_raw, harness_disk_key, None)
+}
+
+fn resolve_model_endpoint_in_conn_with_pending(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+    extra_secret: Option<&str>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
     let secrets = match conn {
         Some(conn) => secrets_in_checked(conn)?,
         None => Vec::new(),
     };
-    resolve_model_endpoint_from_parts(conn, document, default_raw, harness_disk_key, secrets)
+    resolve_model_endpoint_from_parts(
+        conn,
+        document,
+        default_raw,
+        harness_disk_key,
+        secrets,
+        extra_secret,
+    )
 }
 
 pub(crate) fn resolve_model_endpoint_and_key(
@@ -1289,6 +1312,7 @@ pub(crate) fn resolve_model_endpoint_and_key(
             default_raw,
             harness_disk_key.clone(),
             Vec::new(),
+            None,
         ),
         Some(conn) => read_snapshot_tx(conn, |tx| {
             resolve_model_endpoint_in_conn(
@@ -1902,22 +1926,34 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
     write_back_values(context, stored, &guard)
 }
 
+fn collect_value_strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(s) => out.push(s.as_str()),
+        Value::Array(items) => {
+            for item in items {
+                collect_value_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.as_str());
+                collect_value_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn value_has_leaked_endpoint(
     value: &Value,
     known_secrets: Option<&[String]>,
     scrubbed_hashes: Option<&[String]>,
 ) -> bool {
-    match value {
-        Value::String(raw) => endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| value_has_leaked_endpoint(item, known_secrets, scrubbed_hashes)),
-        Value::Object(map) => map.iter().any(|(k, v)| {
-            endpoint_value_is_scrubbed(k, known_secrets, scrubbed_hashes)
-                || value_has_leaked_endpoint(v, known_secrets, scrubbed_hashes)
-        }),
-        _ => false,
-    }
+    let mut strings = Vec::new();
+    collect_value_strings(value, &mut strings);
+    strings
+        .into_iter()
+        .any(|s| endpoint_value_is_scrubbed(s, known_secrets, scrubbed_hashes))
 }
 
 fn config_has_leaked_endpoint(
@@ -2110,6 +2146,24 @@ fn write_store_with<T>(
     })
 }
 
+pub(crate) fn checkpoint_wal_truncate(
+    conn: &Connection,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    retry_until(deadline, || {
+        let (busy, log, checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(InspectError::from_sqlite)?;
+        if busy == 0 && (log == 0 || checkpointed >= log) {
+            Ok(())
+        } else {
+            Err(InspectError::Retry(STORAGE_ERROR.to_string()))
+        }
+    })
+}
+
 fn write_store_scrubbable<T>(
     context: &RuntimeContext,
     existing_only: bool,
@@ -2154,6 +2208,10 @@ fn write_store_scrubbable<T>(
         let stored = read_stored_values(&conn);
         let guard = read_endpoint_write_guard(&conn, harness_key.as_deref())
             .map_err(InspectError::into_message);
+        if scrubbed {
+            checkpoint_wal_truncate(&conn, std::time::Instant::now() + WAL_SWITCH_WAIT)
+                .map_err(unavailable)?;
+        }
         (result, stored, guard)
     };
     Ok((
@@ -2499,17 +2557,29 @@ fn scrub_endpoint_in_tx(
 ) -> Result<bool, (u16, String)> {
     let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let marker = json!(SECRET_MARKER).to_string();
-    let mut extract_leaked = |text: &str| -> Option<String> {
-        serde_json::from_str::<Value>(text)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|s| s != SECRET_MARKER && should_scrub(s))
+    let mut extract_leaked = |text: &str| -> Vec<String> {
+        let parsed = serde_json::from_str::<Value>(text)
+            .unwrap_or_else(|_| Value::String(text.to_string()));
+        let mut strings = Vec::new();
+        collect_value_strings(&parsed, &mut strings);
+        let mut matched: Vec<String> = strings
+            .into_iter()
+            .filter(|s| *s != SECRET_MARKER && should_scrub(s))
+            .map(str::to_string)
+            .collect();
+        if !matches!(parsed, Value::String(_)) && text != marker && should_scrub(text) {
+            matched.push(text.to_string());
+        }
+        matched
     };
     let mut scrubbed = false;
     let mut hashes = Vec::new();
     if let Some((row_text, revision)) = stored_row(conn, HARNESS_API_BASE_URL.key)? {
-        if let Some(leaked) = extract_leaked(&row_text) {
-            push_endpoint_hashes(&mut hashes, &leaked);
+        let leaked = extract_leaked(&row_text);
+        if !leaked.is_empty() {
+            for s in &leaked {
+                push_endpoint_hashes(&mut hashes, s);
+            }
             conn.execute(
                 "UPDATE settings SET value=?1, revision=?2, updated_ms=?3, updated_by=?4 WHERE key=?5",
                 params![marker, revision + 1, now_ms(), actor, HARNESS_API_BASE_URL.key],
@@ -2538,8 +2608,11 @@ fn scrub_endpoint_in_tx(
         let mut row_changed = false;
         let mut scrub_col = |col: Option<String>| -> Option<String> {
             col.map(|text| {
-                if let Some(leaked) = extract_leaked(&text) {
-                    push_endpoint_hashes(&mut hashes, &leaked);
+                let leaked = extract_leaked(&text);
+                if !leaked.is_empty() {
+                    for s in &leaked {
+                        push_endpoint_hashes(&mut hashes, s);
+                    }
                     row_changed = true;
                     marker.clone()
                 } else {
@@ -2614,11 +2687,11 @@ pub(crate) fn scrub_restored_settings_db(
     .map_err(|(_, error)| error)?;
     if changed {
         tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
-        conn.execute_batch("VACUUM; PRAGMA journal_mode=DELETE;")
-            .map_err(|_| STORAGE_ERROR.to_string())?;
     } else {
         drop(tx);
     }
+    conn.execute_batch("PRAGMA journal_mode=DELETE; VACUUM;")
+        .map_err(|_| STORAGE_ERROR.to_string())?;
     conn.close().map_err(|(_, _)| STORAGE_ERROR.to_string())?;
     for name in SIDECARS {
         if path
@@ -2629,7 +2702,7 @@ pub(crate) fn scrub_restored_settings_db(
             return Err(STORAGE_ERROR.to_string());
         }
     }
-    Ok(changed)
+    Ok(true)
 }
 
 /// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
@@ -2652,15 +2725,41 @@ fn store(
     }
     let harness_key = harness_credential(context);
     let (applied, mirror_error) = write_store_scrubbable(context, false, &[setting.key], false, |conn, document| {
+        let raw_secret = setting
+            .secret
+            .then(|| value.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            .flatten();
+        let mut scrubbed_before = if let Some(secret) = raw_secret.as_deref() {
+            scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+        } else {
+            false
+        };
+        if let Some(secret) = raw_secret.as_deref() {
+            if let Some(cfg_endpoint) = document.pointer(HARNESS_API_BASE_URL.pointer) {
+                let mut strings = Vec::new();
+                collect_value_strings(cfg_endpoint, &mut strings);
+                let mut cfg_hashes = Vec::new();
+                for s in strings {
+                    if endpoint_text_matches_secret(s, secret) {
+                        push_endpoint_hashes(&mut cfg_hashes, s);
+                    }
+                }
+                if !cfg_hashes.is_empty() {
+                    record_scrubbed_endpoint_hashes(conn, cfg_hashes, actor)?;
+                    scrubbed_before = true;
+                }
+            }
+        }
         let is_model_secret =
             setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key;
         let snapshot = if expected_endpoint.is_some() || (setting.secret && !value.is_null() && is_model_secret) {
             Some(
-                resolve_model_endpoint_in_conn(
+                resolve_model_endpoint_in_conn_with_pending(
                     Some(conn),
                     Some(document),
                     context.dependency_url("model"),
                     harness_key.clone(),
+                    raw_secret.as_deref(),
                 )
                 .map_err(|error| (503, error.into_message()))?,
             )
@@ -2685,39 +2784,43 @@ fn store(
                 snapshot.and_then(|s| s.effective_endpoint)
             }
             .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
+            if let Some(secret) = raw_secret.as_deref() {
+                if endpoint_text_matches_secret(&endpoint, secret) {
+                    return Err((400, "credential endpoint contains the secret".to_string()));
+                }
+            }
             json!([endpoint, value]).to_string()
         } else {
             value.to_string()
         };
         reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref())?;
-        let raw_secret = setting
-            .secret
-            .then(|| value.as_str().filter(|s| !s.is_empty()).map(str::to_string))
-            .flatten();
         let value = if setting.secret { json!(!value.is_null()) } else { value };
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
-                let scrubbed = if let Some(secret) = raw_secret.as_deref() {
+                let scrubbed_after = if let Some(secret) = raw_secret.as_deref() {
                     scrub_leaked_endpoint_for_secret(conn, secret, actor)?
                 } else {
                     false
                 };
                 return Ok((
                     Applied { value, revision: *revision, changed: false, mirror_error: None },
-                    scrubbed,
+                    scrubbed_before || scrubbed_after,
                 ));
             }
         }
         validate_rollout_change(conn, document, [(setting, Some(&value))])?;
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
-        let scrubbed = if let Some(secret) = raw_secret.as_deref() {
+        let scrubbed_after = if let Some(secret) = raw_secret.as_deref() {
             scrub_leaked_endpoint_for_secret(conn, secret, actor)?
         } else {
             false
         };
         validate_timing(conn, document, &[setting.key], None)?;
-        Ok((Applied { value, revision, changed: true, mirror_error: None }, scrubbed))
+        Ok((
+            Applied { value, revision, changed: true, mirror_error: None },
+            scrubbed_before || scrubbed_after,
+        ))
     })?;
     Ok(Applied { mirror_error, ..applied })
 }
@@ -2785,9 +2888,6 @@ pub(crate) fn undo(
         let raw_old = old_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
-        let raw_new = new_text
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok());
         if key == HARNESS_API_BASE_URL.key {
             if let Some(setting) = find(&key) {
                 permit(setting)?;
@@ -2796,11 +2896,19 @@ pub(crate) fn undo(
                 read_scrubbed_endpoint_hashes(conn).map_err(|e| (503, e.into_message()))?;
             let secrets = secrets_in(conn).map_err(|error| (503, error))?;
             let known_secrets = collect_known_secrets(&secrets, harness_key.as_deref());
-            let is_scrubbed = [raw_old.as_ref(), raw_new.as_ref()]
+            let is_scrubbed = [old_text.as_deref(), new_text.as_deref()]
                 .into_iter()
                 .flatten()
-                .filter_map(Value::as_str)
-                .any(|s| endpoint_value_is_scrubbed(s, Some(&known_secrets), Some(&scrubbed_hashes)));
+                .any(|raw_text| {
+                    let parsed = serde_json::from_str::<Value>(raw_text)
+                        .unwrap_or_else(|_| Value::String(raw_text.to_string()));
+                    value_has_leaked_endpoint(&parsed, Some(&known_secrets), Some(&scrubbed_hashes))
+                        || endpoint_value_is_scrubbed(
+                            raw_text,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        )
+                });
             if is_scrubbed {
                 return Err((400, "setting text contains a credential".to_string()));
             }
@@ -2916,20 +3024,23 @@ pub(crate) fn history(
             let known_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
             let scrubbed_hashes = read_scrubbed_endpoint_hashes(tx)?;
             let shown = |entry_key: &str, text: Option<String>| {
-                text.map_or(Value::Null, |text| {
-                    let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
-                    match &parsed {
-                        Value::String(s)
-                            if entry_key == HARNESS_API_BASE_URL.key
-                                && endpoint_value_is_scrubbed(
-                                    s,
-                                    Some(&known_secrets),
-                                    Some(&scrubbed_hashes),
-                                ) =>
-                        {
-                            json!(SECRET_MARKER)
-                        }
-                        _ => parsed,
+                text.map_or(Value::Null, |raw_text| {
+                    let parsed = serde_json::from_str::<Value>(&raw_text)
+                        .unwrap_or_else(|_| Value::String(raw_text.clone()));
+                    if entry_key == HARNESS_API_BASE_URL.key
+                        && (value_has_leaked_endpoint(
+                            &parsed,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        ) || endpoint_value_is_scrubbed(
+                            &raw_text,
+                            Some(&known_secrets),
+                            Some(&scrubbed_hashes),
+                        ))
+                    {
+                        json!(SECRET_MARKER)
+                    } else {
+                        parsed
                     }
                 })
             };
@@ -3211,6 +3322,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 default_raw,
                 harness_disk_key.clone(),
                 Vec::new(),
+                None,
             )?;
             Ok((Vec::new(), Vec::new(), Some(snapshot), false))
         }
@@ -3223,6 +3335,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 default_raw,
                 harness_disk_key.clone(),
                 secrets.clone(),
+                None,
             )?;
             let password_is_set = crate::console_auth::administrator_password_is_set_in(tx)?;
             Ok((stored, secrets, Some(snapshot), password_is_set))
@@ -3387,6 +3500,7 @@ pub(crate) fn models_snapshot(
                 default_raw,
                 harness_disk_key.clone(),
                 Vec::new(),
+                None,
             )?;
             Ok((Vec::new(), Some(endpoint_snapshot), Vec::new()))
         }
@@ -3399,6 +3513,7 @@ pub(crate) fn models_snapshot(
                 default_raw,
                 harness_disk_key.clone(),
                 secrets,
+                None,
             )?;
             let conv_values = conversation::read_values_checked(tx)?;
             Ok((stored, Some(endpoint_snapshot), conv_values))
