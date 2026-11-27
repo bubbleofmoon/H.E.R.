@@ -817,7 +817,7 @@ fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
         .any(|selected| value == selected)
         || context
             .dependency_url("model")
-            .is_some_and(|model| value == format!("{}/v1", model.trim_end_matches('/')))
+            .is_some_and(|model| value == crate::runtime::model_openai_base_url(model))
 }
 
 fn path_is_within_runtime(context: &RuntimeContext, value: &str) -> bool {
@@ -1013,7 +1013,7 @@ fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Resul
     let model_url = context.dependency_url("model")
         .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
     command.env("ANTHROPIC_BASE_URL", model_url)
-        .env("OPENAI_BASE_URL", format!("{}/v1", model_url.trim_end_matches('/')));
+        .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
     let key = crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url)
         .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
     if let Some(key) = &key {
@@ -1406,6 +1406,70 @@ mod tests {
             !child.get_envs().any(|(name, value)| value.is_some() && name.to_str().is_some_and(super::is_cli_model_key)),
             "CLI accepted a credential after its endpoint changed"
         );
+    }
+
+    #[test]
+    fn cli_model_preserves_explicit_path_prefix_on_https_model_endpoint() {
+        let (fixture, _) = cli_credential_fixture();
+        let prefixed = "https://api.example.com/compatible-mode/v1";
+        let root = fixture.0.as_path();
+        let write_and_bind = |model_url: &str, expected_openai: &str, key: &str| {
+            std::fs::write(
+                root.join("dependencies.json"),
+                serde_json::json!({
+                    "model": model_url,
+                    "dsh": "http://127.0.0.1:2",
+                    "onebot": "http://127.0.0.1:3",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ctx = crate::runtime::RuntimeContext::from_root(root).unwrap();
+            crate::settings::apply(
+                &ctx,
+                crate::settings::CLI_MODEL_API_KEY.key,
+                &serde_json::json!(key),
+                "fixture",
+                "console",
+            )
+            .unwrap();
+            let mut child = std::process::Command::new("fixture-cli");
+            super::configure_isolated_cli_environment(&mut child, &ctx).unwrap();
+            let keys = super::configure_cli_model(&mut child, &ctx).unwrap();
+            assert_eq!(keys, vec![key.to_string()]);
+            let openai_base = child
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new("OPENAI_BASE_URL"))
+                .and_then(|(_, val)| val);
+            assert_eq!(openai_base, Some(std::ffi::OsStr::new(expected_openai)));
+            assert!(super::selected_dependency_url(&ctx, expected_openai));
+            ctx
+        };
+
+        let prefixed_ctx = write_and_bind(prefixed, prefixed, "fixture-https-cli-key");
+        assert!(!super::selected_dependency_url(
+            &prefixed_ctx,
+            "https://api.example.com/compatible-mode/v1/v1"
+        ));
+
+        let bare = "https://api.example.com";
+        let bare_ctx = write_and_bind(bare, "https://api.example.com/v1", "fixture-https-bare-key");
+        assert!(super::selected_dependency_url(&bare_ctx, "https://api.example.com/v1"));
+        assert!(!super::selected_dependency_url(&bare_ctx, "https://api.example.com/v2"));
+
+        std::fs::write(
+            root.join("dependencies.json"),
+            serde_json::json!({
+                "model": "https://api.example.com/other/v1",
+                "dsh": "http://127.0.0.1:2",
+                "onebot": "http://127.0.0.1:3",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let changed = crate::runtime::RuntimeContext::from_root(root).unwrap();
+        let mut child_changed = std::process::Command::new("fixture-cli");
+        assert!(super::configure_cli_model(&mut child_changed, &changed).is_err());
     }
 
     #[test]

@@ -396,11 +396,14 @@ impl RuntimeContext {
             .ok_or("runtime dependencies are invalid")?;
         let mut dependencies = BTreeMap::new();
         for name in REQUIRED_DEPENDENCIES {
-            let url = dependency_object
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|url| is_loopback_http_endpoint(url))
-                .ok_or("runtime dependencies must use local test endpoints")?;
+            let raw = dependency_object.get(name).and_then(Value::as_str);
+            let url = if name == "model" {
+                raw.filter(|url| is_model_endpoint(url))
+                    .ok_or("runtime model dependency must be a loopback HTTP or HTTPS endpoint")?
+            } else {
+                raw.filter(|url| is_loopback_http_endpoint(url))
+                    .ok_or("runtime dependencies must use local test endpoints")?
+            };
             dependencies.insert(name.to_string(), url.to_string());
         }
         if let Some(value) = dependency_object.get("relay") {
@@ -2671,6 +2674,122 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn model_dependency_accepts_https_and_loopback_paths_while_siblings_stay_loopback() {
+        let root = fixture_root("model-endpoint-rules");
+        for valid in [
+            "http://127.0.0.1:43102",
+            "http://[::1]:43102",
+            "http://127.0.0.1:43102/compatible-mode/v1",
+            "http://[::1]:43102/v1",
+            "https://api.example.com",
+            "https://api.example.com:8443",
+            "https://api.example.com/compatible-mode/v1",
+            "https://api.example.com/v1/",
+        ] {
+            fs::write(
+                root.join("dependencies.json"),
+                json!({
+                    "dsh": "http://127.0.0.1:43101",
+                    "model": valid,
+                    "onebot": "http://127.0.0.1:43103",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let context = RuntimeContext::from_root(&root)
+                .unwrap_or_else(|err| panic!("valid model endpoint {valid} was rejected: {err}"));
+            assert_eq!(context.dependency_url("model"), Some(valid));
+        }
+        for invalid in [
+            "http://api.example.com/v1",
+            "http://192.0.2.1:8317",
+            "http://localhost:8317",
+            "https://user:pass@api.example.com/v1",
+            "https://api.example.com/v1?a=1",
+            "https://api.example.com/v1#x",
+            "https://api.example.com/v1/../v2",
+            "https://api.example.com/./v1",
+            "https://api.example.com//v1",
+            "https://api.example.com/%2f",
+            "https://api.example.com/%5C",
+            "https://api.example.com:0/v1",
+            "https://0.0.0.0/v1",
+            "https://api.example.com/v1 ",
+            "https://api.example.com/v1\u{00A0}",
+            "https://api.example.com/v1\\x",
+            "https://@api.example.com/v1",
+            "https:///api.example.com/v1",
+            "https://api.example.com:/v1",
+        ] {
+            fs::write(
+                root.join("dependencies.json"),
+                json!({
+                    "dsh": "http://127.0.0.1:43101",
+                    "model": invalid,
+                    "onebot": "http://127.0.0.1:43103",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(
+                RuntimeContext::from_root(&root).is_err(),
+                "invalid model endpoint was accepted: {invalid}"
+            );
+        }
+        for (field, bad_url) in [
+            ("dsh", "https://api.example.com/v1"),
+            ("dsh", "http://127.0.0.1:43101/path"),
+            ("onebot", "https://api.example.com/v1"),
+            ("onebot", "http://127.0.0.1:43103/path"),
+            ("relay", "https://api.example.com/v1"),
+            ("relay", "http://127.0.0.1:43105/path"),
+        ] {
+            let mut value = json!({
+                "dsh": "http://127.0.0.1:43101",
+                "model": "http://127.0.0.1:43102",
+                "onebot": "http://127.0.0.1:43103",
+            });
+            value[field] = json!(bad_url);
+            fs::write(root.join("dependencies.json"), value.to_string()).unwrap();
+            assert!(
+                RuntimeContext::from_root(&root).is_err(),
+                "sibling {field} must still reject non-loopback or path URL: {bad_url}"
+            );
+        }
+        assert_eq!(model_openai_base_url("http://127.0.0.1:8317"), "http://127.0.0.1:8317/v1");
+        assert_eq!(model_openai_base_url("http://127.0.0.1:8317/"), "http://127.0.0.1:8317/v1");
+        assert_eq!(model_openai_base_url("https://api.example.com"), "https://api.example.com/v1");
+        assert_eq!(model_openai_base_url("https://api.example.com/"), "https://api.example.com/v1");
+        assert_eq!(model_openai_base_url("https://api.example.com/v1"), "https://api.example.com/v1");
+        assert_eq!(model_openai_base_url("https://api.example.com/v1/"), "https://api.example.com/v1");
+        assert_eq!(
+            model_openai_base_url("https://api.example.com/compatible-mode/v1"),
+            "https://api.example.com/compatible-mode/v1"
+        );
+        assert_eq!(
+            model_openai_base_url("https://api.example.com/compatible-mode/v1/"),
+            "https://api.example.com/compatible-mode/v1"
+        );
+        assert_eq!(
+            model_openai_base_url("http://127.0.0.1:43102/compatible-mode/v1"),
+            "http://127.0.0.1:43102/compatible-mode/v1"
+        );
+        assert_eq!(
+            model_openai_endpoint("https://api.example.com"),
+            "https://api.example.com/v1/"
+        );
+        assert_eq!(
+            model_openai_endpoint("https://api.example.com/compatible-mode/v1"),
+            "https://api.example.com/compatible-mode/v1/"
+        );
+        assert_eq!(
+            model_openai_endpoint("https://api.example.com/compatible-mode/v1/"),
+            "https://api.example.com/compatible-mode/v1/"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn isolated_context_selection_rejects_early_legacy_probe_dispatch() {
         let root = fixture_root("dispatch-guard");
         let args = vec![
@@ -3336,6 +3455,109 @@ fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBu
 
 pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
     crate::loopback_http::LoopbackEndpoint::parse(url).is_ok()
+}
+
+/// Validates `"model"` in `dependencies.json`: either a literal loopback HTTP endpoint (bare
+/// origin or clean path) or an HTTPS endpoint without userinfo, query, fragment, dot segments,
+/// double slashes, encoded slashes, port 0, or unspecified IP hosts.
+pub(crate) fn is_model_endpoint(url: &str) -> bool {
+    if url.is_empty()
+        || url.trim() != url
+        || url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let after_scheme = match parsed.scheme() {
+        "http" => match url.strip_prefix("http://") {
+            Some(rest) => rest,
+            None => return false,
+        },
+        "https" => match url.strip_prefix("https://") {
+            Some(rest) => rest,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let raw_path = after_scheme.find('/').map(|idx| &after_scheme[idx..]);
+    let authority = &after_scheme[..after_scheme.len() - raw_path.map_or(0, str::len)];
+    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
+        return false;
+    }
+    if let Some(path) = raw_path {
+        if path.contains("//") {
+            return false;
+        }
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return false;
+        }
+        let inner = path.strip_prefix('/').unwrap_or(path);
+        let inner = inner.strip_suffix('/').unwrap_or(inner);
+        if !inner.is_empty()
+            && inner.split('/').any(|seg| {
+                seg.is_empty()
+                    || seg == "."
+                    || seg == ".."
+                    || seg.eq_ignore_ascii_case("%2e")
+                    || seg.eq_ignore_ascii_case("%2e%2e")
+                    || seg.eq_ignore_ascii_case(".%2e")
+                    || seg.eq_ignore_ascii_case("%2e.")
+            })
+        {
+            return false;
+        }
+    }
+    match parsed.scheme() {
+        "http" => {
+            let origin = &url[..url.len() - raw_path.map_or(0, str::len)];
+            crate::loopback_http::LoopbackEndpoint::parse(origin).is_ok()
+        }
+        "https" => {
+            if parsed.port() == Some(0) {
+                return false;
+            }
+            match parsed.host() {
+                Some(url::Host::Domain(domain)) => !domain.is_empty(),
+                Some(url::Host::Ipv4(ip)) => !ip.is_unspecified(),
+                Some(url::Host::Ipv6(ip)) => !ip.is_unspecified(),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Returns the OpenAI-compatible base URL (no trailing slash) for a validated `"model"` entry:
+/// preserves explicit non-root path prefixes (e.g. `/compatible-mode/v1` or `/v1`) and appends
+/// `/v1` only to bare origins.
+pub(crate) fn model_openai_base_url(model_url: &str) -> String {
+    let trimmed = model_url.trim_end_matches('/');
+    let has_explicit_path = url::Url::parse(model_url)
+        .ok()
+        .is_some_and(|parsed| !parsed.path().is_empty() && parsed.path() != "/");
+    if has_explicit_path {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+/// Returns the OpenAI-compatible base URL with a trailing `/` for `genai::resolver::Endpoint`
+/// so relative `chat/completions` joins append to the final segment.
+pub(crate) fn model_openai_endpoint(model_url: &str) -> String {
+    format!("{}/", model_openai_base_url(model_url))
 }
 
 /// Validate a single canonical live conversation key from either the CLI or a rollout array.
