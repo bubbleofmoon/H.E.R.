@@ -774,3 +774,72 @@ fn ticket443_r7_undo_older_tombstoned_url_returns_400() {
     let (st, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[1]["entry"]}));
     assert_eq!(st, 400, "undoing older credential-bearing url (later > 0) must return 400: {reply}");
 }
+
+#[test]
+fn ticket443_r8_seed_trailing_slash_secret_scrubs_row_and_migration() {
+    let (root, context) = settings_fixture("ticket443 r8 seed trailing slash secret");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let slash_tok = "fixture-r8-slash/";
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{slash_tok}")});
+    });
+    // Trigger seed() before the trailing-slash secret is stored: canonicalized URL omits trailing '/'.
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    // Saving the trailing-slash secret must still match and tombstone the canonicalized row & migration entry.
+    assert_eq!(put(&context, CLI, slash_tok).0, 200);
+    assert_eq!(post(&context, "/api/settings/reset", json!({"setting": CLI})).0, 200);
+
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(
+        snap.effective_endpoint.as_deref(),
+        Some(default_ep.as_str()),
+        "canonicalized seeded url matching trailing-slash secret must be tombstoned across secret reset"
+    );
+    let url_view = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(url_view["value"], Value::Null, "{url_view}");
+    assert_eq!(url_view["stored"], json!("(hidden)"), "{url_view}");
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0]["source"], json!("migration"));
+    assert_eq!(entries[0]["new"], json!("(hidden)"));
+    assert!(!json!(entries).to_string().contains("fixture-r8-slash"));
+}
+
+#[test]
+fn ticket443_r8_mirror_into_fails_closed_on_malformed_stored_endpoint() {
+    let (root, context) = settings_fixture("ticket443 r8 mirror_into fail closed");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    assert_eq!(put(&context, CLI, "fixture-r8-db-secret").0, 200);
+    // Corrupt stored harness.apiBaseUrl row to non-string JSON so EndpointWriteGuard errors.
+    StoreProbe::at(&root.0).insert_value("harness.apiBaseUrl", "12345");
+    let mut doc = stored_config(&root);
+    doc["notes"] = json!("benign-edit");
+    assert!(
+        crate::settings::mirror_into(&context, &mut doc).is_err(),
+        "mirror_into must fail closed instead of returning Ok(false) on errored EndpointWriteGuard"
+    );
+    assert!(
+        crate::config_tx::write_selected_config_text(&context, &doc.to_string()).is_err(),
+        "config_tx must refuse to publish config.json when EndpointWriteGuard errors"
+    );
+}
+
+#[test]
+fn ticket443_r8_undo_scrubbed_migration_entry_returns_400() {
+    let (root, context) = settings_fixture("ticket443 r8 undo scrubbed migration");
+    let tok = "fixture-r8-mig-tok";
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{tok}")});
+    });
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["source"], json!("migration"));
+    let (st, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(
+        st, 400,
+        "undoing scrubbed migration harness.apiBaseUrl entry must return 400, not 409: {reply}"
+    );
+    assert_eq!(reply["error"], "setting text contains a credential");
+}

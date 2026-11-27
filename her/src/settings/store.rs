@@ -1011,6 +1011,20 @@ fn text_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
     known_secrets.iter().any(|key| text.contains(key))
 }
 
+fn endpoint_text_matches_secret(text: &str, secret: &str) -> bool {
+    if text.contains(secret) {
+        return true;
+    }
+    let stripped = secret.trim_end_matches('/');
+    !stripped.is_empty() && stripped != secret && text.trim_end_matches('/').ends_with(stripped)
+}
+
+fn endpoint_contains_any_secret(text: &str, known_secrets: &[String]) -> bool {
+    known_secrets
+        .iter()
+        .any(|key| endpoint_text_matches_secret(text, key))
+}
+
 pub(crate) fn redact_route_array(value: &mut Value, credentials: Option<&[String]>) -> bool {
     let mut redacted = false;
     if let Some(routes) = value.as_array_mut() {
@@ -1047,10 +1061,10 @@ fn endpoint_value_is_scrubbed(
         .normalize(&Value::String(raw.to_string()))
         .and_then(|v| v.as_str().map(str::to_string));
     let matches_secrets = known_secrets.is_some_and(|secrets| {
-        text_contains_any_secret(raw, secrets)
+        endpoint_contains_any_secret(raw, secrets)
             || normalized
                 .as_deref()
-                .is_some_and(|canonical| text_contains_any_secret(canonical, secrets))
+                .is_some_and(|canonical| endpoint_contains_any_secret(canonical, secrets))
     });
     let matches_hashes = scrubbed_hashes.is_some_and(|hashes| {
         hashes.iter().any(|h| *h == endpoint_text_hash(raw))
@@ -1290,9 +1304,10 @@ fn reject_credential_text(
     let known_secrets = collect_known_secrets(&secrets, harness_key);
     let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
     let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
+    let has_endpoint_credential = |text: &str| endpoint_contains_any_secret(text, &known_secrets);
     if prompt_text.is_some_and(has_any_credential)
-        || endpoint_url.is_some_and(has_any_credential)
-        || raw_endpoint_url.is_some_and(has_any_credential)
+        || endpoint_url.is_some_and(has_endpoint_credential)
+        || raw_endpoint_url.is_some_and(has_endpoint_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
             ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
         }))
@@ -1882,12 +1897,16 @@ fn write_back_values(
 fn mirror_after_commit(
     context: &RuntimeContext,
     stored: Result<Vec<(&'static Setting, Value)>, String>,
-    guard: &EndpointWriteGuard,
+    guard: Result<&EndpointWriteGuard, &str>,
 ) -> Option<String> {
-    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored, guard)) {
-        Ok(blocked) if blocked.is_empty() => None,
-        Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
-        Err(error) => Some(error),
+    let mirror_error = match (stored, guard) {
+        (Ok(stored), Ok(guard)) => match write_back_values(context, stored, guard) {
+            Ok(blocked) if blocked.is_empty() => None,
+            Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
+            Err(error) => Some(error),
+        },
+        (Err(error), _) => Some(error),
+        (_, Err(error)) => Some(error.to_string()),
     };
     if let Some(error) = &mirror_error {
         crate::safe_eprintln!("[settings] config.json does not hold the stored settings: {error}");
@@ -1896,15 +1915,16 @@ fn mirror_after_commit(
 }
 
 /// Puts every stored value into `document`, a `config.json` a console writer is about to write, so the writer never
-/// puts back an older value of a stored setting. Returns whether `document` changed; a change keeps
-/// `config.json.pre-settings` first, and a copy that cannot be kept is an error. A document that is
-/// not an object and a store that cannot be read (the overlay reports it) change nothing.
+/// puts back an older value of a stored setting and never leaves a leaked `harness.apiBaseUrl` behind. Returns whether
+/// `document` changed; a change keeps `config.json.pre-settings` first, and a copy that cannot be kept is an error.
+/// A document that is not an object changes nothing; store-read errors fail closed so a caller never publishes an
+/// unscrubbed `config.json`.
 pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Result<bool, String> {
     if !document.is_object() {
         return Ok(false);
     }
     let harness_key = harness_credential(context);
-    let Ok((stored, guard)) = read_store(context, |conn| match conn {
+    let (stored, guard) = read_store(context, |conn| match conn {
         None => Ok((Vec::new(), EndpointWriteGuard::from_disk_key(harness_key.as_deref()))),
         Some(conn) => read_snapshot_tx(conn, |tx| {
             Ok((
@@ -1912,9 +1932,7 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
                 read_endpoint_write_guard(tx, harness_key.as_deref())?,
             ))
         }),
-    }) else {
-        return Ok(false);
-    };
+    })?;
     let (changed, _) = apply_stored_for_config(document, stored, &guard);
     if changed {
         keep_pre_settings_copy(context)?;
@@ -2033,10 +2051,13 @@ fn write_store_with<T>(
         // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
         let stored = read_stored_values(&conn);
         let guard = read_endpoint_write_guard(&conn, harness_key.as_deref())
-            .unwrap_or_else(|_| EndpointWriteGuard::from_disk_key(harness_key.as_deref()));
+            .map_err(InspectError::into_message);
         (result, stored, guard)
     };
-    Ok((result, mirror_after_commit(context, stored, &guard)))
+    Ok((
+        result,
+        mirror_after_commit(context, stored, guard.as_ref().map_err(String::as_str)),
+    ))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -2369,7 +2390,7 @@ fn scrub_leaked_endpoint_for_secret(
         serde_json::from_str::<Value>(text)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|s| s != SECRET_MARKER && s.contains(secret))
+            .filter(|s| s != SECRET_MARKER && endpoint_text_matches_secret(s, secret))
     };
     let mut hashes = Vec::new();
     if let Some((row_text, revision)) = stored_row(conn, HARNESS_API_BASE_URL.key)? {
@@ -2545,24 +2566,16 @@ pub(crate) fn undo(
         if scope != "global" {
             return conversation::undo_entry(conn, context, entry, (scope, key, source, old_text, new_text), actor);
         }
-        let setting = find(&key)
-            .filter(|setting| !setting.secret && scope == "global" && source != "migration")
-            .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
-        permit(setting)?;
-        let later: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
-                params![setting.key, entry],
-                |row| row.get(0),
-            )
-            .map_err(failed)?;
         let raw_old = old_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
         let raw_new = new_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
-        if setting.key == HARNESS_API_BASE_URL.key {
+        if key == HARNESS_API_BASE_URL.key {
+            if let Some(setting) = find(&key) {
+                permit(setting)?;
+            }
             let scrubbed_hashes =
                 read_scrubbed_endpoint_hashes(conn).map_err(|e| (503, e.into_message()))?;
             let secrets = secrets_in(conn).map_err(|error| (503, error))?;
@@ -2576,6 +2589,17 @@ pub(crate) fn undo(
                 return Err((400, "setting text contains a credential".to_string()));
             }
         }
+        let setting = find(&key)
+            .filter(|setting| !setting.secret && scope == "global" && source != "migration")
+            .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+        permit(setting)?;
+        let later: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
+                params![setting.key, entry],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
         let current = stored_row(conn, setting.key)?;
         if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
             return Err((409, CHANGED_SINCE_ERROR.to_string()));
@@ -2665,10 +2689,11 @@ pub(crate) fn history(
                     match &parsed {
                         Value::String(s)
                             if entry_key == HARNESS_API_BASE_URL.key
-                                && (text_contains_any_secret(s, &known_secrets)
-                                    || scrubbed_hashes
-                                        .iter()
-                                        .any(|h| *h == endpoint_text_hash(s))) =>
+                                && endpoint_value_is_scrubbed(
+                                    s,
+                                    Some(&known_secrets),
+                                    Some(&scrubbed_hashes),
+                                ) =>
                         {
                             json!(SECRET_MARKER)
                         }
@@ -2781,7 +2806,7 @@ pub(crate) fn console_changes(
                 if let Some(hk) = harness_credential(context) {
                     known.push(hk);
                 }
-                if text_contains_any_secret(raw_url, &known) {
+                if endpoint_contains_any_secret(raw_url, &known) {
                     return Err((400, "setting text contains a credential".to_string()));
                 }
             }
@@ -3049,7 +3074,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                     || stored_value
                         .as_ref()
                         .and_then(Value::as_str)
-                        .is_some_and(|s| text_contains_any_secret(s, &known_secrets)))
+                        .is_some_and(|s| endpoint_contains_any_secret(s, &known_secrets)))
             {
                 stored_value = Some(json!(SECRET_MARKER));
             }
