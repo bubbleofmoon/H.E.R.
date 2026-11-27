@@ -415,7 +415,11 @@ fn ticket443_harness_api_key_binding_fallback_expected_endpoint_and_redaction() 
     assert_eq!(put(&context, HARNESS_KEY_SETTING, key_b).0, 200);
     let known_secrets = crate::settings::stored_secrets(&context).unwrap();
     assert!(known_secrets.contains(&key_b.to_string()));
-    let route = crate::harness::ModelRoute::for_model(&context, &format!("m-{key_b}")).unwrap();
+    assert!(
+        crate::harness::ModelRoute::for_model(&context, &format!("m-{key_b}")).is_err(),
+        "for_model must refuse a model containing a credential"
+    );
+    let route = crate::harness::ModelRoute::for_model(&context, "fixture-model").unwrap();
     assert_eq!(route.redact(&format!("before {key_b} {disk_key} after")), "before [REDACTED] [REDACTED] after");
     write_config(&root, |cfg| {
         cfg["harness"]["routes"] = json!([{"id": "r1", "model": format!("m-{key_b}")}]);
@@ -633,4 +637,38 @@ fn ticket443_r4_raw_trailing_slash_secret_and_single_tx_view_consistency() {
     assert_eq!(routes_entry["redacted"], json!(true));
     let owner_entry = entries.iter().find(|e| e["key"] == "ownerQQ").unwrap();
     assert_eq!(owner_entry["overriddenBy"]["value"], json!(9102));
+}
+
+#[test]
+fn ticket443_r5_scrub_tombstones_leaked_url_after_secret_reset_or_rotation() {
+    let (root, context) = settings_fixture("ticket443 r5 permanent scrub");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let leaked_tok = "fixture-r5-tombstone-tok";
+    let leaked_url = format!("https://api.example.com/{leaked_tok}");
+    assert_eq!(put(&context, "harness.apiBaseUrl", &leaked_url).0, 200);
+    assert_eq!(put(&context, CLI, leaked_tok).0, 200);
+
+    // Rotate and then reset the secret: the leaked URL must remain tombstoned everywhere.
+    let (rot_st, rot_reply) = put(&context, CLI, "fixture-r5-rotated-tok");
+    assert_eq!(rot_st, 200, "rotate failed: {rot_reply}");
+    let (rst_st, rst_reply) = post(&context, "/api/settings/reset", json!({"setting": CLI}));
+    assert_eq!(rst_st, 200, "reset failed: {rst_reply}");
+
+    let snap = crate::settings::resolve_model_endpoint_and_key(&context).unwrap();
+    assert_eq!(
+        snap.effective_endpoint.as_deref(),
+        Some(default_ep.as_str()),
+        "rotating/resetting secret must never revive tombstoned url"
+    );
+    let url_view = setting_view(&context, "harness.apiBaseUrl");
+    assert_eq!(url_view["value"], Value::Null, "value must stay null after secret reset: {url_view}");
+    assert_eq!(url_view["stored"], json!("(hidden)"), "stored must stay hidden tombstone: {url_view}");
+    assert!(
+        !stored_config(&root).to_string().contains(leaked_tok),
+        "config.json mirror must omit scrubbed /harness/apiBaseUrl"
+    );
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0]["new"], json!("(hidden)"));
+    assert!(!json!(entries).to_string().contains(leaked_tok));
 }

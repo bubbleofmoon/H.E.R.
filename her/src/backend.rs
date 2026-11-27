@@ -108,7 +108,7 @@ impl CliBackend {
             }
             args.extend(["--output-format".into(), "json".into()]);
         }
-        let env = v
+        let env: Vec<(String, String)> = v
             .get("env")
             .and_then(|e| e.as_object())
             .map(|o| {
@@ -117,6 +117,14 @@ impl CliBackend {
                     .collect()
             })
             .unwrap_or_default();
+        let model_snapshot = crate::settings::resolve_model_endpoint_and_key(context);
+        validate_isolated_cli_settings_with_snapshot(
+            context,
+            model_snapshot.as_ref().ok(),
+            &args,
+            &env,
+        )
+        .map_err(BackendError::Config)?;
         Ok(Self {
             id: id.to_string(),
             cmd: cmd.to_string(),
@@ -1459,6 +1467,34 @@ mod tests {
         assert_eq!(envs.get(OsStr::new("ANTHROPIC_BASE_URL")).copied().flatten(), Some(OsStr::new(override_ep)));
         assert_eq!(envs.get(OsStr::new("OPENAI_BASE_URL")).copied().flatten(), Some(OsStr::new(override_ep)));
         assert_eq!(super::cli_model_notice(&context, &cfg_with_explicit), None);
+    }
+
+    #[test]
+    fn ticket443_r5_cli_backend_construction_validates_against_effective_endpoint() {
+        let (_fixture, context) = cli_credential_fixture();
+        let override_ep = "https://cli-r5.example.test/v1";
+        crate::settings::apply(
+            &context,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(override_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        let stale_d = context.dependency_url("model").unwrap();
+        let stale_cfg = serde_json::json!({
+            "cmd": "fixture-cli",
+            "args": [format!("--endpoint={stale_d}")]
+        });
+        assert!(
+            CliBackend::from_config_with_runtime(&context, "c1", &stale_cfg).is_err(),
+            "construction must reject stale D url when effective endpoint overrides dependencies.json"
+        );
+        let ok_cfg = serde_json::json!({
+            "cmd": "fixture-cli",
+            "args": [format!("--endpoint={override_ep}")]
+        });
+        assert!(CliBackend::from_config_with_runtime(&context, "c1", &ok_cfg).is_ok());
     }
 
     #[test]

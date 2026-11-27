@@ -1114,3 +1114,21 @@ async fn ticket443_live_endpoint_switch_and_db_key_without_disk_file() {
     rig.no_more_requests().await;
     assert_ne!(ep_d, ep2);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn ticket443_r5_for_specs_refuses_credential_in_route_model() {
+    let rig = rig("r5-model-cred-guard", json!({"model": "fake-live"}), None).await;
+    let disk_key = std::fs::read_to_string(rig.root.join("config/harness-api-key")).unwrap();
+    let disk_err = ModelRoute::for_model(&rig.context, &format!("m-{disk_key}"))
+        .err()
+        .unwrap_or_default();
+    assert_eq!(disk_err, "harness route model contains a credential");
+
+    let db_key = "fixture-r5-db-model-guard";
+    crate::settings::apply(&rig.context, "harness.apiKey", &json!(db_key), "administrator", "console")
+        .unwrap();
+    let db_err = ModelRoute::for_model(&rig.context, &format!("m-{db_key}"))
+        .err()
+        .unwrap_or_default();
+    assert_eq!(db_err, "harness route model contains a credential");
+}

@@ -11,18 +11,6 @@ use crate::runtime::RuntimeContext;
 use crate::settings::{CONVERSATION_ROUTE, HARNESS_FIRST_ROUTE, HARNESS_ROUTES};
 use serde_json::{json, Value};
 
-fn route_redactor(context: &RuntimeContext) -> impl Fn(&str) -> String {
-    let credentials = crate::settings::stored_secrets(context).map(|mut keys| {
-        keys.extend(crate::settings::harness_credential(context));
-        keys.sort_unstable_by_key(|key| std::cmp::Reverse(key.len()));
-        keys
-    });
-    move |text| match &credentials {
-        Ok(keys) => keys.iter().fold(text.to_string(), |text, key| crate::harness::redact_credential(&text, key)),
-        Err(_) => "[REDACTED]".to_string(),
-    }
-}
-
 /// The global settings API applies the same credential masking as the model route list. This changes only response
 /// fields. The settings view marks a masked effective value so the editor can require a full replacement.
 pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value) {
@@ -64,18 +52,29 @@ pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value)
 /// is not configured or invalid gives `error` and no routes; `healthError` and `storeError` say why route health or
 /// stored values cannot be read. Route ids and models are shown with credentials redacted.
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let cfg = context.load_config().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let shown = route_redactor(context);
+    let models_snap = crate::settings::models_snapshot(context, super::conversation::admitted_conversations)?;
+    let cfg = &models_snap.cfg;
+    let route_credentials = models_snap
+        .store_error
+        .is_none()
+        .then(|| models_snap.endpoint_snapshot.as_ref().map(|snap| snap.all_secrets.as_slice()))
+        .flatten();
+    let shown = |text: &str| match route_credentials {
+        Some(keys) => keys
+            .iter()
+            .fold(text.to_string(), |acc, key| crate::harness::redact_credential(&acc, key)),
+        None => "[REDACTED]".to_string(),
+    };
     let mut reply = json!({"ok": true, "setting": CONVERSATION_ROUTE.key});
-    reply["firstRoute"] = json!(HARNESS_FIRST_ROUTE.read(&cfg).as_str().map(|id| shown(id)));
-    let chain = match crate::harness::routes::chain(&cfg) {
+    reply["firstRoute"] = json!(HARNESS_FIRST_ROUTE.read(cfg).as_str().map(shown));
+    let chain = match crate::harness::routes::chain(cfg) {
         Ok(chain) => chain,
         Err(error) => {
             reply["error"] = json!(error);
             Vec::new()
         }
     };
-    let health = crate::harness::route_health::report(context, &cfg);
+    let health = crate::harness::route_health::report(context, cfg);
     let table = crate::pricing::resolve(cfg.get("pricing"));
     let now = crate::parity_clock::now_ms();
     let routes: Vec<Value> = chain
@@ -111,25 +110,21 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             reply["healthError"] = json!(error);
         }
     }
-    let view = crate::settings::conversation_view(context, &super::conversation::admitted_conversations(&cfg))?;
-    if let Some(error) = view.get("storeError") {
-        reply["storeError"] = error.clone();
+    if let Some(error) = &models_snap.store_error {
+        reply["storeError"] = json!(error);
     }
-    match crate::settings::resolve_model_endpoint_and_key(context) {
-        Ok(snapshot) => {
+    match &models_snap.endpoint_snapshot {
+        Some(snapshot) => {
             reply["effectiveModelEndpoint"] = json!(snapshot.effective_endpoint);
             reply["effectiveModelEndpointSource"] =
                 json!(snapshot.effective_source.map(crate::settings::ModelEndpointSource::as_str));
         }
-        Err(error) => {
+        None => {
             reply["effectiveModelEndpoint"] = Value::Null;
             reply["effectiveModelEndpointSource"] = Value::Null;
-            if reply.get("storeError").is_none() {
-                reply["storeError"] = json!(error);
-            }
         }
     }
-    let conversations: Vec<Value> = view["conversations"]
+    let conversations: Vec<Value> = models_snap.conversations["conversations"]
         .as_array()
         .map(|rows| {
             rows.iter()
@@ -143,8 +138,8 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                     json!({
                         "conversation": row["conversation"],
                         "admitted": row["admitted"],
-                        "stored": entry["stored"].as_str().map(|id| shown(id)),
-                        "route": route.map(|id| shown(id)),
+                        "stored": entry["stored"].as_str().map(shown),
+                        "route": route.map(shown),
                         "inChain": route.is_some_and(|id| chain.iter().any(|known| known.id == id)),
                         "order": order,
                     })

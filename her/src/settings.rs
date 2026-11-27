@@ -95,14 +95,15 @@ pub(crate) use store::{
     engine_choice, harness_credential, has_endpoint_credentials, has_legacy_engine_choices,
     has_stored_setting, has_stored_values, history, holds_any, import_engine_choices,
     inspect_store, keep_file_members, keep_registry_values, last_good_text, migrate_store_v2,
-    mirror_into, open_store_for_write, overlay, overlay_checked, overlay_values, place_changes,
-    preview, read_archive_secrets, read_archive_values, read_store, record_setting_change,
-    redact_route_array, registry_free, reset, reset_conversation, resolve_config,
-    resolve_live_batch, resolve_model_endpoint_and_key, restore_gate, restore_switch_choice, schema_version_checked,
+    mirror_into, models_snapshot, open_store_for_write, overlay, overlay_checked, overlay_values,
+    place_changes, preview, read_archive_secrets, read_archive_values, read_store,
+    record_setting_change, redact_route_array, registry_free, reset, reset_conversation,
+    resolve_config, resolve_live_batch, resolve_model_endpoint_and_key, restore_gate,
+    restore_switch_choice, schema_version_checked,
     secret_revision, secret_value, security_restore, store_mark, store_path, store_schema_version,
     stored_secrets, stored_setting_row, stored_setting_row_checked, undo, view, write_back,
     Applied, Change, InspectError, ModelEndpointSnapshot, ModelEndpointSource, StoreInspection,
-    CONVERSATION_ERROR, STORAGE_ERROR, STORE_SIDECARS,
+    StoredEndpointOverride, CONVERSATION_ERROR, STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

@@ -1595,7 +1595,7 @@ fn add(
 pub(crate) struct VerifiedArchive {
     pub manifest: Manifest,
     pub credentials: crate::console_auth::ArchivedCredentials,
-    pub archive_model_endpoint: Option<Option<(String, String)>>,
+    pub archive_model_endpoint: Option<crate::settings::StoredEndpointOverride>,
     pub archive_secrets: Vec<String>,
     pub settings_overlay: Vec<(&'static crate::settings::Setting, serde_json::Value)>,
 }

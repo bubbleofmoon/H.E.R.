@@ -606,6 +606,13 @@ impl ModelRoute {
             .to_string();
         let endpoint = crate::runtime::model_openai_endpoint(origin);
         let credentials = snapshot.all_secrets;
+        if order.iter().any(|spec| {
+            credentials
+                .iter()
+                .any(|secret| !secret.is_empty() && spec.model.contains(secret))
+        }) {
+            return Err("harness route model contains a credential".into());
+        }
         let routes = order
             .into_iter()
             .map(|spec| Route {

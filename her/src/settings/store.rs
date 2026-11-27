@@ -22,6 +22,7 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -31,6 +32,7 @@ pub(crate) const STORE_SIDECARS: [&str; 3] = SIDECARS;
 /// Global settings start at v1, conversation settings need v2, and durable console authentication needs v3.
 const SCHEMA_VERSION: i64 = 3;
 const SECRET_MARKER: &str = "(hidden)";
+const SCRUBBED_ENDPOINT_HASHES_KEY: &str = "__scrubbed.harness.apiBaseUrl";
 const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
 pub(crate) const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
@@ -935,9 +937,16 @@ impl ModelEndpointSnapshot {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StoredEndpointOverride {
+    Reset,
+    Suppressed,
+    Value { raw: String, canonical: String },
+}
+
 fn stored_model_endpoint_override(
     conn: &Connection,
-) -> Result<Option<Option<(String, String)>>, InspectError> {
+) -> Result<Option<StoredEndpointOverride>, InspectError> {
     let Some((text, _)) = stored_row_sqlite(conn, HARNESS_API_BASE_URL.key).map_err(InspectError::from_sqlite)?
     else {
         return Ok(None);
@@ -945,17 +954,20 @@ fn stored_model_endpoint_override(
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
     if parsed.is_null() {
-        return Ok(Some(None));
+        return Ok(Some(StoredEndpointOverride::Reset));
     }
     let raw = parsed
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
-    let normalized = HARNESS_API_BASE_URL
+    if raw == SECRET_MARKER {
+        return Ok(Some(StoredEndpointOverride::Suppressed));
+    }
+    let canonical = HARNESS_API_BASE_URL
         .normalize(&parsed)
         .and_then(|v| v.as_str().map(str::to_string))
         .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
-    Ok(Some(Some((raw, normalized))))
+    Ok(Some(StoredEndpointOverride::Value { raw, canonical }))
 }
 
 pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, String> {
@@ -964,7 +976,7 @@ pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, Str
 
 pub(crate) fn archive_model_endpoint_override(
     conn: &Connection,
-) -> Result<Option<Option<(String, String)>>, String> {
+) -> Result<Option<StoredEndpointOverride>, String> {
     stored_model_endpoint_override(conn).map_err(InspectError::into_message)
 }
 
@@ -1030,16 +1042,18 @@ fn safe_config_model_endpoint_override(
 }
 
 fn effective_endpoint_from_overrides(
-    stored_override: Option<Option<(String, String)>>,
+    stored_override: Option<StoredEndpointOverride>,
     document: Option<&Value>,
     default_endpoint: Option<String>,
     known_secrets: &[String],
 ) -> (Option<String>, Option<ModelEndpointSource>) {
     let override_ep = match stored_override {
-        Some(Some((raw, canonical))) => (!text_contains_any_secret(&raw, known_secrets)
-            && !text_contains_any_secret(&canonical, known_secrets))
-            .then_some((canonical, ModelEndpointSource::Settings)),
-        Some(None) => None,
+        Some(StoredEndpointOverride::Value { raw, canonical }) => {
+            (!text_contains_any_secret(&raw, known_secrets)
+                && !text_contains_any_secret(&canonical, known_secrets))
+                .then_some((canonical, ModelEndpointSource::Settings))
+        }
+        Some(StoredEndpointOverride::Reset | StoredEndpointOverride::Suppressed) => None,
         None => document
             .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets))
             .map(|url| (url, ModelEndpointSource::Config)),
@@ -1054,7 +1068,7 @@ fn effective_endpoint_from_overrides(
 }
 
 pub(crate) fn archive_effective_model_endpoint(
-    archive_stored_override: Option<Option<(String, String)>>,
+    archive_stored_override: Option<StoredEndpointOverride>,
     archive_config: &Value,
     default_raw: Option<&str>,
     archive_secrets: &[String],
@@ -1088,7 +1102,10 @@ fn resolve_model_endpoint_from_parts(
     };
     let stored_url_suppressed = matches!(
         &stored_override,
-        Some(Some((raw, canonical)))
+        Some(StoredEndpointOverride::Suppressed)
+    ) || matches!(
+        &stored_override,
+        Some(StoredEndpointOverride::Value { raw, canonical })
             if text_contains_any_secret(raw, &all_secrets)
                 || text_contains_any_secret(canonical, &all_secrets)
     );
@@ -1642,7 +1659,16 @@ fn seed(
 /// place); a file `canonical_config` refuses is not written. No store, no schema yet and no stored value write
 /// nothing; a store that cannot be read is an error.
 pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
-    write_back_values(context, stored_values(context)?)
+    let secrets = read_secrets(context)?;
+    let known = collect_known_secrets(&secrets, harness_credential(context).as_deref());
+    write_back_values(context, stored_values(context)?, (!known.is_empty()).then_some(known.as_slice()))
+}
+
+fn config_has_leaked_endpoint(document: &Value, known_secrets: Option<&[String]>) -> bool {
+    let Some(secrets) = known_secrets else { return false };
+    config_model_endpoint_override(document).is_some_and(|(raw, canonical)| {
+        text_contains_any_secret(&raw, secrets) || text_contains_any_secret(&canonical, secrets)
+    })
 }
 
 /// `write_back` of stored values already read: by a writer, on its own read-write connection before it closed, so that
@@ -1651,15 +1677,26 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
 fn write_back_values(
     context: &RuntimeContext,
     stored: Vec<(&'static Setting, Value)>,
+    known_secrets: Option<&[String]>,
 ) -> Result<Vec<&'static str>, String> {
-    if stored.is_empty() {
+    let has_stored_endpoint = stored.iter().any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
+    let check_config_scrub = !has_stored_endpoint && known_secrets.is_some_and(|s| !s.is_empty());
+    if stored.is_empty() && !check_config_scrub {
         return Ok(Vec::new());
     }
     let mut document = raw_config(context)?;
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    let (changed, blocked) = place(&mut document, stored);
+    let scrub_endpoint = !has_stored_endpoint && config_has_leaked_endpoint(&document, known_secrets);
+    if stored.is_empty() && !scrub_endpoint {
+        return Ok(Vec::new());
+    }
+    let (mut changed, blocked) = place(&mut document, stored);
+    if scrub_endpoint {
+        remove_at(&mut document, HARNESS_API_BASE_URL.pointer);
+        changed = true;
+    }
     if changed {
         #[cfg(test)]
         if FAIL_WRITE_BACK.with(|fail| fail.replace(false)) {
@@ -1678,8 +1715,9 @@ fn write_back_values(
 fn mirror_after_commit(
     context: &RuntimeContext,
     stored: Result<Vec<(&'static Setting, Value)>, String>,
+    known_secrets: Option<Vec<String>>,
 ) -> Option<String> {
-    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored)) {
+    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored, known_secrets.as_deref())) {
         Ok(blocked) if blocked.is_empty() => None,
         Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
         Err(error) => Some(error),
@@ -1787,7 +1825,7 @@ fn write_store_with<T>(
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
-    let (result, stored) = {
+    let (result, stored, known_secrets) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
@@ -1816,9 +1854,13 @@ fn write_store_with<T>(
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
         // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
         let stored = read_stored_values(&conn);
-        (result, stored)
+        let known_secrets = secrets_in(&conn)
+            .ok()
+            .map(|secrets| collect_known_secrets(&secrets, harness_key.as_deref()))
+            .or_else(|| harness_key.clone().map(|k| vec![k]));
+        (result, stored, known_secrets)
     };
-    Ok((result, mirror_after_commit(context, stored)))
+    Ok((result, mirror_after_commit(context, stored, known_secrets)))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -2087,6 +2129,103 @@ fn check_schedule_change(
     super::registry::check_schedule(&document)
 }
 
+fn endpoint_text_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn read_scrubbed_endpoint_hashes(conn: &Connection) -> Result<Vec<String>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, SCRUBBED_ENDPOINT_HASHES_KEY)
+        .map_err(InspectError::from_sqlite)?
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))
+}
+
+fn record_scrubbed_endpoint_hashes(
+    conn: &Connection,
+    new_hashes: Vec<String>,
+    actor: &str,
+) -> Result<(), (u16, String)> {
+    if new_hashes.is_empty() {
+        return Ok(());
+    }
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let (mut hashes, revision) = match stored_row(conn, SCRUBBED_ENDPOINT_HASHES_KEY)? {
+        Some((text, rev)) => {
+            let parsed = serde_json::from_str::<Vec<String>>(&text)
+                .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+            (parsed, rev + 1)
+        }
+        None => (Vec::new(), 1),
+    };
+    let mut added = false;
+    for hash in new_hashes {
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+            added = true;
+        }
+    }
+    if !added {
+        return Ok(());
+    }
+    let payload = json!(hashes).to_string();
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+        params![SCRUBBED_ENDPOINT_HASHES_KEY, payload, revision, now_ms(), actor],
+    )
+    .map_err(failed)?;
+    Ok(())
+}
+
+/// Permanently tombstones stored `harness.apiBaseUrl` and records scrubbed audit-text hashes when they contain `secret`.
+fn scrub_leaked_endpoint_for_secret(
+    conn: &Connection,
+    secret: &str,
+    actor: &str,
+) -> Result<(), (u16, String)> {
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let marker = json!(SECRET_MARKER).to_string();
+    let extract_leaked = |text: &str| -> Option<String> {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| s != SECRET_MARKER && s.contains(secret))
+    };
+    let mut hashes = Vec::new();
+    if let Some((row_text, revision)) = stored_row(conn, HARNESS_API_BASE_URL.key)? {
+        if let Some(leaked) = extract_leaked(&row_text) {
+            hashes.push(endpoint_text_hash(&leaked));
+            conn.execute(
+                "UPDATE settings SET value=?1, revision=?2, updated_ms=?3, updated_by=?4 WHERE key=?5",
+                params![marker, revision + 1, now_ms(), actor, HARNESS_API_BASE_URL.key],
+            )
+            .map_err(failed)?;
+        }
+    }
+    let mut statement = conn
+        .prepare("SELECT old_value, new_value FROM settings_audit WHERE scope='global' AND key=?1")
+        .map_err(failed)?;
+    let rows = statement
+        .query_map([HARNESS_API_BASE_URL.key], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(failed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    for (old_val, new_val) in rows {
+        for text in old_val.into_iter().chain(new_val) {
+            if let Some(leaked) = extract_leaked(&text) {
+                hashes.push(endpoint_text_hash(&leaked));
+            }
+        }
+    }
+    record_scrubbed_endpoint_hashes(conn, hashes, actor)
+}
+
 /// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
@@ -2145,15 +2284,25 @@ fn store(
             value.to_string()
         };
         reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref())?;
+        let raw_secret = setting
+            .secret
+            .then(|| value.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            .flatten();
         let value = if setting.secret { json!(!value.is_null()) } else { value };
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
+                if let Some(secret) = raw_secret.as_deref() {
+                    scrub_leaked_endpoint_for_secret(conn, secret, actor)?;
+                }
                 return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
             }
         }
         validate_rollout_change(conn, document, [(setting, Some(&value))])?;
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        if let Some(secret) = raw_secret.as_deref() {
+            scrub_leaked_endpoint_for_secret(conn, secret, actor)?;
+        }
         validate_timing(conn, document, &[setting.key], None)?;
         Ok(Applied { value, revision, changed: true, mirror_error: None })
     })?;
@@ -2238,6 +2387,16 @@ pub(crate) fn undo(
         let raw_old = old_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        if setting.key == HARNESS_API_BASE_URL.key {
+            let scrubbed_hashes =
+                read_scrubbed_endpoint_hashes(conn).map_err(|e| (503, e.into_message()))?;
+            let is_scrubbed = raw_old.as_ref().and_then(Value::as_str).is_some_and(|s| {
+                s == SECRET_MARKER || scrubbed_hashes.iter().any(|h| *h == endpoint_text_hash(s))
+            });
+            if is_scrubbed {
+                return Err((400, "setting text contains a credential".to_string()));
+            }
+        }
         let restored = old_text
             .map(|text| {
                 serde_json::from_str::<Value>(&text)
@@ -2316,13 +2475,17 @@ pub(crate) fn history(
         read_snapshot_tx(conn, |tx| {
             let secrets = secrets_in_checked(tx)?;
             let known_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
+            let scrubbed_hashes = read_scrubbed_endpoint_hashes(tx)?;
             let shown = |entry_key: &str, text: Option<String>| {
                 text.map_or(Value::Null, |text| {
                     let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
                     match &parsed {
                         Value::String(s)
                             if entry_key == HARNESS_API_BASE_URL.key
-                                && text_contains_any_secret(s, &known_secrets) =>
+                                && (text_contains_any_secret(s, &known_secrets)
+                                    || scrubbed_hashes
+                                        .iter()
+                                        .any(|h| *h == endpoint_text_hash(s))) =>
                         {
                             json!(SECRET_MARKER)
                         }
@@ -2752,6 +2915,67 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         reply["storeError"] = json!(error);
     }
     Ok(reply)
+}
+
+pub(crate) struct ModelsSnapshot {
+    pub cfg: Value,
+    pub endpoint_snapshot: Option<ModelEndpointSnapshot>,
+    pub conversations: Value,
+    pub store_error: Option<String>,
+}
+
+/// Reads effective runtime config, model endpoint/secrets snapshot, and conversation routes in one SQLite read transaction.
+pub(crate) fn models_snapshot(
+    context: &RuntimeContext,
+    admitted: impl FnOnce(&Value) -> Vec<String>,
+) -> Result<ModelsSnapshot, (u16, String)> {
+    let raw_doc = raw_config(context).map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    let snapshot_read = read_store(context, |conn| match conn {
+        None => {
+            let endpoint_snapshot = resolve_model_endpoint_from_parts(
+                None,
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                Vec::new(),
+            )?;
+            Ok((Vec::new(), Some(endpoint_snapshot), Vec::new()))
+        }
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            let stored = read_stored_values_checked(tx)?;
+            let secrets = secrets_in_checked(tx)?;
+            let endpoint_snapshot = resolve_model_endpoint_from_parts(
+                Some(tx),
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                secrets,
+            )?;
+            let conv_values = conversation::read_values_checked(tx)?;
+            Ok((stored, Some(endpoint_snapshot), conv_values))
+        }),
+    });
+    let (stored, endpoint_snapshot, conv_values, store_error) = match snapshot_read {
+        Ok((stored, endpoint_snapshot, conv_values)) => (stored, endpoint_snapshot, conv_values, None),
+        Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
+    };
+    let mut effective_doc = raw_doc;
+    overlay_values(&mut effective_doc, &stored);
+    complete_timing(&mut effective_doc);
+    resolve_live_batch(&mut effective_doc);
+    let cfg = context
+        .normalized_config(&effective_doc)
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let admitted_list = admitted(&cfg);
+    let conversations = conversation::build_view(&cfg, &conv_values, &admitted_list, store_error.clone());
+    Ok(ModelsSnapshot {
+        cfg,
+        endpoint_snapshot,
+        conversations,
+        store_error,
+    })
 }
 
 /// #154: the security settings a console audit undo restores from `restored`, the whole `config.json` of a backup:
