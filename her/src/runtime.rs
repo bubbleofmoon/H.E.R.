@@ -874,8 +874,7 @@ impl RuntimeContext {
     /// Callers must keep the returned handle alive for the ownership period and must not unlink
     /// or atomically replace this file. The OS releases the lock when its handle/process closes,
     /// so a crashed owner can be recovered by opening the same persistent file; marker validation
-    /// and updates must happen only while holding the returned handle. Legacy contexts are
-    /// rejected so this helper cannot silently select a user or production path. This uses
+    /// and updates must happen only while holding the returned handle. This uses
     /// `std::fs::File::try_lock` (stable since Rust 1.89):
     /// <https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock>
     pub fn open_locked_file(&self, area: RuntimeArea, relative: &str) -> Result<fs::File, String> {

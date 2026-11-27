@@ -1078,8 +1078,7 @@ fn decimal_exceeds_limit(value: &str, limit: usize) -> bool {
 }
 
 /// Match frozen JS `readBody` at dispatch for all seven currently dispatchable
-/// role mutation routes. This parser contract applies in selected and legacy
-/// contexts without changing which routes the isolated allowlist opens.
+/// role mutation routes across the console allowlist.
 fn role_management_dispatch_body(req: &Request) -> Result<Option<String>, (u16, String)> {
     let is_role_post = req.method == "POST"
         && matches!(
@@ -6064,8 +6063,7 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
 /// Selected runtime (JS `bridge.js` 4311-4341): a manual token goes to `config.json` and to
 /// `data/console-token`; a generated one only to `data/console-token`, with `consoleToken: ""` in
 /// `config.json` (the runtime loader falls back to the file, `RuntimeContext::load_config`). The
-/// Selected rotation keeps a durable digest-only intent through both publications. The legacy runtime
-/// writes the token to `config.json` and its state file.
+/// Selected rotation keeps a durable digest-only intent through both publications.
 fn handle_console_token_post_tx(
     context: &RuntimeContext,
     body: &str,
@@ -6292,8 +6290,7 @@ fn handle_send_sticker(
 }
 
 /// The selected-runtime path uses only the chosen social state, sticker store, and OneBot
-/// dependency. Keep it separate from the legacy implementation above so adding an isolated
-/// request can never inherit its fixed paths or default OneBot endpoint.
+/// dependency.
 fn handle_send_sticker_selected(
     context: &RuntimeContext,
     headers: &std::collections::HashMap<String, String>,

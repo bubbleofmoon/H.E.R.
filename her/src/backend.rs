@@ -1137,6 +1137,7 @@ impl Backend for DshBackend {
     }
 }
 
+#[cfg(test)]
 /// DSH 全挂之后，按 `backends` 配置依次试 CLI 后端。
 ///
 /// **同步**函数，故意不写成 async：`Backend::ask` 本来就是"等子进程跑完"，
