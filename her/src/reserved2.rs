@@ -2771,7 +2771,7 @@ mod tests {
                 let journal = hub.journal.clone();
                 drop(hub);
 
-                let mut restarted = Hub::new(&context, journal, vec![], true);
+                let mut restarted = Hub::new(&context, journal, vec![]);
                 restarted.tick("bot", 9001).await.unwrap();
                 let _abort = restarted
                     .active
@@ -2842,7 +2842,7 @@ mod tests {
             let journal = hub.journal.clone();
             drop(hub);
 
-            let mut restarted = Hub::new(&context, journal, vec![], true);
+            let mut restarted = Hub::new(&context, journal, vec![]);
             restarted.tick("bot", 9001).await.unwrap();
             let _abort = restarted
                 .active
@@ -2897,7 +2897,7 @@ mod tests {
             let context = hub.context.clone();
             let journal = hub.journal.clone();
             drop(hub);
-            let mut restarted = Hub::new(&context, journal, vec![], true);
+            let mut restarted = Hub::new(&context, journal, vec![]);
             restarted.tick_snapshot_hook = Some(snap_tx);
             let ctx_hook = restarted.context.clone();
             let retire_task = tokio::spawn(async move {
@@ -3131,7 +3131,7 @@ mod tests {
             let _ = active.task.await;
             drop(hub);
 
-            let mut restarted = Hub::new(&context, journal, vec![], true);
+            let mut restarted = Hub::new(&context, journal, vec![]);
             restarted.tick("bot", 9001).await.unwrap();
             let _abort = restarted
                 .active
@@ -3288,7 +3288,7 @@ mod tests {
             let journal = hub.journal.clone();
             drop(hub);
 
-            let mut restarted = Hub::new(&context, journal, vec![], true);
+            let mut restarted = Hub::new(&context, journal, vec![]);
             restarted.ready.push((key.into(), "atMention".into()));
             restarted.tick("bot", 9001).await.unwrap();
             let _abort = restarted
@@ -3397,7 +3397,7 @@ mod tests {
 
             // Restart a fresh Hub: durable turn_ledger fallback checkpoint must retire sleepUntil
             // via retire_pending_startup_timeout and not re-fire the timeout.
-            let mut restarted = Hub::new(&context, journal, vec![], true);
+            let mut restarted = Hub::new(&context, journal, vec![]);
             restarted.tick("bot", 9001).await.unwrap();
             let _abort = restarted
                 .active
