@@ -725,10 +725,6 @@ impl SocialDocument {
         self.conversations.insert(key.into(), conv.to_value());
     }
 
-    pub(crate) fn remove_conversation(&mut self, key: &str) -> bool {
-        self.conversations.remove(key).is_some()
-    }
-
     pub(crate) fn active_tokens(&self) -> Vec<String> {
         self.conversations()
             .filter_map(|(_, c)| c.token().map(str::to_string))

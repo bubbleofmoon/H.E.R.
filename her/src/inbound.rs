@@ -1042,21 +1042,6 @@ pub fn backfill_window(
     ))
 }
 
-/// 唤醒已触发：该会话等待中的事件转为 `processing`，之后由主循环在回合结束时标为 `handled`。
-pub async fn start_processing(
-    journal: &SharedJournal,
-    awaiting: &mut std::collections::HashMap<String, Vec<String>>,
-    in_flight: &mut Vec<String>,
-    conversation: &str,
-    now: i64,
-) -> Result<(), String> {
-    if let Some(keys) = awaiting.remove(conversation) {
-        journal.mark_processing(keys.clone(), now).await?;
-        in_flight.extend(keys);
-    }
-    Ok(())
-}
-
 /// 每次（重）连接后立即调用（快，仅写库）：以上次存活时刻为起点，为每个允许会话记录缺口。
 /// 必须在读取新帧之前完成，否则 `last_seen_ms` 会被新帧刷新而丢掉缺口起点。
 pub fn open_reconnect_gaps(

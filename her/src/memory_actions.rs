@@ -82,6 +82,7 @@ pub(crate) fn handle_http_tx(
     }
 }
 
+#[cfg(test)]
 fn configured_header(headers: &HashMap<String, String>, cfg: &Value) -> ConsoleCapability {
     let expected = cfg["consoleToken"].as_str().unwrap_or("").trim();
     if let Some(value) = headers.get("x-console-token").map(|value| value.trim()) {

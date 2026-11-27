@@ -392,16 +392,6 @@ impl Pipeline {
 
     /// 取消这个会话正在跑的回合（对应 DSH 的 `session/cancel`）。
     ///
-    /// 用途：新来的是确定性触发（@ / 关键词 / 提问），而当前回合还没说出口、
-    /// 又已经跑够久 —— 与其让 @ 排队 3 分钟（JS 那边实测 10:58→11:01），
-    /// 不如把这一轮作废，用新消息重开。已经说过话的回合不取消（见 wake.rs 的判定）。
-    pub fn cancel(&mut self, key: &str) -> Result<(), String> {
-        match self.cancel_with_reason(key, "superseded")?.stop_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
     /// Report exactly the epoch minted by this cancellation so the scheduler can retain
     /// buffered work without adopting a later reset or revocation's token. A failed DSH stop is
     /// reported beside the minted epoch, never instead of it.

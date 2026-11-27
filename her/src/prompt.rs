@@ -1218,6 +1218,7 @@ fn build_inner(
     out
 }
 
+#[cfg(test)]
 /// Self-contained prompt builder for CLI/text-only backends without MCP tool calls.
 /// Inlines recent context, status, and identity so the model outputs only the final message text
 /// for Rust to deliver directly.
