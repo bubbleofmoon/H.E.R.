@@ -19,7 +19,7 @@ def her_cli():
     if target:
         candidates.extend(Path(target) / mode / ('her-cli.exe' if os.name == 'nt' else 'her-cli')
                           for mode in ('debug', 'release'))
-    repo = Path(__file__).resolve().parent.parent
+    repo = Path(__file__).resolve().parents[2]
     candidates.extend(repo / 'her/target' / mode / ('her-cli.exe' if os.name == 'nt' else 'her-cli')
                       for mode in ('debug', 'release'))
     cli = next((candidate for candidate in candidates if candidate.is_file()), None)

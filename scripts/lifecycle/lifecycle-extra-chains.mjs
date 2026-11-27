@@ -6,7 +6,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
-import { developmentRoot } from './fixture-paths.mjs';
+import { developmentRoot } from '../fixture-paths.mjs';
 
 const [exe, runtime, root, support, port] = process.argv.slice(2);
 developmentRoot(runtime, exe);

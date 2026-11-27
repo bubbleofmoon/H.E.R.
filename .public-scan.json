@@ -5917,13 +5917,13 @@
       "reason": "Pinned SHA256 of the official Node runtime archive"
     },
     {
-      "path": "scripts/release-fixture-cleanup.ps1",
+      "path": "scripts/lifecycle/release-fixture-cleanup.ps1",
       "value": "2-1-4-7-0-2-4-8-9-4",
       "line_sha256": "0aa1-0940-ffbf-4641-fb1f-3bd8-8e5b-3465-6416-3f32-090a-cfe9-42d8-97d9-9290-4b9b",
       "reason": "Windows file-not-found HRESULT"
     },
     {
-      "path": "scripts/test-lifecycle-fixture.ps1",
+      "path": "scripts/lifecycle/test-lifecycle-fixture.ps1",
       "value": "0-0-1-0-0-0-0-0",
       "line_sha256": "7e4e-69db-4311-1098-2d06-cf68-afda-61b0-af8b-5d44-9fa0-8334-55f9-59d3-b67e-9c79",
       "reason": "Windows API hexadecimal flags"
