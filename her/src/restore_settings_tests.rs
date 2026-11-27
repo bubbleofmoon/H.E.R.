@@ -1399,3 +1399,73 @@ fn ticket443_r4_restore_preview_ignores_destination_only_db_secret() {
         "destination-only DB secret must not suppress archive endpoint switch warning: {warnings:?}"
     );
 }
+
+#[test]
+fn ticket443_r7_restore_preview_suppresses_archived_scrub_hash_after_secret_rotation() {
+    let f = Fixture::new();
+    let context = f.context();
+    let leaked_tok = "fixture-r7-archive-tok";
+    let leaked_url = format!("https://archive-r7.example.test/{leaked_tok}");
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!(leaked_url),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!(leaked_tok),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    // Rotate secret so leaked_tok is no longer in archive_secrets, only its hash in __scrubbed.harness.apiBaseUrl.
+    crate::settings::apply(
+        &context,
+        "cliModel.apiKey",
+        &json!("fixture-r7-rotated-tok"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    // Re-inject the leaked URL into the pre-backup store/config to verify archive_scrubbed_hashes suppresses it.
+    {
+        let db = rusqlite::Connection::open(f.0.join("data/settings.db")).unwrap();
+        db.execute(
+            "UPDATE settings SET value=?1 WHERE key='harness.apiBaseUrl'",
+            [json!(leaked_url).to_string()],
+        )
+        .unwrap();
+    }
+    let mut cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.0.join("config/config.json")).unwrap()).unwrap();
+    cfg["harness"]["apiBaseUrl"] = json!(leaked_url);
+    std::fs::write(f.0.join("config/config.json"), cfg.to_string()).unwrap();
+    let archive_with_scrub_hash = f.backup();
+
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let warnings = preview(&context, &archive_with_scrub_hash, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "archive_scrubbed_hashes must suppress archived leaked url even after secret rotation: {warnings:?}"
+    );
+    // Without archive_scrubbed_hashes, the rotated-key archive would surface leaked_url.
+    let without_hashes = crate::settings::archive_effective_model_endpoint(
+        Some(crate::settings::StoredEndpointOverride::Value {
+            raw: leaked_url.clone(),
+            canonical: leaked_url.clone(),
+        }),
+        &cfg,
+        context.dependency_url("model"),
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(without_hashes.as_deref(), Some(leaked_url.as_str()));
+}

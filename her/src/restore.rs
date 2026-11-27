@@ -196,6 +196,7 @@ impl Prepared {
                     &raw,
                     context.dependency_url("model"),
                     &verified.archive_secrets,
+                    &verified.archive_scrubbed_hashes,
                     live_snap.harness_disk_key.as_deref(),
                 );
                 if let (Some(e_archive), Some(e_live)) = (

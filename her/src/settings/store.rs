@@ -974,6 +974,10 @@ pub(crate) fn read_archive_secrets(conn: &Connection) -> Result<Vec<String>, Str
     Ok(secrets_in(conn)?.into_iter().map(|(_, _, credential)| credential).collect())
 }
 
+pub(crate) fn read_archive_scrubbed_hashes(conn: &Connection) -> Result<Vec<String>, String> {
+    read_scrubbed_endpoint_hashes(conn).map_err(InspectError::into_message)
+}
+
 pub(crate) fn archive_model_endpoint_override(
     conn: &Connection,
 ) -> Result<Option<StoredEndpointOverride>, String> {
@@ -1104,6 +1108,7 @@ pub(crate) fn archive_effective_model_endpoint(
     archive_config: &Value,
     default_raw: Option<&str>,
     archive_secrets: &[String],
+    archive_scrubbed_hashes: &[String],
     host_disk_key: Option<&str>,
 ) -> Option<String> {
     let mut known_secrets = archive_secrets.to_vec();
@@ -1116,7 +1121,7 @@ pub(crate) fn archive_effective_model_endpoint(
         Some(archive_config),
         default_endpoint,
         &known_secrets,
-        &[],
+        archive_scrubbed_hashes,
     )
     .0
 }
@@ -1695,30 +1700,128 @@ fn seed(
 /// `config.json.pre-settings` is kept. Returns the keys whose pointer passes through a non-object in the file (left in
 /// place); a file `canonical_config` refuses is not written. No store, no schema yet and no stored value write
 /// nothing; a store that cannot be read is an error.
+struct EndpointWriteGuard {
+    known_secrets: Vec<String>,
+    scrubbed_hashes: Vec<String>,
+    endpoint_suppressed: bool,
+}
+
+impl EndpointWriteGuard {
+    fn from_disk_key(harness_disk_key: Option<&str>) -> Self {
+        Self {
+            known_secrets: harness_disk_key.map(str::to_string).into_iter().collect(),
+            scrubbed_hashes: Vec::new(),
+            endpoint_suppressed: false,
+        }
+    }
+
+    fn can_scrub(&self) -> bool {
+        self.endpoint_suppressed || !self.known_secrets.is_empty() || !self.scrubbed_hashes.is_empty()
+    }
+}
+
+fn read_endpoint_write_guard(
+    conn: &Connection,
+    harness_disk_key: Option<&str>,
+) -> Result<EndpointWriteGuard, InspectError> {
+    let secrets = secrets_in_checked(conn)?;
+    let known_secrets = collect_known_secrets(&secrets, harness_disk_key);
+    let scrubbed_hashes = read_scrubbed_endpoint_hashes(conn)?;
+    let endpoint_suppressed = match stored_model_endpoint_override(conn)? {
+        Some(StoredEndpointOverride::Suppressed) => true,
+        Some(StoredEndpointOverride::Value { raw, canonical }) => {
+            endpoint_value_is_scrubbed(&raw, Some(&known_secrets), Some(&scrubbed_hashes))
+                || endpoint_value_is_scrubbed(
+                    &canonical,
+                    Some(&known_secrets),
+                    Some(&scrubbed_hashes),
+                )
+        }
+        _ => false,
+    };
+    Ok(EndpointWriteGuard {
+        known_secrets,
+        scrubbed_hashes,
+        endpoint_suppressed,
+    })
+}
+
+fn filter_stored_for_config(
+    stored: Vec<(&'static Setting, Value)>,
+    guard: &EndpointWriteGuard,
+) -> (Vec<(&'static Setting, Value)>, bool) {
+    let mut scrubbed = guard.endpoint_suppressed;
+    let filtered = stored
+        .into_iter()
+        .filter(|(setting, value)| {
+            if setting.key != HARNESS_API_BASE_URL.key {
+                return true;
+            }
+            let leaked = scrubbed
+                || value.as_str().is_some_and(|raw| {
+                    endpoint_value_is_scrubbed(
+                        raw,
+                        Some(&guard.known_secrets),
+                        Some(&guard.scrubbed_hashes),
+                    )
+                });
+            if leaked {
+                scrubbed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (filtered, scrubbed)
+}
+
+fn should_scrub_config_endpoint(
+    document: &Value,
+    has_stored_endpoint: bool,
+    scrubbed: bool,
+    guard: &EndpointWriteGuard,
+) -> bool {
+    !has_stored_endpoint
+        && document.pointer(HARNESS_API_BASE_URL.pointer).is_some()
+        && (scrubbed
+            || config_has_leaked_endpoint(
+                document,
+                Some(&guard.known_secrets),
+                Some(&guard.scrubbed_hashes),
+            ))
+}
+
+fn apply_stored_for_config(
+    document: &mut Value,
+    stored: Vec<(&'static Setting, Value)>,
+    guard: &EndpointWriteGuard,
+) -> (bool, Vec<&'static str>) {
+    let (filtered_stored, scrubbed) = filter_stored_for_config(stored, guard);
+    let has_stored_endpoint = filtered_stored
+        .iter()
+        .any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
+    let scrub_endpoint = should_scrub_config_endpoint(document, has_stored_endpoint, scrubbed, guard);
+    let (mut changed, blocked) = place(document, filtered_stored);
+    if scrub_endpoint {
+        remove_at(document, HARNESS_API_BASE_URL.pointer);
+        changed = true;
+    }
+    (changed, blocked)
+}
+
 pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
     let harness_key = harness_credential(context);
-    let (secrets, scrubbed_hashes, endpoint_suppressed) = read_store(context, |conn| match conn {
-        None => Ok((Vec::new(), Vec::new(), false)),
+    let (stored, guard) = read_store(context, |conn| match conn {
+        None => Ok((Vec::new(), EndpointWriteGuard::from_disk_key(harness_key.as_deref()))),
         Some(conn) => read_snapshot_tx(conn, |tx| {
-            let suppressed = matches!(
-                stored_model_endpoint_override(tx)?,
-                Some(StoredEndpointOverride::Suppressed)
-            );
             Ok((
-                secrets_in_checked(tx)?,
-                read_scrubbed_endpoint_hashes(tx)?,
-                suppressed,
+                read_stored_values_checked(tx)?,
+                read_endpoint_write_guard(tx, harness_key.as_deref())?,
             ))
         }),
     })?;
-    let known = collect_known_secrets(&secrets, harness_key.as_deref());
-    write_back_values(
-        context,
-        stored_values(context)?,
-        (!known.is_empty()).then_some(known.as_slice()),
-        (!scrubbed_hashes.is_empty()).then_some(scrubbed_hashes.as_slice()),
-        endpoint_suppressed,
-    )
+    write_back_values(context, stored, &guard)
 }
 
 fn config_has_leaked_endpoint(
@@ -1738,35 +1841,13 @@ fn config_has_leaked_endpoint(
 fn write_back_values(
     context: &RuntimeContext,
     stored: Vec<(&'static Setting, Value)>,
-    known_secrets: Option<&[String]>,
-    scrubbed_hashes: Option<&[String]>,
-    endpoint_suppressed: bool,
+    guard: &EndpointWriteGuard,
 ) -> Result<Vec<&'static str>, String> {
-    let mut endpoint_scrubbed = endpoint_suppressed;
-    let filtered_stored: Vec<(&'static Setting, Value)> = stored
-        .into_iter()
-        .filter(|(setting, value)| {
-            if setting.key != HARNESS_API_BASE_URL.key {
-                return true;
-            }
-            let leaked = value
-                .as_str()
-                .is_some_and(|raw| endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes));
-            if leaked {
-                endpoint_scrubbed = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
+    let (filtered_stored, scrubbed) = filter_stored_for_config(stored, guard);
     let has_stored_endpoint = filtered_stored
         .iter()
         .any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
-    let check_config_scrub = !has_stored_endpoint
-        && (endpoint_scrubbed
-            || known_secrets.is_some_and(|s| !s.is_empty())
-            || scrubbed_hashes.is_some_and(|h| !h.is_empty()));
+    let check_config_scrub = !has_stored_endpoint && (scrubbed || guard.can_scrub());
     if filtered_stored.is_empty() && !check_config_scrub {
         return Ok(Vec::new());
     }
@@ -1774,10 +1855,7 @@ fn write_back_values(
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    let scrub_endpoint = !has_stored_endpoint
-        && document.pointer(HARNESS_API_BASE_URL.pointer).is_some()
-        && (endpoint_scrubbed
-            || config_has_leaked_endpoint(&document, known_secrets, scrubbed_hashes));
+    let scrub_endpoint = should_scrub_config_endpoint(&document, has_stored_endpoint, scrubbed, guard);
     if filtered_stored.is_empty() && !scrub_endpoint {
         return Ok(Vec::new());
     }
@@ -1804,19 +1882,9 @@ fn write_back_values(
 fn mirror_after_commit(
     context: &RuntimeContext,
     stored: Result<Vec<(&'static Setting, Value)>, String>,
-    known_secrets: Option<Vec<String>>,
-    scrubbed_hashes: Option<Vec<String>>,
-    endpoint_suppressed: bool,
+    guard: &EndpointWriteGuard,
 ) -> Option<String> {
-    let mirror_error = match stored.and_then(|stored| {
-        write_back_values(
-            context,
-            stored,
-            known_secrets.as_deref(),
-            scrubbed_hashes.as_deref(),
-            endpoint_suppressed,
-        )
-    }) {
+    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored, guard)) {
         Ok(blocked) if blocked.is_empty() => None,
         Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
         Err(error) => Some(error),
@@ -1835,8 +1903,19 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
     if !document.is_object() {
         return Ok(false);
     }
-    let Ok(stored) = stored_values(context) else { return Ok(false) };
-    let (changed, _) = place(document, stored);
+    let harness_key = harness_credential(context);
+    let Ok((stored, guard)) = read_store(context, |conn| match conn {
+        None => Ok((Vec::new(), EndpointWriteGuard::from_disk_key(harness_key.as_deref()))),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            Ok((
+                read_stored_values_checked(tx)?,
+                read_endpoint_write_guard(tx, harness_key.as_deref())?,
+            ))
+        }),
+    }) else {
+        return Ok(false);
+    };
+    let (changed, _) = apply_stored_for_config(document, stored, &guard);
     if changed {
         keep_pre_settings_copy(context)?;
     }
@@ -1924,7 +2003,7 @@ fn write_store_with<T>(
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
-    let (result, stored, known_secrets, scrubbed_hashes, endpoint_suppressed) = {
+    let (result, stored, guard) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
@@ -1953,21 +2032,11 @@ fn write_store_with<T>(
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
         // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
         let stored = read_stored_values(&conn);
-        let known_secrets = secrets_in(&conn)
-            .ok()
-            .map(|secrets| collect_known_secrets(&secrets, harness_key.as_deref()))
-            .or_else(|| harness_key.clone().map(|k| vec![k]));
-        let scrubbed_hashes = read_scrubbed_endpoint_hashes(&conn).ok();
-        let endpoint_suppressed = matches!(
-            stored_model_endpoint_override(&conn),
-            Ok(Some(StoredEndpointOverride::Suppressed))
-        );
-        (result, stored, known_secrets, scrubbed_hashes, endpoint_suppressed)
+        let guard = read_endpoint_write_guard(&conn, harness_key.as_deref())
+            .unwrap_or_else(|_| EndpointWriteGuard::from_disk_key(harness_key.as_deref()));
+        (result, stored, guard)
     };
-    Ok((
-        result,
-        mirror_after_commit(context, stored, known_secrets, scrubbed_hashes, endpoint_suppressed),
-    ))
+    Ok((result, mirror_after_commit(context, stored, &guard)))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -2487,9 +2556,6 @@ pub(crate) fn undo(
                 |row| row.get(0),
             )
             .map_err(failed)?;
-        if later > 0 {
-            return Err((409, CHANGED_SINCE_ERROR.to_string()));
-        }
         let raw_old = old_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
@@ -2511,7 +2577,7 @@ pub(crate) fn undo(
             }
         }
         let current = stored_row(conn, setting.key)?;
-        if current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
+        if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
             return Err((409, CHANGED_SINCE_ERROR.to_string()));
         }
         let restored = old_text

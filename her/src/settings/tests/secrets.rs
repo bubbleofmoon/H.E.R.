@@ -717,4 +717,60 @@ fn ticket443_r6_malformed_config_scrub_never_writes_hidden_and_consecutive_url_u
     assert_eq!(seq_entries.len(), 2);
     let (undo_st, undo_reply) = post(&seq_ctx, "/api/settings/undo", json!({"entry": seq_entries[0]["entry"]}));
     assert_eq!(undo_st, 400, "undoing tombstoned consecutive leaked url must return 400, not 409: {undo_reply}");
+    let (older_undo_st, older_undo_reply) = post(&seq_ctx, "/api/settings/undo", json!({"entry": seq_entries[1]["entry"]}));
+    assert_eq!(
+        older_undo_st, 400,
+        "undoing older tombstoned leaked url (later > 0) must return 400, not 409: {older_undo_reply}"
+    );
+}
+
+#[test]
+fn ticket443_r7_mirror_into_and_write_back_scrub_trailing_slash_secret_raw_url() {
+    let (root, context) = settings_fixture("ticket443 r7 raw trailing slash mirror scrub");
+    let slash_key = "fixture-r7-slash/";
+    let raw_leaked = format!("https://api.example.com/{slash_key}");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    std::fs::write(root.0.join("config/harness-api-key"), slash_key).unwrap();
+    StoreProbe::at(&root.0).insert_value("harness.apiBaseUrl", &json!(raw_leaked).to_string());
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": raw_leaked});
+    });
+
+    crate::settings::write_back(&context).unwrap();
+    let after_wb = stored_config(&root);
+    assert!(
+        after_wb.pointer("/harness/apiBaseUrl").is_none() && !after_wb.to_string().contains(slash_key),
+        "write_back must not mirror or retain raw trailing-slash secret url: {after_wb}"
+    );
+
+    let mut candidate_doc = stored_config(&root);
+    candidate_doc["harness"] = json!({"apiBaseUrl": raw_leaked});
+    crate::settings::mirror_into(&context, &mut candidate_doc).unwrap();
+    assert!(
+        candidate_doc.pointer("/harness/apiBaseUrl").is_none()
+            && !candidate_doc.to_string().contains(slash_key),
+        "mirror_into must scrub raw trailing-slash secret url from document: {candidate_doc}"
+    );
+
+    let mut clean_doc = stored_config(&root);
+    crate::settings::mirror_into(&context, &mut clean_doc).unwrap();
+    assert!(
+        clean_doc.pointer("/harness/apiBaseUrl").is_none()
+            && !clean_doc.to_string().contains(slash_key),
+        "mirror_into must not re-insert suppressed raw trailing-slash url: {clean_doc}"
+    );
+}
+
+#[test]
+fn ticket443_r7_undo_older_tombstoned_url_returns_400() {
+    let (_root, context) = settings_fixture("ticket443 r7 undo older tombstoned url");
+    let tok = "fixture-r7-older-undo-tok";
+    assert_eq!(put(&context, "harness.apiBaseUrl", &format!("https://a.example.test/{tok}")).0, 200);
+    assert_eq!(put(&context, "harness.apiBaseUrl", "https://clean-r7.example.test/v1").0, 200);
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert_eq!(entries.len(), 2);
+    // Older entry (`entries[1]`) has later > 0, yet contains a credential -> must return 400, not 409.
+    let (st, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[1]["entry"]}));
+    assert_eq!(st, 400, "undoing older credential-bearing url (later > 0) must return 400: {reply}");
 }
