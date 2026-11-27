@@ -160,9 +160,6 @@ fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
             if setting == crate::settings::HARNESS_API_KEY.key
                 || setting == crate::settings::CLI_MODEL_API_KEY.key =>
         {
-            if exp.trim().is_empty() {
-                return Err((400, "expectedEndpoint must be a non-empty string".to_string()));
-            }
             Some(exp.as_str())
         }
         Some(Value::String(_)) => {

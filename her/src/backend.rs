@@ -150,8 +150,14 @@ impl Backend for CliBackend {
         let exe = resolve_command(&self.cmd).ok_or_else(|| {
             BackendError::Unavailable(format!("命令 {} 不在 PATH 里", self.cmd))
         })?;
-        validate_isolated_cli_settings(&self.context, &self.args, &self.env)
-            .map_err(BackendError::Config)?;
+        let model_snapshot = crate::settings::resolve_model_endpoint_and_key(&self.context);
+        validate_isolated_cli_settings_with_snapshot(
+            &self.context,
+            model_snapshot.as_ref().ok(),
+            &self.args,
+            &self.env,
+        )
+        .map_err(BackendError::Config)?;
         // 输出走**临时文件**而不是管道：管道有两个坑 ——
         // ① 缓冲区写满会阻塞子进程；② `wait_with_output` 没有超时，
         //    CLI 后端是 agent（会自己跑工具循环），实测长提示词下能跑 19 分钟。
@@ -201,7 +207,7 @@ impl Backend for CliBackend {
             }
             cmd.env(k, v);
         }
-        let credentials = configure_cli_model(&mut cmd, &self.context)?;
+        let credentials = configure_cli_model_with_snapshot(&mut cmd, model_snapshot)?;
         let status = run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?;
         // 进程已退出，从临时文件读结果
         let (stdout_text, stderr_text) = output_files.read_texts()?;
@@ -722,7 +728,11 @@ fn isolated_environment_key(key: &str) -> bool {
     )
 }
 
-fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
+fn selected_dependency_url_with_snapshot(
+    context: &RuntimeContext,
+    snapshot: Option<&crate::settings::ModelEndpointSnapshot>,
+    value: &str,
+) -> bool {
     if ["dsh", "onebot", "onebot_ws", "relay"]
         .iter()
         .filter_map(|name| context.dependency_url(name))
@@ -730,14 +740,17 @@ fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
     {
         return true;
     }
-    let Ok(snapshot) = crate::settings::resolve_model_endpoint_and_key(context) else {
-        return false;
-    };
-    let Some(effective) = snapshot.effective_endpoint.as_deref() else {
+    let Some(effective) = snapshot.and_then(|snap| snap.effective_endpoint.as_deref()) else {
         return false;
     };
     let canonical = crate::runtime::canonical_model_endpoint(value);
     canonical == effective || canonical == crate::runtime::model_openai_base_url(effective)
+}
+
+#[cfg(test)]
+fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
+    let snapshot = crate::settings::resolve_model_endpoint_and_key(context).ok();
+    selected_dependency_url_with_snapshot(context, snapshot.as_ref(), value)
 }
 
 fn path_is_within_runtime(context: &RuntimeContext, value: &str) -> bool {
@@ -789,8 +802,9 @@ fn contains_parent_component(value: &str) -> bool {
         .any(|component| component == "..")
 }
 
-fn validate_isolated_cli_settings(
+fn validate_isolated_cli_settings_with_snapshot(
     context: &RuntimeContext,
+    snapshot: Option<&crate::settings::ModelEndpointSnapshot>,
     args: &[String],
     env: &[(String, String)],
 ) -> Result<(), String> {
@@ -799,7 +813,7 @@ fn validate_isolated_cli_settings(
         if is_windows_command_switch(value) {
             continue;
         }
-        if value.contains("://") && !selected_dependency_url(context, value) {
+        if value.contains("://") && !selected_dependency_url_with_snapshot(context, snapshot, value) {
             return Err("isolated CLI arguments may only use selected runtime dependency URLs".into());
         }
         if contains_parent_component(value) {
@@ -813,7 +827,7 @@ fn validate_isolated_cli_settings(
         if isolated_environment_key(key) {
             return Err(format!("isolated backend cannot override selected runtime environment variable {key}"));
         }
-        if value.contains("://") && !selected_dependency_url(context, value) {
+        if value.contains("://") && !selected_dependency_url_with_snapshot(context, snapshot, value) {
             return Err(format!("isolated backend environment variable {key} must use a selected runtime dependency"));
         }
         let key_upper = key.to_ascii_uppercase();
@@ -828,6 +842,16 @@ fn validate_isolated_cli_settings(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn validate_isolated_cli_settings(
+    context: &RuntimeContext,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let snapshot = crate::settings::resolve_model_endpoint_and_key(context).ok();
+    validate_isolated_cli_settings_with_snapshot(context, snapshot.as_ref(), args, env)
 }
 
 fn configure_isolated_cli_environment(
@@ -932,8 +956,11 @@ pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<
     }
 }
 
-fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
-    let snapshot = crate::settings::resolve_model_endpoint_and_key(context)
+fn configure_cli_model_with_snapshot(
+    command: &mut Command,
+    snapshot: Result<crate::settings::ModelEndpointSnapshot, String>,
+) -> Result<Vec<String>, BackendError> {
+    let snapshot = snapshot
         .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
     let model_url = snapshot
         .effective_endpoint
@@ -960,6 +987,14 @@ fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Resul
     }
     explicit.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
     Ok(explicit)
+}
+
+#[cfg(test)]
+fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
+    configure_cli_model_with_snapshot(
+        command,
+        crate::settings::resolve_model_endpoint_and_key(context),
+    )
 }
 
 /// 按 id 跑指定的 CLI 后端（会话级后端覆盖用）。

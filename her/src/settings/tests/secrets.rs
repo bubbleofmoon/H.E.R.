@@ -424,3 +424,74 @@ fn ticket443_harness_api_key_binding_fallback_expected_endpoint_and_redaction() 
     assert_eq!(m_status, 200);
     assert!(!models_reply.to_string().contains(key_b), "models list leaked harness.apiKey: {models_reply}");
 }
+
+#[test]
+fn ticket443_r2_credential_url_hidden_cli_source_and_blank_expected_endpoint() {
+    const HARNESS_KEY_SETTING: &str = "harness.apiKey";
+    let (root, context) = settings_fixture("ticket443 r2 regressions");
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    // 1. cliModel.apiKey view exposes source: null when unset, "settings" when bound, null when bound elsewhere.
+    let cli_unset = setting_view(&context, CLI);
+    assert_eq!(cli_unset.get("source"), Some(&Value::Null), "unset cliModel.apiKey must include source=null: {cli_unset}");
+    assert_eq!(put(&context, CLI, CLI_KEY).0, 200);
+    let cli_set = setting_view(&context, CLI);
+    assert_eq!(cli_set["isSet"], true);
+    assert_eq!(cli_set.get("source"), Some(&json!("settings")), "bound cliModel.apiKey must report source=settings: {cli_set}");
+    assert_eq!(put(&context, "harness.apiBaseUrl", "https://r2-other.example.test/v1").0, 200);
+    let cli_moved = setting_view(&context, CLI);
+    assert_eq!(cli_moved["isSet"], false);
+    assert_eq!(cli_moved["boundElsewhere"], true);
+    assert_eq!(cli_moved.get("source"), Some(&Value::Null), "moved cliModel.apiKey must report source=null: {cli_moved}");
+
+    // 2. Blank string expectedEndpoint reaches transactional store check and returns 409 (not 400).
+    for (setting, exp) in [(HARNESS_KEY_SETTING, ""), (CLI, "   ")] {
+        let (status, reply) = post(
+            &context,
+            "/api/settings/set",
+            json!({"setting": setting, "value": "fixture-r2-key-alpha", "expectedEndpoint": exp}),
+        );
+        assert_eq!(status, 409, "blank expectedEndpoint for {setting} must return 409: {reply}");
+    }
+    let (other_blank_status, _) = post(
+        &context,
+        "/api/settings/set",
+        json!({"setting": SEARCH, "value": KEY, "expectedEndpoint": ""}),
+    );
+    assert_eq!(other_blank_status, 400);
+
+    // 3. Credential-bearing config.json /harness/apiBaseUrl must never leak via resolver, GET /api/settings, or GET /api/settings/models.
+    let (leak_root, leak_ctx) = settings_fixture("ticket443 r2 config credential url");
+    let leak_default = leak_ctx.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let stored_val = "fixture-r2-alpha-val";
+    assert_eq!(put(&leak_ctx, CLI, stored_val).0, 200);
+    let disk_val = "fixture-r2-beta-val";
+    std::fs::write(leak_root.0.join("config/harness-api-key"), disk_val).unwrap();
+
+    for (label, leaked) in [("db-val", stored_val), ("disk-val", disk_val)] {
+        write_config(&leak_root, |cfg| {
+            cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{leaked}")});
+        });
+        let snap = crate::settings::resolve_model_endpoint_and_key(&leak_ctx).unwrap();
+        assert_eq!(
+            snap.effective_endpoint.as_deref(),
+            Some(leak_default.as_str()),
+            "{label}: resolver must ignore credential-bearing config.json url"
+        );
+        let view_entry = setting_view(&leak_ctx, "harness.apiBaseUrl");
+        assert_eq!(
+            view_entry["value"],
+            Value::Null,
+            "{label}: GET /api/settings must hide credential-bearing config.json url: {view_entry}"
+        );
+        let (m_status, models_reply) = admin_request(&leak_ctx, "GET", "/api/settings/models", None);
+        assert_eq!(m_status, 200);
+        assert_eq!(
+            models_reply["effectiveModelEndpoint"],
+            json!(leak_default),
+            "{label}: GET /api/settings/models must ignore credential-bearing config.json url: {models_reply}"
+        );
+        assert_eq!(models_reply["effectiveModelEndpointSource"], json!("dependencies.json"));
+    }
+    let _ = (root, default_ep);
+}

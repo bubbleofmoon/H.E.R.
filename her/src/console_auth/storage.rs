@@ -94,11 +94,8 @@ pub(super) fn administrator_password_in(
     administrator_password_checked(conn).map_err(InspectError::into_message)
 }
 
-pub(crate) fn administrator_password_is_set(context: &RuntimeContext) -> Result<bool, String> {
-    read_store(context, |conn| match conn {
-        None => Ok(false),
-        Some(conn) => Ok(administrator_password_checked(conn)?.is_some()),
-    })
+pub(crate) fn administrator_password_is_set_in(conn: &Connection) -> Result<bool, InspectError> {
+    Ok(administrator_password_checked(conn)?.is_some())
 }
 
 #[cfg(test)]

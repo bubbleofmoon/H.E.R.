@@ -268,6 +268,7 @@ export const SettingField: React.FC<{
       ) : kind.type === 'password' ? (
         <input
           type="password"
+          aria-label={setting.label}
           autoComplete="new-password"
           value={typeof draftValue === 'string' ? draftValue : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
@@ -286,6 +287,7 @@ export const SettingField: React.FC<{
         <div className="space-y-1">
           <input
             type="text"
+            aria-label={setting.label}
             maxLength={kind.maxChars}
             value={typeof effective === 'string' ? effective : ''}
             onChange={(e) => {

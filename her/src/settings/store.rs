@@ -689,6 +689,16 @@ fn inspect_attempt(
     }
 }
 
+fn read_snapshot_tx<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T, InspectError>,
+) -> Result<T, InspectError> {
+    let tx = conn.unchecked_transaction().map_err(InspectError::from_sqlite)?;
+    let value = read(&tx)?;
+    tx.rollback().map_err(InspectError::from_sqlite)?;
+    Ok(value)
+}
+
 pub(crate) fn read_store<T>(
     context: &RuntimeContext,
     mut read: impl FnMut(Option<&Connection>) -> Result<T, InspectError>,
@@ -945,28 +955,54 @@ pub(crate) fn archive_model_endpoint_override(conn: &Connection) -> Result<Optio
     stored_model_endpoint_override(conn).map_err(InspectError::into_message)
 }
 
-fn resolve_model_endpoint_in_conn(
+pub(crate) fn config_model_endpoint_override(document: &Value) -> Option<String> {
+    HARNESS_API_BASE_URL
+        .found_in(document)
+        .and_then(|v| HARNESS_API_BASE_URL.normalize(v))
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
+fn text_contains_credential(
+    text: &str,
+    secrets: &[(&'static str, String, String)],
+    harness_key: Option<&str>,
+) -> bool {
+    harness_key.is_some_and(|key| text.contains(key))
+        || secrets.iter().any(|(_, _, key)| text.contains(key))
+}
+
+fn safe_config_model_endpoint_override(
+    document: &Value,
+    secrets: &[(&'static str, String, String)],
+    harness_disk_key: Option<&str>,
+) -> Option<String> {
+    let url = config_model_endpoint_override(document)?;
+    let raw_has_cred = HARNESS_API_BASE_URL
+        .found_in(document)
+        .and_then(Value::as_str)
+        .is_some_and(|raw| text_contains_credential(raw, secrets, harness_disk_key));
+    (!raw_has_cred && !text_contains_credential(&url, secrets, harness_disk_key)).then_some(url)
+}
+
+fn resolve_model_endpoint_from_parts(
     conn: Option<&Connection>,
     document: Option<&Value>,
     default_raw: Option<&str>,
     harness_disk_key: Option<String>,
+    secrets: Vec<(&'static str, String, String)>,
 ) -> Result<ModelEndpointSnapshot, InspectError> {
     let stored_override = match conn {
         Some(conn) => stored_model_endpoint_override(conn)?,
         None => None,
     };
-    let config_override = || {
-        document.and_then(|doc| {
-            HARNESS_API_BASE_URL
-                .found_in(doc)
-                .and_then(|v| HARNESS_API_BASE_URL.normalize(v))
-                .and_then(|v| v.as_str().map(str::to_string))
-        })
-    };
     let override_ep = match stored_override {
         Some(Some(url)) => Some((url, ModelEndpointSource::Settings)),
         Some(None) => None,
-        None => config_override().map(|url| (url, ModelEndpointSource::Config)),
+        None => document
+            .and_then(|doc| {
+                safe_config_model_endpoint_override(doc, &secrets, harness_disk_key.as_deref())
+            })
+            .map(|url| (url, ModelEndpointSource::Config)),
     };
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
     let (effective_endpoint, effective_source) = match override_ep {
@@ -975,10 +1011,6 @@ fn resolve_model_endpoint_in_conn(
             default_endpoint.clone(),
             default_endpoint.as_ref().map(|_| ModelEndpointSource::Dependencies),
         ),
-    };
-    let secrets = match conn {
-        Some(conn) => secrets_in_checked(conn)?,
-        None => Vec::new(),
     };
     let mut all_secrets: Vec<String> = secrets
         .iter()
@@ -1024,14 +1056,41 @@ fn resolve_model_endpoint_in_conn(
     })
 }
 
+fn resolve_model_endpoint_in_conn(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
+    let secrets = match conn {
+        Some(conn) => secrets_in_checked(conn)?,
+        None => Vec::new(),
+    };
+    resolve_model_endpoint_from_parts(conn, document, default_raw, harness_disk_key, secrets)
+}
+
 pub(crate) fn resolve_model_endpoint_and_key(
     context: &RuntimeContext,
 ) -> Result<ModelEndpointSnapshot, String> {
     let document = raw_config(context)?;
     let harness_disk_key = harness_credential(context);
     let default_raw = context.dependency_url("model");
-    read_store(context, |conn| {
-        resolve_model_endpoint_in_conn(conn, Some(&document), default_raw, harness_disk_key.clone())
+    read_store(context, |conn| match conn {
+        None => resolve_model_endpoint_from_parts(
+            None,
+            Some(&document),
+            default_raw,
+            harness_disk_key.clone(),
+            Vec::new(),
+        ),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            resolve_model_endpoint_in_conn(
+                Some(tx),
+                Some(&document),
+                default_raw,
+                harness_disk_key.clone(),
+            )
+        }),
     })
 }
 
@@ -1078,9 +1137,7 @@ fn reject_credential_text(
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
     let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
-    let has_any_credential = |text: &str| {
-        harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text)
-    };
+    let has_any_credential = |text: &str| text_contains_credential(text, &secrets, harness_key);
     if prompt_text.is_some_and(has_any_credential)
         || endpoint_url.is_some_and(has_any_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
@@ -2399,30 +2456,49 @@ fn sorted(value: Value) -> Value {
 /// values are not applied. While the admin agent mode puts another owner in force (`RuntimeContext::load_config`), the
 /// owner's entry has `overriddenBy` with that owner.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let mut document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let raw_doc = raw_config(context).map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    let snapshot_read = read_store(context, |conn| match conn {
+        None => {
+            let snapshot = resolve_model_endpoint_from_parts(
+                None,
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                Vec::new(),
+            )?;
+            Ok((Vec::new(), Vec::new(), Some(snapshot), false))
+        }
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            let stored = read_stored_values_checked(tx)?;
+            let secrets = secrets_in_checked(tx)?;
+            let snapshot = resolve_model_endpoint_from_parts(
+                Some(tx),
+                Some(&raw_doc),
+                default_raw,
+                harness_disk_key.clone(),
+                secrets.clone(),
+            )?;
+            let password_is_set = crate::console_auth::administrator_password_is_set_in(tx)?;
+            Ok((stored, secrets, Some(snapshot), password_is_set))
+        }),
+    });
+    let (stored, secrets, endpoint_snapshot, password_is_set, store_error) = match snapshot_read {
+        Ok((stored, secrets, snapshot, password_is_set)) => {
+            (stored, secrets, snapshot, password_is_set, None)
+        }
+        Err(error) => (Vec::new(), Vec::new(), None, false, Some(error)),
+    };
+    let mut document = raw_doc;
+    overlay_values(&mut document, &stored);
     complete_timing(&mut document);
-    let (stored, store_error) = match stored_values(context) {
-        Ok(stored) => (stored, None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
-    let (secrets, store_error) = match read_secrets(context) {
-        Ok(secrets) => (secrets, store_error),
-        Err(error) => (Vec::new(), store_error.or(Some(error))),
-    };
-    let (endpoint_snapshot, store_error) = match resolve_model_endpoint_and_key(context) {
-        Ok(snapshot) => (Some(snapshot), store_error),
-        Err(error) => (None, store_error.or(Some(error))),
-    };
-    let (password_is_set, store_error) =
-        match crate::console_auth::administrator_password_is_set(context) {
-            Ok(is_set) => (is_set, store_error),
-            Err(error) => (false, store_error.or(Some(error))),
-        };
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let search_endpoint = crate::aux_search::settings_endpoint(&document);
-    let model_fallback = context
-        .dependency_url("model")
-        .map(crate::runtime::canonical_model_endpoint);
+    let model_fallback = endpoint_snapshot
+        .as_ref()
+        .and_then(|snap| snap.default_endpoint.clone())
+        .or_else(|| default_raw.map(crate::runtime::canonical_model_endpoint));
     let settings: Vec<Value> = registry()
         .map(|setting| {
             let mut entry = json!({
@@ -2440,25 +2516,30 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 return entry;
             }
             if setting.secret {
-                if setting.key == HARNESS_API_KEY.key {
+                if setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key {
+                    let is_harness = setting.key == HARNESS_API_KEY.key;
                     if let Some(snap) = &endpoint_snapshot {
-                        entry["isSet"] = json!(snap.harness_db_key.is_some());
-                        if snap.harness_bound_elsewhere {
+                        let (is_set, bound_elsewhere, source) = if is_harness {
+                            (
+                                snap.harness_db_key.is_some(),
+                                snap.harness_bound_elsewhere,
+                                snap.harness_key_source(),
+                            )
+                        } else {
+                            (
+                                snap.cli_model_key.is_some(),
+                                snap.cli_bound_elsewhere,
+                                snap.cli_model_key.as_ref().map(|_| "settings"),
+                            )
+                        };
+                        entry["isSet"] = json!(is_set);
+                        if bound_elsewhere {
                             entry["boundElsewhere"] = json!(true);
                         }
-                        entry["source"] = json!(snap.harness_key_source());
+                        entry["source"] = json!(source);
                     } else {
                         entry["isSet"] = json!(false);
                         entry["source"] = Value::Null;
-                    }
-                } else if setting.key == CLI_MODEL_API_KEY.key {
-                    if let Some(snap) = &endpoint_snapshot {
-                        entry["isSet"] = json!(snap.cli_model_key.is_some());
-                        if snap.cli_bound_elsewhere {
-                            entry["boundElsewhere"] = json!(true);
-                        }
-                    } else {
-                        entry["isSet"] = json!(false);
                     }
                 } else {
                     let matching = secrets.iter().any(|(key, bound, _)| {
@@ -2474,7 +2555,19 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 return entry;
             }
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = if setting.key == ROLLOUT_GROUPS.key {
+            let value = if setting.key == HARNESS_API_BASE_URL.key {
+                match &endpoint_snapshot {
+                    Some(snap)
+                        if matches!(
+                            snap.effective_source,
+                            Some(ModelEndpointSource::Settings | ModelEndpointSource::Config)
+                        ) =>
+                    {
+                        json!(snap.effective_endpoint)
+                    }
+                    _ => Value::Null,
+                }
+            } else if setting.key == ROLLOUT_GROUPS.key {
                 setting.found_in(&document).cloned().unwrap_or(Value::Null)
             } else {
                 setting.read(&document)

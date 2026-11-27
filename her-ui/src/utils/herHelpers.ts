@@ -119,12 +119,13 @@ export function parseSettingDraftForSave(item: SettingItemView | undefined, rawV
 export interface ExtraDirtySource {
   count: number;
   label: string;
+  validateBeforeSave?: () => boolean;
   onSave: (resolvedEndpoint?: string) => Promise<void>;
   onDiscard: () => void;
 }
 
-const MODEL_ENDPOINT_KEY = 'harness.apiBaseUrl';
-const MODEL_CREDENTIAL_KEYS = new Set(['harness.apiKey', 'cliModel.apiKey']);
+export const MODEL_ENDPOINT_KEY = 'harness.apiBaseUrl';
+export const MODEL_CREDENTIAL_KEYS = new Set(['harness.apiKey', 'cliModel.apiKey']);
 
 export function canonicalModelEndpoint(url: unknown): string | undefined {
   if (typeof url !== 'string') return undefined;
@@ -136,13 +137,12 @@ export function resolveActiveModelEndpoint(
   items: SettingItemView[],
   overrideEndpoint?: unknown,
 ): string | undefined {
-  const fromOverride = canonicalModelEndpoint(overrideEndpoint);
-  if (fromOverride) return fromOverride;
   const endpointItem = items.find((s) => s.key === MODEL_ENDPOINT_KEY);
-  return (
-    canonicalModelEndpoint(endpointItem?.value) ??
-    canonicalModelEndpoint(endpointItem?.fallback?.value)
-  );
+  const fallback = canonicalModelEndpoint(endpointItem?.fallback?.value);
+  if (overrideEndpoint !== undefined) {
+    return canonicalModelEndpoint(overrideEndpoint) ?? fallback;
+  }
+  return canonicalModelEndpoint(endpointItem?.value) ?? fallback;
 }
 
 export function utf16Length(value: string): number {
@@ -439,6 +439,9 @@ export function useSettingsDrafts(
         count: totalCount,
         label,
         onSave: async () => {
+          if (extraDirty?.validateBeforeSave && !extraDirty.validateBeforeSave()) {
+            return;
+          }
           let resolvedEndpoint: string | undefined;
           if (dirtyKeys.length > 0) {
             const outcome = await saveAll();

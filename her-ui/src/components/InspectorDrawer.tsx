@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import { useConsole } from '../stores/consoleStore';
 import { formatAppliesLabel } from '../utils/format';
 import {
+  MODEL_CREDENTIAL_KEYS,
   localizeSettingItem,
   parseSettingDraftForSave,
   resolveActiveModelEndpoint,
@@ -95,10 +96,9 @@ export const InspectorDrawer: React.FC = () => {
       return;
     }
     const saveRev = draftRevRef.current;
-    const expectedEndpoint =
-      settingItem.key === 'harness.apiKey' || settingItem.key === 'cliModel.apiKey'
-        ? resolveActiveModelEndpoint(settings)
-        : undefined;
+    const expectedEndpoint = MODEL_CREDENTIAL_KEYS.has(settingItem.key)
+      ? resolveActiveModelEndpoint(settings)
+      : undefined;
     const executeSave = async (confirm: boolean) => {
       setBusy(true);
       try {

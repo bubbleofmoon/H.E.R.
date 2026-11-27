@@ -90,8 +90,8 @@ pub(crate) use store::{
 pub(crate) use store::{
     apply, apply_changes, apply_checked_endpoint, apply_conversation, apply_switch_choice,
     archive_model_endpoint_override, backup_source, canonical_conversation, check_store_schema,
-    complete_timing, console_changes, conversation_admitted, conversation_value,
-    conversation_view, direct_change_error, engine_choice, harness_credential,
+    complete_timing, config_model_endpoint_override, console_changes, conversation_admitted,
+    conversation_value, conversation_view, direct_change_error, engine_choice, harness_credential,
     has_endpoint_credentials, has_legacy_engine_choices, has_stored_setting, has_stored_values,
     history, holds_any, import_engine_choices, inspect_store, keep_file_members,
     keep_registry_values, last_good_text, migrate_store_v2, mirror_into, open_store_for_write,
@@ -101,7 +101,8 @@ pub(crate) use store::{
     schema_version_checked, secret_revision, secret_value, security_restore, store_mark,
     store_path, store_schema_version, stored_secrets, stored_setting_row,
     stored_setting_row_checked, undo, view, write_back, Applied, Change, InspectError,
-    ModelEndpointSource, StoreInspection, CONVERSATION_ERROR, STORAGE_ERROR, STORE_SIDECARS,
+    ModelEndpointSnapshot, ModelEndpointSource, StoreInspection, CONVERSATION_ERROR,
+    STORAGE_ERROR, STORE_SIDECARS,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

@@ -196,11 +196,7 @@ impl Prepared {
             let archive_endpoint = match verified.archive_model_endpoint {
                 Some(Some(url)) => Some(url),
                 Some(None) => host_default.clone(),
-                None => crate::settings::HARNESS_API_BASE_URL
-                    .found_in(&raw)
-                    .and_then(|v| crate::settings::HARNESS_API_BASE_URL.normalize(v))
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .or(host_default),
+                None => crate::settings::config_model_endpoint_override(&raw).or(host_default),
             };
             if let (Some(e_archive), Ok(live_snap)) = (
                 archive_endpoint.as_deref(),

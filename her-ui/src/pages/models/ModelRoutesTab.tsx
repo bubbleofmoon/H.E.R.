@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, KeyRound, RefreshCw, Star } from 'lucide-react';
-import { SettingItemView, saveSettingValue } from '../../api/client';
+import { SettingItemView } from '../../api/client';
 import {
   DetailedModelRoute,
   DetailedModelsResponse,
@@ -21,6 +21,8 @@ import {
 import {
   ExtraDirtySource,
   INPUT_CLASS,
+  MODEL_CREDENTIAL_KEYS,
+  MODEL_ENDPOINT_KEY,
   canonicalModelEndpoint,
   localizeSettingItem,
   resolveActiveModelEndpoint,
@@ -36,8 +38,6 @@ const MODEL_SETTING_KEYS = new Set([
   'webSearch.model',
   'engine.default',
 ]);
-
-const MODEL_CREDENTIAL_KEYS = new Set(['harness.apiKey', 'cliModel.apiKey']);
 
 function isValidSecretValue(value: string): string | null {
   const bytes = new TextEncoder().encode(value);
@@ -188,20 +188,13 @@ export const ModelRoutesTab: React.FC = () => {
     [secretDrafts],
   );
 
-  const saveSecretWithEndpoint = useCallback(
-    async (item: SettingItemView, expectedEndpoint?: string): Promise<boolean> => {
-      if (secretBusyKey !== null) return false;
-      const raw = secretDraftsRef.current[item.key] ?? '';
-      const validationErr = isValidSecretValue(raw);
-      if (validationErr) {
-        pushToast(`${item.key}: ${validationErr}`, 'warn');
-        return false;
-      }
-      setSecretBusyKey(item.key);
+  const persistValidatedSecret = useCallback(
+    async (item: SettingItemView, raw: string, expectedEndpoint?: string): Promise<boolean> => {
       try {
         await saveSetting(item.key, raw, Boolean(item.confirm), expectedEndpoint);
         if (!mountedRef.current) return true;
         setSecretDrafts((prev) => {
+          if (prev[item.key] !== raw) return prev;
           const next = { ...prev };
           delete next[item.key];
           return next;
@@ -213,30 +206,55 @@ export const ModelRoutesTab: React.FC = () => {
           pushToast(formatErrorMessage(err, `保存 ${item.key} 失败`), 'danger');
         }
         return false;
-      } finally {
-        if (mountedRef.current) {
-          setSecretBusyKey(null);
-        }
       }
     },
-    [secretBusyKey, saveSetting, pushToast, loadModels],
+    [saveSetting, pushToast, loadModels],
   );
+
+  const validateDirtySecrets = useCallback((): boolean => {
+    for (const key of dirtySecretKeys) {
+      const raw = secretDraftsRef.current[key] ?? '';
+      const validationErr = isValidSecretValue(raw);
+      if (validationErr) {
+        pushToast(`${key}: ${validationErr}`, 'warn');
+        return false;
+      }
+    }
+    return true;
+  }, [dirtySecretKeys, pushToast]);
 
   const saveAllSecrets = useCallback(
     async (resolvedEndpoint?: string) => {
+      if (secretBusyKey !== null || !validateDirtySecrets()) return;
       const targetEndpoint = resolvedEndpoint ?? activeEndpointInfo.endpoint ?? undefined;
       for (const key of dirtySecretKeys) {
         const item = secretSettings.find((s) => s.key === key);
-        if (item) {
-          const ok = await saveSecretWithEndpoint(
+        if (!item) continue;
+        const raw = secretDraftsRef.current[item.key] ?? '';
+        setSecretBusyKey(item.key);
+        let ok = false;
+        try {
+          ok = await persistValidatedSecret(
             item,
+            raw,
             MODEL_CREDENTIAL_KEYS.has(item.key) ? targetEndpoint : undefined,
           );
-          if (!ok) break;
+        } finally {
+          if (mountedRef.current) {
+            setSecretBusyKey(null);
+          }
         }
+        if (!ok) break;
       }
     },
-    [dirtySecretKeys, secretSettings, saveSecretWithEndpoint, activeEndpointInfo.endpoint],
+    [
+      secretBusyKey,
+      validateDirtySecrets,
+      dirtySecretKeys,
+      secretSettings,
+      persistValidatedSecret,
+      activeEndpointInfo.endpoint,
+    ],
   );
 
   const discardAllSecrets = useCallback(() => {
@@ -248,55 +266,73 @@ export const ModelRoutesTab: React.FC = () => {
     return {
       count: dirtySecretKeys.length,
       label: `${dirtySecretKeys.length} 项未保存 API 密钥草稿`,
+      validateBeforeSave: validateDirtySecrets,
       onSave: saveAllSecrets,
       onDiscard: discardAllSecrets,
     };
-  }, [dirtySecretKeys.length, saveAllSecrets, discardAllSecrets]);
+  }, [dirtySecretKeys.length, validateDirtySecrets, saveAllSecrets, discardAllSecrets]);
 
   const { drafts, dirtyKeys, setDraft, clearDraft, handleReset } = useSettingsDrafts(
     curatedModelSettings,
     '模型设置',
     { extraDirty: extraSecretDirty },
   );
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
 
   const handleSaveSecret = useCallback(
     async (item: SettingItemView) => {
       if (secretBusyKey !== null) return;
+      const raw = secretDraftsRef.current[item.key] ?? '';
+      const validationErr = isValidSecretValue(raw);
+      if (validationErr) {
+        pushToast(`${item.key}: ${validationErr}`, 'warn');
+        return;
+      }
       const isModelSecret = MODEL_CREDENTIAL_KEYS.has(item.key);
       let targetEndpoint = isModelSecret ? activeEndpointInfo.endpoint ?? undefined : undefined;
-      if (isModelSecret && dirtyKeys.includes('harness.apiBaseUrl')) {
-        setSecretBusyKey(item.key);
-        try {
-          const res = await saveSettingValue('harness.apiBaseUrl', drafts['harness.apiBaseUrl'], false);
-          if (!mountedRef.current) return;
-          clearDraft('harness.apiBaseUrl');
-          targetEndpoint =
-            resolveActiveModelEndpoint(settings, res.value) ?? targetEndpoint;
-          await refreshLiveData();
-        } catch (err) {
-          if (mountedRef.current) {
-            pushToast(
-              formatErrorMessage(err, '保存模型接口地址失败，已中止保存密钥'),
-              'danger',
-            );
+      setSecretBusyKey(item.key);
+      try {
+        if (isModelSecret && dirtyKeys.includes(MODEL_ENDPOINT_KEY)) {
+          const urlToSave = draftsRef.current[MODEL_ENDPOINT_KEY];
+          try {
+            await saveSetting(MODEL_ENDPOINT_KEY, urlToSave, false);
+          } catch (err) {
+            if (mountedRef.current) {
+              pushToast(
+                formatErrorMessage(err, '保存模型接口地址失败，已中止保存密钥'),
+                'danger',
+              );
+            }
+            return;
           }
-          setSecretBusyKey(null);
-          return;
+          if (!mountedRef.current) return;
+          if (draftsRef.current[MODEL_ENDPOINT_KEY] === urlToSave) {
+            clearDraft(MODEL_ENDPOINT_KEY);
+          }
+          await loadModels();
+          targetEndpoint =
+            canonicalModelEndpoint(urlToSave) ??
+            resolveActiveModelEndpoint(settings, urlToSave) ??
+            targetEndpoint;
         }
-        setSecretBusyKey(null);
+        await persistValidatedSecret(item, raw, targetEndpoint);
+      } finally {
+        if (mountedRef.current) {
+          setSecretBusyKey(null);
+        }
       }
-      await saveSecretWithEndpoint(item, targetEndpoint);
     },
     [
       secretBusyKey,
       activeEndpointInfo.endpoint,
       dirtyKeys,
-      drafts,
+      saveSetting,
       clearDraft,
+      loadModels,
       settings,
-      refreshLiveData,
       pushToast,
-      saveSecretWithEndpoint,
+      persistValidatedSecret,
     ],
   );
 
@@ -701,6 +737,7 @@ export const ModelRoutesTab: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-2">
                     <input
                       type="password"
+                      aria-label={item.label}
                       autoComplete="new-password"
                       value={draft}
                       disabled={anySecretBusy}
