@@ -86,6 +86,16 @@ impl CliBackend {
         id: &str,
         v: &Value,
     ) -> Result<Self, BackendError> {
+        let model_snapshot = crate::settings::resolve_model_endpoint_and_key(context);
+        Self::from_config_with_snapshot(context, model_snapshot.as_ref().ok(), id, v)
+    }
+
+    fn from_config_with_snapshot(
+        context: &RuntimeContext,
+        model_snapshot: Option<&crate::settings::ModelEndpointSnapshot>,
+        id: &str,
+        v: &Value,
+    ) -> Result<Self, BackendError> {
         let cmd = v
             .get("cmd")
             .and_then(|c| c.as_str())
@@ -117,14 +127,8 @@ impl CliBackend {
                     .collect()
             })
             .unwrap_or_default();
-        let model_snapshot = crate::settings::resolve_model_endpoint_and_key(context);
-        validate_isolated_cli_settings_with_snapshot(
-            context,
-            model_snapshot.as_ref().ok(),
-            &args,
-            &env,
-        )
-        .map_err(BackendError::Config)?;
+        validate_isolated_cli_settings_with_snapshot(context, model_snapshot, &args, &env)
+            .map_err(BackendError::Config)?;
         Ok(Self {
             id: id.to_string(),
             cmd: cmd.to_string(),
@@ -741,10 +745,18 @@ fn selected_dependency_url_with_snapshot(
     snapshot: Option<&crate::settings::ModelEndpointSnapshot>,
     value: &str,
 ) -> bool {
-    if ["dsh", "onebot", "onebot_ws", "relay"]
-        .iter()
-        .filter_map(|name| context.dependency_url(name))
-        .any(|selected| value == selected)
+    let is_stale_default = snapshot.is_some_and(|snap| !snap.matches_default())
+        && context.dependency_url("model").is_some_and(|d| {
+            let canonical_d = crate::runtime::canonical_model_endpoint(d);
+            let canonical_v = crate::runtime::canonical_model_endpoint(value);
+            canonical_v == canonical_d
+                || canonical_v == crate::runtime::model_openai_base_url(&canonical_d)
+        });
+    if !is_stale_default
+        && ["dsh", "onebot", "onebot_ws", "relay"]
+            .iter()
+            .filter_map(|name| context.dependency_url(name))
+            .any(|selected| value == selected)
     {
         return true;
     }
@@ -1017,12 +1029,15 @@ pub fn cli_fallback_by_id_with_runtime(
     prompt: &str,
     timeout_s: u64,
 ) -> Result<(String, String), String> {
-    let reg = Registry::from_config_with_runtime(context, cfg).map_err(|e| e.message().to_string())?;
-    let target = reg
-        .chain
-        .iter()
-        .find(|b| b.id() == id)
+    let entries = build_backend_entries(context, cfg).map_err(|e| e.message().to_string())?;
+    let target = entries
+        .into_iter()
+        .find(|entry| entry.id() == id)
         .ok_or_else(|| format!("backends 里没有 id={id} 的后端"))?;
+    let target = match target {
+        BackendEntry::Ready(b) => b,
+        BackendEntry::InvalidCli { error, .. } => return Err(error.message().to_string()),
+    };
     if target.kind() != "cli" {
         return Err(format!("后端 {id} 的 kind={} 不是 cli", target.kind()));
     }
@@ -1107,6 +1122,73 @@ pub fn command_in_path(cmd: &str) -> bool {
     resolve_command(cmd).is_some()
 }
 
+enum BackendEntry {
+    Ready(Box<dyn Backend>),
+    InvalidCli { id: String, error: BackendError },
+}
+
+impl BackendEntry {
+    fn id(&self) -> &str {
+        match self {
+            Self::Ready(b) => b.id(),
+            Self::InvalidCli { id, .. } => id,
+        }
+    }
+}
+
+fn build_backend_entries(
+    context: &RuntimeContext,
+    cfg: &Value,
+) -> Result<Vec<BackendEntry>, BackendError> {
+    let list = configured_backends(cfg);
+    if list.is_empty() {
+        return Ok(vec![BackendEntry::Ready(Box::new(DshBackend {
+            id: "dsh".into(),
+            model: String::new(),
+        }))]);
+    }
+    let has_cli = list
+        .iter()
+        .any(|item| item.get("kind").and_then(|v| v.as_str()).unwrap_or("cli") == "cli");
+    let model_snapshot = has_cli
+        .then(|| crate::settings::resolve_model_endpoint_and_key(context).ok())
+        .flatten();
+    let mut entries = Vec::with_capacity(list.len());
+    for item in list {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            return Err(BackendError::Config("backends 里有条目缺少 id".into()));
+        }
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("cli");
+        match kind {
+            "dsh" => entries.push(BackendEntry::Ready(Box::new(DshBackend {
+                id,
+                model: item.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }))),
+            "cli" => match CliBackend::from_config_with_snapshot(
+                context,
+                model_snapshot.as_ref(),
+                &id,
+                item,
+            ) {
+                Ok(b) => entries.push(BackendEntry::Ready(Box::new(b))),
+                Err(error) => entries.push(BackendEntry::InvalidCli { id, error }),
+            },
+            other => {
+                return Err(BackendError::Config(format!(
+                    "后端 {id} 的 kind={other} 不支持（只认 dsh / cli）"
+                )))
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// 后端注册表：按配置顺序组成候选链。
 pub struct Registry {
     pub chain: Vec<Box<dyn Backend>>,
@@ -1123,35 +1205,11 @@ impl Registry {
         context: &RuntimeContext,
         cfg: &Value,
     ) -> Result<Self, BackendError> {
-        let list = configured_backends(cfg);
-        if list.is_empty() {
-            return Ok(Self {
-                chain: vec![Box::new(DshBackend { id: "dsh".into(), model: String::new() })],
-            });
-        }
         let mut chain: Vec<Box<dyn Backend>> = Vec::new();
-        for item in list {
-            let id = item
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if id.is_empty() {
-                return Err(BackendError::Config("backends 里有条目缺少 id".into()));
-            }
-            let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("cli");
-            match kind {
-                "dsh" => chain.push(Box::new(DshBackend {
-                    id,
-                    model: item.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                })),
-                "cli" => chain.push(Box::new(CliBackend::from_config_with_runtime(context, &id, item)?)),
-                other => {
-                    return Err(BackendError::Config(format!(
-                        "后端 {id} 的 kind={other} 不支持（只认 dsh / cli）"
-                    )))
-                }
+        for entry in build_backend_entries(context, cfg)? {
+            match entry {
+                BackendEntry::Ready(b) => chain.push(b),
+                BackendEntry::InvalidCli { error, .. } => return Err(error),
             }
         }
         Ok(Self { chain })
@@ -1231,9 +1289,17 @@ pub fn cli_fallback_with_runtime_reporting(
     if let Some(refusal) = crate::failover::cli_fallback_refusal(cfg) {
         return Err(refusal);
     }
-    let reg = Registry::from_config_with_runtime(context, cfg).map_err(|e| e.message().to_string())?;
+    let entries = build_backend_entries(context, cfg).map_err(|e| e.message().to_string())?;
     let mut notes: Vec<String> = Vec::new();
-    for b in reg.chain.iter() {
+    for entry in entries {
+        let b = match entry {
+            BackendEntry::Ready(b) => b,
+            BackendEntry::InvalidCli { id, error } => {
+                report(&id, error.message());
+                notes.push(format!("{id}：{}", error.message()));
+                continue;
+            }
+        };
         if b.kind() != "cli" {
             continue; // dsh 候选上面已经试过了
         }
@@ -1495,6 +1561,121 @@ mod tests {
             "args": [format!("--endpoint={override_ep}")]
         });
         assert!(CliBackend::from_config_with_runtime(&context, "c1", &ok_cfg).is_ok());
+    }
+
+    #[test]
+    fn ticket443_r6_relay_collision_does_not_bypass_model_env_and_healthy_candidate_survives_stale_peer() {
+        let (fixture, context) = cli_credential_fixture();
+        let d_url = context.dependency_url("model").unwrap().to_string();
+        let dsh_url = context.dependency_url("dsh").unwrap().to_string();
+        let onebot_url = context.dependency_url("onebot").unwrap().to_string();
+        // Set relay URL equal to baseline model D, then override harness.apiBaseUrl to E != D.
+        std::fs::write(
+            fixture.0.join("dependencies.json"),
+            serde_json::json!({
+                "dsh": dsh_url,
+                "model": d_url,
+                "onebot": onebot_url,
+                "relay": d_url,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&fixture.0).unwrap();
+        let override_ep = "https://cli-r6.example.test/v1";
+        crate::settings::apply(
+            &ctx,
+            crate::settings::HARNESS_API_BASE_URL.key,
+            &serde_json::json!(override_ep),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        crate::settings::apply(
+            &ctx,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-r6-cli-key"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+
+        for env_key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+            assert!(
+                validate_isolated_cli_settings(&ctx, &[], &[(env_key.into(), override_ep.into())]).is_err(),
+                "{env_key} must remain blocked by isolated_environment_key"
+            );
+        }
+        assert!(
+            validate_isolated_cli_settings(
+                &ctx,
+                &[format!("--endpoint={d_url}")],
+                &[],
+            )
+            .is_err(),
+            "arg equal to stale D must be refused even when relay shares D"
+        );
+        assert!(
+            validate_isolated_cli_settings(
+                &ctx,
+                &[],
+                &[("CUSTOM_MODEL_URL".into(), d_url.clone())],
+            )
+            .is_err(),
+            "env var equal to stale D must be refused even when relay shares D"
+        );
+        assert!(
+            validate_isolated_cli_settings(
+                &ctx,
+                &[format!("--endpoint={override_ep}")],
+                &[("CUSTOM_MODEL_URL".into(), override_ep.into())],
+            )
+            .is_ok(),
+            "args/env equal to effective E must be accepted"
+        );
+
+        let (cmd, args) = if cfg!(windows) {
+            ("cmd", vec!["/C", "echo", "healthy-r6-ok"])
+        } else {
+            ("sh", vec!["-c", "echo healthy-r6-ok"])
+        };
+        let cfg = serde_json::json!({
+            "backends": {
+                "failoverFallback": true,
+                "list": [
+                    { "id": "stale-cli", "kind": "cli", "cmd": cmd, "args": [format!("--endpoint={d_url}")] },
+                    { "id": "good-cli", "kind": "cli", "cmd": cmd, "args": args }
+                ]
+            }
+        });
+        let mut reported = Vec::new();
+        let fallback_res = cli_fallback_with_runtime_reporting(
+            &ctx,
+            &cfg,
+            "group:1",
+            "hi",
+            5,
+            |id, err| reported.push((id.to_string(), err.to_string())),
+        );
+        assert_eq!(
+            fallback_res.as_ref().map(|(id, text)| (id.as_str(), text.trim())),
+            Ok(("good-cli", "healthy-r6-ok")),
+            "stale first candidate must not block healthy candidate: {fallback_res:?}"
+        );
+        assert!(
+            reported.iter().any(|(id, _)| id == "stale-cli"),
+            "stale candidate failure must still be reported: {reported:?}"
+        );
+        let by_id_good = cli_fallback_by_id_with_runtime(&ctx, &cfg, "good-cli", "group:1", "hi", 5);
+        assert_eq!(
+            by_id_good.as_ref().map(|(id, text)| (id.as_str(), text.trim())),
+            Ok(("good-cli", "healthy-r6-ok")),
+            "selecting healthy candidate by id must succeed even with stale peer: {by_id_good:?}"
+        );
+        assert!(
+            cli_fallback_by_id_with_runtime(&ctx, &cfg, "stale-cli", "group:1", "hi", 5).is_err(),
+            "explicitly selecting stale candidate by id must still be rejected"
+        );
     }
 
     #[test]

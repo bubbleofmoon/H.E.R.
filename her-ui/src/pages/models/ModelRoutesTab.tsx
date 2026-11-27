@@ -212,8 +212,10 @@ export const ModelRoutesTab: React.FC = () => {
     [saveSetting, pushToast, loadModels],
   );
 
+  const savingRef = useRef(false);
+
   const prepareSecretSave = useCallback((): ((resolvedEndpoint?: string) => Promise<void>) | null => {
-    if (secretBusyKey !== null) return null;
+    if (secretBusyKey !== null || savingRef.current) return null;
     const frozenEntries: { item: SettingItemView; raw: string }[] = [];
     for (const key of dirtySecretKeys) {
       const item = secretSettings.find((s) => s.key === key);
@@ -280,11 +282,25 @@ export const ModelRoutesTab: React.FC = () => {
     };
   }, [dirtySecretKeys.length, prepareSecretSave, saveAllSecrets, discardAllSecrets]);
 
+  const onModelSettingSettled = useCallback(
+    async (keys: string[]) => {
+      if (
+        keys.includes(MODEL_ENDPOINT_KEY) ||
+        keys.includes('harness.firstRoute') ||
+        keys.includes('harness.routes')
+      ) {
+        await loadModels();
+      }
+    },
+    [loadModels],
+  );
+
   const { drafts, dirtyKeys, saving, setDraft, clearDraft, handleReset } = useSettingsDrafts(
     curatedModelSettings,
     '模型设置',
-    { extraDirty: extraSecretDirty },
+    { extraDirty: extraSecretDirty, onSettled: onModelSettingSettled },
   );
+  savingRef.current = saving;
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
 

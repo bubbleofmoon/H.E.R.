@@ -217,8 +217,9 @@ export const SettingField: React.FC<{
         {onReset && (
           <button
             type="button"
+            disabled={disabled}
             onClick={onReset}
-            className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)]"
+            className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <RotateCcw className="h-3 w-3" />
             恢复默认
@@ -231,6 +232,7 @@ export const SettingField: React.FC<{
         <div className="flex items-center gap-2 pt-0.5">
           <Switch
             checked={effective === true}
+            disabled={disabled}
             onChange={(next) => onDraftChange?.(next)}
             label={setting.label}
           />
@@ -241,6 +243,7 @@ export const SettingField: React.FC<{
       ) : kind.type === 'text' || kind.type === 'route list' ? (
         <textarea
           rows={5}
+          disabled={disabled}
           value={
             kind.type === 'route list'
               ? draftValue === undefined && setting.redacted
@@ -264,7 +267,7 @@ export const SettingField: React.FC<{
                 ? '[{"id": "primary", "model": "..."}]'
                 : ''
           }
-          className="w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 font-mono text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 font-mono text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : kind.type === 'password' ? (
         <input
@@ -315,6 +318,7 @@ export const SettingField: React.FC<{
       ) : kind.type === 'integer' || kind.type === 'number' || kind.type === 'probability' ? (
         <input
           type="number"
+          disabled={disabled}
           min={kind.min}
           max={kind.max}
           step={kind.type === 'integer' ? 1 : 'any'}
@@ -324,13 +328,14 @@ export const SettingField: React.FC<{
             const raw = e.target.value.trim();
             onDraftChange(raw === '' ? null : Number(raw));
           }}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : kind.type === 'choice' && Array.isArray(kind.options) ? (
         <select
+          disabled={disabled}
           value={typeof effective === 'string' ? effective : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         >
           {typeof effective !== 'string' && <option value="">（请选择）</option>}
           {kind.options.map((opt) => (
@@ -342,13 +347,15 @@ export const SettingField: React.FC<{
       ) : kind.type === 'daily time' ? (
         <input
           type="time"
+          disabled={disabled}
           value={typeof effective === 'string' ? effective : ''}
           onChange={(e) => onDraftChange?.(e.target.value)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       ) : (
         <input
           type="text"
+          disabled={disabled}
           value={
             (kind.type === 'id list' || kind.type === 'conversation list') &&
             typeof draftValue === 'string'
@@ -363,7 +370,7 @@ export const SettingField: React.FC<{
             onDraftChange?.(e.target.value);
           }}
           placeholder={formatSettingDisplay(setting)}
-          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
         />
       )}
 

@@ -671,4 +671,50 @@ fn ticket443_r5_scrub_tombstones_leaked_url_after_secret_reset_or_rotation() {
     assert!(!entries.is_empty());
     assert_eq!(entries[0]["new"], json!("(hidden)"));
     assert!(!json!(entries).to_string().contains(leaked_tok));
+    let (undo_st, undo_reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(undo_st, 400, "undoing scrubbed leaked url must return 400: {undo_reply}");
+}
+
+#[test]
+fn ticket443_r6_malformed_config_scrub_never_writes_hidden_and_consecutive_url_undo_is_400() {
+    // 1. Malformed secret-bearing /harness/apiBaseUrl in config.json is scrubbed on write-back,
+    // and write_back never persists "(hidden)" or secret-bearing harness.apiBaseUrl into config.json.
+    let (root, context) = settings_fixture("ticket443 r6 malformed config scrub");
+    let tok = "fixture-r6-malformed-tok";
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": format!("not-a-valid-url-{tok}")});
+    });
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    let after_secret = stored_config(&root);
+    assert!(
+        after_secret.pointer("/harness/apiBaseUrl").is_none(),
+        "write-back must scrub malformed secret-bearing /harness/apiBaseUrl: {after_secret}"
+    );
+    assert!(
+        !after_secret.to_string().contains(tok) && !after_secret.to_string().contains("(hidden)"),
+        "config.json must never retain secret or (hidden): {after_secret}"
+    );
+
+    // Even if a stored row somehow holds "(hidden)" (or a leaked URL), write_back removes /harness/apiBaseUrl.
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": "https://stale.example.test/v1"});
+    });
+    StoreProbe::at(&root.0).insert_value("harness.apiBaseUrl", &json!("(hidden)").to_string());
+    crate::settings::write_back(&context).unwrap();
+    let after_wb = stored_config(&root);
+    assert!(
+        after_wb.pointer("/harness/apiBaseUrl").is_none() && !after_wb.to_string().contains("(hidden)"),
+        "write_back must never write (hidden) into config.json: {after_wb}"
+    );
+
+    // 2. Two consecutive credential-bearing URLs followed by saving the secret: undo of latest entry returns 400, not 409.
+    let (_seq_root, seq_ctx) = settings_fixture("ticket443 r6 consecutive leaked urls");
+    let seq_tok = "fixture-r6-seq-tok";
+    assert_eq!(put(&seq_ctx, "harness.apiBaseUrl", &format!("https://a.example.test/{seq_tok}")).0, 200);
+    assert_eq!(put(&seq_ctx, "harness.apiBaseUrl", &format!("https://b.example.test/{seq_tok}")).0, 200);
+    assert_eq!(put(&seq_ctx, CLI, seq_tok).0, 200);
+    let (seq_entries, _) = history_page(&seq_ctx, "?setting=harness.apiBaseUrl");
+    assert_eq!(seq_entries.len(), 2);
+    let (undo_st, undo_reply) = post(&seq_ctx, "/api/settings/undo", json!({"entry": seq_entries[0]["entry"]}));
+    assert_eq!(undo_st, 400, "undoing tombstoned consecutive leaked url must return 400, not 409: {undo_reply}");
 }

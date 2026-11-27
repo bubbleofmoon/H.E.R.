@@ -209,7 +209,11 @@ export function settingValuesEqual(a: unknown, b: unknown): boolean {
 export function useSettingsDrafts(
   items: SettingItemView[],
   labelPrefix: string,
-  options: { manageDirtyBar?: boolean; extraDirty?: ExtraDirtySource | null } = {},
+  options: {
+    manageDirtyBar?: boolean;
+    extraDirty?: ExtraDirtySource | null;
+    onSettled?: (keys: string[]) => void | Promise<void>;
+  } = {},
 ) {
   const { resetSetting, openConfirm, pushToast, refreshLiveData, setDirtyEntry } = useConsole();
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
@@ -220,6 +224,8 @@ export function useSettingsDrafts(
   const draftRevRef = useRef<Record<string, number>>({});
   const manageDirtyBar = options.manageDirtyBar !== false;
   const extraDirty = options.extraDirty ?? null;
+  const onSettledRef = useRef(options.onSettled);
+  onSettledRef.current = options.onSettled;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -375,6 +381,7 @@ export function useSettingsDrafts(
 
       if (savedEntries.length > 0) {
         await refreshLiveData();
+        await onSettledRef.current?.(savedEntries.map((e) => e.key));
         if (mountedRef.current) {
           setDrafts((prev) => {
             let changed = false;
@@ -521,8 +528,10 @@ export function useSettingsDrafts(
             return;
           }
           const rev = draftRevRef.current[key] ?? 0;
+          if (mountedRef.current) setSaving(true);
           try {
             await resetSetting(key, needsConfirm);
+            await onSettledRef.current?.([key]);
             if (!mountedRef.current) return;
             setDrafts((prev) => {
               if (!(key in prev) || (draftRevRef.current[key] ?? 0) !== rev) {
@@ -534,6 +543,8 @@ export function useSettingsDrafts(
             });
           } catch (err) {
             pushToast(formatErrorMessage(err, `恢复 ${key} 默认值失败`), 'danger');
+          } finally {
+            if (mountedRef.current) setSaving(false);
           }
         },
       });

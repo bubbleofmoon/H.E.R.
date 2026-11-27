@@ -1031,13 +1031,40 @@ pub(crate) fn redact_route_array(value: &mut Value, credentials: Option<&[String
     redacted
 }
 
+fn endpoint_value_is_scrubbed(
+    raw: &str,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    if raw == SECRET_MARKER {
+        return true;
+    }
+    let normalized = HARNESS_API_BASE_URL
+        .normalize(&Value::String(raw.to_string()))
+        .and_then(|v| v.as_str().map(str::to_string));
+    let matches_secrets = known_secrets.is_some_and(|secrets| {
+        text_contains_any_secret(raw, secrets)
+            || normalized
+                .as_deref()
+                .is_some_and(|canonical| text_contains_any_secret(canonical, secrets))
+    });
+    let matches_hashes = scrubbed_hashes.is_some_and(|hashes| {
+        hashes.iter().any(|h| *h == endpoint_text_hash(raw))
+            || normalized
+                .as_deref()
+                .is_some_and(|canonical| hashes.iter().any(|h| *h == endpoint_text_hash(canonical)))
+    });
+    matches_secrets || matches_hashes
+}
+
 fn safe_config_model_endpoint_override(
     document: &Value,
     known_secrets: &[String],
+    scrubbed_hashes: &[String],
 ) -> Option<String> {
     let (raw, canonical) = config_model_endpoint_override(document)?;
-    (!text_contains_any_secret(&raw, known_secrets)
-        && !text_contains_any_secret(&canonical, known_secrets))
+    (!endpoint_value_is_scrubbed(&raw, Some(known_secrets), Some(scrubbed_hashes))
+        && !endpoint_value_is_scrubbed(&canonical, Some(known_secrets), Some(scrubbed_hashes)))
     .then_some(canonical)
 }
 
@@ -1046,16 +1073,21 @@ fn effective_endpoint_from_overrides(
     document: Option<&Value>,
     default_endpoint: Option<String>,
     known_secrets: &[String],
+    scrubbed_hashes: &[String],
 ) -> (Option<String>, Option<ModelEndpointSource>) {
     let override_ep = match stored_override {
         Some(StoredEndpointOverride::Value { raw, canonical }) => {
-            (!text_contains_any_secret(&raw, known_secrets)
-                && !text_contains_any_secret(&canonical, known_secrets))
-                .then_some((canonical, ModelEndpointSource::Settings))
+            (!endpoint_value_is_scrubbed(&raw, Some(known_secrets), Some(scrubbed_hashes))
+                && !endpoint_value_is_scrubbed(
+                    &canonical,
+                    Some(known_secrets),
+                    Some(scrubbed_hashes),
+                ))
+            .then_some((canonical, ModelEndpointSource::Settings))
         }
         Some(StoredEndpointOverride::Reset | StoredEndpointOverride::Suppressed) => None,
         None => document
-            .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets))
+            .and_then(|doc| safe_config_model_endpoint_override(doc, known_secrets, scrubbed_hashes))
             .map(|url| (url, ModelEndpointSource::Config)),
     };
     match override_ep {
@@ -1084,6 +1116,7 @@ pub(crate) fn archive_effective_model_endpoint(
         Some(archive_config),
         default_endpoint,
         &known_secrets,
+        &[],
     )
     .0
 }
@@ -1096,9 +1129,12 @@ fn resolve_model_endpoint_from_parts(
     secrets: Vec<(&'static str, String, String)>,
 ) -> Result<ModelEndpointSnapshot, InspectError> {
     let all_secrets = collect_known_secrets(&secrets, harness_disk_key.as_deref());
-    let stored_override = match conn {
-        Some(conn) => stored_model_endpoint_override(conn)?,
-        None => None,
+    let (stored_override, scrubbed_hashes) = match conn {
+        Some(conn) => (
+            stored_model_endpoint_override(conn)?,
+            read_scrubbed_endpoint_hashes(conn)?,
+        ),
+        None => (None, Vec::new()),
     };
     let stored_url_suppressed = matches!(
         &stored_override,
@@ -1106,8 +1142,8 @@ fn resolve_model_endpoint_from_parts(
     ) || matches!(
         &stored_override,
         Some(StoredEndpointOverride::Value { raw, canonical })
-            if text_contains_any_secret(raw, &all_secrets)
-                || text_contains_any_secret(canonical, &all_secrets)
+            if endpoint_value_is_scrubbed(raw, Some(&all_secrets), Some(&scrubbed_hashes))
+                || endpoint_value_is_scrubbed(canonical, Some(&all_secrets), Some(&scrubbed_hashes))
     );
     let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
     let (effective_endpoint, effective_source) = effective_endpoint_from_overrides(
@@ -1115,6 +1151,7 @@ fn resolve_model_endpoint_from_parts(
         document,
         default_endpoint.clone(),
         &all_secrets,
+        &scrubbed_hashes,
     );
 
     let mut harness_db_key = None;
@@ -1659,16 +1696,40 @@ fn seed(
 /// place); a file `canonical_config` refuses is not written. No store, no schema yet and no stored value write
 /// nothing; a store that cannot be read is an error.
 pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
-    let secrets = read_secrets(context)?;
-    let known = collect_known_secrets(&secrets, harness_credential(context).as_deref());
-    write_back_values(context, stored_values(context)?, (!known.is_empty()).then_some(known.as_slice()))
+    let harness_key = harness_credential(context);
+    let (secrets, scrubbed_hashes, endpoint_suppressed) = read_store(context, |conn| match conn {
+        None => Ok((Vec::new(), Vec::new(), false)),
+        Some(conn) => read_snapshot_tx(conn, |tx| {
+            let suppressed = matches!(
+                stored_model_endpoint_override(tx)?,
+                Some(StoredEndpointOverride::Suppressed)
+            );
+            Ok((
+                secrets_in_checked(tx)?,
+                read_scrubbed_endpoint_hashes(tx)?,
+                suppressed,
+            ))
+        }),
+    })?;
+    let known = collect_known_secrets(&secrets, harness_key.as_deref());
+    write_back_values(
+        context,
+        stored_values(context)?,
+        (!known.is_empty()).then_some(known.as_slice()),
+        (!scrubbed_hashes.is_empty()).then_some(scrubbed_hashes.as_slice()),
+        endpoint_suppressed,
+    )
 }
 
-fn config_has_leaked_endpoint(document: &Value, known_secrets: Option<&[String]>) -> bool {
-    let Some(secrets) = known_secrets else { return false };
-    config_model_endpoint_override(document).is_some_and(|(raw, canonical)| {
-        text_contains_any_secret(&raw, secrets) || text_contains_any_secret(&canonical, secrets)
-    })
+fn config_has_leaked_endpoint(
+    document: &Value,
+    known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+) -> bool {
+    HARNESS_API_BASE_URL
+        .found_in(document)
+        .and_then(Value::as_str)
+        .is_some_and(|raw| endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes))
 }
 
 /// `write_back` of stored values already read: by a writer, on its own read-write connection before it closed, so that
@@ -1678,21 +1739,49 @@ fn write_back_values(
     context: &RuntimeContext,
     stored: Vec<(&'static Setting, Value)>,
     known_secrets: Option<&[String]>,
+    scrubbed_hashes: Option<&[String]>,
+    endpoint_suppressed: bool,
 ) -> Result<Vec<&'static str>, String> {
-    let has_stored_endpoint = stored.iter().any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
-    let check_config_scrub = !has_stored_endpoint && known_secrets.is_some_and(|s| !s.is_empty());
-    if stored.is_empty() && !check_config_scrub {
+    let mut endpoint_scrubbed = endpoint_suppressed;
+    let filtered_stored: Vec<(&'static Setting, Value)> = stored
+        .into_iter()
+        .filter(|(setting, value)| {
+            if setting.key != HARNESS_API_BASE_URL.key {
+                return true;
+            }
+            let leaked = value
+                .as_str()
+                .is_some_and(|raw| endpoint_value_is_scrubbed(raw, known_secrets, scrubbed_hashes));
+            if leaked {
+                endpoint_scrubbed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let has_stored_endpoint = filtered_stored
+        .iter()
+        .any(|(setting, _)| setting.key == HARNESS_API_BASE_URL.key);
+    let check_config_scrub = !has_stored_endpoint
+        && (endpoint_scrubbed
+            || known_secrets.is_some_and(|s| !s.is_empty())
+            || scrubbed_hashes.is_some_and(|h| !h.is_empty()));
+    if filtered_stored.is_empty() && !check_config_scrub {
         return Ok(Vec::new());
     }
     let mut document = raw_config(context)?;
     if crate::config::canonical_config(&document).is_err() {
         return Err(CONFIG_ERROR.to_string());
     }
-    let scrub_endpoint = !has_stored_endpoint && config_has_leaked_endpoint(&document, known_secrets);
-    if stored.is_empty() && !scrub_endpoint {
+    let scrub_endpoint = !has_stored_endpoint
+        && document.pointer(HARNESS_API_BASE_URL.pointer).is_some()
+        && (endpoint_scrubbed
+            || config_has_leaked_endpoint(&document, known_secrets, scrubbed_hashes));
+    if filtered_stored.is_empty() && !scrub_endpoint {
         return Ok(Vec::new());
     }
-    let (mut changed, blocked) = place(&mut document, stored);
+    let (mut changed, blocked) = place(&mut document, filtered_stored);
     if scrub_endpoint {
         remove_at(&mut document, HARNESS_API_BASE_URL.pointer);
         changed = true;
@@ -1716,8 +1805,18 @@ fn mirror_after_commit(
     context: &RuntimeContext,
     stored: Result<Vec<(&'static Setting, Value)>, String>,
     known_secrets: Option<Vec<String>>,
+    scrubbed_hashes: Option<Vec<String>>,
+    endpoint_suppressed: bool,
 ) -> Option<String> {
-    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored, known_secrets.as_deref())) {
+    let mirror_error = match stored.and_then(|stored| {
+        write_back_values(
+            context,
+            stored,
+            known_secrets.as_deref(),
+            scrubbed_hashes.as_deref(),
+            endpoint_suppressed,
+        )
+    }) {
         Ok(blocked) if blocked.is_empty() => None,
         Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
         Err(error) => Some(error),
@@ -1825,7 +1924,7 @@ fn write_store_with<T>(
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
-    let (result, stored, known_secrets) = {
+    let (result, stored, known_secrets, scrubbed_hashes, endpoint_suppressed) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
@@ -1858,9 +1957,17 @@ fn write_store_with<T>(
             .ok()
             .map(|secrets| collect_known_secrets(&secrets, harness_key.as_deref()))
             .or_else(|| harness_key.clone().map(|k| vec![k]));
-        (result, stored, known_secrets)
+        let scrubbed_hashes = read_scrubbed_endpoint_hashes(&conn).ok();
+        let endpoint_suppressed = matches!(
+            stored_model_endpoint_override(&conn),
+            Ok(Some(StoredEndpointOverride::Suppressed))
+        );
+        (result, stored, known_secrets, scrubbed_hashes, endpoint_suppressed)
     };
-    Ok((result, mirror_after_commit(context, stored, known_secrets)))
+    Ok((
+        result,
+        mirror_after_commit(context, stored, known_secrets, scrubbed_hashes, endpoint_suppressed),
+    ))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -2380,22 +2487,32 @@ pub(crate) fn undo(
                 |row| row.get(0),
             )
             .map_err(failed)?;
-        let current = stored_row(conn, setting.key)?;
-        if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
+        if later > 0 {
             return Err((409, CHANGED_SINCE_ERROR.to_string()));
         }
         let raw_old = old_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        let raw_new = new_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
         if setting.key == HARNESS_API_BASE_URL.key {
             let scrubbed_hashes =
                 read_scrubbed_endpoint_hashes(conn).map_err(|e| (503, e.into_message()))?;
-            let is_scrubbed = raw_old.as_ref().and_then(Value::as_str).is_some_and(|s| {
-                s == SECRET_MARKER || scrubbed_hashes.iter().any(|h| *h == endpoint_text_hash(s))
-            });
+            let secrets = secrets_in(conn).map_err(|error| (503, error))?;
+            let known_secrets = collect_known_secrets(&secrets, harness_key.as_deref());
+            let is_scrubbed = [raw_old.as_ref(), raw_new.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|s| endpoint_value_is_scrubbed(s, Some(&known_secrets), Some(&scrubbed_hashes)));
             if is_scrubbed {
                 return Err((400, "setting text contains a credential".to_string()));
             }
+        }
+        let current = stored_row(conn, setting.key)?;
+        if current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
+            return Err((409, CHANGED_SINCE_ERROR.to_string()));
         }
         let restored = old_text
             .map(|text| {
