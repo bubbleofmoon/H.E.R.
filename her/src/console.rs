@@ -6181,14 +6181,14 @@ fn handle_sticker_image(
         );
         (500, "读取表情图片出错：（表情获取失败）".to_string())
     })?;
-    let fetched = crate::safe_fetch::fetch_bytes(&url, limits.bytes).map_err(|err| {
+    let bytes = crate::media::fetch_url_bytes(&url, limits.bytes).map_err(|reason| {
         eprintln!(
             "{}",
-            crate::media::format_failure_log("sticker", crate::media::classify_fetch_error(&err))
+            crate::media::format_failure_log("sticker", &reason)
         );
         (500, "读取表情图片出错：（表情获取失败）".to_string())
     })?;
-    if let Some((w, h)) = crate::media_normalize::image_dimensions(&fetched.bytes) {
+    if let Some((w, h)) = crate::media_normalize::image_dimensions(&bytes) {
         if w * h > limits.pixels {
             eprintln!(
                 "{}",
@@ -6200,7 +6200,7 @@ fn handle_sticker_image(
             return Err((400, format!("图片分辨率（{w}x{h}）超出上限，已拦截")));
         }
     }
-    let normalized = crate::media_normalize::normalize_diagnosed(&fetched.bytes, limits.pixels)
+    let normalized = crate::media_normalize::normalize_diagnosed(&bytes, limits.pixels)
         .map_err(|e| {
             eprintln!(
                 "{}",
