@@ -1559,10 +1559,11 @@ pub(crate) fn rearm_observation_sleep(
         .map_err(|(_, error)| error)
 }
 
-/// Ensure a reconciled `reserved2` conversation stays schedulable after an interrupted wake:
-/// if its finite `sleepUntil` was consumed before the crash and neither the model nor an operator
-/// wrote a newer configuration, restore a still-future deadline or draw a fresh default sleep;
-/// otherwise keep at least one active trigger or timer (`wake::ensure_wakeable`).
+/// Repair an interrupted `reserved2` conversation's wake config when neither the model nor an
+/// operator wrote a newer configuration: if `infinite` is `false` and its finite `sleepUntil` was
+/// consumed or invalid, restore a still-future deadline or draw a fresh default sleep; only repair
+/// corrupted non-boolean `infinite` plans via `wake::ensure_wakeable`, never operator-cancelled
+/// `infinite: true` plans.
 pub(crate) fn rearm_interrupted_reserved2_wake(
     context: &RuntimeContext,
     cfg: &Value,
@@ -1599,8 +1600,8 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             if !same_wake || !same_config {
                 return Ok(());
             }
-            if wake["infinite"] != true
-                && wake["sleepUntil"]
+            if wake["infinite"] == true
+                || wake["sleepUntil"]
                     .as_str()
                     .and_then(crate::wake::parse_iso_ms)
                     .is_some()
@@ -4025,5 +4026,54 @@ mod tests {
             .and_then(crate::wake::parse_iso_ms)
             .expect("unparseable sleepUntil must be replaced with valid iso_at(now)");
         assert!(bad_rearmed_ms >= before_bad && bad_rearmed_ms <= after_bad);
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_operator_cancelled_infinite_plan() {
+        let root = TestDir::new("rearm-operator-cancelled-infinite-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": {
+                "wake": {
+                    "recommendedDefaultInfinite": false,
+                    "recommendedSleepMinMs": 60_000,
+                    "recommendedSleepMaxMs": 60_000
+                }
+            }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": true,
+                    "lastWakeAt": 10,
+                    "sleepUntil": null,
+                    "triggers": {
+                        "atMention": false,
+                        "nameMention": false,
+                        "question": false,
+                        "poke": false,
+                        "anyMessage": false,
+                        "probability": 0,
+                        "keywords": [],
+                        "speakerIds": []
+                    },
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": true, "sleepUntil": null}}});
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+
+        let wc = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc["infinite"], true, "operator-cancelled infinite plan must stay infinite: true");
+        assert!(wc["sleepUntil"].is_null(), "operator-cancelled infinite plan must keep sleepUntil null");
     }
 }

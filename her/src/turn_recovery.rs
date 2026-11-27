@@ -1358,9 +1358,6 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                     set
                 });
                 let (turns, _) = turn_ledger::fold(&records);
-                if !terminal_rearm_done && rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at) {
-                    terminal_rearm_done = true;
-                }
                 let mut expiry_applied = false;
                 for turn in turns.iter().filter(|t| t.paused_at.is_some() && (t.state == State::Paused || t.notification_intent)) {
                     let pause_ready = if turn.pause_notified {
@@ -1399,6 +1396,7 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                 };
                 let outbox = crate::send_outbox::read_records(&context);
                 let pass = Pass { context: &context, cfg: &cfg };
+                let mut reconciled = false;
                 for turn in &turns {
                     let working = startup.contains(&turn.id)
                         && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
@@ -1416,14 +1414,27 @@ async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<Stri
                     }
                     last_try.insert(turn.id.clone(), now());
                     pass.reconcile_at(&journal, turn, &turns, &outbox, Some(started_at)).await;
+                    reconciled = true;
                 }
+                let (records, turns) = if reconciled {
+                    let Ok(records) = turn_ledger::read_records(&context) else { continue };
+                    let (turns, _) = turn_ledger::fold(&records);
+                    (records, turns)
+                } else {
+                    (records, turns)
+                };
                 pass.resolutions(&journal, &turns, &records);
                 pass.release_held(&journal, &turns, &records);
                 pass.finished_with_cache(&journal, &turns, &mut abandoned_closed);
                 pass.report_stuck_resumed(&journal, &turns);
-                // Orphans only after every startup turn has a verdict that is not "still open".
+                // Orphans and terminal startup rearms only after every startup turn has settled.
                 let unsettled = turns.iter().any(|t| startup.contains(&t.id) && t.state.is_open());
                 if !unsettled {
+                    if !terminal_rearm_done
+                        && rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at)
+                    {
+                        terminal_rearm_done = true;
+                    }
                     pass.orphans(&journal, &turns, &records);
                 }
             }
