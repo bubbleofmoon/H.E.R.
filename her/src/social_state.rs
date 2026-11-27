@@ -749,15 +749,12 @@ pub(crate) fn mode(context: &RuntimeContext) -> String {
     mode_checked(context).unwrap_or_else(|_| "reserved2".to_string())
 }
 
-/// Active mode, failing explicitly when the selected runtime's `mode.json` is unreadable or invalid.
-pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialError> {
-    let text = context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| SocialError::Storage("runtime mode is unavailable".to_string()))?;
-    let Some(text) = text else {
+/// Validate the JSON text of a runtime's `mode.json` snapshot.
+pub(crate) fn validate_mode_text(raw: Option<&str>) -> Result<String, SocialError> {
+    let Some(text) = raw else {
         return Ok("reserved2".to_string());
     };
-    let value: Value = serde_json::from_str(&text)
+    let value: Value = serde_json::from_str(text)
         .map_err(|_| SocialError::Storage("runtime mode is invalid".to_string()))?;
     let Some(object) = value.as_object() else {
         return Err(SocialError::Storage("runtime mode is invalid".to_string()));
@@ -769,6 +766,14 @@ pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialErr
         None => Ok("reserved2".to_string()),
         Some(_) => Err(SocialError::Storage("runtime mode is invalid".to_string())),
     }
+}
+
+/// Active mode, failing explicitly when the selected runtime's `mode.json` is unreadable or invalid.
+pub(crate) fn mode_checked(context: &RuntimeContext) -> Result<String, SocialError> {
+    let text = context
+        .read_optional_text(RuntimeArea::Data, "mode.json")
+        .map_err(|_| SocialError::Storage("runtime mode is unavailable".to_string()))?;
+    validate_mode_text(text.as_deref())
 }
 
 pub(crate) fn set_mode(
@@ -1056,6 +1061,27 @@ pub(crate) fn ensure_or_rotate(
     rotate: bool,
 ) -> Result<String, SocialError> {
     ensure_or_rotate_agent_token(context, key, rotate).map_err(SocialError::Storage)
+}
+
+/// Atomically rotate `key`'s token under the conversation-state write lock only when its current
+/// token still belongs to one of `epochs`, leaving any replacement token and queued work untouched.
+pub(crate) fn rotate_if_epoch(
+    context: &RuntimeContext,
+    key: &str,
+    epochs: &[String],
+) -> Result<(), SocialError> {
+    ConversationState::for_runtime(context)
+        .update_existing(key, |conv| {
+            if conv
+                .token()
+                .is_some_and(|tok| epochs.iter().any(|ep| ep == &token_epoch(tok)))
+            {
+                conv.rotate_token();
+            }
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|(_, message)| SocialError::Storage(message))
 }
 
 pub(crate) fn revoke_if_current(
@@ -1451,6 +1477,103 @@ pub(crate) fn rearm_observation_sleep(
         .map_err(|(_, error)| error)
 }
 
+/// Repair an interrupted `reserved2` conversation's wake config when neither the model nor an
+/// operator wrote a newer configuration: if `infinite` is `false` and its finite `sleepUntil` was
+/// consumed or invalid, restore a still-future deadline or draw a fresh default sleep; only repair
+/// corrupted non-boolean `infinite` plans via `wake::ensure_wakeable`, never operator-cancelled
+/// `infinite: true` plans.
+pub(crate) fn rearm_interrupted_reserved2_wake(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    wake_claim: Option<&Value>,
+    max_confirmed_at: Option<i64>,
+    max_live_wake_at: Option<i64>,
+) -> Result<(), String> {
+    rearm_interrupted_reserved2_wake_for_token(
+        context,
+        cfg,
+        key,
+        wake_claim,
+        max_confirmed_at,
+        max_live_wake_at,
+        None,
+    )
+}
+
+pub(crate) fn rearm_interrupted_reserved2_wake_for_token(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    wake_claim: Option<&Value>,
+    max_confirmed_at: Option<i64>,
+    max_live_wake_at: Option<i64>,
+    expected_token: Option<&str>,
+) -> Result<(), String> {
+    if !inbound_admitted(cfg, key)
+        || mode_checked(context).map_err(String::from)? != "reserved2"
+    {
+        return Ok(());
+    }
+    let now = now_ms();
+    ConversationState::for_runtime(context)
+        .update_document(|doc| {
+            let Some(mut conv) = doc.conversation(key) else {
+                return Ok(());
+            };
+            if let Some(expected) = expected_token {
+                if !credential_eq(conv.token().unwrap_or(""), expected) {
+                    return Ok(());
+                }
+            }
+            let Some(mut wake) = conv.field("wakeConfig").cloned().filter(Value::is_object) else {
+                return Ok(());
+            };
+            let original = wake.clone();
+            let previous = wake_claim.and_then(|claim| claim.get("previous"));
+            let same_wake = max_live_wake_at
+                .is_none_or(|cutoff| wake["lastWakeAt"].as_i64().is_none_or(|at| at <= cutoff));
+            let same_config = if let Some(prev) = previous {
+                prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]
+            } else if let Some(cutoff) = max_confirmed_at {
+                wake["confirmedAt"].as_i64().is_none_or(|at| at <= cutoff)
+            } else {
+                true
+            };
+            if !same_wake || !same_config {
+                return Ok(());
+            }
+            if wake["sleepRetired"] == true
+                || wake["infinite"] == true
+                || wake["sleepUntil"]
+                    .as_str()
+                    .and_then(crate::wake::parse_iso_ms)
+                    .is_some()
+            {
+                return Ok(());
+            }
+            if wake["infinite"] == false {
+                let restored_future = previous
+                    .and_then(|prev| prev["wakeConfig"]["sleepUntil"].as_str())
+                    .filter(|iso| crate::wake::parse_iso_ms(iso).is_some_and(|at| at > now));
+                if let Some(iso) = restored_future {
+                    wake["sleepUntil"] = json!(iso);
+                    crate::wake::clear_sleep_retired(&mut wake);
+                } else {
+                    crate::wake::draw_default_sleep(&mut wake, cfg, now, rand01());
+                }
+            } else {
+                crate::wake::ensure_wakeable(&mut wake, cfg, now, rand01());
+            }
+            if wake != original {
+                conv.set_field("wakeConfig", wake);
+                doc.set_conversation(key, conv);
+            }
+            Ok(())
+        })
+        .map_err(|(_, error)| error)
+}
+
 // ── Conversation lifecycle, wake bookkeeping & resets ────────────────────────────────────────────
 
 pub(crate) fn record_reserved2_incoming(
@@ -1539,6 +1662,7 @@ pub(crate) fn record_reserved2_incoming(
 
 pub(crate) const WAKE_ACCESS_REFUSED: &str = "wake refused by current access settings";
 pub(crate) const WAKE_SUSPENDED: &str = "wake suspended by current settings";
+pub(crate) const WAKE_TIMEOUT_STALE: &str = "queued timeout deadline invalidated";
 
 pub(crate) fn claim_reserved2_wake(
     context: &RuntimeContext,
@@ -1546,6 +1670,37 @@ pub(crate) fn claim_reserved2_wake(
     reason: &str,
     now: i64,
     expected: Option<&str>,
+) -> Result<(Value, String), SocialError> {
+    claim_reserved2_wake_inner(context, key, reason, now, expected, None, false)
+}
+
+pub(crate) fn claim_reserved2_wake_for_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    reason: &str,
+    now: i64,
+    expected: Option<&str>,
+    expected_sleep: Option<&str>,
+) -> Result<(Value, String), SocialError> {
+    claim_reserved2_wake_inner(
+        context,
+        key,
+        reason,
+        now,
+        expected,
+        expected_sleep,
+        reason == "timeout",
+    )
+}
+
+fn claim_reserved2_wake_inner(
+    context: &RuntimeContext,
+    key: &str,
+    reason: &str,
+    now: i64,
+    expected: Option<&str>,
+    expected_sleep: Option<&str>,
+    require_active_deadline: bool,
 ) -> Result<(Value, String), SocialError> {
     ConversationState::for_runtime(context)
         .update_document(|doc| {
@@ -1569,6 +1724,24 @@ pub(crate) fn claim_reserved2_wake(
                 .to_string();
             if expected.is_some_and(|exp| !credential_eq(exp, &current_token)) {
                 return Err((409, "queued wake token invalidated".to_string()));
+            }
+            if require_active_deadline || expected_sleep.is_some() {
+                let current_wc = conv.field("wakeConfig");
+                let infinite = current_wc
+                    .and_then(|wc| wc.get("infinite"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let retired = current_wc
+                    .and_then(|wc| wc.get("sleepRetired"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let current_sleep = current_wc
+                    .and_then(|wc| wc.get("sleepUntil"))
+                    .and_then(Value::as_str);
+                let matches_expected = expected_sleep.is_none_or(|exp| current_sleep == Some(exp));
+                if infinite || retired || current_sleep.is_none() || !matches_expected {
+                    return Err((409, WAKE_TIMEOUT_STALE.to_string()));
+                }
             }
             let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
             wc["lastWakeAt"] = json!(now);
@@ -1600,6 +1773,56 @@ pub(crate) fn claim_reserved2_wake(
         .map_err(SocialError::from_http)
 }
 
+fn clear_reserved2_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    expected_token: Option<&str>,
+    at: i64,
+    previous: &Value,
+    mark_retired: bool,
+) -> Result<(), SocialError> {
+    let state = ConversationState::for_runtime(context);
+    let retire_wc = |conv: &mut Conversation| {
+        if let Some(expected) = expected_token {
+            if !credential_eq(conv.token().unwrap_or(""), expected) {
+                return Err((403, "queued wake token invalidated".into()));
+            }
+        }
+        if let Some(mut wc) = conv.field("wakeConfig").cloned() {
+            let same_wake_at = wc["lastWakeAt"].as_i64() == Some(at);
+            let same_deadline = previous["wakeConfig"]["sleepUntil"].is_string()
+                && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"];
+            let owns_deadline = if same_wake_at {
+                wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                    || (mark_retired && wc["sleepUntil"].is_null())
+            } else {
+                expected_token.is_none()
+                    && wc["lastWakeAt"].as_i64().is_some_and(|live| live >= at)
+                    && same_deadline
+            };
+            if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+                && wc["infinite"] != true
+                && owns_deadline
+            {
+                wc["sleepUntil"] = Value::Null;
+                if mark_retired {
+                    wc["sleepRetired"] = json!(true);
+                }
+                conv.set_field("wakeConfig", wc);
+            }
+        }
+        Ok(())
+    };
+    if expected_token.is_some() {
+        state.update(key, retire_wc).map_err(SocialError::from_http)
+    } else {
+        state
+            .update_existing(key, retire_wc)
+            .map(|_| ())
+            .map_err(SocialError::from_http)
+    }
+}
+
 pub(crate) fn consume_reserved2_deadline(
     context: &RuntimeContext,
     key: &str,
@@ -1607,17 +1830,74 @@ pub(crate) fn consume_reserved2_deadline(
     at: i64,
     previous: &Value,
 ) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, Some(expected_token), at, previous, false)
+}
+
+pub(crate) fn retire_reserved2_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    expected_token: &str,
+    at: i64,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, Some(expected_token), at, previous, true)
+}
+
+pub(crate) fn retire_reserved2_deadline_for_recovery(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    clear_reserved2_deadline(context, key, None, at, previous, true)
+}
+
+fn rollback_reserved2_wake_inner(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    previous: &Value,
+    retire_token: Option<&str>,
+) -> Result<(), SocialError> {
     ConversationState::for_runtime(context)
         .update(key, |conv| {
-            if !credential_eq(conv.token().unwrap_or(""), expected_token) {
-                return Err((403, "queued wake token invalidated".into()));
+            if let Some(expected_token) = retire_token {
+                if !credential_eq(conv.token().unwrap_or(""), expected_token) {
+                    return Ok(());
+                }
+            }
+            if let Some(mut times) = conv.field("wakeTimes").and_then(Value::as_array).cloned() {
+                if let Some(i) = times.iter().rposition(|v| v.as_i64() == Some(at)) {
+                    times.remove(i);
+                }
+                conv.set_field("wakeTimes", Value::Array(times));
             }
             if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-                if wc["lastWakeAt"].as_i64() == Some(at)
-                    && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                    && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
-                {
-                    wc["sleepUntil"] = Value::Null;
+                if wc["lastWakeAt"].as_i64() == Some(at) {
+                    for field in ["lastWakeAt", "wakeCount"] {
+                        wc[field] = previous["wakeConfig"][field].clone();
+                    }
+                    conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
+                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"] {
+                        let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                            || wc["sleepUntil"].is_null();
+                        if retire_token.is_some() && wc["infinite"] != true && owns_deadline {
+                            wc["sleepUntil"] = Value::Null;
+                            wc["sleepRetired"] = json!(true);
+                        } else if retire_token.is_none()
+                            && wc["infinite"] != true
+                            && wc["sleepRetired"] != true
+                            && wc["sleepUntil"]
+                                .as_str()
+                                .and_then(crate::wake::parse_iso_ms)
+                                .is_none()
+                        {
+                            wc["sleepUntil"] = previous["wakeConfig"]["sleepUntil"].clone();
+                            if wc["sleepUntil"].is_string() {
+                                crate::wake::clear_sleep_retired(&mut wc);
+                            }
+                        }
+                    }
                     conv.set_field("wakeConfig", wc);
                 }
             }
@@ -1632,29 +1912,17 @@ pub(crate) fn rollback_reserved2_wake(
     at: i64,
     previous: &Value,
 ) -> Result<(), SocialError> {
-    ConversationState::for_runtime(context)
-        .update(key, |conv| {
-            if let Some(mut times) = conv.field("wakeTimes").and_then(Value::as_array).cloned() {
-                if let Some(i) = times.iter().rposition(|v| v.as_i64() == Some(at)) {
-                    times.remove(i);
-                }
-                conv.set_field("wakeTimes", Value::Array(times));
-            }
-            if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-                if wc["lastWakeAt"].as_i64() == Some(at) {
-                    for field in ["lastWakeAt", "wakeCount"] {
-                        wc[field] = previous["wakeConfig"][field].clone();
-                    }
-                    conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
-                    if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"] {
-                        wc["sleepUntil"] = previous["wakeConfig"]["sleepUntil"].clone();
-                    }
-                    conv.set_field("wakeConfig", wc);
-                }
-            }
-            Ok(())
-        })
-        .map_err(SocialError::from_http)
+    rollback_reserved2_wake_inner(context, key, at, previous, None)
+}
+
+pub(crate) fn rollback_and_retire_reserved2_wake(
+    context: &RuntimeContext,
+    key: &str,
+    at: i64,
+    expected_token: &str,
+    previous: &Value,
+) -> Result<(), SocialError> {
+    rollback_reserved2_wake_inner(context, key, at, previous, Some(expected_token))
 }
 
 pub(crate) fn complete_reserved2_turn(
@@ -2265,6 +2533,7 @@ pub(crate) fn reconcile_default_wake_configs(
             if let Some(fields) = plan.as_object_mut() {
                 fields.remove("sleepUntil");
                 fields.remove("sleepRangeMs");
+                fields.remove("sleepRetired");
             }
         } else if !target.infinite && (current.infinite || range_changed) {
             crate::wake::draw_default_sleep(plan, &cfg, now_ms(), rand01());
@@ -3537,5 +3806,291 @@ mod tests {
             turn,
             "wrong-token"
         ));
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_future_and_newer_configs() {
+        let root = TestDir::new("rearm-interrupted-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": { "wake": { "recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000 } }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        let future = crate::sticker::iso_at(now_ms() + 500_000);
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": false,
+                    "lastWakeAt": 10,
+                    "sleepUntil": null,
+                    "triggers": {"atMention": true},
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+        let future_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": future}}});
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&future_claim), None, None).unwrap();
+        assert_eq!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"],
+            future,
+            "still-future deadline from wake_claim must be restored"
+        );
+
+        // Consumed past deadline draws a new default sleep even when a crashed provisional lastWakeAt <= cutoff exists.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(12);
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        let past_claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
+        let before = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
+        let rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("past deadline must re-arm a new sleepUntil across provisional claim");
+        assert!(rearmed >= before + 60_000);
+
+        // Newer live wake (lastWakeAt > cutoff) on the same confirmedAt must never be overwritten.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(20);
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
+        assert!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
+            "newer live wake must keep its consumed sleepUntil untouched by older claim"
+        );
+
+        // Newer model/operator config (infinite: true) is left untouched.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "active",
+                "infinite": true,
+                "sleepUntil": null,
+                "triggers": {"atMention": true, "anyMessage": true},
+                "confirmedAt": 9
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None, None).unwrap();
+        let kept = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
+        assert_eq!(kept["confirmedAt"], 9);
+        assert_eq!(kept["infinite"], true);
+        assert!(kept["sleepUntil"].is_null());
+
+        // Newer finite config with null sleepUntil (confirmedAt changed) is also left untouched.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "sleepUntil": null,
+                "triggers": {"atMention": true},
+                "confirmedAt": 10
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&past_claim), None, None).unwrap();
+        let kept_finite = &context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"];
+        assert_eq!(kept_finite["confirmedAt"], 10);
+        assert_eq!(kept_finite["infinite"], false);
+        assert!(kept_finite["sleepUntil"].is_null());
+
+        // Globally paused documents and socialV2.enabled=false restarts still re-arm consumed finite deadlines.
+        update_raw(&context, |doc| {
+            doc["paused"] = json!(true);
+            doc["conversations"]["group:42"]["wakeConfig"]["confirmedAt"] = json!(2);
+            doc["conversations"]["group:42"]["wakeConfig"]["lastWakeAt"] = json!(10);
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+        let mut disabled_cfg = cfg.clone();
+        disabled_cfg["socialV2"]["enabled"] = json!(false);
+        let before_paused = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &disabled_cfg, "group:42", Some(&past_claim), Some(10), Some(15)).unwrap();
+        let paused_rearmed = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("global pause and disabled socialV2 restart must still re-arm consumed finite sleepUntil");
+        assert!(paused_rearmed >= before_paused + 60_000);
+
+        // Unclaimed turn (wake_claim = None) must not overwrite a newer config whose confirmedAt > cutoff.
+        update_raw(&context, |doc| {
+            doc["paused"] = json!(false);
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "lastWakeAt": 100,
+                "sleepUntil": null,
+                "triggers": {"atMention": true},
+                "confirmedAt": 200
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", None, Some(150), Some(150)).unwrap();
+        assert!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
+            "unclaimed turn must keep newer config (confirmedAt > begun_at) untouched"
+        );
+
+        // Rollback must preserve an already-valid finite sleepUntil (e.g., drawn by newer operator defaults).
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "lastWakeAt": 10,
+                "sleepUntil": future,
+                "confirmedAt": 2
+            });
+            Ok(())
+        })
+        .unwrap();
+        rollback_reserved2_wake(&context, "group:42", 10, &past_claim["previous"]).unwrap();
+        let rolled_back = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert!(
+            rolled_back["lastWakeAt"].is_null(),
+            "rollback must run when confirmedAt and lastWakeAt match"
+        );
+        assert_eq!(
+            rolled_back["sleepUntil"],
+            future,
+            "rollback must not overwrite an already-valid finite sleepUntil with an old deadline"
+        );
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_zero_delay_finite_plan() {
+        let root = TestDir::new("rearm-zero-delay-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": {
+                "wake": {
+                    "sleepMinMs": 0,
+                    "sleepMaxMs": 0,
+                    "recommendedSleepMinMs": 0,
+                    "recommendedSleepMaxMs": 0,
+                    "recommendedDefaultInfinite": true
+                }
+            }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": false,
+                    "lastWakeAt": 10,
+                    "sleepUntil": null,
+                    "triggers": {
+                        "atMention": false,
+                        "nameMention": false,
+                        "speakerIds": [],
+                        "keywords": [],
+                        "question": false,
+                        "poke": false,
+                        "anyMessage": false,
+                        "probability": 0.0
+                    },
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "sleepUntil": "2000-01-01T00:00:00.000Z"}}});
+        let before = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+        let after = now_ms();
+        let wc = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc["infinite"], false, "zero-delay finite plan must not flip to infinite: true");
+        let rearmed_iso = wc["sleepUntil"].as_str().expect("sleepUntil must be set");
+        let rearmed_ms = crate::wake::parse_iso_ms(rearmed_iso).expect("sleepUntil must parse as ISO");
+        assert!(
+            rearmed_ms >= before && rearmed_ms <= after && rearmed_iso == crate::sticker::iso_at(rearmed_ms),
+            "zero-delay bounds must re-arm sleepUntil to iso_at(now), got {rearmed_iso}"
+        );
+
+        // Unparseable sleepUntil with infinite=false is also re-armed rather than left invalid or flipped to infinite.
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"]["wakeConfig"]["sleepUntil"] = json!("invalid-timestamp");
+            Ok(())
+        })
+        .unwrap();
+        let before_bad = now_ms();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+        let after_bad = now_ms();
+        let wc_bad = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc_bad["infinite"], false);
+        let bad_rearmed_ms = wc_bad["sleepUntil"]
+            .as_str()
+            .and_then(crate::wake::parse_iso_ms)
+            .expect("unparseable sleepUntil must be replaced with valid iso_at(now)");
+        assert!(bad_rearmed_ms >= before_bad && bad_rearmed_ms <= after_bad);
+    }
+
+    #[test]
+    fn rearm_interrupted_reserved2_wake_preserves_operator_cancelled_infinite_plan() {
+        let root = TestDir::new("rearm-operator-cancelled-infinite-r2");
+        let cfg = json!({
+            "allow": { "groups": [42] },
+            "socialV2": {
+                "wake": {
+                    "recommendedDefaultInfinite": false,
+                    "recommendedSleepMinMs": 60_000,
+                    "recommendedSleepMaxMs": 60_000
+                }
+            }
+        });
+        let context = test_context(&root, cfg.clone());
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+
+        update_raw(&context, |doc| {
+            doc["conversations"]["group:42"] = json!({
+                "agentToken": "tok-42",
+                "wakeConfig": {
+                    "mode": "diving",
+                    "infinite": true,
+                    "lastWakeAt": 10,
+                    "sleepUntil": null,
+                    "triggers": {
+                        "atMention": false,
+                        "nameMention": false,
+                        "question": false,
+                        "poke": false,
+                        "anyMessage": false,
+                        "probability": 0,
+                        "keywords": [],
+                        "speakerIds": []
+                    },
+                    "confirmedAt": 2
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = json!({"at": 10, "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": true, "sleepUntil": null}}});
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", Some(&claim), Some(10), Some(15)).unwrap();
+
+        let wc = context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"].clone();
+        assert_eq!(wc["infinite"], true, "operator-cancelled infinite plan must stay infinite: true");
+        assert!(wc["sleepUntil"].is_null(), "operator-cancelled infinite plan must keep sleepUntil null");
     }
 }

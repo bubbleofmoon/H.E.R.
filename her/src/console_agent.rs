@@ -1400,6 +1400,11 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
             wc["infinite"] = json!(true);
         }
         crate::wake::ensure_wakeable(&mut wc, cfg, now, rand01());
+        if wc.get("infinite").and_then(Value::as_bool) == Some(true)
+            || wc.get("sleepUntil").is_some_and(Value::is_string)
+        {
+            crate::wake::clear_sleep_retired(&mut wc);
+        }
         wc["confirmedAt"] = json!(now);
         wc["confirmedBy"] = json!("mark_read");
         conv.set_field("wakeConfig", wc.clone());

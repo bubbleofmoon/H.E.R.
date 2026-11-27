@@ -280,10 +280,14 @@ fn set_sleep(caller: front::AdminCaller<'_>, key: &str, fields: Option<&serde_js
             return Err((409, "该会话没有有限潜水".to_string()));
         }
         match until {
-            Some(at) => conversation_wake["sleepUntil"] = json!(crate::sticker::iso_at(at)),
+            Some(at) => {
+                conversation_wake["sleepUntil"] = json!(crate::sticker::iso_at(at));
+                crate::wake::clear_sleep_retired(&mut conversation_wake);
+            }
             None => {
                 conversation_wake["infinite"] = json!(true);
                 conversation_wake["sleepUntil"] = Value::Null;
+                crate::wake::clear_sleep_retired(&mut conversation_wake);
             }
         }
         conv.set_field("wakeConfig", conversation_wake);
