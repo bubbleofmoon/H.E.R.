@@ -1,74 +1,18 @@
 # Production operations
 
-Public rules only. Production operating procedures are not published here: they live in the
-vault, repository `bubbleofmoon/H.E.R.-vault`, file `docs/agents/production-ops.md`, checked
-out at `C:/her-vault`. That document holds the live layout, the log files and report
-formats, the console and exe-swap procedures, and every incident and owner-edit record. A
-public issue, comment or commit names those vault paths and nothing else.
+Public rules only. Live layout, log/report formats, console/exe-swap procedures, incidents and owner edits stay in vault `bubbleofmoon/H.E.R.-vault` (`C:/her-vault/docs/agents/production-ops.md`). Public text names vault paths only.
 
 ## Public rules
 
-- Production lives in one root, `C:/qqbot` (the install root, `docs/agents/runtime-paths.md`);
-  until the owner's move (#67) brings them inside, `C:/qqbot-rust`, the relay folder
-  `C:/her-orch/relay` and `~/.dsh` are production too. Production is read-only for
-  development: never write any of them or `memory.db`; never change a scheduled task, a
-  service, a token, a release directory or a configuration file there. Development work
-  never stops, starts or replaces a production process.
-- A production database is read from file metadata only, or from a copy taken with the
-  owner's go; it is never opened in place, in any mode. `mode=ro` on a WAL database creates
-  `-wal` and `-shm` beside it and leaves them after close, and `immutable=1` reuses existing
-  ones, so no open mode is safe against a live database.
-- Every production action is the owner's, taken with the owner's go at the time it happens
-  (`docs/agents/baton.md`). An agent prepares the command and the check, and reports what it
-  would do; it never runs it. A go relayed through a handoff does not change this: a
-  production-action handoff carries the exact command and check for the owner to run. The
-  one exception is the #67 move below.
-- Tests never touch production. They run against throwaway runtimes and fake QQ gateways,
-  agent hosts and model servers, and never contact real QQ, DSH, model or TTS services.
-  `HER_INSTALL_ROOT` points a test at a throwaway installation, never at a live one.
-- Production incident detail stays in the vault: diagnosis notes, `her-cli report` output,
-  log excerpts and receipts go to `C:/her-vault/.scratch/<feature>/evidence/<NN>/` or
-  `C:/her-orch/<ticket>/evidence/`. A public text names those files by path, writes
-  conversation keys as `group:<n>` or `private:<n>` placeholders, and never quotes a log
-  line, a conversation, a session id, a token or an account number. `scripts/gh-public`
-  refuses log-, chat- and account-shaped text; a refusal means the material belongs in the
-  vault, not that the rule needs widening.
-- The `her-cli report` contract that product code must keep is under Crate contracts below; its
-  file list, window semantics and format details are in the vault document.
-- The move into the install root (#67) is `scripts/production-move.ps1` with `-Production`,
-  from an administrator PowerShell under the owner's account: `-Mode Inventory` (read-only
-  checks that report every blocker at once; a check that needs a failed one reports
-  `skipped: needs <check>`) first, then `-Mode Move` (`-DigestModel <id>` also points the memory digest at the
-  relay), and `-Mode Rollback -Production -StateFile <evidence>\state.json` returns to the
-  untouched originals. `-Mode OperatorFolders` copies the ops scripts into `C:\qqbot\ops`
-  afterwards. For this move only, the Windows coordinator runs the script for the owner:
-  Inventory at any time, non-interactively, and Move, OperatorFolders and a manual Rollback
-  only on the owner's go. A go counts only in one form: the owner gives it in the Linux
-  coordinator's session, and the Linux coordinator relays it in a handoff that quotes the
-  owner's words and names the release. The Windows coordinator then writes a one-time go
-  file directly in `C:\her-orch\67\go\`, holding the single line `MOVE <release>`,
-  `ROLLBACK <release>` or `COPY`, at most 2 hours before the run, and passes it as
-  `-OwnerGoFile`. The first run that gets past the invocation guards consumes it: the run
-  checks it and deletes it before its first change, whatever that run does afterwards. The go
-  file guards against an agent acting without a relayed owner go. Anyone who can write the go
-  folder could write a go file, so the script cannot authenticate the writer, and races that
-  need the same account to swap links during a run are out of scope beyond failing closed.
-  The same go covers the move's post-move checks and the persona import and
-  assignment through the console. The script's own automatic rollback needs no go. Without
-  `-OwnerGoFile`, Move, Rollback and OperatorFolders need an interactive session and the
-  typed word (`MOVE`, `ROLLBACK`, `COPY`). Every other production action stays the owner's.
-  The Windows session's guard accepts a relayed go only for Move and Rollback through a go
-  file. OperatorFolders (its own `COPY` go), installing a release, editing the live DSH profile
-  or presets, restarting DSH and lifecycle changes need the owner's own words in the Windows
-  session. Linux hands those to the owner (`baton:owner`) with the exact sentence to type,
-  rather than relaying them.
-  Development runs the script only with `-Rehearsal`, through
-  `scripts/lifecycle/test-production-move.ps1` under a temporary root. Its evidence folder holds
-  production detail (`state.json` keeps real paths for the rollback) and goes to the vault;
-  the console and `inventory.json` show the profile root as `<profile>`. In production the
-  evidence folder may not lie under the account profile, so printed rollback commands keep
-  usable paths.
+- **Read-only boundary:** production root is `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay`, `~/.dsh`). Never write them or `memory.db`, change scheduled tasks/services/tokens/releases/configs there, or stop/start/replace production processes from development.
+- **Database safety:** read production DBs from file metadata or an owner-approved copy only — never open live DBs in place (`mode=ro` creates/leaves `-wal`/`-shm`; `immutable=1` reuses existing ones).
+- **Owner authority:** every production action requires the owner's go at execution time (`docs/agents/baton.md`); agents prepare commands/checks only (exception: `#67` move below).
+- **Test isolation:** tests use throwaway runtimes (`HER_INSTALL_ROOT`) and fake gateways/agent hosts/model servers; never contact real QQ, DSH, model or TTS services.
+- **Evidence hygiene:** diagnosis notes, `her-cli report` output, log excerpts and receipts go to `C:/her-vault/.scratch/<feature>/evidence/<NN>/` or `C:/her-orch/<ticket>/evidence/`. Public text uses `group:<n>` / `private:<n>` placeholders and never quotes logs, chats, session IDs, tokens or account numbers (`scripts/gh-public` enforces).
+- **Production move (`#67`, `scripts/production-move.ps1 -Production`):** admin PowerShell under owner account: `-Mode Inventory` (non-interactive read-only; blocked checks report `skipped: needs <check>`), `-Mode Move` (`-DigestModel <id>` sets digest model), `-Mode Rollback -Production -StateFile <evidence>\state.json`, `-Mode OperatorFolders` (copies ops scripts to `C:\qqbot\ops`).
+  - Relayed go exception: Windows coordinator may run `Inventory` anytime, and `Move`/`Rollback` only with a relayed owner go from the Linux coordinator session quoting the owner's words and release tag; write a one-time go file (`MOVE <release>`, `ROLLBACK <release>`, or `COPY`) in `C:\her-orch\67\go\` <=2h before run (`-OwnerGoFile`, consumed/deleted before first change). `OperatorFolders` (`COPY`), release installs, DSH profile/preset edits, DSH restarts and lifecycle changes still require the owner's direct words in the Windows session.
+  - Development tests only with `-Rehearsal` via `scripts/lifecycle/test-production-move.ps1` under a temp root (`state.json` goes to vault; console/`inventory.json` mask profile as `<profile>`; production rollback paths must remain usable outside account profile).
 
 ## Crate contracts
 
-`her-cli report` reads selected production diagnostic files without config loading, service calls, locks or writes. Preserve its explicit runtime selection, install-root guard, shared captured-length streaming reads and metadata-only output in both text and JSON. Collector timing carries bridge turn and submitted-attempt identities; summaries require a final-attempt match. Formats, window semantics and source availability: the vault document named above (public rules only here).
+`her-cli report` reads selected production diagnostic files without config loading, service calls, locks or writes. Preserve explicit runtime selection, install-root guard, shared captured-length streaming reads, and metadata-only text/JSON output. Collector timing carries bridge turn and submitted-attempt identities; summaries require a final-attempt match. Formats and window semantics live in the vault document.
