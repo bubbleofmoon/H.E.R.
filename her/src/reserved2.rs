@@ -2714,6 +2714,280 @@ mod tests {
         .expect("the briefing mention cap fixture must settle");
     }
 
+    #[tokio::test]
+    async fn ticket297_hub_tick_before_recovery_retires_unconsumed_expired_timeout() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let key = HARNESS_CAP_KEY;
+            let due_ms = crate::turn_ledger::now_ms() - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            let previous = json!({
+                "wakeConfig": {
+                    "confirmedAt": 2,
+                    "infinite": false,
+                    "sleepUntil": due_iso,
+                    "lastWakeAt": 0,
+                    "wakeCount": 0
+                },
+                "lastWakeReason": ""
+            });
+
+            for (label, close_cancelled) in [
+                ("harness-cap-r23-before-rec-cancelled", true),
+                ("harness-cap-r23-before-rec-open", false),
+            ] {
+                let (_root, mut hub, console) = harness_cap_fixture(label, None).await;
+                drop(console);
+                hub.awaiting.clear();
+                let tok = "tok-r23-race1";
+                conversation_state::update_raw(&hub.context, |state| {
+                    let conv = &mut state["conversations"][key];
+                    conv["agentToken"] = json!(tok);
+                    conv["engagedAt"] = json!(0);
+                    conv["wakeTimes"] = json!([10]);
+                    conv["wakeConfig"]["confirmedAt"] = json!(2);
+                    conv["wakeConfig"]["infinite"] = json!(false);
+                    conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                    conv["wakeConfig"]["lastWakeAt"] = json!(10);
+                    conv["wakeConfig"]["wakeCount"] = json!(1);
+                    Ok(())
+                })
+                .unwrap();
+                let rec = crate::turn_ledger::Recorder::begin_reserved2(
+                    &hub.context,
+                    key,
+                    "harness",
+                    "timeout",
+                    &crate::send_outbox::token_epoch(tok),
+                    &[],
+                )
+                .unwrap();
+                rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+                rec.verified("expired-before-admission", "turnTimeout").unwrap();
+                if close_cancelled {
+                    rec.end("cancelled", "turnTimeout").unwrap();
+                }
+
+                let context = hub.context.clone();
+                let journal = hub.journal.clone();
+                drop(hub);
+
+                let mut restarted = Hub::new(&context, journal, vec![], true);
+                restarted.tick("bot", 9001).await.unwrap();
+                let _abort = restarted
+                    .active
+                    .get(key)
+                    .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+                assert!(
+                    !restarted.active.contains_key(key),
+                    "{label}: Hub::tick before recovery must not dispatch expired-before-admission timeout"
+                );
+                let state = restarted.state().unwrap();
+                let wc = &state["conversations"][key]["wakeConfig"];
+                assert!(
+                    wc["sleepUntil"].is_null(),
+                    "{label}: Hub::tick before recovery must retire unconsumed sleepUntil, got {wc}"
+                );
+                assert_eq!(wc["sleepRetired"], json!(true), "{label}: must set sleepRetired");
+                assert_eq!(wc["lastWakeAt"], json!(10), "{label}: must not overwrite lastWakeAt");
+                assert_eq!(wc["wakeCount"], json!(1), "{label}: must not bump wakeCount");
+                assert_eq!(
+                    restarted.drivers[key].sched.wc.sleep_until, None,
+                    "{label}: live driver must clear retired sleep_until"
+                );
+                assert_eq!(
+                    restarted.drivers[key].sched.sleep_at, None,
+                    "{label}: live driver must clear retired sleep_at"
+                );
+                restarted.tick("bot", 9001).await.unwrap();
+                assert!(
+                    !restarted.active.contains_key(key),
+                    "{label}: subsequent tick must remain idle"
+                );
+            }
+
+            // Newer operator schedule with a distinct due deadline must not be retired.
+            let (_root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r23-rescheduled", None).await;
+            drop(console);
+            hub.awaiting.clear();
+            let op_due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 500);
+            let tok = "tok-r23-op-due";
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["agentToken"] = json!(tok);
+                conv["engagedAt"] = json!(0);
+                conv["wakeTimes"] = json!([10]);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(op_due_iso);
+                conv["wakeConfig"]["lastWakeAt"] = json!(10);
+                conv["wakeConfig"]["wakeCount"] = json!(1);
+                Ok(())
+            })
+            .unwrap();
+            let rec = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "timeout",
+                &crate::send_outbox::token_epoch(tok),
+                &[],
+            )
+            .unwrap();
+            rec.wake_claim(&json!({"at": 10, "previous": previous})).unwrap();
+            rec.verified("expired-before-admission", "turnTimeout").unwrap();
+            rec.end("cancelled", "turnTimeout").unwrap();
+
+            let context = hub.context.clone();
+            let journal = hub.journal.clone();
+            drop(hub);
+
+            let mut restarted = Hub::new(&context, journal, vec![], true);
+            restarted.tick("bot", 9001).await.unwrap();
+            let _abort = restarted
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                restarted.active.contains_key(key),
+                "distinct due operator schedule must still dispatch"
+            );
+            assert_eq!(restarted.active[key].reason, "timeout");
+        })
+        .await
+        .expect("the hub-before-recovery fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_hub_queued_timeout_revalidates_deadline_after_retirement() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            // Part A: retirement wins after Hub::tick reads state, before timeout claim.
+            let (_root, mut hub, console) =
+                harness_cap_fixture("harness-cap-r23-reval-retired", None).await;
+            drop(console);
+            hub.awaiting.clear();
+            let key = HARNESS_CAP_KEY;
+            let due_ms = crate::turn_ledger::now_ms() - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            let previous = json!({
+                "wakeConfig": {
+                    "confirmedAt": 2,
+                    "infinite": false,
+                    "sleepUntil": due_iso,
+                    "lastWakeAt": 0,
+                    "wakeCount": 0
+                },
+                "lastWakeReason": ""
+            });
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeTimes"] = json!([10]);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                conv["wakeConfig"]["lastWakeAt"] = json!(10);
+                conv["wakeConfig"]["wakeCount"] = json!(1);
+                Ok(())
+            })
+            .unwrap();
+
+            let (snap_tx, snap_rx) =
+                tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+            let context = hub.context.clone();
+            let journal = hub.journal.clone();
+            drop(hub);
+            let mut restarted = Hub::new(&context, journal, vec![], true);
+            restarted.tick_snapshot_hook = Some(snap_tx);
+            let ctx_hook = restarted.context.clone();
+            let retire_task = tokio::spawn(async move {
+                let done = snap_rx.await.unwrap();
+                social_state::retire_reserved2_deadline_for_recovery(
+                    &ctx_hook,
+                    key,
+                    10,
+                    &previous,
+                )
+                .unwrap();
+                done.send(()).unwrap();
+            });
+
+            restarted.tick("bot", 9001).await.unwrap();
+            retire_task.await.unwrap();
+            let _abort = restarted
+                .active
+                .get(key)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                !restarted.active.contains_key(key),
+                "Hub::tick must reject queued timeout after retirement wins post-snapshot"
+            );
+            let state = restarted.state().unwrap();
+            let wc = &state["conversations"][key]["wakeConfig"];
+            assert!(wc["sleepUntil"].is_null(), "sleepUntil must stay retired, got {wc}");
+            assert_eq!(wc["sleepRetired"], json!(true));
+            assert_eq!(wc["lastWakeAt"], json!(10));
+            assert_eq!(wc["wakeCount"], json!(1));
+            assert_eq!(restarted.drivers[key].sched.wc.sleep_until, None);
+            assert_eq!(restarted.drivers[key].sched.sleep_at, None);
+
+            // Part B: queued timeout parked in dsh_wait must revalidate after operator /schedule change.
+            let (root2, mut hub2) = queued_hub("r23-queued-timeout-rescheduled").await;
+            hub2.ready.clear();
+            hub2.awaiting.clear();
+            let key2 = "group:420042";
+            let due2_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+            let future2_ms = crate::turn_ledger::now_ms() + 120_000;
+            let future2_iso = crate::sticker::iso_at(future2_ms);
+            conversation_state::update_raw(&hub2.context, |state| {
+                let conv = &mut state["conversations"][key2];
+                conv["wakeTimes"] = json!([10]);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due2_iso);
+                conv["wakeConfig"]["lastWakeAt"] = json!(10);
+                conv["wakeConfig"]["wakeCount"] = json!(1);
+                Ok(())
+            })
+            .unwrap();
+            let cfg2 = hub2.context.load_config().unwrap();
+            crate::dsh_health::observe(&hub2.context, &cfg2, false, "synthetic outage", true);
+            hub2.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub2.dsh_wait.len(key2), 1, "timeout must park in dsh_wait");
+            assert!(!hub2.active.contains_key(key2));
+
+            conversation_state::update_raw(&hub2.context, |state| {
+                state["conversations"][key2]["wakeConfig"]["sleepUntil"] = json!(future2_iso);
+                Ok(())
+            })
+            .unwrap();
+            crate::dsh_health::observe(&hub2.context, &cfg2, true, "", true);
+            hub2.tick("bot", 9001).await.unwrap();
+            let _abort2 = hub2
+                .active
+                .get(key2)
+                .map(|a| CancelHarnessCapFixture(a.task.abort_handle()));
+            assert!(
+                !hub2.active.contains_key(key2),
+                "stale queued timeout must not claim over newer operator schedule"
+            );
+            let state2 = hub2.state().unwrap();
+            let wc2 = &state2["conversations"][key2]["wakeConfig"];
+            assert_eq!(wc2["sleepUntil"], json!(future2_iso));
+            assert_eq!(wc2["lastWakeAt"], json!(10));
+            assert_eq!(wc2["wakeCount"], json!(1));
+            assert_eq!(
+                hub2.drivers[key2].sched.wc.sleep_until.as_deref(),
+                Some(future2_iso.as_str()),
+                "live driver must adopt newer operator schedule"
+            );
+            drop(hub2);
+            std::fs::remove_dir_all(root2).unwrap();
+        })
+        .await
+        .expect("the queued timeout revalidation fixture must settle");
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -4592,6 +4866,7 @@ pub struct Hub {
     /// normal dispatch (every validity check) once DSH is back.
     dsh_wait: DshWait,
     tokens: HashMap<String, String>,
+    timeout_deadlines: HashMap<String, String>,
     retries: HashMap<String, (i64, String)>,
     rollback_pending: HashMap<String, (i64, Value, Option<String>)>,
     rearm_pending: HashMap<String, (i64, String, Value, String)>,
@@ -4666,6 +4941,7 @@ impl Hub {
             held: HashMap::new(),
             dsh_wait: DshWait::default(),
             tokens: HashMap::new(),
+            timeout_deadlines: HashMap::new(),
             retries: HashMap::new(),
             rollback_pending: HashMap::new(),
             rearm_pending: HashMap::new(),
@@ -4766,6 +5042,7 @@ impl Hub {
         self.drivers.clear();
         self.synced.clear();
         self.tokens.clear();
+        self.timeout_deadlines.clear();
         self.retries.clear();
         self.rollback_pending.clear();
         self.rearm_pending.clear();
@@ -4790,6 +5067,7 @@ impl Hub {
         self.drivers.remove(key);
         self.synced.remove(key);
         self.tokens.remove(key);
+        self.timeout_deadlines.remove(key);
         self.held.remove(key);
         self.dsh_wait.remove(key);
         self.retries.remove(key);
@@ -4842,8 +5120,27 @@ impl Hub {
     /// ordinary queued ingress; an external rotation still invalidates ordinary work.
     /// A cancellation that fails is logged and never aborts the ingress or tick that routed it:
     /// a failed DSH stop still revoked the old epoch, so its minted token is adopted all the same.
+    fn remember_timeout_deadline(&mut self, key: &str, reason: &str, previous: &Value) {
+        if reason == "timeout" {
+            if let Some(deadline) = previous["wakeConfig"]["sleepUntil"].as_str() {
+                self.timeout_deadlines
+                    .insert(key.to_string(), deadline.to_string());
+            }
+        }
+    }
+
     fn route_driver_event(&mut self, cfg: &Value, key: &str, event: session::WakeEvent) {
         if event.reason != "turnTimeout" {
+            if event.reason == "timeout" {
+                if let Some(deadline) = self
+                    .drivers
+                    .get(key)
+                    .filter(|d| !d.sched.wc.infinite)
+                    .and_then(|d| d.sched.wc.sleep_until.clone())
+                {
+                    self.timeout_deadlines.insert(key.to_string(), deadline);
+                }
+            }
             self.ready.push((key.to_string(), event.reason));
             return;
         }
@@ -5841,6 +6138,7 @@ impl Hub {
                     );
                 }
                 if held && !had_inbound {
+                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
                     self.held.insert(key.clone(), active.reason.clone());
                 }
             }
@@ -5852,14 +6150,19 @@ impl Hub {
                 let keys = active.inbound;
                 self.awaiting.entry(key.clone()).or_default().extend(keys.clone());
                 self.journal.run(move |j| j.settle_events(&keys, "received", now)).await?;
+                self.remember_timeout_deadline(&key, &active.reason, &active.previous);
                 self.park_for_dsh(&key, now, active.reason);
             } else if retry {
-                let failures = self.failures.entry(key.clone()).or_default();
-                *failures += 1;
-                if *failures <= MAX_WAKE_RETRIES {
+                let attempt = {
+                    let failures = self.failures.entry(key.clone()).or_default();
+                    *failures += 1;
+                    *failures
+                };
+                if attempt <= MAX_WAKE_RETRIES {
+                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
                     self.retries.insert(
                         key.clone(),
-                        (now + 5_000 * (1_i64 << (*failures - 1)), active.reason),
+                        (now + 5_000 * (1_i64 << (attempt - 1)), active.reason),
                     );
                     let keys = active.inbound;
                     self.awaiting
@@ -6013,6 +6316,9 @@ impl Hub {
                 if reason == "wakeReminder" {
                     self.ready.push((key, reason));
                 } else if let Some(d) = self.drivers.get_mut(&key) {
+                    if reason == "timeout" {
+                        self.timeout_deadlines.remove(&key);
+                    }
                     d.sched.prompt_running = true;
                     d.sched.schedule_wake(&reason, now);
                 }
@@ -6020,11 +6326,13 @@ impl Hub {
             }
             self.suspended_claims.remove(&key);
             if !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
+                self.timeout_deadlines.remove(&key);
                 continue;
             }
             if crate::group_mute::active(&self.context, &key).is_some() {
                 // #46: no wake while muted; its messages stay unread for the first wake after the mute.
                 println!("{key} [reserved2] 该群当前依然处在管理员禁言期间之内，所以这次唤醒调度已自动跳过（触发原因为 {reason}）");
+                self.timeout_deadlines.remove(&key);
                 continue;
             }
             if crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key) {
@@ -6034,6 +6342,16 @@ impl Hub {
                 self.park_for_dsh(&key, now, reason);
                 continue;
             }
+            let expected_sleep = (reason == "timeout")
+                .then(|| {
+                    self.timeout_deadlines.get(&key).cloned().or_else(|| {
+                        self.drivers
+                            .get(&key)
+                            .filter(|d| !d.sched.wc.infinite)
+                            .and_then(|d| d.sched.wc.sleep_until.clone())
+                    })
+                })
+                .flatten();
             let mut keys = Vec::new();
             let mut claimed = None;
             // Keep each drained job until a task or a bounded retry owns it.
@@ -6071,7 +6389,25 @@ impl Hub {
                     }
                     (conv, token)
                 } else {
-                    let claim = social_state::claim_reserved2_wake(&self.context, &key, &reason, now, expected.as_deref())?;
+                    let claim = if reason == "timeout" {
+                        crate::turn_recovery::retire_pending_startup_timeout(&self.context, &key)?;
+                        social_state::claim_reserved2_wake_for_deadline(
+                            &self.context,
+                            &key,
+                            &reason,
+                            now,
+                            expected.as_deref(),
+                            expected_sleep.as_deref(),
+                        )?
+                    } else {
+                        social_state::claim_reserved2_wake(
+                            &self.context,
+                            &key,
+                            &reason,
+                            now,
+                            expected.as_deref(),
+                        )?
+                    };
                     claimed = Some(claim.clone());
                     claim
                 };
@@ -6086,13 +6422,55 @@ impl Hub {
                 Ok::<_, String>((previous, dispatch_token, prompt, cli_prompt, target))
             }.await;
             let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
-                Ok(prepared) => prepared,
+                Ok(prepared) => {
+                    self.timeout_deadlines.remove(&key);
+                    prepared
+                }
                 Err(error) if error == STALE_WAKE || error == social_state::WAKE_ACCESS_REFUSED => {
                     // Authority changed while the wake was queued. Settle its ingress without a retry.
                     self.invalidate_key(&key, now).await?;
                     self.journal.mark_handled(keys, now).await?;
                     let reason = if error == STALE_WAKE { "token-invalidated" } else { "settings-invalidated" };
                     self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":reason}))?;
+                    continue;
+                }
+                Err(error) if error == social_state::WAKE_TIMEOUT_STALE => {
+                    self.timeout_deadlines.remove(&key);
+                    self.suspended_claims.remove(&key);
+                    if !keys.is_empty() {
+                        self.awaiting.insert(key.clone(), keys.clone());
+                        if let Err(error) = self.journal.run(move |j| j.requeue_unsubmitted(&keys, now)).await {
+                            println!("[reserved2] {key} stale timeout journal rollback failed: {error}");
+                        }
+                    }
+                    if let Some(d) = self.drivers.get_mut(&key) {
+                        d.sched.prompt_running = false;
+                        d.sched.turn_started_at = None;
+                        d.sched.pending_wake_key_at = None;
+                        d.sched.wake_times.retain(|at| *at != now);
+                        d.sched.wc.sleep_until = None;
+                        d.sched.sleep_at = None;
+                        if d.sched.pending_wake_reason.as_deref() == Some("timeout") {
+                            d.sched.pending_wake_at = None;
+                            d.sched.pending_wake_reason = None;
+                        }
+                    }
+                    if let Ok(fresh_state) = self.state() {
+                        let conv = &fresh_state["conversations"][&key];
+                        let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
+                        if let Some(d) = self.drivers.get_mut(&key) {
+                            if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
+                                d.adopt_wake_config(persisted_wake, now);
+                                self.synced.insert(key.clone(), next);
+                            } else {
+                                sync_persisted_driver_deadline(d, conv, persisted_wake, now);
+                            }
+                            d.refresh_observed_state(conv, now);
+                        }
+                    } else {
+                        self.synced.remove(&key);
+                    }
+                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":"timeout-stale"}))?;
                     continue;
                 }
                 Err(error) => {
@@ -6138,13 +6516,16 @@ impl Hub {
                     *failures += 1;
                     if *failures <= MAX_WAKE_RETRIES {
                         self.retries.insert(key, (now + 5_000 * (1_i64 << (*failures - 1)), reason));
-                    } else if let Some((previous, dispatch_token)) = claimed.as_ref() {
-                        let retire_timeout = (reason == "timeout"
-                            && previous["wakeConfig"]["sleepUntil"].is_string())
-                            || previous["wakeConfig"]["sleepRetired"] == true;
-                        if !retire_timeout && previous["wakeConfig"]["infinite"] == false {
-                            self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
-                            self.drain_rearm_pending(&cfg);
+                    } else {
+                        self.timeout_deadlines.remove(&key);
+                        if let Some((previous, dispatch_token)) = claimed.as_ref() {
+                            let retire_timeout = (reason == "timeout"
+                                && previous["wakeConfig"]["sleepUntil"].is_string())
+                                || previous["wakeConfig"]["sleepRetired"] == true;
+                            if !retire_timeout && previous["wakeConfig"]["infinite"] == false {
+                                self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
+                                self.drain_rearm_pending(&cfg);
+                            }
                         }
                     }
                     continue;

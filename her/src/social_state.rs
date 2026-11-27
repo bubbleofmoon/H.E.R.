@@ -1795,6 +1795,7 @@ pub(crate) fn record_reserved2_incoming(
 
 pub(crate) const WAKE_ACCESS_REFUSED: &str = "wake refused by current access settings";
 pub(crate) const WAKE_SUSPENDED: &str = "wake suspended by current settings";
+pub(crate) const WAKE_TIMEOUT_STALE: &str = "queued timeout deadline invalidated";
 
 pub(crate) fn claim_reserved2_wake(
     context: &RuntimeContext,
@@ -1802,6 +1803,37 @@ pub(crate) fn claim_reserved2_wake(
     reason: &str,
     now: i64,
     expected: Option<&str>,
+) -> Result<(Value, String), SocialError> {
+    claim_reserved2_wake_inner(context, key, reason, now, expected, None, false)
+}
+
+pub(crate) fn claim_reserved2_wake_for_deadline(
+    context: &RuntimeContext,
+    key: &str,
+    reason: &str,
+    now: i64,
+    expected: Option<&str>,
+    expected_sleep: Option<&str>,
+) -> Result<(Value, String), SocialError> {
+    claim_reserved2_wake_inner(
+        context,
+        key,
+        reason,
+        now,
+        expected,
+        expected_sleep,
+        reason == "timeout",
+    )
+}
+
+fn claim_reserved2_wake_inner(
+    context: &RuntimeContext,
+    key: &str,
+    reason: &str,
+    now: i64,
+    expected: Option<&str>,
+    expected_sleep: Option<&str>,
+    require_active_deadline: bool,
 ) -> Result<(Value, String), SocialError> {
     ConversationState::for_runtime(context)
         .update_document(|doc| {
@@ -1825,6 +1857,24 @@ pub(crate) fn claim_reserved2_wake(
                 .to_string();
             if expected.is_some_and(|exp| !credential_eq(exp, &current_token)) {
                 return Err((409, "queued wake token invalidated".to_string()));
+            }
+            if require_active_deadline || expected_sleep.is_some() {
+                let current_wc = conv.field("wakeConfig");
+                let infinite = current_wc
+                    .and_then(|wc| wc.get("infinite"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let retired = current_wc
+                    .and_then(|wc| wc.get("sleepRetired"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let current_sleep = current_wc
+                    .and_then(|wc| wc.get("sleepUntil"))
+                    .and_then(Value::as_str);
+                let matches_expected = expected_sleep.is_none_or(|exp| current_sleep == Some(exp));
+                if infinite || retired || current_sleep.is_none() || !matches_expected {
+                    return Err((409, WAKE_TIMEOUT_STALE.to_string()));
+                }
             }
             let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
             wc["lastWakeAt"] = json!(now);

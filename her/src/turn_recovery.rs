@@ -1424,6 +1424,36 @@ pub fn spawn(context: RuntimeContext) {
     });
 }
 
+fn is_cancelled_expired_timeout_before_admission(turn: &Turn) -> bool {
+    is_expired_timeout_before_admission(turn)
+        && turn.state == State::Cancelled
+        && turn.outcome_reason == "turnTimeout"
+}
+
+/// Retire an unconsumed `expired-before-admission` `"timeout"` deadline on demand when the live
+/// hub reaches timeout dispatch ahead of the background recovery thread.
+pub(crate) fn retire_pending_startup_timeout(
+    context: &RuntimeContext,
+    key: &str,
+) -> Result<(), String> {
+    if !context.is_isolated() {
+        return Ok(());
+    }
+    let records = turn_ledger::read_records(context)?;
+    let (turns, _) = turn_ledger::fold(&records);
+    let Some(turn) = turns.iter().rfind(|t| t.key == key) else {
+        return Ok(());
+    };
+    if (turn.reserved2 || turn.wake_claim.is_some())
+        && turn.backend == "harness"
+        && (is_cancelled_expired_timeout_before_admission(turn)
+            || (turn.state.is_open() && is_expired_timeout_before_admission(turn)))
+    {
+        retire_expired_timeout_if_needed(context, turn)?;
+    }
+    Ok(())
+}
+
 /// Re-arm interrupted terminal `reserved2` harness wakes once per conversation per startup when
 /// the previous process committed a terminal outcome before the hub could schedule or re-arm the
 /// next wake deadline.
@@ -1456,9 +1486,7 @@ pub(crate) fn rearm_startup_terminal_sleeps(
         if done.contains(key) || keys_with_unsettled_startup.contains(key) {
             continue;
         }
-        let expired_timeout_before_admission = is_expired_timeout_before_admission(turn)
-            && turn.state == State::Cancelled
-            && turn.outcome_reason == "turnTimeout";
+        let expired_timeout_before_admission = is_cancelled_expired_timeout_before_admission(turn);
         if !keys_with_live_turn.contains(key)
             && expired_timeout_before_admission
             && (turn.reserved2 || turn.wake_claim.is_some())
