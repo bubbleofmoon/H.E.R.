@@ -1595,8 +1595,13 @@ pub(crate) fn rearm_interrupted_reserved2_wake(
             } else {
                 true
             };
-            let same_config =
-                previous.is_none_or(|prev| prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]);
+            let same_config = if let Some(prev) = previous {
+                prev["wakeConfig"]["confirmedAt"] == wake["confirmedAt"]
+            } else if let Some(cutoff) = max_wake_at {
+                wake["confirmedAt"].as_i64().is_none_or(|at| at <= cutoff)
+            } else {
+                true
+            };
             if !same_wake || !same_config {
                 return Ok(());
             }
@@ -3898,5 +3903,25 @@ mod tests {
             .and_then(crate::wake::parse_iso_ms)
             .expect("global pause must still re-arm consumed finite sleepUntil");
         assert!(paused_rearmed >= before_paused + 60_000);
+
+        // Unclaimed turn (wake_claim = None) must not overwrite a newer config whose confirmedAt > cutoff.
+        update_raw(&context, |doc| {
+            doc["paused"] = json!(false);
+            doc["conversations"]["group:42"]["wakeConfig"] = json!({
+                "mode": "diving",
+                "infinite": false,
+                "lastWakeAt": 100,
+                "sleepUntil": null,
+                "triggers": {"atMention": true},
+                "confirmedAt": 200
+            });
+            Ok(())
+        })
+        .unwrap();
+        rearm_interrupted_reserved2_wake(&context, &cfg, "group:42", None, Some(150)).unwrap();
+        assert!(
+            context.read_social_state().unwrap()["conversations"]["group:42"]["wakeConfig"]["sleepUntil"].is_null(),
+            "unclaimed turn must keep newer config (confirmedAt > begun_at) untouched"
+        );
     }
 }
