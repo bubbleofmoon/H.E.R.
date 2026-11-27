@@ -33,6 +33,7 @@ FAST_TEST_SUITES: tuple[str, ...] = (
     "test_check_repo.py",
     "test_ci_suite.py",
     "test_codex_task.py",
+    "test_lifecycle_layout.py",
     "test_quick_workflow.py",
     "test_run_scans.py",
     "test_snowluma_export.py",

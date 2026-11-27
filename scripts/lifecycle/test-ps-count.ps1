@@ -141,7 +141,7 @@ foreach ($count in @(0,1,2)) {
   if ($matched.Count -ne $count -or ($matched.Count -gt 0) -ne ($count -gt 0)) { throw "Run predicate failed with $count matches." }
 }
 
-$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 # Keep discovery inside the worktree; do not follow links or enumerate installed/baseline trees.
 $pending = [Collections.Generic.Stack[string]]::new()
 $pending.Push($repo)

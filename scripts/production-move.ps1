@@ -1,7 +1,7 @@
 # Owner-run move of production into the install-root layout under C:\qqbot (#67).
 # Windows PowerShell 5.1. The owner runs it with -Production from an interactive administrator PowerShell and types
 # the confirmation word before the first change; development runs it only with -Rehearsal under a temporary root,
-# through scripts\test-production-move.ps1.
+# through scripts\lifecycle\test-production-move.ps1.
 #   -Mode SelfTest         pure checks of the parsers and rules; reads and writes nothing
 #   -Mode Inventory        every check of Move, read-only, all findings at once; writes inventory.json
 #   -Mode Move             stage the release, restrict the install root, stop the old production, copy with hash
