@@ -165,10 +165,67 @@ fn accepted_diagnosed(bytes: Vec<u8>, limits: Limits) -> Result<(Normalized, usi
     Ok((normalized, raw))
 }
 
+fn qq_downscaled_spec_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str() != Some("multimedia.nt.qq.com.cn")
+        || parsed.path() != "/download"
+    {
+        return None;
+    }
+    let query = parsed.query()?;
+    let mut replaced = false;
+    let parts: Vec<&str> = query
+        .split('&')
+        .map(|part| {
+            if part == "spec=0" && !replaced {
+                replaced = true;
+                "spec=720"
+            } else {
+                part
+            }
+        })
+        .collect();
+    if !replaced {
+        return None;
+    }
+    let new_query = parts.join("&");
+    let mut out = parsed;
+    out.set_query(Some(&new_query));
+    Some(out.into())
+}
+
+fn fetch_url_bytes_with<F>(url: &str, max_bytes: usize, mut fetcher: F) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str, usize) -> Result<Vec<u8>, String>,
+{
+    match fetcher(url, max_bytes) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            let reason = classify_fetch_error(&err);
+            if reason == "fetch_body_too_large" {
+                if let Some(fallback_url) = qq_downscaled_spec_url(url) {
+                    return fetcher(&fallback_url, max_bytes).map_err(|err2| {
+                        format!("{reason};spec720:{}", classify_fetch_error(&err2))
+                    });
+                }
+            }
+            Err(reason.to_string())
+        }
+    }
+}
+
+/// Fetch image bytes through `safe_fetch`, retrying oversized QQ NT `spec=0` URLs at `spec=720`.
+pub fn fetch_url_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    fetch_url_bytes_with(url, max_bytes, |u, cap| {
+        crate::safe_fetch::fetch_bytes(u, cap).map(|f| f.bytes)
+    })
+}
+
 fn from_url_diagnosed(url: &str, limits: Limits) -> Result<(Normalized, usize), String> {
-    let fetched = crate::safe_fetch::fetch_bytes(url, limits.bytes)
-        .map_err(|err| classify_fetch_error(&err).to_string())?;
-    accepted_diagnosed(fetched.bytes, limits)
+    let bytes = fetch_url_bytes(url, limits.bytes)?;
+    accepted_diagnosed(bytes, limits)
 }
 
 fn try_gateway_b64_fields(
@@ -692,12 +749,14 @@ mod tests {
         assert_eq!(reasons, vec!["gateway_b64:base64:decode_failed"]);
 
         let mut err_reasons = Vec::new();
-        let bad_gif = STANDARD.encode(crate::media_normalize::fixtures::gif(257, 1, 1));
+        let mut malformed_gif = crate::media_normalize::fixtures::gif(3, 8, 8);
+        malformed_gif.pop();
+        let bad_gif = STANDARD.encode(malformed_gif);
         let fail_obj = json!({"data": bad_gif, "base64": "", "file": "C:/not/a/file.gif"});
         assert!(try_gateway_b64_fields(&fail_obj, limits, &mut err_reasons).is_none());
         assert_eq!(
             err_reasons,
-            vec!["gateway_b64:data:normalize:gif_too_many_frames(frames=257,max=256)"]
+            vec!["gateway_b64:data:normalize:gif_missing_trailer"]
         );
     }
 
@@ -747,5 +806,86 @@ mod tests {
             image_err,
             "gateway:gateway_reply_failed;url:fetch_http_status"
         );
+    }
+
+    #[test]
+    fn qq_downscaled_spec_url_rewrites_only_qq_download_spec_zero() {
+        assert_eq!(
+            qq_downscaled_spec_url(
+                "https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc-123_XYZ&spec=0&rkey=key_1"
+            ),
+            Some(
+                "https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc-123_XYZ&spec=720&rkey=key_1"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            qq_downscaled_spec_url("https://example.com/download?spec=0"),
+            None
+        );
+        assert_eq!(
+            qq_downscaled_spec_url("https://multimedia.nt.qq.com.cn/other?spec=0"),
+            None
+        );
+        assert_eq!(
+            qq_downscaled_spec_url("https://multimedia.nt.qq.com.cn/download?spec=720"),
+            None
+        );
+        assert_eq!(
+            qq_downscaled_spec_url("https://multimedia.nt.qq.com.cn/download?appid=1406"),
+            None
+        );
+        assert_eq!(
+            qq_downscaled_spec_url("ftp://multimedia.nt.qq.com.cn/download?spec=0"),
+            None
+        );
+    }
+
+    #[test]
+    fn fetch_url_bytes_with_retries_spec720_only_on_oversize() {
+        let orig = "https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc&spec=0&rkey=rk";
+        let downscaled =
+            "https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc&spec=720&rkey=rk";
+
+        let mut seen = Vec::new();
+        let bytes = fetch_url_bytes_with(orig, 1024, |u, _| {
+            seen.push(u.to_string());
+            if u == orig {
+                Err("响应体超过大小上限".to_string())
+            } else {
+                Ok(b"ok-720".to_vec())
+            }
+        })
+        .unwrap();
+        assert_eq!(bytes, b"ok-720");
+        assert_eq!(seen, vec![orig.to_string(), downscaled.to_string()]);
+
+        let mut seen_forbidden = Vec::new();
+        let err = fetch_url_bytes_with(orig, 1024, |u, _| {
+            seen_forbidden.push(u.to_string());
+            Err("抓取失败：HTTP 403".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "fetch_http_status");
+        assert_eq!(seen_forbidden, vec![orig.to_string()]);
+
+        let both_err = fetch_url_bytes_with(orig, 1024, |u, _| {
+            if u == orig {
+                Err("响应体超过大小上限".to_string())
+            } else {
+                Err("抓取失败：HTTP 404".to_string())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(both_err, "fetch_body_too_large;spec720:fetch_http_status");
+        assert!(!both_err.contains("rkey"));
+        assert!(!both_forbidden_leaks(&both_err));
+    }
+
+    fn both_forbidden_leaks(s: &str) -> bool {
+        s.contains("http://")
+            || s.contains("https://")
+            || s.contains("multimedia.nt.qq")
+            || s.contains("fileid")
     }
 }
