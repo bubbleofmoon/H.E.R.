@@ -1171,6 +1171,27 @@ pub(crate) fn ensure_or_rotate(
     ensure_or_rotate_agent_token(context, key, rotate).map_err(SocialError::Storage)
 }
 
+/// Atomically rotate `key`'s token under the conversation-state write lock only when its current
+/// token still belongs to one of `epochs`, leaving any replacement token and queued work untouched.
+pub(crate) fn rotate_if_epoch(
+    context: &RuntimeContext,
+    key: &str,
+    epochs: &[String],
+) -> Result<(), SocialError> {
+    ConversationState::for_runtime(context)
+        .update_existing(key, |conv| {
+            if conv
+                .token()
+                .is_some_and(|tok| epochs.iter().any(|ep| ep == &token_epoch(tok)))
+            {
+                conv.rotate_token();
+            }
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|(_, message)| SocialError::Storage(message))
+}
+
 pub(crate) fn revoke_if_current(
     context: &RuntimeContext,
     key: &str,

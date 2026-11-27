@@ -18,7 +18,7 @@
 //! Console, private owner commands and expiry share one paused-turn resolution path; this task applies it.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -32,6 +32,12 @@ use crate::turn_ledger::{self, Recorder, State, Turn};
 const PASS_INTERVAL: Duration = Duration::from_secs(2);
 const UNREACHABLE_RETRY_MS: i64 = 10_000;
 const DEFAULT_WAIT_SECS: u64 = 900;
+const MAX_CONCURRENT_DSH_PROBES: usize = 4;
+
+fn dsh_probe_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static DSH_PROBE_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    DSH_PROBE_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DSH_PROBES)))
+}
 
 /// Anchor expiry to the first durable pause, never to a recovery pass or process start.
 fn auto_abandon_at(cfg: &Value, turn: &Turn) -> Option<i64> {
@@ -741,8 +747,7 @@ fn apply_at(
     if matches!(verdict, Verdict::Resume(_) | Verdict::Abandon(_) | Verdict::Complete(_) | Verdict::Fail(_) | Verdict::Cancel(_)) {
         if let Some(("cancel-requested", reason)) = turn.finalization_claim() {
             if !commit(
-                crate::social_state::ensure_or_rotate(context, &turn.key, true)
-                    .map(|_| ())
+                crate::social_state::rotate_if_epoch(context, &turn.key, &turn.epochs)
                     .map_err(String::from),
             ) {
                 return;
@@ -953,14 +958,7 @@ impl Pass<'_> {
         if !turn.notes.iter().any(|note| note["verdict"] == "cancel-requested") {
             return true;
         }
-        let revoke = crate::social_state::token(self.context, &turn.key).and_then(|token| {
-            if token.is_some_and(|token| turn.epochs.contains(&crate::send_outbox::token_epoch(&token))) {
-                crate::social_state::ensure_or_rotate(self.context, &turn.key, true).map(|_| ())
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(error) = revoke {
+        if let Err(error) = crate::social_state::rotate_if_epoch(self.context, &turn.key, &turn.epochs) {
             println!("[recovery] ❌ 取消回合 {} 换令牌失败，稍后重试：{error}", turn.id);
             return false;
         }
@@ -1501,14 +1499,28 @@ async fn reconcile_harness_turns(
     reconciled
 }
 
+type SharedDshSnapshot = (Arc<Vec<Turn>>, Arc<Result<Vec<Value>, String>>);
+
+fn get_or_init_dsh_snapshot(
+    slot: &mut Option<SharedDshSnapshot>,
+    turns: &[Turn],
+    outbox: &Result<Vec<Value>, String>,
+) -> SharedDshSnapshot {
+    let (shared_turns, shared_outbox) = slot.get_or_insert_with(|| {
+        (Arc::new(turns.to_vec()), Arc::new(outbox.clone()))
+    });
+    (Arc::clone(shared_turns), Arc::clone(shared_outbox))
+}
+
 fn spawn_dsh_reconcile_turns(
     context: &RuntimeContext,
     cfg: &Value,
     turns: &[Turn],
     outbox: &Result<Vec<Value>, String>,
     state: &mut RecoveryState,
-) {
+) -> Option<SharedDshSnapshot> {
     let startup = state.startup.as_ref().expect("startup initialized before reconciliation");
+    let mut shared_snapshot: Option<SharedDshSnapshot> = None;
     for turn in turns.iter().filter(|t| t.backend != "harness") {
         let working = startup.contains(&turn.id)
             && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
@@ -1521,6 +1533,9 @@ fn spawn_dsh_reconcile_turns(
                 continue;
             }
         }
+        let Ok(permit) = dsh_probe_semaphore().clone().try_acquire_owned() else {
+            continue;
+        };
         {
             let mut active = active_turns().lock().unwrap_or_else(|p| p.into_inner());
             if !active.insert(turn.id.clone()) {
@@ -1531,9 +1546,9 @@ fn spawn_dsh_reconcile_turns(
         let context = context.clone();
         let cfg = cfg.clone();
         let turn = turn.clone();
-        let turns = turns.to_vec();
-        let outbox = outbox.clone();
+        let (turns, outbox) = get_or_init_dsh_snapshot(&mut shared_snapshot, turns, outbox);
         tokio::spawn(async move {
+            let _permit = permit;
             let mut guard = ActiveTurnGuard(Some(turn.id.clone()));
             let context_bg = context.clone();
             let cfg_bg = cfg.clone();
@@ -1555,8 +1570,9 @@ fn spawn_dsh_reconcile_turns(
             })
             .await;
             if matches!(assessed, Ok(Some(true))) {
-                // Release the reconcile guard before reattach re-claims `turn.id` in active_turns().
+                // Release the reconcile guard and probe permit before reattach re-claims `turn.id` in active_turns().
                 drop(guard);
+                drop(_permit);
                 let pass = Pass { context: &context, cfg: &cfg };
                 pass.reattach(&turn);
                 return;
@@ -1564,6 +1580,7 @@ fn spawn_dsh_reconcile_turns(
             let _ = &mut guard;
         });
     }
+    shared_snapshot
 }
 
 async fn run_recovery_pass(context: &RuntimeContext, started_at: i64, state: &mut RecoveryState) {
@@ -1643,7 +1660,7 @@ async fn run_recovery_pass(context: &RuntimeContext, started_at: i64, state: &mu
         } else {
             (records, turns)
         };
-        spawn_dsh_reconcile_turns(context, &cfg, &turns, &outbox, state);
+        let _ = spawn_dsh_reconcile_turns(context, &cfg, &turns, &outbox, state);
         let startup = state.startup.as_ref().expect("startup initialized");
         pass.resolutions(&journal, &turns, &records);
         pass.release_held(&journal, &turns, &records);
@@ -1711,7 +1728,7 @@ mod tests {
             journal.record_received(&input, "group:1", "{}", 1).unwrap();
             journal.mark_processing(&[input.clone()], 2).unwrap();
             journal.recover_interrupted(3).unwrap();
-            let recorder = Recorder::begin(&context, "group:1", "dsh", "atMention", "e1", &[input.clone()], None).unwrap();
+            let recorder = Recorder::begin(&context, "group:1", "dsh", "atMention", &crate::send_outbox::token_epoch("old-token"), &[input.clone()], None).unwrap();
             recorder.verified("cancel-requested", "turnTimeout").unwrap();
             let pending = turn(crate::turn_ledger::read_records(&context).unwrap());
             let cfg = context.load_config().unwrap();
@@ -3200,6 +3217,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
+        let _probe_lock = dsh_probe_test_lock().lock().await;
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let dsh_url = format!("http://{}", listener.local_addr().unwrap());
@@ -3351,8 +3370,14 @@ mod tests {
         );
     }
 
+    fn dsh_probe_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[test]
     fn ticket297_blocking_dsh_probe_does_not_starve_single_worker_harness_pass() {
+        let _probe_lock = dsh_probe_test_lock().blocking_lock();
         use std::io::{BufRead, Read, Write};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -3537,6 +3562,285 @@ mod tests {
             Some(future_iso.as_str()),
             "pass 2 must restore group:1's deadline without starving behind the DSH probe"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket297_cancel_claim_recovery_preserves_replacement_epoch_wake() {
+        // 1) Replacement epoch ep2 and its queued admin wake must stay untouched when T1 (ep1) settles.
+        let fx = setup_submitted_harness_turn("her-297-epoch-revoke-", "reserved2", true, None, true);
+        Recorder::attach(&fx.context, &fx.turn_id, "group:1")
+            .verified("cancel-requested", "harnessCancelled")
+            .unwrap();
+        let replacement_token = crate::social_state::ensure_or_rotate(&fx.context, "group:1", true).unwrap();
+        let replacement_epoch = crate::send_outbox::token_epoch(&replacement_token);
+        assert_ne!(replacement_epoch, fx.epoch);
+        let queued_wake = json!([{"reason": "admin", "at": 20}]);
+        crate::conversation_state::ConversationState::for_runtime(&fx.context)
+            .update_existing("group:1", |conv| {
+                conv.set_field("adminWakes", queued_wake.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&fx.context).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&fx.context);
+        Pass { context: &fx.context, cfg: &fx.cfg }.reconcile(&fx.journal, &turns[0], &turns, &outbox).await;
+
+        let recovered = fold(&turn_ledger::read_records(&fx.context).unwrap()).0.remove(0);
+        assert_eq!(recovered.state, State::Cancelled);
+        assert_eq!(recovered.outcome_reason, "harnessCancelled");
+        assert_eq!(
+            crate::social_state::token(&fx.context, "group:1").unwrap().as_deref(),
+            Some(replacement_token.as_str()),
+            "recovery of expired T1 cancel-requested claim must not rotate replacement epoch ep2"
+        );
+        let social = fx.context.read_social_state().unwrap();
+        assert_eq!(social["conversations"]["group:1"]["adminWakes"], queued_wake);
+
+        // 2) revoke_cancel_requested on an interrupted non-harness turn also preserves replacement epoch ep2.
+        let rec_dsh = Recorder::begin(&fx.context, "group:1", "dsh", "atMention", &fx.epoch, &[], None).unwrap();
+        rec_dsh.verified("cancel-requested", "turnTimeout").unwrap();
+        let dsh_turn = fold(&turn_ledger::read_records(&fx.context).unwrap())
+            .0
+            .into_iter()
+            .find(|t| t.id == rec_dsh.id)
+            .unwrap();
+        assert!(Pass { context: &fx.context, cfg: &fx.cfg }.revoke_cancel_requested(&dsh_turn));
+        assert_eq!(
+            crate::social_state::token(&fx.context, "group:1").unwrap().as_deref(),
+            Some(replacement_token.as_str()),
+            "revoke_cancel_requested must not rotate replacement epoch ep2"
+        );
+
+        // 3) Matching epoch ep1 is still rotated, and missing token stays untouched without error.
+        let fx_match = setup_submitted_harness_turn("her-297-epoch-match-", "reserved2", true, None, true);
+        Recorder::attach(&fx_match.context, &fx_match.turn_id, "group:1")
+            .verified("cancel-requested", "harnessCancelled")
+            .unwrap();
+        let turns_match = fold(&turn_ledger::read_records(&fx_match.context).unwrap()).0;
+        let outbox_match = crate::send_outbox::read_records(&fx_match.context);
+        Pass { context: &fx_match.context, cfg: &fx_match.cfg }
+            .reconcile(&fx_match.journal, &turns_match[0], &turns_match, &outbox_match)
+            .await;
+        assert_ne!(
+            crate::social_state::token(&fx_match.context, "group:1").unwrap().as_deref(),
+            Some("fixture-token-297"),
+            "matching epoch ep1 must still be rotated"
+        );
+        crate::social_state::rotate_if_epoch(&fx_match.context, "group:999", std::slice::from_ref(&fx_match.epoch)).unwrap();
+        assert_eq!(crate::social_state::token(&fx_match.context, "group:999").unwrap(), None);
+    }
+
+    #[test]
+    fn ticket297_dsh_reconcile_bounds_concurrency_and_shares_snapshot() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ReleaseOnDrop(Arc<AtomicBool>, Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+                self.1.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let _probe_lock = dsh_probe_test_lock().blocking_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dsh_url = format!("http://{}", listener.local_addr().unwrap());
+        let hold_probes = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let _release_guard = ReleaseOnDrop(Arc::clone(&hold_probes), Arc::clone(&stop));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let hold_srv = Arc::clone(&hold_probes);
+        let stop_srv = Arc::clone(&stop);
+        let in_flight_srv = Arc::clone(&in_flight);
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let hold = Arc::clone(&hold_srv);
+                        let stop = Arc::clone(&stop_srv);
+                        let in_flight = Arc::clone(&in_flight_srv);
+                        handlers.push(std::thread::spawn(move || {
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                            let mut first_line = String::new();
+                            let _ = reader.read_line(&mut first_line);
+                            let mut length = 0usize;
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                    break;
+                                }
+                                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                    length = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                            if first_line.starts_with("POST ") {
+                                let mut body = vec![0; length];
+                                let _ = reader.read_exact(&mut body);
+                                in_flight.fetch_add(1, Ordering::AcqRel);
+                                while hold.load(Ordering::Acquire) && !stop.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                                let rpc_id = req["rpcId"].as_str().unwrap_or("");
+                                let reply = json!({
+                                    "type": "server-response",
+                                    "rpcId": rpc_id,
+                                    "result": {
+                                        "ok": false,
+                                        "error": {"code": "session-not-found", "message": "gone"}
+                                    }
+                                })
+                                .to_string();
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                                    reply.len()
+                                );
+                                in_flight.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1, 2, 3, 4, 5, 6]},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-dsh-bound-")),
+            &cfg,
+            &json!({"dsh": dsh_url, "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        std::fs::create_dir_all(root.0.join("user/dsh")).unwrap();
+        std::fs::write(
+            root.0.join("user/dsh/.credentials.yaml"),
+            "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        let mut convs = serde_json::Map::new();
+        for g in 1..=6 {
+            convs.insert(format!("group:{g}"), json!({"agentToken": format!("tok-297-g{g}")}));
+        }
+        std::fs::write(root.0.join("data/social-v2.json"), json!({"conversations": convs}).to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let _journal = Journal::open(&context).unwrap();
+
+        let empty_turns: Vec<Turn> = Vec::new();
+        let outbox = crate::send_outbox::read_records(&context);
+        let mut empty_state = RecoveryState { startup: Some(HashSet::new()), ..Default::default() };
+        assert!(
+            spawn_dsh_reconcile_turns(&context, &cfg, &empty_turns, &outbox, &mut empty_state).is_none(),
+            "spawn_dsh_reconcile_turns must not allocate a snapshot when no DSH turns are eligible"
+        );
+
+        let mut turn_ids = Vec::new();
+        for g in 1..=6 {
+            let tok = format!("tok-297-g{g}");
+            let rec = Recorder::begin_reserved2(
+                &context,
+                &format!("group:{g}"),
+                "dsh",
+                "timeout",
+                &crate::send_outbox::token_epoch(&tok),
+                &[],
+            )
+            .unwrap();
+            rec.attempt(&format!("rpc-297-{g}"), &format!("sess-297-{g}")).unwrap();
+            turn_ids.push(rec.id);
+        }
+
+        let turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+        let cutoff = now() + 500;
+        let startup = startup_turns(&turn_ledger::read_records(&context).unwrap(), cutoff);
+        let mut state = RecoveryState { startup: Some(startup), ..Default::default() };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (shared_turns, shared_outbox) =
+                spawn_dsh_reconcile_turns(&context, &cfg, &turns, &outbox, &mut state)
+                    .expect("expected shared Arc snapshot when spawning DSH probes");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline && in_flight.load(Ordering::Acquire) < MAX_CONCURRENT_DSH_PROBES {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Allow any unbounded spawns a moment to hit active_turns() and the mock listener.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            assert_eq!(
+                Arc::strong_count(&shared_turns),
+                1 + MAX_CONCURRENT_DSH_PROBES,
+                "all spawned DSH probes must share one Arc<Vec<Turn>> snapshot"
+            );
+            assert_eq!(
+                Arc::strong_count(&shared_outbox),
+                1 + MAX_CONCURRENT_DSH_PROBES,
+                "all spawned DSH probes must share one Arc<Result<Vec<Value>, String>> outbox snapshot"
+            );
+            drop(shared_turns);
+            drop(shared_outbox);
+
+            let active_count = {
+                let active = active_turns().lock().unwrap_or_else(|p| p.into_inner());
+                turn_ids.iter().filter(|id| active.contains(*id)).count()
+            };
+            assert_eq!(active_count, MAX_CONCURRENT_DSH_PROBES);
+            assert_eq!(in_flight.load(Ordering::Acquire), MAX_CONCURRENT_DSH_PROBES);
+
+            hold_probes.store(false, Ordering::Release);
+            let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < settle_deadline {
+                let current_turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+                if turn_ids
+                    .iter()
+                    .all(|id| current_turns.iter().any(|t| &t.id == id && !t.state.is_open()))
+                {
+                    break;
+                }
+                let _ = spawn_dsh_reconcile_turns(&context, &cfg, &current_turns, &outbox, &mut state);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            let active_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < active_deadline {
+                let drained = {
+                    let active = active_turns().lock().unwrap_or_else(|p| p.into_inner());
+                    turn_ids.iter().all(|id| !active.contains(id))
+                };
+                if drained {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        let final_turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+        for id in &turn_ids {
+            assert!(
+                final_turns.iter().any(|t| &t.id == id && !t.state.is_open()),
+                "excess DSH turn {id} must settle once permits free"
+            );
+        }
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch
