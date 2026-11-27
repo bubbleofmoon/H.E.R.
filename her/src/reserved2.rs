@@ -41,20 +41,13 @@ fn rearm_dropped_provisional_sleep(
     let records = crate::turn_ledger::read_records(context)?;
     let (turns, _) = crate::turn_ledger::fold(&records);
     let fallback = json!({ "at": at, "previous": previous });
-    let mut found_claim = None;
-    for t in turns.iter().rev().filter(|t| t.key == key) {
-        let Some(claim) = t.wake_claim.as_ref() else {
-            continue;
-        };
-        if claim["previous"]["wakeConfig"]["confirmedAt"] != previous["wakeConfig"]["confirmedAt"] {
-            break;
-        }
-        if claim["previous"]["wakeConfig"]["sleepUntil"].is_string() {
-            found_claim = Some(claim);
-            break;
-        }
-    }
-    let claim = found_claim.unwrap_or(&fallback);
+    let claim = crate::turn_recovery::wake_claim_for_rearm(
+        &turns,
+        key,
+        Some(&previous["wakeConfig"]["confirmedAt"]),
+        None,
+    )
+    .unwrap_or(&fallback);
     social_state::rearm_interrupted_reserved2_wake_for_token(
         context,
         cfg,

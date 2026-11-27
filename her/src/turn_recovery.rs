@@ -615,18 +615,54 @@ fn close_interrupted_harness(
     Ok(false)
 }
 
+pub(crate) fn wake_claim_for_rearm<'a>(
+    turns: &'a [Turn],
+    key: &str,
+    expected_confirmed_at: Option<&Value>,
+    up_to_turn_id: Option<&str>,
+) -> Option<&'a Value> {
+    let slice = up_to_turn_id
+        .and_then(|id| turns.iter().position(|t| t.id == id))
+        .map_or(turns, |idx| &turns[..=idx]);
+    let mut target_confirmed = expected_confirmed_at;
+    for t in slice.iter().rev().filter(|t| t.key == key) {
+        let Some(claim) = t.wake_claim.as_ref() else {
+            continue;
+        };
+        let c = &claim["previous"]["wakeConfig"]["confirmedAt"];
+        if target_confirmed.is_none() {
+            target_confirmed = Some(c);
+        }
+        if target_confirmed != Some(c) {
+            break;
+        }
+        if claim["previous"]["wakeConfig"]["sleepUntil"].is_string() {
+            return Some(claim);
+        }
+    }
+    None
+}
+
 fn rearm_reserved2_if_needed(
     context: &RuntimeContext,
     cfg: &Value,
+    turns: &[Turn],
     turn: &Turn,
     live_cutoff: Option<i64>,
 ) -> Result<(), String> {
     if turn.backend == "harness" && (turn.reserved2 || turn.wake_claim.is_some()) {
+        let claim = wake_claim_for_rearm(
+            turns,
+            &turn.key,
+            turn.wake_claim.as_ref().map(|c| &c["previous"]["wakeConfig"]["confirmedAt"]),
+            Some(&turn.id),
+        )
+        .or(turn.wake_claim.as_ref());
         crate::social_state::rearm_interrupted_reserved2_wake(
             context,
             cfg,
             &turn.key,
-            turn.wake_claim.as_ref(),
+            claim,
             Some(turn.begun_at),
             Some(live_cutoff.unwrap_or_else(now)),
         )?;
@@ -654,17 +690,18 @@ fn apply_at(
     let current = resolution_gate(context).and_then(|gate| {
         let records = turn_ledger::read_records(context).map_err(|e| (503, e))?;
         let (turns, _) = turn_ledger::fold(&records);
-        let latest = turns.into_iter().find(|t| t.id == turn.id);
-        Ok((gate, latest))
+        let idx = turns.iter().position(|t| t.id == turn.id && !t.state.is_final());
+        Ok((gate, turns, idx))
     });
-    let (_gate, latest) = match current {
+    let (_gate, turns, idx) = match current {
         Ok(current) => current,
         Err((_, error)) => {
             crate::safe_println!("[recovery] 无法核对最新回合状态，稍后重试：{error}");
             return;
         }
     };
-    let Some(turn) = latest.as_ref().filter(|t| !t.state.is_final()) else { return; };
+    let Some(idx) = idx else { return; };
+    let turn = &turns[idx];
     let verdict = preserve_finalization_claim(turn, verdict.clone());
     let recorder = Recorder::attach(context, &turn.id, &turn.key);
     let log = |text: &str| println!("[recovery] 回合 {} ({}) {text}", turn.id, turn.key);
@@ -687,7 +724,7 @@ fn apply_at(
         ) {
             return;
         }
-        if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
+        if !commit(rearm_reserved2_if_needed(context, cfg, &turns, turn, live_cutoff)) {
             return;
         }
         if commit(recorder.end_reconciled(outcome, ledger_reason)) {
@@ -748,7 +785,7 @@ fn apply_at(
                     return;
                 }
             }
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
+            if !commit(rearm_reserved2_if_needed(context, cfg, &turns, turn, live_cutoff)) {
                 return;
             }
             let _ = recorder.verified("not-executed", why);
@@ -766,7 +803,7 @@ fn apply_at(
             // Re-arm any consumed wake deadline BEFORE committing `abandoned` so a transient rearm
             // failure keeps the turn open (even without a SQLite row) for recovery to retry, and
             // commit `abandoned` before closing SQLite so a mid-close crash never flips to Cancelled.
-            if !commit(rearm_reserved2_if_needed(context, cfg, turn, live_cutoff)) {
+            if !commit(rearm_reserved2_if_needed(context, cfg, &turns, turn, live_cutoff)) {
                 return;
             }
             if commit(recorder.end_reconciled("abandoned", why)) {
@@ -1344,11 +1381,18 @@ fn rearm_startup_terminal_sleeps(
             done.insert(key.to_string());
             continue;
         }
+        let claim = wake_claim_for_rearm(
+            turns,
+            &turn.key,
+            turn.wake_claim.as_ref().map(|c| &c["previous"]["wakeConfig"]["confirmedAt"]),
+            Some(&turn.id),
+        )
+        .or(turn.wake_claim.as_ref());
         match crate::social_state::rearm_interrupted_reserved2_wake(
             context,
             cfg,
             &turn.key,
-            turn.wake_claim.as_ref(),
+            claim,
             Some(turn.begun_at),
             Some(cutoff),
         ) {
@@ -1364,108 +1408,159 @@ fn rearm_startup_terminal_sleeps(
     ok
 }
 
-async fn recovery_loop(context: RuntimeContext, mut startup: Option<HashSet<String>>, started_at: i64) {
+#[derive(Default)]
+struct RecoveryState {
+    startup: Option<HashSet<String>>,
+    last_try: std::collections::HashMap<String, i64>,
+    terminal_rearm_done: HashSet<String>,
+    abandoned_closed: HashSet<String>,
+}
+
+async fn reconcile_backend_turns(
+    pass: &Pass<'_>,
+    journal: &Journal,
+    turns: &[Turn],
+    outbox: &Result<Vec<Value>, String>,
+    started_at: i64,
+    state: &mut RecoveryState,
+    harness_only: bool,
+) -> bool {
+    let startup = state.startup.as_ref().expect("startup initialized before reconciliation");
+    let mut reconciled = false;
+    for turn in turns.iter().filter(|t| (t.backend == "harness") == harness_only) {
+        let working = startup.contains(&turn.id)
+            && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
+        if !working {
+            continue;
+        }
+        if active_turns().lock().unwrap_or_else(|p| p.into_inner()).contains(&turn.id) {
+            continue;
+        }
+        if turn.state == State::Paused {
+            let tried = state.last_try.get(&turn.id).copied().unwrap_or(0);
+            if now() - tried < UNREACHABLE_RETRY_MS {
+                continue;
+            }
+        }
+        state.last_try.insert(turn.id.clone(), now());
+        pass.reconcile_at(journal, turn, turns, outbox, Some(started_at)).await;
+        reconciled = true;
+    }
+    reconciled
+}
+
+async fn run_recovery_pass(context: &RuntimeContext, started_at: i64, state: &mut RecoveryState) {
+    if let (Ok(cfg), Ok(journal), Ok(records)) =
+        (context.load_config(), Journal::open(context), turn_ledger::read_records(context))
     {
-        let mut last_try: std::collections::HashMap<String, i64> = Default::default();
-        let mut terminal_rearm_done: HashSet<String> = HashSet::new();
-        let mut abandoned_closed: HashSet<String> = HashSet::new();
-        loop {
-            if let (Ok(cfg), Ok(journal), Ok(records)) =
-                (context.load_config(), Journal::open(&context), turn_ledger::read_records(&context))
-            {
-                let startup = startup.get_or_insert_with(|| {
-                    let set = startup_turns(&records, started_at);
-                    if !set.is_empty() {
-                        println!("[recovery] 启动时有 {} 个未完成回合，先向 DSH 与发送账本核对", set.len());
-                    }
-                    set
-                });
-                let (turns, _) = turn_ledger::fold(&records);
-                let mut expiry_applied = false;
-                for turn in turns.iter().filter(|t| t.paused_at.is_some() && (t.state == State::Paused || t.notification_intent)) {
-                    let pause_ready = if turn.pause_notified {
-                        true
-                    } else {
-                        match notify_turn(&context, &cfg, &turn.id, false) {
-                            Ok(()) => true,
-                            Err((_, error)) => {
-                                crate::safe_println!("[recovery] 暂停通知记录失败：{error}");
-                                false
-                            }
-                        }
-                    };
-                    if turn.state == State::Paused && auto_abandon_at(&cfg, turn).is_some_and(|at| now() >= at) {
-                        match resolve(&context, &turn.id, "abandon", false, "auto") {
-                            Ok(_) => expiry_applied = true,
-                            Err((status, error)) if status != 409 => {
-                                crate::safe_println!("[recovery] 自动放弃失败：{error}");
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                    if pause_ready && turn.state.is_final() && !turn.resolution_notified {
-                        if let Err((_, error)) = notify_turn(&context, &cfg, &turn.id, true) {
-                            crate::safe_println!("[recovery] 处理通知记录失败：{error}");
-                        }
+        if state.startup.is_none() {
+            let set = startup_turns(&records, started_at);
+            if !set.is_empty() {
+                println!("[recovery] 启动时有 {} 个未完成回合，先向 DSH 与发送账本核对", set.len());
+            }
+            state.startup = Some(set);
+        }
+        let (turns, _) = turn_ledger::fold(&records);
+        let mut expiry_applied = false;
+        for turn in turns.iter().filter(|t| t.paused_at.is_some() && (t.state == State::Paused || t.notification_intent)) {
+            let pause_ready = if turn.pause_notified {
+                true
+            } else {
+                match notify_turn(context, &cfg, &turn.id, false) {
+                    Ok(()) => true,
+                    Err((_, error)) => {
+                        crate::safe_println!("[recovery] 暂停通知记录失败：{error}");
+                        false
                     }
                 }
-                // Expiry may just have resolved a turn. Re-read before any reconciliation/replay.
-                let (records, turns) = if expiry_applied {
-                    let Ok(records) = turn_ledger::read_records(&context) else { continue };
-                    let (turns, _) = turn_ledger::fold(&records);
-                    (records, turns)
-                } else {
-                    (records, turns)
-                };
-                let outbox = crate::send_outbox::read_records(&context);
-                let pass = Pass { context: &context, cfg: &cfg };
-                // Re-arm already-settled harness conversations before any slow DSH probe can block the pass.
-                rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
-                let mut reconciled = false;
-                // Reconcile harness turns before DSH turns so an unreachable DSH probe cannot delay harness recovery.
-                for harness_only in [true, false] {
-                    for turn in turns.iter().filter(|t| (t.backend == "harness") == harness_only) {
-                        let working = startup.contains(&turn.id)
-                            && (turn.state.is_open() || (turn.state == State::Paused && turn.pause_reason == "dsh-unreachable"));
-                        if !working {
-                            continue;
-                        }
-                        if active_turns().lock().unwrap_or_else(|p| p.into_inner()).contains(&turn.id) {
-                            continue;
-                        }
-                        if turn.state == State::Paused {
-                            let tried = last_try.get(&turn.id).copied().unwrap_or(0);
-                            if now() - tried < UNREACHABLE_RETRY_MS {
-                                continue;
-                            }
-                        }
-                        last_try.insert(turn.id.clone(), now());
-                        pass.reconcile_at(&journal, turn, &turns, &outbox, Some(started_at)).await;
-                        reconciled = true;
+            };
+            if turn.state == State::Paused && auto_abandon_at(&cfg, turn).is_some_and(|at| now() >= at) {
+                match resolve(context, &turn.id, "abandon", false, "auto") {
+                    Ok(_) => expiry_applied = true,
+                    Err((status, error)) if status != 409 => {
+                        crate::safe_println!("[recovery] 自动放弃失败：{error}");
                     }
-                }
-                let (records, turns) = if reconciled {
-                    let Ok(records) = turn_ledger::read_records(&context) else { continue };
-                    let (turns, _) = turn_ledger::fold(&records);
-                    (records, turns)
-                } else {
-                    (records, turns)
-                };
-                if reconciled {
-                    rearm_startup_terminal_sleeps(&context, &cfg, &turns, started_at, startup, &mut terminal_rearm_done);
-                }
-                pass.resolutions(&journal, &turns, &records);
-                pass.release_held(&journal, &turns, &records);
-                pass.finished_with_cache(&journal, &turns, &mut abandoned_closed);
-                pass.report_stuck_resumed(&journal, &turns);
-                // Orphans run only after every startup turn has settled.
-                let unsettled = turns.iter().any(|t| startup.contains(&t.id) && t.state.is_open());
-                if !unsettled {
-                    pass.orphans(&journal, &turns, &records);
+                    Err(_) => {}
                 }
             }
-            tokio::time::sleep(PASS_INTERVAL).await;
+            if pause_ready && turn.state.is_final() && !turn.resolution_notified {
+                if let Err((_, error)) = notify_turn(context, &cfg, &turn.id, true) {
+                    crate::safe_println!("[recovery] 处理通知记录失败：{error}");
+                }
+            }
         }
+        // Expiry may just have resolved a turn. Re-read before any reconciliation/replay.
+        let (records, turns) = if expiry_applied {
+            let Ok(records) = turn_ledger::read_records(context) else { return };
+            let (turns, _) = turn_ledger::fold(&records);
+            (records, turns)
+        } else {
+            (records, turns)
+        };
+        let outbox = crate::send_outbox::read_records(context);
+        let pass = Pass { context, cfg: &cfg };
+        // Re-arm already-settled harness conversations before any slow DSH probe can block the pass.
+        let mut rearm_ok = rearm_startup_terminal_sleeps(
+            context,
+            &cfg,
+            &turns,
+            started_at,
+            state.startup.as_ref().expect("startup initialized"),
+            &mut state.terminal_rearm_done,
+        );
+        // Reconcile harness turns before DSH turns so an unreachable DSH probe cannot delay harness recovery.
+        let harness_reconciled =
+            reconcile_backend_turns(&pass, &journal, &turns, &outbox, started_at, state, true).await;
+        let (records, turns) = if harness_reconciled {
+            let Ok(records) = turn_ledger::read_records(context) else { return };
+            let (turns, _) = turn_ledger::fold(&records);
+            rearm_ok = rearm_startup_terminal_sleeps(
+                context,
+                &cfg,
+                &turns,
+                started_at,
+                state.startup.as_ref().expect("startup initialized"),
+                &mut state.terminal_rearm_done,
+            ) && rearm_ok;
+            (records, turns)
+        } else {
+            (records, turns)
+        };
+        let startup = state.startup.as_ref().expect("startup initialized");
+        let harness_open = turns
+            .iter()
+            .any(|t| startup.contains(&t.id) && t.backend == "harness" && t.state.is_open());
+        // Skip slow DSH probes if startup rearm failed transiently or any startup harness turn remains open.
+        let dsh_reconciled = if rearm_ok && !harness_open {
+            reconcile_backend_turns(&pass, &journal, &turns, &outbox, started_at, state, false).await
+        } else {
+            false
+        };
+        let (records, turns) = if dsh_reconciled {
+            let Ok(records) = turn_ledger::read_records(context) else { return };
+            let (turns, _) = turn_ledger::fold(&records);
+            (records, turns)
+        } else {
+            (records, turns)
+        };
+        let startup = state.startup.as_ref().expect("startup initialized");
+        pass.resolutions(&journal, &turns, &records);
+        pass.release_held(&journal, &turns, &records);
+        pass.finished_with_cache(&journal, &turns, &mut state.abandoned_closed);
+        pass.report_stuck_resumed(&journal, &turns);
+        // Orphans run only after every startup turn has settled.
+        let unsettled = turns.iter().any(|t| startup.contains(&t.id) && t.state.is_open());
+        if !unsettled {
+            pass.orphans(&journal, &turns, &records);
+        }
+    }
+}
+
+async fn recovery_loop(context: RuntimeContext, startup: Option<HashSet<String>>, started_at: i64) {
+    let mut state = RecoveryState { startup, ..Default::default() };
+    loop {
+        run_recovery_pass(&context, started_at, &mut state).await;
+        tokio::time::sleep(PASS_INTERVAL).await;
     }
 }
 
@@ -2370,7 +2465,7 @@ mod tests {
         dsh_turn.reserved2 = true;
         dsh_turn.wake_claim = Some(obs_claim.clone());
         std::fs::write(fx_abandoned._root.0.join("data/mode.json"), "{broken").unwrap();
-        assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &dsh_turn, None).is_ok());
+        assert!(rearm_reserved2_if_needed(&fx_abandoned.context, &fx_abandoned.cfg, &turns, &dsh_turn, None).is_ok());
     }
 
     #[tokio::test]
@@ -2692,6 +2787,309 @@ mod tests {
             state["conversations"]["group:3"]["wakeConfig"]["sleepUntil"].as_str(),
             Some(future_iso.as_str()),
             "open harness group:3 must reconcile and re-arm before unrelated group:2 DSH probe blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket297_startup_rearm_scans_back_for_future_deadline() {
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1]},
+            "harness": {"model": "fake-chat"},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let future_iso = crate::sticker::iso_at(now() + 300_000);
+        let wake_cfg = json!({
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": null,
+            "triggers": {"atMention": true},
+            "confirmedAt": 2,
+            "lastWakeAt": 10,
+            "wakeCount": 2
+        });
+
+        // Case 1: settled terminal/resumed T1 carrying future_iso followed by failed pre-submit T2 (sleepUntil: null).
+        let root1 = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-startup-multihop-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root1.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root1.0.join("data/social-v2.json"),
+            json!({"conversations": {"group:1": {"agentToken": "tok-297-m1", "wakeTimes": [10], "wakeConfig": wake_cfg}}}).to_string(),
+        )
+        .unwrap();
+        let ctx1 = RuntimeContext::from_root(&root1.0).unwrap();
+        let _j1 = Journal::open(&ctx1).unwrap();
+        let t1 = Recorder::begin_reserved2(
+            &ctx1,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-m1"),
+            &[],
+        )
+        .unwrap();
+        t1.wake_claim(&json!({
+            "at": 10,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": future_iso}}
+        }))
+        .unwrap();
+        t1.end("completed", "ok").unwrap();
+
+        let t2 = Recorder::begin_reserved2(
+            &ctx1,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-m1"),
+            &[],
+        )
+        .unwrap();
+        t2.wake_claim(&json!({
+            "at": 11,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": null}}
+        }))
+        .unwrap();
+        t2.end("failed", "pre-submit").unwrap();
+
+        let cutoff1 = now() + 500;
+        let turns1 = fold(&turn_ledger::read_records(&ctx1).unwrap()).0;
+        let mut done1 = HashSet::new();
+        assert!(rearm_startup_terminal_sleeps(&ctx1, &cfg, &turns1, cutoff1, &HashSet::new(), &mut done1));
+        assert_eq!(
+            ctx1.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "startup terminal rearm must scan back from T2 (sleepUntil: null) to T1's still-future deadline"
+        );
+
+        // Case 2: open T2 path exercising rearm_reserved2_if_needed during reconcile_at.
+        let root2 = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-open-multihop-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root2.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root2.0.join("data/social-v2.json"),
+            json!({"conversations": {"group:1": {"agentToken": "tok-297-m2", "wakeTimes": [10], "wakeConfig": wake_cfg}}}).to_string(),
+        )
+        .unwrap();
+        let ctx2 = RuntimeContext::from_root(&root2.0).unwrap();
+        let j2 = Journal::open(&ctx2).unwrap();
+        let open_t1 = Recorder::begin_reserved2(
+            &ctx2,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-m2"),
+            &[],
+        )
+        .unwrap();
+        open_t1.wake_claim(&json!({
+            "at": 10,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": future_iso}}
+        }))
+        .unwrap();
+        open_t1.end("completed", "ok").unwrap();
+
+        let open_t2 = Recorder::begin_reserved2(
+            &ctx2,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-m2"),
+            &[],
+        )
+        .unwrap();
+        open_t2.wake_claim(&json!({
+            "at": 11,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": null}}
+        }))
+        .unwrap();
+
+        let cutoff2 = now() + 500;
+        let turns2 = fold(&turn_ledger::read_records(&ctx2).unwrap()).0;
+        let outbox2 = crate::send_outbox::read_records(&ctx2);
+        Pass { context: &ctx2, cfg: &cfg }
+            .reconcile_at(&j2, &turns2[1], &turns2, &outbox2, Some(cutoff2))
+            .await;
+        let turns2_after = fold(&turn_ledger::read_records(&ctx2).unwrap()).0;
+        assert_eq!(turns2_after[1].state, State::Resumed);
+        assert_eq!(
+            ctx2.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "open-turn rearm_reserved2_if_needed must scan back from T2 (sleepUntil: null) to T1's still-future deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket297_transient_startup_rearm_failure_skips_slow_dsh_probe() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dsh_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let dsh_probed = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let dsh_probed_srv = Arc::clone(&dsh_probed);
+        let server = std::thread::spawn(move || {
+            let mut held_streams = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut first_line = String::new();
+                        let _ = reader.read_line(&mut first_line);
+                        let mut length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        if first_line.starts_with("POST ") {
+                            let mut body = vec![0; length];
+                            let _ = reader.read_exact(&mut body);
+                            let reply = r#"{"type":"server-response","ok":true,"payload":{"result":null}}"#;
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                                reply.len()
+                            );
+                        } else {
+                            dsh_probed_srv.store(true, Ordering::Relaxed);
+                            held_streams.push(stream);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = json!({
+            "consoleToken": "synthetic-review-token-297",
+            "allow": {"groups": [1, 2]},
+            "harness": {"model": "fake-chat"},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}},
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-dsh-skip-on-err-")),
+            &cfg,
+            &json!({"dsh": dsh_url, "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1"}),
+        );
+        std::fs::create_dir_all(root.0.join("user/dsh")).unwrap();
+        std::fs::write(
+            root.0.join("user/dsh/.credentials.yaml"),
+            "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        let future_iso = crate::sticker::iso_at(now() + 300_000);
+        let wake_cfg = json!({
+            "mode": "diving",
+            "infinite": false,
+            "sleepUntil": null,
+            "triggers": {"atMention": true},
+            "confirmedAt": 1,
+            "lastWakeAt": 10,
+            "wakeCount": 1
+        });
+        let valid_social = json!({
+            "conversations": {
+                "group:1": {"agentToken": "tok-297-g1", "wakeTimes": [10], "wakeConfig": wake_cfg},
+                "group:2": {"agentToken": "tok-297-g2", "wakeTimes": [10], "wakeConfig": wake_cfg}
+            }
+        })
+        .to_string();
+        std::fs::write(root.0.join("data/social-v2.json"), &valid_social).unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let _journal = Journal::open(&context).unwrap();
+
+        let rec1 = Recorder::begin_reserved2(
+            &context,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g1"),
+            &[],
+        )
+        .unwrap();
+        rec1.wake_claim(&json!({
+            "at": 10,
+            "previous": {
+                "wakeConfig": {"confirmedAt": 1, "infinite": false, "sleepUntil": future_iso}
+            }
+        }))
+        .unwrap();
+        rec1.end("completed", "ok").unwrap();
+
+        let rec2 = Recorder::begin_reserved2(
+            &context,
+            "group:2",
+            "dsh",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-g2"),
+            &[],
+        )
+        .unwrap();
+        rec2.attempt("rpc-297-dsh", "sess-297-dsh").unwrap();
+
+        // Corrupt social-v2.json transiently so pass 1's startup rearm fails.
+        std::fs::write(root.0.join("data/social-v2.json"), "{broken").unwrap();
+        let cutoff = now() + 500;
+        let startup = startup_turns(&turn_ledger::read_records(&context).unwrap(), cutoff);
+        assert!(startup.contains(&rec2.id));
+        let mut state = RecoveryState { startup: Some(startup), ..Default::default() };
+
+        let pass1 = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_recovery_pass(&context, cutoff, &mut state),
+        )
+        .await;
+        assert!(pass1.is_ok(), "pass 1 must finish without timing out on group:2's slow DSH probe");
+        assert!(
+            !state.terminal_rearm_done.contains("group:1"),
+            "group:1 must remain pending in terminal_rearm_done after transient rearm failure"
+        );
+        assert!(
+            !dsh_probed.load(Ordering::Relaxed),
+            "pass 1 must skip group:2's slow DSH probe when startup rearm fails transiently"
+        );
+
+        // Restore social-v2.json and run pass 2; group:1 must restore its still-future deadline immediately.
+        std::fs::write(root.0.join("data/social-v2.json"), &valid_social).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            run_recovery_pass(&context, cutoff, &mut state),
+        )
+        .await;
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+
+        assert!(
+            state.terminal_rearm_done.contains("group:1"),
+            "pass 2 must mark group:1 done once social-v2.json recovers"
+        );
+        let social = context.read_social_state().unwrap();
+        assert_eq!(
+            social["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].as_str(),
+            Some(future_iso.as_str()),
+            "pass 2 must restore group:1's still-future deadline immediately"
         );
     }
 
