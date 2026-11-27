@@ -2575,6 +2575,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ticket297_restart_before_hub_tick_does_not_rearm_expired_timeout() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) = harness_cap_fixture("harness-cap-pre-tick-restart", None).await;
+            let key = HARNESS_CAP_KEY;
+            let due_ms = crate::parity_clock::now_ms() - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+            let cap_clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(crate::turn_ledger::now_ms()));
+            hub.cap_clock = Some(cap_clock.clone());
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "timeout");
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            let mid_records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let (mid_turns, _) = crate::turn_ledger::fold(&mid_records);
+            assert_eq!(mid_turns.len(), 1);
+            assert!(mid_turns[0].wake_claim.is_some(), "pipeline must record wake_claim before snapshot");
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"].is_null(),
+                "consume_reserved2_deadline must clear sleepUntil before snapshot"
+            );
+
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            cap_clock.store(cap, std::sync::atomic::Ordering::Release);
+            hub.pump_timers(&cfg, cap);
+            harness_cap_http_response(snapshot, "503 Service Unavailable", "application/json", "{}").await;
+            wait_for_harness_cap_wake(&hub).await;
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+
+            // Simulate process crash/restart BEFORE Hub::tick runs reserved2.rs:5557-5567.
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let (turns, _) = crate::turn_ledger::fold(&records);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].state, crate::turn_ledger::State::Cancelled);
+            assert_eq!(turns[0].outcome_reason, "turnTimeout");
+
+            let cutoff = crate::turn_ledger::now_ms() + 1_000;
+            let mut done = HashSet::new();
+            assert!(crate::turn_recovery::rearm_startup_terminal_sleeps(
+                &hub.context,
+                &cfg,
+                &turns,
+                cutoff,
+                &HashSet::new(),
+                &mut done,
+            ));
+            let state = hub.state().unwrap();
+            let wc = &state["conversations"][key]["wakeConfig"];
+            assert!(
+                wc["sleepUntil"].is_null(),
+                "restart before Hub::tick must not re-arm expired timeout wake, got {wc}"
+            );
+            assert_eq!(
+                wc["sleepRetired"],
+                json!(true),
+                "expired timeout wake must persist sleepRetired before Hub::tick runs, got {wc}"
+            );
+        })
+        .await
+        .expect("the pre-tick restart fixture must settle");
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -4426,6 +4501,8 @@ pub struct Hub {
     epoch_contended_hook: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)]
     collector_finished_hook: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    cap_clock: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     context: RuntimeContext,
     journal: inbound::SharedJournal,
     drivers: HashMap<String, session::Driver>,
@@ -4501,6 +4578,8 @@ impl Hub {
             epoch_contended_hook: None,
             #[cfg(test)]
             collector_finished_hook: None,
+            #[cfg(test)]
+            cap_clock: None,
             context: context.clone(),
             journal,
             drivers: HashMap::new(),
@@ -6024,10 +6103,16 @@ impl Hub {
             let admitted = pipeline::MintedEpoch::default();
             let admitted_shared = admitted.clone();
             let retries_remaining = self.failures.get(&key).copied().unwrap_or_default() < MAX_WAKE_RETRIES;
+            #[cfg(test)]
+            let cap_clock = self.cap_clock.clone();
             let task = tokio::spawn(async move {
                 match pipeline::Pipeline::new_without_dsh(&context, &cfg2, true) {
                     Err(error) => DispatchResult::new(Err(error), true),
                     Ok(mut pipe) => {
+                        #[cfg(test)]
+                        {
+                            pipe.cap_clock = cap_clock;
+                        }
                         pipe.share_session(shared);
                         pipe.share_minted_epoch(minted_shared);
                         pipe.share_reserved2_route(route_shared, admitted_shared);

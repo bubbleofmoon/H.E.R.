@@ -649,6 +649,11 @@ pub(crate) fn wake_claim_for_rearm<'a>(
     None
 }
 
+fn is_expired_timeout_before_admission(turn: &Turn) -> bool {
+    turn.reason == "timeout"
+        && turn.notes.iter().any(|note| note["verdict"] == "expired-before-admission")
+}
+
 fn rearm_reserved2_if_needed(
     context: &RuntimeContext,
     cfg: &Value,
@@ -656,7 +661,10 @@ fn rearm_reserved2_if_needed(
     turn: &Turn,
     live_cutoff: Option<i64>,
 ) -> Result<(), String> {
-    if turn.backend == "harness" && (turn.reserved2 || turn.wake_claim.is_some()) {
+    if turn.backend == "harness"
+        && (turn.reserved2 || turn.wake_claim.is_some())
+        && !is_expired_timeout_before_admission(turn)
+    {
         let claim = wake_claim_for_rearm(
             turns,
             &turn.key,
@@ -1412,7 +1420,11 @@ pub(crate) fn rearm_startup_terminal_sleeps(
         if done.contains(key) || keys_with_unsettled_startup.contains(key) {
             continue;
         }
+        let expired_timeout_before_admission = is_expired_timeout_before_admission(turn)
+            && turn.state == State::Cancelled
+            && turn.outcome_reason == "turnTimeout";
         let eligible = !keys_with_live_turn.contains(key)
+            && !expired_timeout_before_admission
             && (turn.reserved2 || turn.wake_claim.is_some())
             && turn.backend == "harness"
             && matches!(
@@ -3673,6 +3685,71 @@ mod tests {
             crate::social_state::token(&fx_match.context, "group:1").unwrap().as_deref(),
             Some("fixture-token-297"),
             "pause recovery with matching epoch must still rotate"
+        );
+    }
+
+    #[test]
+    fn ticket297_startup_rearm_skips_expired_before_admission_timeout_note() {
+        let mut cfg = json!({
+            "consoleToken": "synthetic-review-token",
+            "allow": {"groups": [1]},
+            "socialV2": {"wake": {"recommendedSleepMinMs": 60_000, "recommendedSleepMaxMs": 60_000}}
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-297-exp-note-")),
+            &cfg,
+            &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            json!({
+                "conversations": {
+                    "group:1": {
+                        "agentToken": "tok-297-exp-note",
+                        "wakeTimes": [10],
+                        "wakeConfig": {
+                            "confirmedAt": 2,
+                            "infinite": false,
+                            "sleepUntil": null,
+                            "lastWakeAt": 10
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ctx = RuntimeContext::from_root(&root.0).unwrap();
+        cfg = ctx.load_config().unwrap();
+        let _journal = Journal::open(&ctx).unwrap();
+        let due_iso = crate::sticker::iso_at(crate::turn_ledger::now_ms() - 1_000);
+        let rec = Recorder::begin_reserved2(
+            &ctx,
+            "group:1",
+            "harness",
+            "timeout",
+            &crate::send_outbox::token_epoch("tok-297-exp-note"),
+            &[],
+        )
+        .unwrap();
+        rec.wake_claim(&json!({
+            "at": 10,
+            "previous": {"wakeConfig": {"confirmedAt": 2, "infinite": false, "sleepUntil": due_iso}}
+        }))
+        .unwrap();
+        rec.verified("expired-before-admission", "turnTimeout").unwrap();
+        rec.end("cancelled", "turnTimeout").unwrap();
+
+        let turns = fold(&turn_ledger::read_records(&ctx).unwrap()).0;
+        let cutoff = crate::turn_ledger::now_ms() + 1_000;
+        let mut done = HashSet::new();
+        assert!(rearm_startup_terminal_sleeps(&ctx, &cfg, &turns, cutoff, &HashSet::new(), &mut done));
+        assert!(done.contains("group:1"));
+        let wc = ctx.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"].clone();
+        assert!(
+            wc["sleepUntil"].is_null(),
+            "startup rearm must skip timeout turn with expired-before-admission note even without sleepRetired, got {wc}"
         );
     }
 
