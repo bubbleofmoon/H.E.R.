@@ -1669,3 +1669,48 @@ fn ticket443_r11_full_restore_vacuums_unmatched_freed_page_remnants() {
         "full restore must vacuum non-empty settings.db even when no row matches"
     );
 }
+
+#[test]
+fn ticket443_r12_full_restore_rejects_stale_confirmation_when_live_endpoint_changes() {
+    let f = Fixture::new();
+    let context = f.context();
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive = f.backup();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-before-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let plan = preview(&context, &archive, false).unwrap();
+    let stale_confirmation = plan["confirmation"].as_str().unwrap().to_string();
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://live-after-r12.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let err = execute_with(
+        &context,
+        &archive,
+        false,
+        &stale_confirmation,
+        "fixture-admin",
+        &mut FakeControl::default(),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "full restore must reject stale confirmation after live endpoint change");
+}

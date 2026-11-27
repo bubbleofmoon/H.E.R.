@@ -91,7 +91,7 @@ export function normalizeEndpointDraftValue(
   if (
     (item?.kind.type === 'model endpoint' || item?.key === MODEL_ENDPOINT_KEY) &&
     typeof rawValue === 'string' &&
-    rawValue.trim() === ''
+    rawValue === ''
   ) {
     return null;
   }

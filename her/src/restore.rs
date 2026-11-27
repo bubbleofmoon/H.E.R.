@@ -182,6 +182,9 @@ impl Prepared {
         let mut config_bytes = None;
         let mut configured_token = None;
         let mut scrubbed_settings_db = None;
+        let mut live_effective_endpoint: Option<String> = None;
+        let mut archive_effective_endpoint: Option<String> = None;
+        let mut endpoint_switch_warning = false;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -198,20 +201,23 @@ impl Prepared {
                 .ok()
                 .and_then(|snap| snap.harness_disk_key.clone())
                 .or_else(|| crate::settings::harness_credential(context));
+            let archive_endpoint = crate::settings::archive_effective_model_endpoint(
+                verified.archive_model_endpoint.clone(),
+                &raw,
+                context.dependency_url("model"),
+                &verified.archive_secrets,
+                &verified.archive_scrubbed_hashes,
+                host_disk_key.as_deref(),
+            );
+            archive_effective_endpoint = archive_endpoint;
             if let Ok(live_snap) = &live_snap {
-                let archive_endpoint = crate::settings::archive_effective_model_endpoint(
-                    verified.archive_model_endpoint.clone(),
-                    &raw,
-                    context.dependency_url("model"),
-                    &verified.archive_secrets,
-                    &verified.archive_scrubbed_hashes,
-                    host_disk_key.as_deref(),
-                );
+                live_effective_endpoint = live_snap.effective_endpoint.clone();
                 if let (Some(e_archive), Some(e_live)) = (
-                    archive_endpoint.as_deref(),
-                    live_snap.effective_endpoint.as_deref(),
+                    archive_effective_endpoint.as_deref(),
+                    live_effective_endpoint.as_deref(),
                 ) {
                     if e_live != e_archive {
+                        endpoint_switch_warning = true;
                         warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
                     }
                 }
@@ -297,8 +303,16 @@ impl Prepared {
         let scope = if memory_only { "memory" } else { "everything" };
         // Bind both the bytes selected by the administrator and the replacement plan.
         hash.update(
-            serde_json::to_vec(&json!([context.runtime_root(), scope, replaces, removes]))
-                .map_err(|e| e.to_string())?,
+            serde_json::to_vec(&json!([
+                context.runtime_root(),
+                scope,
+                replaces,
+                removes,
+                live_effective_endpoint,
+                archive_effective_endpoint,
+                endpoint_switch_warning,
+            ]))
+            .map_err(|e| e.to_string())?,
         );
         let confirmation = format!("{:x}", hash.finalize());
         let time = metadata

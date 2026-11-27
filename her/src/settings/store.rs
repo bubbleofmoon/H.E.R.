@@ -33,6 +33,7 @@ pub(crate) const STORE_SIDECARS: [&str; 3] = SIDECARS;
 const SCHEMA_VERSION: i64 = 3;
 const SECRET_MARKER: &str = "(hidden)";
 const SCRUBBED_ENDPOINT_HASHES_KEY: &str = "__scrubbed.harness.apiBaseUrl";
+const SCRUB_CLEANUP_PENDING_KEY: &str = "__scrubbed.pendingCleanup";
 const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
 pub(crate) const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
@@ -2084,12 +2085,19 @@ fn remove_from_config(
         remove_at(&mut document, setting.pointer);
         changed = true;
     }
-    if should_scrub_config_endpoint(
+    let config_leaked = config_has_leaked_endpoint(
         &document,
-        has_clean_stored_endpoint,
-        guard.endpoint_suppressed,
-        guard,
-    ) {
+        Some(&guard.known_secrets),
+        Some(&guard.scrubbed_hashes),
+    );
+    if config_leaked
+        || should_scrub_config_endpoint(
+            &document,
+            has_clean_stored_endpoint,
+            guard.endpoint_suppressed,
+            guard,
+        )
+    {
         remove_at(&mut document, HARNESS_API_BASE_URL.pointer);
         changed = true;
     }
@@ -2173,6 +2181,7 @@ fn write_store_scrubbable<T>(
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
+    let mut cleanup_failed = false;
     let (result, stored, guard) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
             .map_err(unavailable)?;
@@ -2190,7 +2199,18 @@ fn write_store_scrubbable<T>(
         }
         seed(&tx, &document, now_ms(), written, harness_key.as_deref())?;
         let access_before = access_rows(&tx)?;
+        let pending_before = stored_row(&tx, SCRUB_CLEANUP_PENDING_KEY)?;
         let (result, scrubbed) = write(&tx, &document)?;
+        let needs_cleanup = scrubbed || pending_before.is_some();
+        if scrubbed && pending_before.is_none() {
+            tx.execute(
+                "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+                 updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                params![SCRUB_CLEANUP_PENDING_KEY, "true", 1_i64, now_ms(), SEED_ACTOR],
+            )
+            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+        }
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -2199,25 +2219,38 @@ fn write_store_scrubbable<T>(
             panic!("settings: simulated crash before the store commit");
         }
         tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-        if scrubbed {
-            conn.execute_batch("VACUUM;")
-                .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-        }
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
-        // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
+        // its index; reading before cleanup also lets us mirror scrubbed config.json if cleanup hits 503.
         let stored = read_stored_values(&conn);
         let guard = read_endpoint_write_guard(&conn, harness_key.as_deref())
             .map_err(InspectError::into_message);
-        if scrubbed {
-            checkpoint_wal_truncate(&conn, std::time::Instant::now() + WAL_SWITCH_WAIT)
-                .map_err(unavailable)?;
+        if needs_cleanup {
+            let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+            let cleaned = conn
+                .execute_batch("VACUUM;")
+                .map_err(|_| STORAGE_ERROR.to_string())
+                .and_then(|_| checkpoint_wal_truncate(&conn, deadline))
+                .and_then(|_| {
+                    conn.execute(
+                        "DELETE FROM settings WHERE key=?1",
+                        [SCRUB_CLEANUP_PENDING_KEY],
+                    )
+                    .map(|_| ())
+                    .map_err(|_| STORAGE_ERROR.to_string())
+                })
+                .and_then(|_| checkpoint_wal_truncate(&conn, deadline));
+            if cleaned.is_err() {
+                cleanup_failed = true;
+            }
         }
         (result, stored, guard)
     };
-    Ok((
-        result,
-        mirror_after_commit(context, stored, guard.as_ref().map_err(String::as_str)),
-    ))
+    let mirror_error =
+        mirror_after_commit(context, stored, guard.as_ref().map_err(String::as_str));
+    if cleanup_failed {
+        return Err(unavailable(STORAGE_ERROR.to_string()));
+    }
+    Ok((result, mirror_error))
 }
 
 pub(crate) fn migrate_store_v2(conn: &Connection) -> Result<(), String> {
@@ -2725,16 +2758,40 @@ fn store(
     }
     let harness_key = harness_credential(context);
     let (applied, mirror_error) = write_store_scrubbable(context, false, &[setting.key], false, |conn, document| {
+        let old = stored_row(conn, setting.key)?;
         let raw_secret = setting
             .secret
             .then(|| value.as_str().filter(|s| !s.is_empty()).map(str::to_string))
             .flatten();
-        let mut scrubbed_before = if let Some(secret) = raw_secret.as_deref() {
-            scrub_leaked_endpoint_for_secret(conn, secret, actor)?
+        let previous_secret = if setting.secret {
+            old.as_ref().and_then(|(old_text, _)| {
+                serde_json::from_str::<Value>(old_text).ok().and_then(|parsed| match parsed {
+                    Value::Array(items) => items
+                        .get(1)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    Value::String(s) if !s.is_empty() => Some(s),
+                    _ => None,
+                })
+            })
         } else {
-            false
+            None
         };
-        if let Some(secret) = raw_secret.as_deref() {
+        let mut secrets_to_scrub: Vec<String> = Vec::new();
+        for candidate in [raw_secret.as_deref(), previous_secret.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !secrets_to_scrub.iter().any(|s| s == candidate) {
+                secrets_to_scrub.push(candidate.to_string());
+            }
+        }
+        let mut scrubbed_before = false;
+        for secret in &secrets_to_scrub {
+            if scrub_leaked_endpoint_for_secret(conn, secret, actor)? {
+                scrubbed_before = true;
+            }
             if let Some(cfg_endpoint) = document.pointer(HARNESS_API_BASE_URL.pointer) {
                 let mut strings = Vec::new();
                 collect_value_strings(cfg_endpoint, &mut strings);
@@ -2795,7 +2852,6 @@ fn store(
         };
         reject_credential_text(conn, setting, raw_value, &value, harness_key.as_deref())?;
         let value = if setting.secret { json!(!value.is_null()) } else { value };
-        let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
                 let scrubbed_after = if let Some(secret) = raw_secret.as_deref() {

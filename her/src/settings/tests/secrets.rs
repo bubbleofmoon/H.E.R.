@@ -1269,3 +1269,152 @@ fn ticket443_r11_models_api_redacts_price_currency_and_symbol() {
         "price.symbol must be redacted: {price}"
     );
 }
+
+#[test]
+fn ticket443_r12_rotating_or_resetting_secret_scrubs_outgoing_leaked_endpoint() {
+    // Part A: rotating a stored secret scrubs audit and config endpoint leaks carrying the outgoing secret.
+    let (root, context) = settings_fixture("ticket443 r12 outgoing secret rotate");
+    let old_tok = "sk-old-r12-tok";
+    let new_tok = "sk-new-r12-tok";
+    let leaked_old_url = format!("https://rotate-r12.example.test/{old_tok}/v1");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    assert_eq!(put(&context, CLI, old_tok).0, 200);
+    write_config(&root, |cfg| {
+        cfg["harness"]["apiBaseUrl"] = json!(leaked_old_url);
+    });
+    StoreProbe::at(&root.0).insert_audit(&[crate::settings::AuditRow {
+        at_ms: 1000,
+        actor: "fixture",
+        source: "console",
+        scope: "global",
+        key: "harness.apiBaseUrl",
+        old: None,
+        new: Some(json!(leaked_old_url).to_string()),
+        request: "r12-rotate-audit".to_string(),
+    }]);
+
+    assert_eq!(put(&context, CLI, new_tok).0, 200);
+    let (entries, _) = history_page(&context, "?setting=harness.apiBaseUrl");
+    assert!(
+        !entries.iter().any(|e| e.to_string().contains(old_tok)),
+        "rotation must scrub outgoing secret from audit history: {entries:?}"
+    );
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "rotation must scrub leaked config/harness.apiBaseUrl carrying outgoing secret"
+    );
+
+    // Part B: resetting a stored secret scrubs audit and config endpoint leaks carrying the reset secret.
+    let (root2, context2) = settings_fixture("ticket443 r12 outgoing secret reset");
+    let reset_tok = "sk-reset-r12-tok";
+    let leaked_reset_url = format!("https://reset-r12.example.test/{reset_tok}/v1");
+    assert_eq!(set_quiet(&context2, json!(4500)).0, 200);
+    assert_eq!(put(&context2, CLI, reset_tok).0, 200);
+    write_config(&root2, |cfg| {
+        cfg["harness"]["apiBaseUrl"] = json!(leaked_reset_url);
+    });
+    StoreProbe::at(&root2.0).insert_audit(&[crate::settings::AuditRow {
+        at_ms: 1000,
+        actor: "fixture",
+        source: "console",
+        scope: "global",
+        key: "harness.apiBaseUrl",
+        old: None,
+        new: Some(json!(leaked_reset_url).to_string()),
+        request: "r12-reset-audit".to_string(),
+    }]);
+
+    let (st, reply) = post(&context2, "/api/settings/reset", json!({"setting": CLI}));
+    assert_eq!(st, 200, "{reply}");
+    let (entries2, _) = history_page(&context2, "?setting=harness.apiBaseUrl");
+    assert!(
+        !entries2.iter().any(|e| e.to_string().contains(reset_tok)),
+        "reset must scrub outgoing secret from audit history: {entries2:?}"
+    );
+    assert!(
+        stored_config(&root2).pointer("/harness/apiBaseUrl").is_none(),
+        "reset must scrub leaked config/harness.apiBaseUrl carrying reset secret"
+    );
+}
+
+#[test]
+fn ticket443_r12_pinned_ro_503_mirrors_config_and_retry_completes_physical_cleanup() {
+    let (root, context) = settings_fixture("ticket443 r12 pinned ro 503");
+    let tok = "fixture-r12-pin-tok";
+    let wal_host = "ro-503-r12.example.test";
+    let leaked_url = format!("https://{wal_host}/{tok}");
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": leaked_url})).0,
+        200
+    );
+    assert_eq!(stored_config(&root).pointer("/harness/apiBaseUrl"), Some(&json!(leaked_url)));
+
+    let db_path = root.0.join("data/settings.db");
+    let ro = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let ro_tx = ro.unchecked_transaction().unwrap();
+    let _: i64 = ro_tx.query_row("SELECT count(*) FROM settings", [], |r| r.get(0)).unwrap();
+
+    // While RO transaction pins WAL, put must return 503 AFTER mirroring scrubbed config.json.
+    let (st1, _) = put(&context, CLI, tok);
+    assert_eq!(st1, 503, "pinned RO snapshot must cause 503 when physical cleanup cannot truncate WAL");
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "503 from failed physical cleanup must still mirror scrubbed config.json"
+    );
+
+    // Release RO snapshot and retry exact same save: durable pending marker completes VACUUM + TRUNCATE.
+    drop(ro_tx);
+    drop(ro);
+    let (st2, _) = put(&context, CLI, tok);
+    assert_eq!(st2, 200);
+
+    let wal_path = root.0.join("data/settings.db-wal");
+    if wal_path.exists() {
+        let wal_bytes = std::fs::read(&wal_path).unwrap();
+        assert!(
+            !wal_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
+            "settings.db-wal must have zero leaked url bytes after retry cleanup"
+        );
+    }
+    let db_bytes = std::fs::read(&db_path).unwrap();
+    assert!(
+        !db_bytes.windows(wal_host.len()).any(|w| w == wal_host.as_bytes()),
+        "settings.db must have zero leaked url bytes after retry cleanup"
+    );
+}
+
+#[test]
+fn ticket443_r12_remove_from_config_always_scrubs_leaked_endpoint() {
+    let (root, context) = settings_fixture("ticket443 r12 remove_from_config");
+    let tok = "sk-r12-rm-tok";
+    assert_eq!(
+        post(&context, "/api/settings/set", json!({"setting": "harness.apiBaseUrl", "value": "https://clean-r12-rm.example.test/v1"})).0,
+        200
+    );
+    assert_eq!(put(&context, CLI, tok).0, 200);
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    let (entries, _) = history_page(&context, "?setting=reply.wakeQuietMs");
+    let entry = entries[0]["entry"].as_i64().unwrap();
+
+    // Inject a leaked /harness/apiBaseUrl into config.json while store holds a clean endpoint.
+    let leaked_cfg = format!("https://leaked-r12-rm.example.test/{tok}/v1");
+    write_config(&root, |cfg| {
+        cfg["harness"]["apiBaseUrl"] = json!(leaked_cfg);
+    });
+
+    // Abort right after remove_from_config runs (before commit/mirror_after_commit) to verify remove_from_config itself scrubbed config.json.
+    crate::settings::PANIC_BEFORE_COMMIT.with(|p| p.set(true));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::settings::undo(&context, entry, "fixture-admin", &|_| Ok(()))
+    }));
+    crate::settings::PANIC_BEFORE_COMMIT.with(|p| p.set(false));
+    assert!(res.is_err(), "expected PANIC_BEFORE_COMMIT after remove_from_config");
+    assert!(
+        stored_config(&root).pointer("/harness/apiBaseUrl").is_none(),
+        "remove_from_config must scrub leaked config/harness.apiBaseUrl even when store holds a clean endpoint"
+    );
+}
