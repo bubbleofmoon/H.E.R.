@@ -241,15 +241,21 @@ fn clear_pending(
         crate::session_map::retire_if(context, key, sid).map_err(refused)?;
     }
     if pending.archive_started {
-        if conv.token().is_none() {
+        let prev = read_handover(Some(conv)).map_err(refused)?;
+        let prior_epochs = if conv.token().is_none() {
             conv.rotate_token();
-        }
+            Vec::new()
+        } else if prev.epoch.as_deref() == Some(epoch(Some(conv)).as_str()) {
+            prev.prior_epochs
+        } else {
+            Vec::new()
+        };
         conv.set_field(FIELD, json!(Handover {
             engine: Some(continuing),
             epoch: Some(epoch(Some(conv))),
             summary: Some(pending.summary.clone()),
             pending: None,
-            prior_epochs: Vec::new(),
+            prior_epochs,
         }));
         return Ok(());
     }
@@ -693,9 +699,7 @@ mod tests {
             let token = crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
             let gen = epoch(Some(&ConversationState::for_runtime(&context).read(key).unwrap().unwrap()));
             ConversationState::for_runtime(&context).update(key, |conv| {
-                conv.set_field(FIELD, json!(Handover {
-                    engine: Some(Engine::Dsh), epoch: Some(gen.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
-                }));
+                conv.set_field(FIELD, json!({"engine": "dsh", "epoch": gen}));
                 Ok(())
             }).unwrap();
             // Console switch keeps strict conversation_admitted (409 NOT_ADMITTED when allow is empty).
@@ -710,9 +714,7 @@ mod tests {
             // automatic switch Harness -> DSH must also succeed.
             let gen2 = epoch(Some(&ConversationState::for_runtime(&context).read(key).unwrap().unwrap()));
             ConversationState::for_runtime(&context).update(key, |conv| {
-                conv.set_field(FIELD, json!(Handover {
-                    engine: Some(Engine::Harness), epoch: Some(gen2.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
-                }));
+                conv.set_field(FIELD, json!({"engine": "harness", "epoch": gen2}));
                 Ok(())
             }).unwrap();
             crate::settings::apply_switch_choice(&context, key, &json!("dsh")).unwrap();
@@ -727,9 +729,7 @@ mod tests {
             let tok99 = crate::social_state::ensure_or_rotate(&context, "group:99", true).unwrap();
             let gen99 = epoch(Some(&ConversationState::for_runtime(&context).read("group:99").unwrap().unwrap()));
             ConversationState::for_runtime(&context).update("group:99", |conv| {
-                conv.set_field(FIELD, json!(Handover {
-                    engine: Some(Engine::Dsh), epoch: Some(gen99.clone()), summary: None, pending: None, prior_epochs: Vec::new(),
-                }));
+                conv.set_field(FIELD, json!({"engine": "dsh", "epoch": gen99}));
                 Ok(())
             }).unwrap();
             let deny_err = prepare_turn(&context, "group:99", mode, Some(&tok99), None).err().unwrap();

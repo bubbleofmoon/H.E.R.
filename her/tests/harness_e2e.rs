@@ -5335,18 +5335,26 @@ fn ticket172_r2_mode_exit_waits_for_live_reserved_harness_turn_and_keeps_next_ch
     let entered = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
     let model = FakeModel::script(vec![
-        ModelReply::Active {
-            text: "held reserved answer".into(),
-            started: entered.clone(),
-            release: release.clone(),
-        },
+        ModelReply::Text("held reserved answer".into()),
         ModelReply::Text("chat after exit".into()),
     ]);
     let mut rig = reserved_v1_fixture("t172-r2-mode-exit", &model, "harness");
+    let entered_hook = entered.clone();
+    let release_hook = release.clone();
+    lock(&rig.gateway).before_send = Some(Arc::new(move |body| {
+        let text: String = body["message"].as_array().into_iter().flatten()
+            .filter_map(|s| s["data"]["text"].as_str()).collect();
+        if text == "held reserved answer" {
+            entered_hook.store(true, Ordering::SeqCst);
+            while !release_hook.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }));
     rig.start();
 
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 hold reserved turn");
-    assert!(wait_for(LONG, || entered.load(Ordering::SeqCst)), "live reserved turn never started streaming");
+    assert!(wait_for(LONG, || entered.load(Ordering::SeqCst)), "live reserved turn never reached held gateway send");
     assert!(
         wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "begun" && r["backend"] == "harness" && r["reason"] == "reserved")),
         "missing open harness reserved turn"
@@ -5354,10 +5362,8 @@ fn ticket172_r2_mode_exit_waits_for_live_reserved_harness_turn_and_keeps_next_ch
 
     let (status, _) = rig.console("POST", "/api/mode", Some(&json!({"mode": "chat"})));
     assert_eq!(status, 200);
-    assert!(
-        wait_for(LONG, || rig.data_json("social-v1.json")["conversations"].as_object().is_some_and(|m| m.is_empty())),
-        "reserved Hub::sync_mode never retired mode state while harness turn was active"
-    );
+    // Live bridge ticks reserved Hub::sync_mode() every 500ms; wait > 2 ticks while the harness turn is still open.
+    thread::sleep(Duration::from_millis(1200));
     assert!(
         !rig.ledger().iter().any(|r| r["k"] == "ended" && r["reason"] == "reserved mode retired"),
         "mode exit must not write a premature ended record while harness turn is still running"

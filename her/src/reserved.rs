@@ -949,7 +949,6 @@ impl Hub {
     async fn sync_mode(&mut self) -> Result<(), String> {
         let stamp = mode_stamp(&self.context)?;
         if stamp != self.stamp {
-            self.stamp = stamp;
             for job in std::mem::take(&mut self.pending) {
                 self.journal.mark_handled(job.inbound, now()).await?;
             }
@@ -978,6 +977,7 @@ impl Hub {
                 }
             }
             self.active = retained;
+            self.stamp = stamp;
         }
         Ok(())
     }
@@ -1012,7 +1012,7 @@ impl Hub {
             let mut job = active.job;
             job.authority.token = admitted;
             let (result, unsubmitted, failure_parks) = active.task.await.map_err(|e| e.to_string())?;
-            if result.is_err() && unsubmitted && job.authority.check(&self.context, &key).is_ok() {
+            if result.is_err() && unsubmitted && job.authority.refresh_for_engine_switch(&self.context, &key).is_ok() {
                 if failure_parks.unwrap_or_else(|| {
                     crate::dsh_health::is_down(&self.context)
                         && self.context.load_config().ok().is_none_or(|c| job_needs_dsh(&self.context, &c, &key))
@@ -1830,32 +1830,131 @@ mod tests {
             Ok(s.clone())
         }).unwrap();
         hub.job(&state, key, "flush".into(), vec![], false, vec![], "f1".into(), 60_000, vec!["ev-r2-1".into()]).unwrap();
+        let t1 = hub.pending[0].authority.token.clone();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            conv.set_field("engineHandover", json!({"engine": "dsh", "epoch": crate::send_outbox::token_epoch(&t1)}));
+            Ok(())
+        }).unwrap();
 
         // 1) Engine switch DSH -> Harness (rotates T1 -> T2).
         crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
         crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
         let t2 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t2, t1);
         hub.tick("bot").await.unwrap();
         assert_eq!(hub.pending.len(), 1, "queued job/flush must survive engine switch");
         assert_eq!(hub.pending[0].authority.token, t2);
         assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r2-1").unwrap().as_deref(), Some("received"));
         assert_eq!(read(&context).unwrap().flush["f1"].status, "running");
 
-        // 2) Back-to-back console switch Harness -> DSH (rotates T2 -> T3).
+        // 2) Back-to-back console switch Harness -> DSH (rotates T2 -> T3; clear prior summary to stay offline).
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            if let Some(mut h) = conv.field("engineHandover").cloned() {
+                if let Some(obj) = h.as_object_mut() { obj.remove("summary"); }
+                conv.set_field("engineHandover", h);
+            }
+            Ok(())
+        }).unwrap();
         crate::settings::apply_switch_choice(&context, key, &json!("dsh")).unwrap();
         crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Dsh).unwrap();
         let t3 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t3, t2);
         hub.tick("bot").await.unwrap();
         assert_eq!(hub.pending.len(), 1, "queued job must survive back-to-back engine switch");
         assert_eq!(hub.pending[0].authority.token, t3);
 
         // 3) Non-switch rotation (T3 -> T4), even followed by an engine switch (T4 -> T5), must cancel & settle flush failed.
         crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            if let Some(mut h) = conv.field("engineHandover").cloned() {
+                if let Some(obj) = h.as_object_mut() { obj.remove("summary"); }
+                conv.set_field("engineHandover", h);
+            }
+            Ok(())
+        }).unwrap();
         crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
         crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
         hub.tick("bot").await.unwrap();
         assert!(hub.pending.is_empty(), "non-switch token rotation breaks handover chain and cancels queued job");
         assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r2-1").unwrap().as_deref(), Some("handled"));
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "failed");
+
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket172_r3_active_unsubmitted_job_refreshes_on_concurrent_console_switch() {
+        let (root, context) = fixture();
+        let key = "group:42";
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-harness-key").unwrap();
+        std::fs::write(
+            root.join("config/config.json"),
+            json!({
+                "allow":{"groups":[42]},
+                "consoleToken":"synthetic-console-token",
+                "harness":{"model":"fake-chat"},
+                "conversationEngines":{key:"dsh"}
+            }).to_string(),
+        ).unwrap();
+        context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let journal = SharedJournal::new(crate::inbound::Journal::open(&context).unwrap());
+        journal.record_received("ev-r3-1".into(), key.into(), "{}".into(), 1).await.unwrap();
+        journal.record_received("ev-r3-2".into(), key.into(), "{}".into(), 2).await.unwrap();
+        let mut hub = Hub::new(&context, journal, vec![key.into()], false).unwrap();
+        let state = mutate(&context, |s| {
+            s.conversations.insert(key.into(), Conversation::default());
+            s.flush.insert("f1".into(), Flush { key: key.into(), status: "running".into(), remaining: 1 });
+            Ok(s.clone())
+        }).unwrap();
+
+        // 1) Active unsubmitted job (minted == None) undergoes concurrent console switch (T1 -> T2).
+        hub.job(&state, key, "retry-work".into(), vec![], false, vec![], "f1".into(), 0, vec!["ev-r3-1".into()]).unwrap();
+        let job = hub.pending.pop_front().unwrap();
+        let t1 = job.authority.token.clone();
+        crate::conversation_state::ConversationState::for_runtime(&context).update(key, |conv| {
+            conv.set_field("engineHandover", json!({"engine": "dsh", "epoch": crate::send_outbox::token_epoch(&t1)}));
+            Ok(())
+        }).unwrap();
+        hub.active.insert(
+            key.into(),
+            Active {
+                job,
+                task: tokio::spawn(async { (Err("transient failure".into()), true, None) }),
+                minted: Default::default(),
+            },
+        );
+        while !hub.active[key].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        crate::settings::apply_switch_choice(&context, key, &json!("harness")).unwrap();
+        crate::engine_switch::prepare(&context, key, "reserved", crate::turn_engine::Engine::Harness).unwrap();
+        let t2 = crate::social_state::token(&context, key).unwrap().unwrap();
+        assert_ne!(t2, t1);
+        hub.tick("bot").await.unwrap();
+        assert_eq!(hub.pending.len(), 1, "active unsubmitted job must refresh on concurrent console switch");
+        assert_eq!(hub.pending[0].authority.token, t2);
+        assert_eq!(hub.pending[0].attempt, 1);
+        assert_eq!(read(&context).unwrap().flush["f1"].status, "running");
+
+        // 2) Active unsubmitted job whose token undergoes a non-switch rotation must still drop & settle failed.
+        let mut job2 = hub.pending.pop_front().unwrap();
+        job2.inbound = vec!["ev-r3-2".into()];
+        hub.active.insert(
+            key.into(),
+            Active {
+                job: job2,
+                task: tokio::spawn(async { (Err("transient failure".into()), true, None) }),
+                minted: Default::default(),
+            },
+        );
+        while !hub.active[key].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        crate::social_state::ensure_or_rotate(&context, key, true).unwrap();
+        hub.tick("bot").await.unwrap();
+        assert!(hub.pending.is_empty(), "non-switch token rotation must drop active unsubmitted job");
+        assert_eq!(crate::inbound::Journal::open(&context).unwrap().stage_of("ev-r3-2").unwrap().as_deref(), Some("handled"));
         assert_eq!(read(&context).unwrap().flush["f1"].status, "failed");
 
         drop(hub);
