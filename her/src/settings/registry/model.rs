@@ -6,9 +6,23 @@ use crate::harness::budget::{
     HISTORY_SHARE_MIN,
 };
 use crate::settings::kinds::{
-    BoundedNumber, FileRule, Integer, ModelId, RouteId, RouteList, RouteTokens, Switch,
+    BoundedNumber, FileRule, Integer, ModelEndpoint, ModelId, RouteId, RouteList, RouteTokens,
+    Switch,
 };
 use crate::settings::{ConversationSetting, Setting};
+
+/// Read via `settings::resolve_model_endpoint_and_key` for harness turns, one-shot jobs and CLI model launches.
+pub(crate) const HARNESS_API_BASE_URL: Setting = Setting {
+    key: "harness.apiBaseUrl",
+    pointer: "/harness/apiBaseUrl",
+    kind: &ModelEndpoint,
+    applies: "live",
+    group: "model and cost",
+    label: "Model API base URL",
+    hint: "Loopback HTTP or HTTPS OpenAI-compatible base URL for harness and CLI model requests; leave unset or reset to use dependencies.json. Changing this invalidates bound model API keys until re-entered.",
+    chat: false,
+    secret: false,
+};
 
 /// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which
 /// `harness::one_shot` falls back to); its model id rule also checks each route's model.
@@ -160,6 +174,7 @@ pub(crate) const HARNESS_SUMMARIES: Setting = Setting {
 
 /// The group's settings, in registry order.
 pub(super) const SETTINGS: &[Setting] = &[
+    HARNESS_API_BASE_URL,
     HARNESS_MODEL,
     HARNESS_ROUTES,
     HARNESS_MAX_STEPS,

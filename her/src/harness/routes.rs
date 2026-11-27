@@ -7,7 +7,7 @@
 use super::route_health::{self, Seen};
 use super::usage;
 use crate::run_record::{Component, Outcome, Trigger};
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 use genai::{
     adapter::AdapterKind,
     chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, StopReason, Usage},
@@ -594,21 +594,18 @@ impl ModelRoute {
         if order.is_empty() {
             return Err(MODEL_NOT_CONFIGURED.into());
         }
-        let origin = context
-            .dependency_url("model")
-            .ok_or("harness model endpoint is unavailable")?;
-        let key = context
-            .read_text(RuntimeArea::Config, "harness-api-key")
-            .map_err(|_| "harness model credential is unavailable")?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err("harness model credential is empty".into());
-        }
-        let endpoint = crate::runtime::model_openai_endpoint(origin);
-        let mut credentials = crate::settings::stored_secrets(context)
+        let snapshot = crate::settings::resolve_model_endpoint_and_key(context)
             .map_err(|_| "stored model credentials are unavailable")?;
-        credentials.push(key.to_string());
-        credentials.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+        let origin = snapshot
+            .effective_endpoint
+            .as_deref()
+            .ok_or("harness model endpoint is unavailable")?;
+        let key = snapshot
+            .harness_api_key()
+            .ok_or("Set harness.apiKey in Settings for the current model endpoint.")?
+            .to_string();
+        let endpoint = crate::runtime::model_openai_endpoint(origin);
+        let credentials = snapshot.all_secrets;
         let routes = order
             .into_iter()
             .map(|spec| Route {

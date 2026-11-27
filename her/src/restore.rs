@@ -168,7 +168,7 @@ impl Prepared {
         let mut warnings = Vec::new();
         if !memory_only {
             if !credentials.has_endpoints {
-                warnings.push("整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。");
+                warnings.push("整库覆写恢复将会抹掉本地保存的联网搜索密钥、直连服务商密钥与模型接口密钥。");
             }
             let password_warning = if credentials.has_password {
                 "完全恢复会使用备份中的管理员密码，并退出所有浏览器会话。"
@@ -190,6 +190,30 @@ impl Prepared {
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             let raw = crate::backup::parse_archive_config(&bytes)?;
+            let host_default = context
+                .dependency_url("model")
+                .map(crate::runtime::canonical_model_endpoint);
+            let archive_endpoint = match verified.archive_model_endpoint {
+                Some(Some(url)) => Some(url),
+                Some(None) => host_default.clone(),
+                None => crate::settings::HARNESS_API_BASE_URL
+                    .found_in(&raw)
+                    .and_then(|v| crate::settings::HARNESS_API_BASE_URL.normalize(v))
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .or(host_default),
+            };
+            if let (Some(e_archive), Ok(live_snap)) = (
+                archive_endpoint.as_deref(),
+                crate::settings::resolve_model_endpoint_and_key(context),
+            ) {
+                if live_snap
+                    .effective_endpoint
+                    .as_deref()
+                    .is_some_and(|e_live| e_live != e_archive)
+                {
+                    warnings.push("完全恢复会将当前生效的模型接口地址（及对应绑定密钥）切换为备份中的接口地址。");
+                }
+            }
             let (config, _) = crate::backup::validate_archive_config(
                 context.runtime_root(),
                 raw,

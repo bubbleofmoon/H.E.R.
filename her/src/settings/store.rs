@@ -13,8 +13,8 @@ pub(crate) use conversation::{
 };
 
 use super::{
-    find, find_conversation, registry, Setting, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER,
-    WEB_SEARCH_API_KEY,
+    find, find_conversation, registry, Setting, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY,
+    HARNESS_API_BASE_URL, HARNESS_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY,
 };
 use super::registry::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 use crate::guarded_fs::file_link_count;
@@ -810,7 +810,7 @@ fn secrets_in_checked(
     conn: &Connection,
 ) -> Result<Vec<(&'static str, String, String)>, InspectError> {
     let mut secrets = Vec::new();
-    for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY] {
+    for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY, &HARNESS_API_KEY] {
         if let Some((endpoint, credential)) = secret_row_checked(conn, setting)? {
             secrets.push((setting.key, endpoint, credential));
         }
@@ -827,24 +827,212 @@ pub(crate) fn secret_value(
     setting: &Setting,
     endpoint: &str,
 ) -> Result<Option<String>, String> {
-    if setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key {
+    if setting.key != WEB_SEARCH_API_KEY.key
+        && setting.key != CLI_MODEL_API_KEY.key
+        && setting.key != HARNESS_API_KEY.key
+    {
         return Ok(None);
     }
+    let is_model = setting.key != WEB_SEARCH_API_KEY.key;
+    let target = if is_model {
+        crate::runtime::canonical_model_endpoint(endpoint)
+    } else {
+        endpoint.to_string()
+    };
     read_store(context, |conn| {
         let Some(conn) = conn else { return Ok(None) };
         Ok(secret_row_checked(conn, setting)?
-            .filter(|(bound, _)| bound == endpoint)
+            .filter(|(bound, _)| {
+                if is_model {
+                    crate::runtime::canonical_model_endpoint(bound) == target
+                } else {
+                    bound == &target
+                }
+            })
             .map(|(_, credential)| credential))
     })
 }
 
 pub(crate) fn has_endpoint_credentials(conn: &Connection) -> Result<bool, String> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
-        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2, ?3) AND value <> 'null')",
+        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key, HARNESS_API_KEY.key],
         |row| row.get(0),
     )
     .map_err(|_| STORAGE_ERROR.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelEndpointSource {
+    Settings,
+    Config,
+    Dependencies,
+}
+
+impl ModelEndpointSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+            Self::Config => "config",
+            Self::Dependencies => "dependencies.json",
+        }
+    }
+}
+
+pub(crate) struct ModelEndpointSnapshot {
+    pub default_endpoint: Option<String>,
+    pub effective_endpoint: Option<String>,
+    pub effective_source: Option<ModelEndpointSource>,
+    pub harness_db_key: Option<String>,
+    pub harness_disk_key: Option<String>,
+    pub harness_bound_elsewhere: bool,
+    pub cli_model_key: Option<String>,
+    pub cli_bound_elsewhere: bool,
+    pub all_secrets: Vec<String>,
+}
+
+impl ModelEndpointSnapshot {
+    pub(crate) fn matches_default(&self) -> bool {
+        matches!(
+            (&self.effective_endpoint, &self.default_endpoint),
+            (Some(e), Some(d)) if e == d
+        )
+    }
+
+    /// Resolves the active `HARNESS_API_KEY` from the snapshot:
+    /// 1. Stored `harness.apiKey` row bound to `canonical(E)`
+    /// 2. Else if `canonical(E) == canonical(D)` and non-empty `config/harness-api-key` exists on disk
+    /// 3. Else `None` (fail closed)
+    pub(crate) fn harness_api_key(&self) -> Option<&str> {
+        if let Some(key) = self.harness_db_key.as_deref() {
+            return Some(key);
+        }
+        if self.matches_default() {
+            return self.harness_disk_key.as_deref();
+        }
+        None
+    }
+
+    pub(crate) fn harness_key_source(&self) -> Option<&'static str> {
+        if self.harness_db_key.is_some() {
+            Some("settings")
+        } else if self.matches_default() && self.harness_disk_key.is_some() {
+            Some("file")
+        } else {
+            None
+        }
+    }
+}
+
+fn stored_model_endpoint_override(conn: &Connection) -> Result<Option<Option<String>>, InspectError> {
+    let Some((text, _)) = stored_row_sqlite(conn, HARNESS_API_BASE_URL.key).map_err(InspectError::from_sqlite)?
+    else {
+        return Ok(None);
+    };
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|_| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
+    if parsed.is_null() {
+        return Ok(Some(None));
+    }
+    let normalized = HARNESS_API_BASE_URL
+        .normalize(&parsed)
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or_else(|| InspectError::Fatal(STORAGE_ERROR.to_string()))?;
+    Ok(Some(Some(normalized)))
+}
+
+pub(crate) fn archive_model_endpoint_override(conn: &Connection) -> Result<Option<Option<String>>, String> {
+    stored_model_endpoint_override(conn).map_err(InspectError::into_message)
+}
+
+fn resolve_model_endpoint_in_conn(
+    conn: Option<&Connection>,
+    document: Option<&Value>,
+    default_raw: Option<&str>,
+    harness_disk_key: Option<String>,
+) -> Result<ModelEndpointSnapshot, InspectError> {
+    let stored_override = match conn {
+        Some(conn) => stored_model_endpoint_override(conn)?,
+        None => None,
+    };
+    let config_override = || {
+        document.and_then(|doc| {
+            HARNESS_API_BASE_URL
+                .found_in(doc)
+                .and_then(|v| HARNESS_API_BASE_URL.normalize(v))
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+    };
+    let override_ep = match stored_override {
+        Some(Some(url)) => Some((url, ModelEndpointSource::Settings)),
+        Some(None) => None,
+        None => config_override().map(|url| (url, ModelEndpointSource::Config)),
+    };
+    let default_endpoint = default_raw.map(crate::runtime::canonical_model_endpoint);
+    let (effective_endpoint, effective_source) = match override_ep {
+        Some((url, source)) => (Some(url), Some(source)),
+        None => (
+            default_endpoint.clone(),
+            default_endpoint.as_ref().map(|_| ModelEndpointSource::Dependencies),
+        ),
+    };
+    let secrets = match conn {
+        Some(conn) => secrets_in_checked(conn)?,
+        None => Vec::new(),
+    };
+    let mut all_secrets: Vec<String> = secrets
+        .iter()
+        .map(|(_, _, credential)| credential.clone())
+        .chain(harness_disk_key.clone())
+        .collect();
+    all_secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    all_secrets.dedup();
+
+    let mut harness_db_key = None;
+    let mut harness_bound_elsewhere = false;
+    let mut cli_model_key = None;
+    let mut cli_bound_elsewhere = false;
+    for (key, bound, credential) in secrets {
+        let matches_effective = effective_endpoint
+            .as_deref()
+            .is_some_and(|e| crate::runtime::canonical_model_endpoint(&bound) == e);
+        if key == HARNESS_API_KEY.key {
+            if matches_effective {
+                harness_db_key = Some(credential);
+            } else {
+                harness_bound_elsewhere = true;
+            }
+        } else if key == CLI_MODEL_API_KEY.key {
+            if matches_effective {
+                cli_model_key = Some(credential);
+            } else {
+                cli_bound_elsewhere = true;
+            }
+        }
+    }
+
+    Ok(ModelEndpointSnapshot {
+        default_endpoint,
+        effective_endpoint,
+        effective_source,
+        harness_db_key,
+        harness_disk_key,
+        harness_bound_elsewhere,
+        cli_model_key,
+        cli_bound_elsewhere,
+        all_secrets,
+    })
+}
+
+pub(crate) fn resolve_model_endpoint_and_key(
+    context: &RuntimeContext,
+) -> Result<ModelEndpointSnapshot, String> {
+    let document = raw_config(context)?;
+    let harness_disk_key = harness_credential(context);
+    let default_raw = context.dependency_url("model");
+    read_store(context, |conn| {
+        resolve_model_endpoint_in_conn(conn, Some(&document), default_raw, harness_disk_key.clone())
+    })
 }
 
 pub(crate) fn has_stored_setting(conn: &Connection, key: &str) -> Result<bool, (u16, String)> {
@@ -883,13 +1071,18 @@ fn reject_credential_text(
     conn: &Connection, setting: &Setting, value: &Value, harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
     let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
+    let endpoint_url = value.as_str().filter(|_| setting.key == HARNESS_API_BASE_URL.key);
     let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
-    if prompt_text.is_none() && routes.is_none() {
+    if prompt_text.is_none() && endpoint_url.is_none() && routes.is_none() {
         return Ok(());
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
     let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
-    if prompt_text.is_some_and(|text| harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text))
+    let has_any_credential = |text: &str| {
+        harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text)
+    };
+    if prompt_text.is_some_and(has_any_credential)
+        || endpoint_url.is_some_and(has_any_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
             ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
         }))
@@ -1707,9 +1900,21 @@ pub(crate) fn apply(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
+    apply_checked_endpoint(context, key, value, actor, source, None)
+}
+
+/// Like `apply`, additionally enforcing `expected_endpoint` inside the write transaction for model endpoint credentials.
+pub(crate) fn apply_checked_endpoint(
+    context: &RuntimeContext,
+    key: &str,
+    value: &Value,
+    actor: &str,
+    source: &str,
+    expected_endpoint: Option<&str>,
+) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
-    store(context, setting, value, actor, source)
+    store(context, setting, value, actor, source, expected_endpoint)
 }
 
 /// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
@@ -1738,6 +1943,7 @@ fn store(
     value: Value,
     actor: &str,
     source: &str,
+    expected_endpoint: Option<&str>,
 ) -> Result<Applied, (u16, String)> {
     if super::registry::checks_schedule(setting.key) {
         let unavailable = |error| (503, error);
@@ -1747,14 +1953,39 @@ fn store(
             [(setting, Some(value.clone()))],
         )?;
     }
-    let harness_key = setting.kind.text_default().and_then(|_| harness_credential(context));
+    let harness_key = harness_credential(context);
     let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
+        let is_model_secret =
+            setting.key == HARNESS_API_KEY.key || setting.key == CLI_MODEL_API_KEY.key;
+        let snapshot = if expected_endpoint.is_some() || (setting.secret && !value.is_null() && is_model_secret) {
+            Some(
+                resolve_model_endpoint_in_conn(
+                    Some(conn),
+                    Some(document),
+                    context.dependency_url("model"),
+                    harness_key.clone(),
+                )
+                .map_err(|error| (503, error.into_message()))?,
+            )
+        } else {
+            None
+        };
+        if let Some(expected) = expected_endpoint {
+            let expected = crate::runtime::canonical_model_endpoint(expected);
+            let actual = snapshot.as_ref().and_then(|s| s.effective_endpoint.as_deref());
+            if actual != Some(expected.as_str()) {
+                return Err((
+                    409,
+                    "model endpoint changed before credential save; refresh and re-enter the key".to_string(),
+                ));
+            }
+        }
         // The configuration gate keeps the endpoint stable until the store commits.
         let text = if setting.secret && !value.is_null() {
             let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
                 crate::aux_search::settings_endpoint(document)
             } else {
-                context.dependency_url("model").map(str::to_string)
+                snapshot.and_then(|s| s.effective_endpoint)
             }
             .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
             json!([endpoint, value]).to_string()
@@ -1783,7 +2014,7 @@ fn store(
 /// empty one included. A stored default already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
     let setting = generic_setting(key)?;
-    store(context, setting, setting.default_value(), actor, "reset")
+    store(context, setting, setting.default_value(), actor, "reset", None)
 }
 
 const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
@@ -2178,12 +2409,20 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         Ok(secrets) => (secrets, store_error),
         Err(error) => (Vec::new(), store_error.or(Some(error))),
     };
+    let (endpoint_snapshot, store_error) = match resolve_model_endpoint_and_key(context) {
+        Ok(snapshot) => (Some(snapshot), store_error),
+        Err(error) => (None, store_error.or(Some(error))),
+    };
     let (password_is_set, store_error) =
         match crate::console_auth::administrator_password_is_set(context) {
             Ok(is_set) => (is_set, store_error),
             Err(error) => (false, store_error.or(Some(error))),
         };
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
+    let search_endpoint = crate::aux_search::settings_endpoint(&document);
+    let model_fallback = context
+        .dependency_url("model")
+        .map(crate::runtime::canonical_model_endpoint);
     let settings: Vec<Value> = registry()
         .map(|setting| {
             let mut entry = json!({
@@ -2201,7 +2440,37 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 return entry;
             }
             if setting.secret {
-                entry["isSet"] = json!(secrets.iter().any(|(key, _, _)| *key == setting.key));
+                if setting.key == HARNESS_API_KEY.key {
+                    if let Some(snap) = &endpoint_snapshot {
+                        entry["isSet"] = json!(snap.harness_db_key.is_some());
+                        if snap.harness_bound_elsewhere {
+                            entry["boundElsewhere"] = json!(true);
+                        }
+                        entry["source"] = json!(snap.harness_key_source());
+                    } else {
+                        entry["isSet"] = json!(false);
+                        entry["source"] = Value::Null;
+                    }
+                } else if setting.key == CLI_MODEL_API_KEY.key {
+                    if let Some(snap) = &endpoint_snapshot {
+                        entry["isSet"] = json!(snap.cli_model_key.is_some());
+                        if snap.cli_bound_elsewhere {
+                            entry["boundElsewhere"] = json!(true);
+                        }
+                    } else {
+                        entry["isSet"] = json!(false);
+                    }
+                } else {
+                    let matching = secrets.iter().any(|(key, bound, _)| {
+                        *key == setting.key && search_endpoint.as_deref() == Some(bound.as_str())
+                    });
+                    let bound_elsewhere =
+                        !matching && secrets.iter().any(|(key, _, _)| *key == setting.key);
+                    entry["isSet"] = json!(matching);
+                    if bound_elsewhere {
+                        entry["boundElsewhere"] = json!(true);
+                    }
+                }
                 return entry;
             }
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
@@ -2213,6 +2482,9 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             entry["default"] = setting.default_value();
             entry["stored"] = json!(stored_value);
             entry["value"] = value.clone();
+            if setting.key == HARNESS_API_BASE_URL.key {
+                entry["fallback"] = json!({"source": "dependencies.json", "value": model_fallback});
+            }
             if setting.confirmed() {
                 entry["confirm"] = json!(true);
             }

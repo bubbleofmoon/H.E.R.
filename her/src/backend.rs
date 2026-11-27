@@ -723,13 +723,21 @@ fn isolated_environment_key(key: &str) -> bool {
 }
 
 fn selected_dependency_url(context: &RuntimeContext, value: &str) -> bool {
-    ["dsh", "model", "onebot", "onebot_ws"]
+    if ["dsh", "onebot", "onebot_ws", "relay"]
         .iter()
         .filter_map(|name| context.dependency_url(name))
         .any(|selected| value == selected)
-        || context
-            .dependency_url("model")
-            .is_some_and(|model| value == crate::runtime::model_openai_base_url(model))
+    {
+        return true;
+    }
+    let Ok(snapshot) = crate::settings::resolve_model_endpoint_and_key(context) else {
+        return false;
+    };
+    let Some(effective) = snapshot.effective_endpoint.as_deref() else {
+        return false;
+    };
+    let canonical = crate::runtime::canonical_model_endpoint(value);
+    canonical == effective || canonical == crate::runtime::model_openai_base_url(effective)
 }
 
 fn path_is_within_runtime(context: &RuntimeContext, value: &str) -> bool {
@@ -897,37 +905,50 @@ fn configured_backends(cfg: &Value) -> &[Value] {
 
 /// A presence-only health advisory for configured CLI candidates without a usable model key.
 pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<&'static str> {
-    let needs_key = configured_backends(cfg).iter().any(|item| {
-        item["kind"].as_str().unwrap_or("cli") == "cli"
-            && !item["env"].as_object().is_some_and(|env| {
+    let cli_candidates: Vec<_> = configured_backends(cfg)
+        .iter()
+        .filter(|item| item["kind"].as_str().unwrap_or("cli") == "cli")
+        .collect();
+    if cli_candidates.is_empty() {
+        return None;
+    }
+    let Ok(snapshot) = crate::settings::resolve_model_endpoint_and_key(context) else {
+        return Some("Settings could not read cliModel.apiKey.");
+    };
+    let allow_explicit = snapshot.matches_default();
+    let needs_key = cli_candidates.iter().any(|item| {
+        !(allow_explicit
+            && item["env"].as_object().is_some_and(|env| {
                 env.iter().any(|(name, value)| value.as_str().is_some_and(|value| explicit_cli_model_key(name, value)))
-            })
+            }))
     });
     if !needs_key {
         return None;
     }
-    let Some(model_url) = context.dependency_url("model") else {
-        return Some(CLI_MODEL_KEY_MISSING);
-    };
-    match crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url) {
-        Ok(Some(_)) => None,
-        Ok(None) => Some(CLI_MODEL_KEY_MISSING),
-        Err(_) => Some("Settings could not read cliModel.apiKey."),
+    if snapshot.effective_endpoint.is_none() || snapshot.cli_model_key.is_none() {
+        Some(CLI_MODEL_KEY_MISSING)
+    } else {
+        None
     }
 }
 
 fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
-    let model_url = context.dependency_url("model")
+    let snapshot = crate::settings::resolve_model_endpoint_and_key(context)
+        .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
+    let model_url = snapshot
+        .effective_endpoint
+        .as_deref()
         .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
     command.env("ANTHROPIC_BASE_URL", model_url)
         .env("OPENAI_BASE_URL", crate::runtime::model_openai_base_url(model_url));
-    let key = crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url)
-        .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
-    if let Some(key) = &key {
+    if let Some(key) = snapshot.cli_model_key {
         for name in CLI_MODEL_KEY_ALIASES {
-            command.env(name, key);
+            command.env(name, &key);
         }
-        return Ok(vec![key.clone()]);
+        return Ok(vec![key]);
+    }
+    if !snapshot.matches_default() {
+        return Err(BackendError::Config(CLI_MODEL_KEY_MISSING.into()));
     }
     let mut explicit: Vec<_> = command.get_envs()
         .filter_map(|(name, value)| Some((name.to_str()?, value?.to_str()?)))
@@ -1351,6 +1372,58 @@ mod tests {
         let changed = crate::runtime::RuntimeContext::from_root(root).unwrap();
         let mut child_changed = std::process::Command::new("fixture-cli");
         assert!(super::configure_cli_model(&mut child_changed, &changed).is_err());
+    }
+
+    #[test]
+    fn ticket443_cli_model_tracks_harness_api_base_url_and_gates_explicit_env_keys() {
+        use std::ffi::OsStr;
+        let (fixture, context) = cli_credential_fixture();
+        let override_ep = "https://cli-override.example.test/compatible-mode/v1";
+        std::fs::write(
+            fixture.0.join("config/config.json"),
+            serde_json::json!({
+                "consoleToken": "fixture-cli-token",
+                "harness": { "apiBaseUrl": override_ep }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(super::selected_dependency_url(&context, override_ep));
+        assert!(!super::selected_dependency_url(&context, "http://127.0.0.1:1"));
+
+        let mut child = std::process::Command::new("fixture-cli");
+        super::configure_isolated_cli_environment(&mut child, &context).unwrap();
+        child.env("OPENAI_API_KEY", "fixture-explicit-legacy-key");
+        let err = super::configure_cli_model(&mut child, &context).unwrap_err();
+        assert!(
+            err.message().contains("cliModel.apiKey"),
+            "explicit env key must be refused when effective endpoint overrides dependencies.json: {}",
+            err.message()
+        );
+        let cfg_with_explicit = serde_json::json!({
+            "backends": [{"id": "c1", "kind": "cli", "cmd": "fixture", "env": {"OPENAI_API_KEY": "fixture-explicit-legacy-key"}}]
+        });
+        assert!(
+            super::cli_model_notice(&context, &cfg_with_explicit).is_some(),
+            "cli_model_notice must warn when E != D even if candidate has explicit env key"
+        );
+
+        crate::settings::apply(
+            &context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &serde_json::json!("fixture-bound-override-key"),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        let mut child_ok = std::process::Command::new("fixture-cli");
+        super::configure_isolated_cli_environment(&mut child_ok, &context).unwrap();
+        let keys = super::configure_cli_model(&mut child_ok, &context).unwrap();
+        assert_eq!(keys, vec!["fixture-bound-override-key".to_string()]);
+        let envs: std::collections::HashMap<_, _> = child_ok.get_envs().collect();
+        assert_eq!(envs.get(OsStr::new("ANTHROPIC_BASE_URL")).copied().flatten(), Some(OsStr::new(override_ep)));
+        assert_eq!(envs.get(OsStr::new("OPENAI_BASE_URL")).copied().flatten(), Some(OsStr::new(override_ep)));
+        assert_eq!(super::cli_model_notice(&context, &cfg_with_explicit), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod choice;
 mod daily_time;
 mod id_list;
 mod integer;
+mod model_endpoint;
 mod model_id;
 mod owner_id;
 mod rollout_list;
@@ -26,6 +27,7 @@ pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;
 pub(crate) use integer::{FileRule, Integer};
+pub(crate) use model_endpoint::ModelEndpoint;
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
 pub(crate) use rollout_list::RolloutList;

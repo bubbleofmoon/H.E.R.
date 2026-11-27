@@ -41,6 +41,9 @@ export interface SettingItemView {
   confirm?: boolean;
   managedBy?: string;
   isSet?: boolean;
+  boundElsewhere?: boolean;
+  source?: 'settings' | 'file' | null;
+  fallback?: { source?: string; value?: unknown };
   redacted?: boolean;
   overriddenBy?: { source?: string; value?: unknown };
   value?: unknown;
@@ -273,11 +276,18 @@ export async function saveSettingValue(
   setting: string,
   value: unknown,
   confirm = false,
+  expectedEndpoint?: string,
 ): Promise<Record<string, unknown>> {
+  const body: Record<string, unknown> = confirm
+    ? { setting, value, confirm: true }
+    : { setting, value };
+  if (expectedEndpoint !== undefined) {
+    body.expectedEndpoint = expectedEndpoint;
+  }
   return runWithSettingWriteLock(setting, () =>
     apiRequest('/api/settings/set', {
       method: 'POST',
-      body: confirm ? { setting, value, confirm: true } : { setting, value },
+      body,
     }),
   );
 }

@@ -17,7 +17,7 @@ fn ticket219_core_registry_and_chat() {
         .filter(|setting| setting.secret)
         .map(|setting| setting.key)
         .collect();
-    assert_eq!(registered, [SEARCH, CLI, "console.administratorPassword"]);
+    assert_eq!(registered, [SEARCH, CLI, "harness.apiKey", "console.administratorPassword"]);
     assert!(
         crate::settings::registry().all(|setting| !setting.secret || !setting.chat),
         "a credential cannot be chat-visible",
@@ -286,4 +286,141 @@ fn ticket219_core_search_cache_reloads_on_credential_rotation() {
     assert_eq!(put(&context, SEARCH, "fixture-search-rotation").0, 200);
     assert_eq!(search()["results"][0]["title"], "[REDACTED]");
     assert_eq!(observed.into_inner(), [KEY, "fixture-search-rotation"], "rotation did not invalidate the cached answer");
+}
+
+#[test]
+fn ticket443_harness_api_key_binding_fallback_expected_endpoint_and_redaction() {
+    const HARNESS_KEY_SETTING: &str = "harness.apiKey";
+    const BASE_URL_SETTING: &str = "harness.apiBaseUrl";
+    let (root, context) = settings_fixture("ticket443 harness api key");
+    let disk_key = "fixture-disk-harness-key";
+    std::fs::write(root.0.join("config/harness-api-key"), disk_key).unwrap();
+    write_config(&root, |cfg| {
+        cfg["harness"] = json!({"model": "fixture-model", "apiKey": "fixture-ignored-config-literal"});
+    });
+    let default_ep = context.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+
+    let view = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view["isSet"], false, "disk fallback must keep isSet=false: {view}");
+    assert_eq!(view["source"], json!("file"), "disk fallback must report source=file: {view}");
+    assert!(view.get("boundElsewhere").is_none_or(|v| v == false));
+
+    let ep_b = "https://override-b.example.test/compatible-mode/v1";
+    assert_eq!(put(&context, BASE_URL_SETTING, ep_b).0, 200);
+    let view_b = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view_b["isSet"], false);
+    assert_eq!(view_b["source"], Value::Null, "disk key must not apply to override endpoint: {view_b}");
+
+    let err = crate::harness::ModelRoute::for_model(&context, "fixture-model").err().unwrap_or_default();
+    assert_eq!(err, "Set harness.apiKey in Settings for the current model endpoint.");
+
+    // expectedEndpoint validation: 400 on wrong settings / non-string; 409 on stale endpoint; 200 on matching canonical endpoint.
+    let (bad_setting_status, _) = post(&context, "/api/settings/set", json!({
+        "setting": QUIET_KEY, "value": 4500, "expectedEndpoint": ep_b
+    }));
+    assert_eq!(bad_setting_status, 400);
+    let (bad_search_status, _) = post(&context, "/api/settings/set", json!({
+        "setting": SEARCH, "value": KEY, "expectedEndpoint": ep_b
+    }));
+    assert_eq!(bad_search_status, 400);
+    let (bad_type_status, _) = post(&context, "/api/settings/set", json!({
+        "setting": HARNESS_KEY_SETTING, "value": "fixture-b-key", "expectedEndpoint": 42
+    }));
+    assert_eq!(bad_type_status, 400);
+    let (stale_status, stale_reply) = post(&context, "/api/settings/set", json!({
+        "setting": HARNESS_KEY_SETTING, "value": "fixture-b-key", "expectedEndpoint": default_ep
+    }));
+    assert_eq!(stale_status, 409, "{stale_reply}");
+
+    let key_b = "fixture-harness-b-key";
+    let (ok_status, ok_reply) = post(&context, "/api/settings/set", json!({
+        "setting": HARNESS_KEY_SETTING,
+        "value": key_b,
+        "expectedEndpoint": format!("{ep_b}/"),
+    }));
+    assert_eq!(ok_status, 200, "{ok_reply}");
+    assert_eq!(ok_reply["isSet"], true);
+
+    let view_b_set = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view_b_set["isSet"], true);
+    assert_eq!(view_b_set["source"], json!("settings"));
+
+    // Move B -> C -> B: B's bound row is preserved.
+    let ep_c = "https://override-c.example.test/v1";
+    assert_eq!(put(&context, BASE_URL_SETTING, ep_c).0, 200);
+    let view_c = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view_c["isSet"], false);
+    assert_eq!(view_c["boundElsewhere"], true);
+    assert_eq!(view_c["source"], Value::Null);
+    assert!(!view_c.to_string().contains(ep_b));
+    assert!(!view_c.to_string().contains(key_b));
+
+    assert_eq!(put(&context, BASE_URL_SETTING, ep_b).0, 200);
+    let view_b_again = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view_b_again["isSet"], true);
+    assert_eq!(view_b_again["source"], json!("settings"));
+
+    // Resetting back to D restores disk fallback while marking boundElsewhere=true.
+    assert_eq!(post(&context, "/api/settings/reset", json!({"setting": BASE_URL_SETTING})).0, 200);
+    let view_d = setting_view(&context, HARNESS_KEY_SETTING);
+    assert_eq!(view_d["isSet"], false);
+    assert_eq!(view_d["boundElsewhere"], true);
+    assert_eq!(view_d["source"], json!("file"));
+
+    // reject_credential_text blocks credentials inside harness.apiBaseUrl.
+    for leaked in [key_b, disk_key] {
+        let (leak_status, leak_reply) = put(&context, BASE_URL_SETTING, &format!("https://api.example.com/{leaked}"));
+        assert_eq!(leak_status, 400, "{leak_reply}");
+        assert_eq!(leak_reply["error"], "setting text contains a credential");
+    }
+
+    // Confirm config.json /harness/apiKey literal is ignored and never mirrored.
+    let loaded = context.load_config_document().unwrap();
+    assert_eq!(loaded.pointer("/harness/apiKey"), Some(&json!("fixture-ignored-config-literal")));
+    assert_eq!(put(&context, BASE_URL_SETTING, ep_c).0, 200);
+    assert!(
+        crate::harness::ModelRoute::for_model(&context, "fixture-model").is_err(),
+        "/harness/apiKey in config.json must never authenticate"
+    );
+
+    // cliModel.apiKey also enforces expectedEndpoint 409 conflict guard and binding-aware view.
+    let (cli_stale, _) = post(&context, "/api/settings/set", json!({
+        "setting": CLI, "value": CLI_KEY, "expectedEndpoint": ep_b
+    }));
+    assert_eq!(cli_stale, 409);
+    let (cli_ok, cli_reply) = post(&context, "/api/settings/set", json!({
+        "setting": CLI, "value": CLI_KEY, "expectedEndpoint": format!("{ep_c}/")
+    }));
+    assert_eq!((cli_ok, &cli_reply["isSet"]), (200, &json!(true)));
+    assert_eq!(setting_view(&context, CLI)["isSet"], true);
+    assert_eq!(put(&context, BASE_URL_SETTING, ep_b).0, 200);
+    let cli_moved = setting_view(&context, CLI);
+    assert_eq!(cli_moved["isSet"], false);
+    assert_eq!(cli_moved["boundElsewhere"], true);
+
+    // Seed never imports a config.json /harness/apiBaseUrl containing a credential.
+    let (seed_root, seed_ctx) = settings_fixture("ticket443 seed url credential");
+    let secret_in_url = "fixture-secret-seed-url";
+    assert_eq!(put(&seed_ctx, CLI, secret_in_url).0, 200);
+    write_config(&seed_root, |cfg| {
+        cfg["harness"] = json!({"apiBaseUrl": format!("https://api.example.com/{secret_in_url}")});
+    });
+    assert_eq!(set_quiet(&seed_ctx, json!(4600)).0, 200);
+    assert!(
+        history_page(&seed_ctx, "?setting=harness.apiBaseUrl").0.is_empty(),
+        "seed must skip harness.apiBaseUrl containing a credential"
+    );
+
+    // Redaction across settings::stored_secrets, harness::routes, and /api/settings/models covers DB harness.apiKey.
+    assert_eq!(put(&context, HARNESS_KEY_SETTING, key_b).0, 200);
+    let known_secrets = crate::settings::stored_secrets(&context).unwrap();
+    assert!(known_secrets.contains(&key_b.to_string()));
+    let route = crate::harness::ModelRoute::for_model(&context, &format!("m-{key_b}")).unwrap();
+    assert_eq!(route.redact(&format!("before {key_b} {disk_key} after")), "before [REDACTED] [REDACTED] after");
+    write_config(&root, |cfg| {
+        cfg["harness"]["routes"] = json!([{"id": "r1", "model": format!("m-{key_b}")}]);
+    });
+    let (m_status, models_reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(m_status, 200);
+    assert!(!models_reply.to_string().contains(key_b), "models list leaked harness.apiKey: {models_reply}");
 }

@@ -916,7 +916,7 @@ fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
         assert_eq!(
             full["warnings"],
             json!([
-                "整库覆写恢复将会抹掉本地保存的联网搜索密钥与直连服务商密钥。",
+                "整库覆写恢复将会抹掉本地保存的联网搜索密钥、直连服务商密钥与模型接口密钥。",
                 "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。",
             ])
         );
@@ -1246,4 +1246,66 @@ fn restore_settings_preview_retries_sidecars_during_concurrent_writes_without_bl
         }
     });
     assert!(previews >= 5);
+}
+
+#[test]
+fn ticket443_cross_endpoint_restore_preview_warns_and_three_key_warning_applies() {
+    let f = Fixture::new();
+    let archive_no_keys = f.backup();
+    let context = f.context();
+
+    let empty_warn = preview(&context, &archive_no_keys, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        empty_warn.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains("联网搜索") && s.contains("直连") && s.contains("模型接口")
+        }),
+        "missing-credentials warning must name all three credential classes: {empty_warn:?}"
+    );
+
+    crate::settings::apply(
+        &context,
+        "harness.apiBaseUrl",
+        &json!("https://archive-endpoint.example.test/v1"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    crate::settings::apply(
+        &context,
+        "harness.apiKey",
+        &json!("fixture-harness-archive-key"),
+        "fixture-admin",
+        "console",
+    )
+    .unwrap();
+    let archive_override = f.backup();
+
+    // Archive with harness.apiKey counts as having endpoint credentials (no wipe warning on same endpoint).
+    let same_endpoint_warnings = preview(&context, &archive_override, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        !same_endpoint_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("抹掉")),
+        "harness.apiKey must count in has_endpoint_credentials: {same_endpoint_warnings:?}"
+    );
+    assert!(
+        !same_endpoint_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("接口地址")),
+        "same endpoint must not trigger cross-endpoint warning: {same_endpoint_warnings:?}"
+    );
+
+    // Switch live endpoint back to D (or another URL) and preview restoring archive_override -> cross-endpoint warning!
+    crate::settings::reset(&context, "harness.apiBaseUrl", "fixture-admin").unwrap();
+    let cross_warnings = preview(&context, &archive_override, false).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        cross_warnings.iter().any(|w| w.as_str().unwrap_or("").contains("模型接口地址")),
+        "cross-endpoint restore preview must warn about endpoint switch: {cross_warnings:?}"
+    );
 }

@@ -128,6 +128,20 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if let Some(error) = view.get("storeError") {
         reply["storeError"] = error.clone();
     }
+    match crate::settings::resolve_model_endpoint_and_key(context) {
+        Ok(snapshot) => {
+            reply["effectiveModelEndpoint"] = json!(snapshot.effective_endpoint);
+            reply["effectiveModelEndpointSource"] =
+                json!(snapshot.effective_source.map(crate::settings::ModelEndpointSource::as_str));
+        }
+        Err(error) => {
+            reply["effectiveModelEndpoint"] = Value::Null;
+            reply["effectiveModelEndpointSource"] = Value::Null;
+            if reply.get("storeError").is_none() {
+                reply["storeError"] = json!(error);
+            }
+        }
+    }
     let conversations: Vec<Value> = view["conversations"]
         .as_array()
         .map(|rows| {

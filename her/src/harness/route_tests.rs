@@ -1055,3 +1055,62 @@ async fn model_endpoint_preserves_explicit_path_prefix_for_turns_and_one_shot() 
     }
     rig.no_more_requests().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn ticket443_live_endpoint_switch_and_db_key_without_disk_file() {
+    let rig = rig("live-endpoint-switch", json!({"model": "fake-live"}), None).await;
+    // Remove disk key file; DB harness.apiKey must suffice on its own.
+    std::fs::remove_file(rig.root.join("config/harness-api-key")).unwrap();
+    let ep_d = rig.context.dependency_url("model").unwrap().to_string();
+    crate::settings::apply(&rig.context, "harness.apiKey", &json!("fixture-db-key-d"), "administrator", "console")
+        .unwrap();
+
+    let server1 = tokio::spawn({
+        let listener = rig.model.clone();
+        async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let req = read_http_request(&mut socket).await;
+            socket.write_all(text("answer from ep_d").as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            req
+        }
+    });
+    let mut turn1 = rig.admit("live-switch-1");
+    assert_eq!(ended(&mut turn1).await, Ok("answer from ep_d".to_string()));
+    assert_eq!(server1.await.unwrap().1, "Bearer fixture-db-key-d");
+
+    // Start a second endpoint and switch harness.apiBaseUrl + harness.apiKey WITHOUT creating a new RuntimeContext.
+    let listener2 = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let ep2 = format!("http://{}/compatible-mode/v1", listener2.local_addr().unwrap());
+    crate::settings::apply(&rig.context, "harness.apiBaseUrl", &json!(ep2), "administrator", "console").unwrap();
+    // Before setting key for ep2, even if disk key is restored, fail closed and never leak disk key to ep2!
+    std::fs::write(rig.root.join("config/harness-api-key"), "fixture-disk-must-not-leak").unwrap();
+    let err = ModelRoute::for_conversation(&rig.context, &rig.cfg, "private:8808").err().unwrap_or_default();
+    assert_eq!(err, "Set harness.apiKey in Settings for the current model endpoint.");
+
+    crate::settings::apply(&rig.context, "harness.apiKey", &json!("fixture-db-key-ep2"), "administrator", "console")
+        .unwrap();
+    let server2 = tokio::spawn({
+        let listener = listener2.clone();
+        async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let req = read_http_request(&mut socket).await;
+            socket.write_all(text("answer from ep2").as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            req
+        }
+    });
+    let mut turn2 = rig.admit("live-switch-2");
+    assert_eq!(ended(&mut turn2).await, Ok("answer from ep2".to_string()));
+    let (req_line2, auth2, _) = server2.await.unwrap();
+    assert!(req_line2.starts_with("POST /compatible-mode/v1/chat/completions "), "{req_line2}");
+    assert_eq!(auth2, "Bearer fixture-db-key-ep2");
+    rig.no_more_requests().await;
+    assert_ne!(ep_d, ep2);
+}

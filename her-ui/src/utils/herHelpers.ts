@@ -7,6 +7,10 @@ export const INPUT_CLASS =
   'w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50';
 
 const SETTING_ZH_OVERRIDES: Record<string, { label: string; hint: string }> = {
+  'harness.apiBaseUrl': {
+    label: '模型接口地址（harness.apiBaseUrl）',
+    hint: 'OpenAI 兼容接口地址，支持回环 HTTP 或 HTTPS（保留显式路径前缀如 /compatible-mode/v1，仅裸域名自动补全 /v1）；留空或恢复默认将回退至 dependencies.json。修改此地址后，原端点绑定的密钥将失效，需重新输入。',
+  },
   'harness.model': {
     label: '默认会话模型（harness.model）',
     hint: '未设置 harness.routes 时回合引擎默认使用的中继模型 ID；每回合开始时读取。若两者均未设置则无法启动对话回合。',
@@ -45,7 +49,11 @@ const SETTING_ZH_OVERRIDES: Record<string, { label: string; hint: string }> = {
   },
   'cliModel.apiKey': {
     label: '中继模型服务 API 密钥',
-    hint: '中继或模型端点的调用凭据（8–4096 字节可打印 ASCII，不含空格）；仅显示已设置状态，不回显原文。',
+    hint: '与当前生效模型接口地址绑定的 CLI 调用凭据（8–4096 字节可打印 ASCII，不含空格）；仅显示已设置状态，不回显原文。更改模型接口地址后需重新输入。',
+  },
+  'harness.apiKey': {
+    label: '对话模型接口 API 密钥（harness.apiKey）',
+    hint: '仅写凭据（8–4096 字节可打印 ASCII，不含空格），与当前生效的模型接口地址绑定；当使用 dependencies.json 默认地址且未在设置库保存时，回退读取 config/harness-api-key。更改模型接口地址后需重新输入。',
   },
   'engine.default': {
     label: '默认回合执行引擎',
@@ -111,8 +119,30 @@ export function parseSettingDraftForSave(item: SettingItemView | undefined, rawV
 export interface ExtraDirtySource {
   count: number;
   label: string;
-  onSave: () => Promise<void>;
+  onSave: (resolvedEndpoint?: string) => Promise<void>;
   onDiscard: () => void;
+}
+
+const MODEL_ENDPOINT_KEY = 'harness.apiBaseUrl';
+const MODEL_CREDENTIAL_KEYS = new Set(['harness.apiKey', 'cliModel.apiKey']);
+
+export function canonicalModelEndpoint(url: unknown): string | undefined {
+  if (typeof url !== 'string') return undefined;
+  const trimmed = url.replace(/\/+$/, '');
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function resolveActiveModelEndpoint(
+  items: SettingItemView[],
+  overrideEndpoint?: unknown,
+): string | undefined {
+  const fromOverride = canonicalModelEndpoint(overrideEndpoint);
+  if (fromOverride) return fromOverride;
+  const endpointItem = items.find((s) => s.key === MODEL_ENDPOINT_KEY);
+  return (
+    canonicalModelEndpoint(endpointItem?.value) ??
+    canonicalModelEndpoint(endpointItem?.fallback?.value)
+  );
 }
 
 export function utf16Length(value: string): number {
@@ -235,7 +265,7 @@ export function useSettingsDrafts(
         confirm: boolean;
         item?: SettingItemView;
       }[],
-    ): Promise<{ saved: number; failed: string[] }> => {
+    ): Promise<{ saved: number; failed: string[]; resolvedEndpoint?: string }> => {
       if (snapshots.length === 0) {
         return { saved: 0, failed: [] };
       }
@@ -245,30 +275,67 @@ export function useSettingsDrafts(
         return { saved: 0, failed: [] };
       }
 
-      // Reserve every key's per-key write lock in api/client.ts synchronously on tick 0.
-      const outcomes = await Promise.all(
-        active.map(async ({ key, value, rev, confirm, item }) => {
-          try {
-            const parsedValue = parseSettingDraftForSave(item, value);
-            const res = await saveSettingValue(key, parsedValue, confirm);
-            const mirrorErr =
-              typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
-            const wakeErr =
-              typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
-                ? res.wakeRefreshError
-                : null;
-            const warn = [mirrorErr, wakeErr].filter(Boolean).join('；') || null;
-            return { key, rev, ok: true as const, warn };
-          } catch (err) {
-            return {
-              key,
-              rev,
-              ok: false as const,
-              error: `${key}: ${formatErrorMessage(err, '保存失败')}`,
-            };
-          }
-        }),
+      const saveOne = async ({
+        key,
+        value,
+        rev,
+        confirm,
+        item,
+        expectedEndpoint,
+      }: {
+        key: string;
+        value: unknown;
+        rev: number;
+        confirm: boolean;
+        item?: SettingItemView;
+        expectedEndpoint?: string;
+      }) => {
+        try {
+          const parsedValue = parseSettingDraftForSave(item, value);
+          const res = await saveSettingValue(key, parsedValue, confirm, expectedEndpoint);
+          const mirrorErr =
+            typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
+          const wakeErr =
+            typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
+              ? res.wakeRefreshError
+              : null;
+          const warn = [mirrorErr, wakeErr].filter(Boolean).join('；') || null;
+          return { key, rev, ok: true as const, warn, value: res.value };
+        } catch (err) {
+          return {
+            key,
+            rev,
+            ok: false as const,
+            error: `${key}: ${formatErrorMessage(err, '保存失败')}`,
+          };
+        }
+      };
+
+      const endpointEntry = active.find((entry) => entry.key === MODEL_ENDPOINT_KEY);
+      const otherEntries = active.filter((entry) => entry.key !== MODEL_ENDPOINT_KEY);
+      const outcomes: Awaited<ReturnType<typeof saveOne>>[] = [];
+      let resolvedEndpoint = resolveActiveModelEndpoint(itemsRef.current);
+
+      if (endpointEntry) {
+        const epOutcome = await saveOne(endpointEntry);
+        outcomes.push(epOutcome);
+        if (!epOutcome.ok) {
+          pushToast(`部分${labelPrefix}保存失败：${epOutcome.error}`, 'danger');
+          return { saved: 0, failed: [epOutcome.error], resolvedEndpoint };
+        }
+        resolvedEndpoint = resolveActiveModelEndpoint(itemsRef.current, epOutcome.value);
+      }
+
+      // Reserve every remaining key's per-key write lock in api/client.ts synchronously on tick 0.
+      const restOutcomes = await Promise.all(
+        otherEntries.map((entry) =>
+          saveOne({
+            ...entry,
+            expectedEndpoint: MODEL_CREDENTIAL_KEYS.has(entry.key) ? resolvedEndpoint : undefined,
+          }),
+        ),
       );
+      outcomes.push(...restOutcomes);
 
       const failed: string[] = [];
       const warnings: string[] = [];
@@ -311,40 +378,51 @@ export function useSettingsDrafts(
         pushToast(`已保存 ${savedEntries.length} 项${labelPrefix}`, 'success');
       }
 
-      return { saved: savedEntries.length, failed };
+      return { saved: savedEntries.length, failed, resolvedEndpoint };
     },
     [refreshLiveData, pushToast, labelPrefix],
   );
 
-  const saveAll = useCallback(async (): Promise<{ saved: number; failed: string[] }> => {
-    if (dirtyKeys.length === 0) {
-      return { saved: 0, failed: [] };
-    }
-    const snapshots = dirtyKeys.map((key) => {
-      const item = itemsRef.current.find((s) => s.key === key);
-      return {
-        key,
-        value: drafts[key],
-        rev: draftRevRef.current[key] ?? 0,
-        confirm: Boolean(item?.confirm),
-        item,
-      };
-    });
-    const confirmKeys = snapshots.filter((s) => s.confirm).map((s) => s.key);
-    if (confirmKeys.length > 0) {
-      openConfirm({
-        title: `确认修改 ${confirmKeys.length} 项安全设置？`,
-        description: `待保存的受保护设置：${confirmKeys.join('、')}。\n确认后将立即生效，并在必要时重新评估访问权限。`,
-        confirmLabel: '确认保存',
-        danger: true,
-        onConfirm: async () => {
-          await executeSaveBatch(snapshots);
-        },
+  const saveAll = useCallback(
+    async (): Promise<{
+      saved: number;
+      failed: string[];
+      deferred?: boolean;
+      resolvedEndpoint?: string;
+    }> => {
+      if (dirtyKeys.length === 0) {
+        return { saved: 0, failed: [] };
+      }
+      const snapshots = dirtyKeys.map((key) => {
+        const item = itemsRef.current.find((s) => s.key === key);
+        return {
+          key,
+          value: drafts[key],
+          rev: draftRevRef.current[key] ?? 0,
+          confirm: Boolean(item?.confirm),
+          item,
+        };
       });
-      return { saved: 0, failed: [] };
-    }
-    return executeSaveBatch(snapshots);
-  }, [dirtyKeys, drafts, executeSaveBatch, openConfirm]);
+      const confirmKeys = snapshots.filter((s) => s.confirm).map((s) => s.key);
+      if (confirmKeys.length > 0) {
+        openConfirm({
+          title: `确认修改 ${confirmKeys.length} 项安全设置？`,
+          description: `待保存的受保护设置：${confirmKeys.join('、')}。\n确认后将立即生效，并在必要时重新评估访问权限。`,
+          confirmLabel: '确认保存',
+          danger: true,
+          onConfirm: async () => {
+            const batch = await executeSaveBatch(snapshots);
+            if (batch.failed.length === 0 && extraDirty && extraDirty.count > 0) {
+              await extraDirty.onSave(batch.resolvedEndpoint);
+            }
+          },
+        });
+        return { saved: 0, failed: [], deferred: true };
+      }
+      return executeSaveBatch(snapshots);
+    },
+    [dirtyKeys, drafts, executeSaveBatch, openConfirm, extraDirty],
+  );
 
   useEffect(() => {
     if (!manageDirtyBar) return;
@@ -361,11 +439,16 @@ export function useSettingsDrafts(
         count: totalCount,
         label,
         onSave: async () => {
+          let resolvedEndpoint: string | undefined;
           if (dirtyKeys.length > 0) {
-            await saveAll();
+            const outcome = await saveAll();
+            if (outcome.deferred || outcome.failed.length > 0) {
+              return;
+            }
+            resolvedEndpoint = outcome.resolvedEndpoint;
           }
           if (extraDirty && extraDirty.count > 0) {
-            await extraDirty.onSave();
+            await extraDirty.onSave(resolvedEndpoint);
           }
         },
         onDiscard: () => {

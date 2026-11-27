@@ -5,6 +5,7 @@ import { formatAppliesLabel } from '../utils/format';
 import {
   localizeSettingItem,
   parseSettingDraftForSave,
+  resolveActiveModelEndpoint,
   settingValuesEqual,
 } from '../utils/herHelpers';
 import { AuditInspector } from './AuditInspector';
@@ -94,10 +95,14 @@ export const InspectorDrawer: React.FC = () => {
       return;
     }
     const saveRev = draftRevRef.current;
+    const expectedEndpoint =
+      settingItem.key === 'harness.apiKey' || settingItem.key === 'cliModel.apiKey'
+        ? resolveActiveModelEndpoint(settings)
+        : undefined;
     const executeSave = async (confirm: boolean) => {
       setBusy(true);
       try {
-        await saveSetting(settingItem.key, parsedValue, confirm);
+        await saveSetting(settingItem.key, parsedValue, confirm, expectedEndpoint);
         if (draftRevRef.current === saveRev) {
           setDraftValue(undefined);
         }

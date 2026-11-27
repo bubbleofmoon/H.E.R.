@@ -88,7 +88,12 @@ interface ConsoleContextValue {
   triggerQqLoginWindow: () => void;
   settings: SettingItemView[];
   conversations: ConversationStateSummary[];
-  saveSetting: (setting: string, value: unknown, confirm?: boolean) => Promise<void>;
+  saveSetting: (
+    setting: string,
+    value: unknown,
+    confirm?: boolean,
+    expectedEndpoint?: string,
+  ) => Promise<void>;
   resetSetting: (setting: string, confirm?: boolean) => Promise<void>;
   toasts: ToastItem[];
   pushToast: (message: string, tone?: ToastTone, undo?: { label: string; run: () => void }) => void;
@@ -680,8 +685,13 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   );
 
   const saveSetting = useCallback(
-    async (setting: string, value: unknown, confirm = false) => {
-      const res = await saveSettingValue(setting, value, confirm);
+    async (
+      setting: string,
+      value: unknown,
+      confirm = false,
+      expectedEndpoint?: string,
+    ) => {
+      const res = await saveSettingValue(setting, value, confirm, expectedEndpoint);
       await refreshLiveData();
       const mirrorErr = typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
       const wakeErr =
