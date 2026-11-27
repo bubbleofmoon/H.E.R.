@@ -8074,33 +8074,6 @@ fn parse_messages(raw: &Value) -> Vec<String> {
 ///
 /// 归属校验是**安全边界**：拿别的群的 message id 来引用，会把那个群的内容读出来。
 /// 所以网关返回的对象里必须能确认归属，确认不了就当解析失败。
-fn resolve_reply_info(cfg: &Value, kind: &str, conv_id: &str, message_id: &str) -> Option<Value> {
-    let http_url = cfg
-        .get("snowluma")
-        .and_then(|s| s.get("httpUrl"))
-        .and_then(|u| u.as_str())
-        .unwrap_or("http://127.0.0.1:3000");
-    resolve_reply_info_at(http_url, cfg, kind, conv_id, message_id)
-}
-
-fn resolve_reply_info_at(
-    http_url: &str,
-    cfg: &Value,
-    kind: &str,
-    conv_id: &str,
-    message_id: &str,
-) -> Option<Value> {
-    let numeric: i64 = message_id.trim().parse().ok()?;
-    let token = cfg
-        .get("snowluma")
-        .and_then(|s| s.get("accessToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-    let ob = crate::onebot::OneBot::new(http_url, token);
-    resolve_reply_info_with_client(&ob, kind, conv_id, message_id)
-}
-
 fn resolve_reply_info_with_client(
     ob: &crate::onebot::OneBot,
     kind: &str,

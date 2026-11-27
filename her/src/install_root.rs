@@ -65,7 +65,7 @@ impl InstallRoot {
         &self.lexical
     }
 
-    /// Installed runtimes keep backups beside the install root; non-installed runtimes keep backups beside themselves.
+    /// Installed runtimes resolve relative backup destinations under the install root; external runtimes resolve them under the selected runtime root.
     /// Lexical only: loading settings never touches the destination (it may be a slow share).
     pub fn backup_destination(&self, runtime: &Path, configured: &Path) -> Result<PathBuf, String> {
         let installed = self.protects(runtime)?;
