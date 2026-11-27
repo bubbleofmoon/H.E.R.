@@ -830,33 +830,6 @@ fn js_id_numbers(v: Option<Value>) -> Value {
     )
 }
 
-fn handle_whitelist(cfg: &Value) -> Value {
-    // QQ 号一律字符串（和 JS 的 loadConfig 一致；数字会被前端当 number 拼进 URL 时丢精度风险）
-    let ids = |v: Option<Value>| -> Value {
-        let arr = v.and_then(|x| x.as_array().cloned()).unwrap_or_default();
-        Value::Array(
-            arr.into_iter()
-                .map(|x| match x {
-                    Value::String(s) => json!(s.trim().to_string()),
-                    Value::Number(n) => json!(n.to_string()),
-                    other => other,
-                })
-                .collect(),
-        )
-    };
-    let list = |name: &str| -> Value {
-        ids(cfg.get("allow").and_then(|a| a.get(name)).cloned())
-    };
-    let deny = |name: &str| -> Value {
-        ids(cfg.get("deny").and_then(|d| d.get(name)).cloned())
-    };
-    json!({
-        "allow": { "private": list("private"), "groups": list("groups") },
-        "deny": { "private": deny("private"), "groups": deny("groups") },
-        "ownerQQ": cfg.get("ownerQQ").and_then(|v| v.as_i64()).unwrap_or(0),
-    })
-}
-
 /// `/api/socialV2/state?key=`：单个会话的**摘要**（不是整份状态）。
 ///
 /// JS 只回 7 个字段：wakeConfig / wakeSafety / unreadCount / recentCount /
@@ -20537,7 +20510,6 @@ pub(super) mod tests {
 
     #[test]
     fn concurrent_json_writes_stay_parseable_and_leave_no_tmp() {
-        static WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let (root, context) = fixture_runtime("atomic-json-writes", "fixture-atomic-json-tok");
         let mut handles = Vec::new();
         for i in 0..16 {
@@ -20545,8 +20517,7 @@ pub(super) mod tests {
             handles.push(std::thread::spawn(move || {
                 for j in 0..20 {
                     let payload = serde_json::to_vec(&json!({ "writer": i, "round": j })).unwrap();
-                    let _guard = WRITE_GATE.lock().unwrap_or_else(|e| e.into_inner());
-                    ctx.write_atomic(RuntimeArea::Data, "state.json", &payload)
+                    ctx.write_atomic(RuntimeArea::Data, "mode.json", &payload)
                         .unwrap();
                 }
             }));
@@ -20554,7 +20525,7 @@ pub(super) mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let text = context.read_text(RuntimeArea::Data, "state.json").unwrap();
+        let text = context.read_text(RuntimeArea::Data, "mode.json").unwrap();
         let v: Value = serde_json::from_str(&text).expect("并发写完之后必须是完整 JSON");
         assert!(v.get("writer").is_some());
         let leftovers: Vec<String> = std::fs::read_dir(root.0.join("data"))

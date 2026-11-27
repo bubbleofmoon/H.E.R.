@@ -1126,11 +1126,6 @@ pub(crate) fn read_document(context: &RuntimeContext) -> Result<Value, String> {
     })
 }
 
-pub(crate) fn read_document_with_bom(context: &RuntimeContext) -> Option<Value> {
-    let text = read_text(context).ok()?;
-    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
-}
-
 pub(crate) fn read_optional_document(context: &RuntimeContext) -> Result<Value, String> {
     match context.read_optional_text(RuntimeArea::Data, FILE)? {
         Some(text) => serde_json::from_str(&text).map_err(|e| e.to_string()),
