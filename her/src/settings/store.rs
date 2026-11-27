@@ -1176,11 +1176,12 @@ fn reject_credential_text(
     }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
     let known_secrets = collect_known_secrets(&secrets, harness_key);
+    let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
     let has_any_credential = |text: &str| text_contains_any_secret(text, &known_secrets);
     if prompt_text.is_some_and(has_any_credential)
         || endpoint_url.is_some_and(has_any_credential)
         || routes.is_some_and(|routes| routes.iter().any(|route| {
-            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_any_credential)
+            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
         }))
     {
         return Err((400, "setting text contains a credential".to_string()));

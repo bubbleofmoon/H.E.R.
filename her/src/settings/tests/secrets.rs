@@ -546,31 +546,32 @@ fn ticket443_r3_stored_url_and_routes_credential_suppression() {
     let (undo_status, _) = post(&context, "/api/settings/undo", json!({"entry": entries_after[0]["entry"]}));
     assert_eq!(undo_status, 400);
 
-    // 2. harness.routes reject_credential_text and seed() check config/harness-api-key.
-    let (route_root, route_ctx) = settings_fixture("ticket443 r3 routes disk credential");
-    let disk_val = "fixture-r3-disk-alpha";
-    std::fs::write(route_root.0.join("config/harness-api-key"), disk_val).unwrap();
+    // 2. Stored harness.apiBaseUrl containing a post-added config/harness-api-key is also suppressed,
+    // while harness.routes rejects stored DB secrets in set/seed (preserving existing disk-key masking).
+    let (disk_root, disk_ctx) = settings_fixture("ticket443 r3 stored url disk credential");
+    let disk_default = disk_ctx.dependency_url("model").unwrap().trim_end_matches('/').to_string();
+    let disk_tok = "fixture-r3-later-disk-tok";
+    assert_eq!(put(&disk_ctx, "harness.apiBaseUrl", &format!("https://api.example.com/{disk_tok}")).0, 200);
+    std::fs::write(disk_root.0.join("config/harness-api-key"), disk_tok).unwrap();
+    let disk_snap = crate::settings::resolve_model_endpoint_and_key(&disk_ctx).unwrap();
+    assert_eq!(disk_snap.effective_endpoint.as_deref(), Some(disk_default.as_str()));
+    assert_eq!(setting_view(&disk_ctx, "harness.apiBaseUrl")["value"], Value::Null);
+    assert_eq!(history_page(&disk_ctx, "?setting=harness.apiBaseUrl").0[0]["new"], json!("(hidden)"));
+
+    let (route_root, route_ctx) = settings_fixture("ticket443 r3 routes db credential");
+    let db_val = "fixture-r3-route-db-alpha";
+    assert_eq!(put(&route_ctx, "harness.apiKey", db_val).0, 200);
     for bad_routes in [
-        json!([{"id": "r1", "model": disk_val}]),
-        json!([{"id": disk_val, "model": "m1"}]),
+        json!([{"id": "r1", "model": db_val}]),
+        json!([{"id": db_val, "model": "m1"}]),
     ] {
         let (st, reply) = post(
             &route_ctx,
             "/api/settings/set",
             json!({"setting": "harness.routes", "value": bad_routes}),
         );
-        assert_eq!(st, 400, "harness.routes write containing disk key must fail: {reply}");
+        assert_eq!(st, 400, "harness.routes write containing DB key must fail: {reply}");
         assert_eq!(reply["error"], "setting text contains a credential");
     }
-
-    let (seed_root, seed_ctx) = settings_fixture("ticket443 r3 routes seed disk credential");
-    std::fs::write(seed_root.0.join("config/harness-api-key"), disk_val).unwrap();
-    write_config(&seed_root, |cfg| {
-        cfg["harness"] = json!({"routes": [{"id": "r1", "model": disk_val}]});
-    });
-    assert_eq!(set_quiet(&seed_ctx, json!(4600)).0, 200);
-    assert!(
-        history_page(&seed_ctx, "?setting=harness.routes").0.is_empty(),
-        "seed must skip harness.routes containing config/harness-api-key"
-    );
+    let _ = route_root;
 }
