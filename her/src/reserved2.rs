@@ -2400,6 +2400,181 @@ mod tests {
         .expect("the atomic dispatch-prep timeout retirement fixture must settle");
     }
 
+    #[tokio::test]
+    async fn ticket297_restart_does_not_rearm_timeout_consumed_before_admission_cap() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, _console) = harness_cap_fixture("harness-cap-consumed-retire", None).await;
+            let key = HARNESS_CAP_KEY;
+            let due_ms = crate::parity_clock::now_ms() - 1_000;
+            let due_iso = crate::sticker::iso_at(due_ms);
+
+            // Seed an earlier terminal reserved2 harness turn T1 in the same confirmedAt epoch.
+            let rec1 = crate::turn_ledger::Recorder::begin_reserved2(
+                &hub.context,
+                key,
+                "harness",
+                "timeout",
+                "tok-epoch",
+                &[],
+            )
+            .unwrap();
+            rec1.wake_claim(&json!({
+                "at": 100,
+                "previous": {
+                    "wakeConfig": {
+                        "confirmedAt": 2,
+                        "infinite": false,
+                        "sleepUntil": due_iso
+                    }
+                }
+            }))
+            .unwrap();
+            rec1.end_reconciled("completed", "completed").unwrap();
+
+            conversation_state::update_raw(&hub.context, |state| {
+                let conv = &mut state["conversations"][key];
+                conv["engagedAt"] = json!(0);
+                conv["wakeConfig"]["confirmedAt"] = json!(2);
+                conv["wakeConfig"]["infinite"] = json!(false);
+                conv["wakeConfig"]["sleepUntil"] = json!(due_iso);
+                Ok(())
+            })
+            .unwrap();
+
+            let cfg = hub.context.load_config().unwrap();
+            let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
+            hub.tick("bot", 9001).await.unwrap();
+            assert_eq!(hub.active[key].reason, "timeout");
+            let _task = CancelHarnessCapFixture(hub.active[key].task.abort_handle());
+
+            // Simulate pipeline.rs:1185 consuming sleepUntil to null before ExpiredBeforeAdmission fires.
+            let at = hub.active[key].at;
+            let previous = hub.active[key].previous.clone();
+            let token = social_state::token(&hub.context, key).unwrap().unwrap();
+            social_state::consume_reserved2_deadline(&hub.context, key, &token, at, &previous).unwrap();
+            assert!(
+                hub.state().unwrap()["conversations"][key]["wakeConfig"]["sleepUntil"].is_null(),
+                "precondition: consume_reserved2_deadline clears sleepUntil to null"
+            );
+
+            let cap = hub.drivers[key].sched.turn_cap_at().unwrap();
+            hub.pump_timers(&cfg, cap);
+            assert!(hub.active[key].route() == pipeline::Reserved2Route::ExpiredBeforeAdmission);
+            drop(gate);
+            wait_for_harness_cap_wake(&hub).await;
+
+            hub.tick("bot", 9001).await.unwrap();
+            let post_tick = hub.state().unwrap();
+            let post_wc = &post_tick["conversations"][key]["wakeConfig"];
+            assert!(
+                post_wc["sleepUntil"].is_null(),
+                "ExpiredBeforeAdmission timeout must keep sleepUntil null, got {post_wc}"
+            );
+            assert_eq!(
+                post_wc["sleepRetired"],
+                json!(true),
+                "ExpiredBeforeAdmission timeout must set sleepRetired even when sleepUntil was already consumed, got {post_wc}"
+            );
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let (turns, _) = crate::turn_ledger::fold(&records);
+            assert_eq!(turns.len(), 1, "ExpiredBeforeAdmission must not write a begun turn");
+            let cutoff = crate::turn_ledger::now_ms() + 1_000;
+            let mut done = HashSet::new();
+            assert!(crate::turn_recovery::rearm_startup_terminal_sleeps(
+                &hub.context,
+                &cfg,
+                &turns,
+                cutoff,
+                &HashSet::new(),
+                &mut done,
+            ));
+            let state = hub.state().unwrap();
+            let wc = &state["conversations"][key]["wakeConfig"];
+            assert!(
+                wc["sleepUntil"].is_null(),
+                "restart recovery must not re-arm a timeout consumed before ExpiredBeforeAdmission, got {wc}"
+            );
+            assert_eq!(
+                wc["sleepRetired"],
+                json!(true),
+                "restart recovery must preserve sleepRetired on consumed retired timeout, got {wc}"
+            );
+        })
+        .await
+        .expect("the consumed-before-cap retired restart fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket297_exhausted_timeout_rollback_preserves_concurrent_schedule_deadline() {
+        let (_root, hub, _console) = harness_cap_fixture("harness-cap-schedule-owner", None).await;
+        let key = HARNESS_CAP_KEY;
+        let old_due = crate::sticker::iso_at(crate::parity_clock::now_ms() - 1_000);
+        let operator_deadline = crate::sticker::iso_at(crate::parity_clock::now_ms() + 120_000);
+
+        conversation_state::update_raw(&hub.context, |state| {
+            let conv = &mut state["conversations"][key];
+            conv["engagedAt"] = json!(0);
+            conv["wakeConfig"]["confirmedAt"] = json!(2);
+            conv["wakeConfig"]["infinite"] = json!(false);
+            conv["wakeConfig"]["sleepUntil"] = json!(old_due);
+            Ok(())
+        })
+        .unwrap();
+
+        let (previous, token) = social_state::claim_reserved2_wake(&hub.context, key, "timeout", 10_000, None).unwrap();
+        // Concurrent operator Schedule edit replaces sleepUntil while token, lastWakeAt, and confirmedAt stay unchanged.
+        conversation_state::update_raw(&hub.context, |state| {
+            let wc = &mut state["conversations"][key]["wakeConfig"];
+            wc["sleepUntil"] = json!(operator_deadline);
+            crate::wake::clear_sleep_retired(wc);
+            Ok(())
+        })
+        .unwrap();
+
+        social_state::rollback_and_retire_reserved2_wake(&hub.context, key, 10_000, &token, &previous).unwrap();
+        let state = hub.state().unwrap();
+        let wc = &state["conversations"][key]["wakeConfig"];
+        assert_eq!(
+            wc["sleepUntil"],
+            json!(operator_deadline),
+            "exhausted timeout rollback must preserve concurrent operator Schedule deadline, got {wc}"
+        );
+        assert!(
+            wc["sleepRetired"].is_null(),
+            "exhausted timeout rollback must not set sleepRetired over concurrent operator Schedule deadline, got {wc}"
+        );
+
+        // Concurrent operator Schedule cancellation (infinite: true, sleepUntil: null) must also stay unretired.
+        conversation_state::update_raw(&hub.context, |state| {
+            let wc = &mut state["conversations"][key]["wakeConfig"];
+            wc["infinite"] = json!(false);
+            wc["sleepUntil"] = json!(old_due);
+            crate::wake::clear_sleep_retired(wc);
+            Ok(())
+        })
+        .unwrap();
+        let (previous2, token2) = social_state::claim_reserved2_wake(&hub.context, key, "timeout", 20_000, None).unwrap();
+        conversation_state::update_raw(&hub.context, |state| {
+            let wc = &mut state["conversations"][key]["wakeConfig"];
+            wc["infinite"] = json!(true);
+            wc["sleepUntil"] = Value::Null;
+            crate::wake::clear_sleep_retired(wc);
+            Ok(())
+        })
+        .unwrap();
+
+        social_state::rollback_and_retire_reserved2_wake(&hub.context, key, 20_000, &token2, &previous2).unwrap();
+        let state2 = hub.state().unwrap();
+        let wc2 = &state2["conversations"][key]["wakeConfig"];
+        assert_eq!(wc2["infinite"], json!(true), "cancelled schedule must stay infinite: true, got {wc2}");
+        assert!(wc2["sleepUntil"].is_null(), "cancelled schedule must keep sleepUntil null, got {wc2}");
+        assert!(
+            wc2["sleepRetired"].is_null(),
+            "exhausted timeout rollback must not set sleepRetired over operator Schedule cancellation, got {wc2}"
+        );
+    }
+
     async fn wait_for_harness_cap_wake(hub: &Hub) {
         while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

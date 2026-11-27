@@ -1870,9 +1870,11 @@ fn clear_reserved2_deadline(
                 return Err((403, "queued wake token invalidated".into()));
             }
             if let Some(mut wc) = conv.field("wakeConfig").cloned() {
+                let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                    || (mark_retired && wc["infinite"] != true && wc["sleepUntil"].is_null());
                 if wc["lastWakeAt"].as_i64() == Some(at)
                     && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                    && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                    && owns_deadline
                 {
                     wc["sleepUntil"] = Value::Null;
                     if mark_retired {
@@ -1933,10 +1935,13 @@ fn rollback_reserved2_wake_inner(
                     }
                     conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
                     if wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"] {
-                        if retire_token.is_some() {
+                        let owns_deadline = wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"]
+                            || wc["sleepUntil"].is_null();
+                        if retire_token.is_some() && wc["infinite"] != true && owns_deadline {
                             wc["sleepUntil"] = Value::Null;
                             wc["sleepRetired"] = json!(true);
-                        } else if wc["infinite"] != true
+                        } else if retire_token.is_none()
+                            && wc["infinite"] != true
                             && wc["sleepUntil"]
                                 .as_str()
                                 .and_then(crate::wake::parse_iso_ms)
