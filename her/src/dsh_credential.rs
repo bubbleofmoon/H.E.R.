@@ -392,6 +392,7 @@ impl LoginWatch {
     }
 
     /// The streak's alert has not been accepted for sending yet.
+    #[cfg(test)]
     pub fn alert_owed(&self) -> bool {
         self.alert_owed
     }

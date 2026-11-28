@@ -192,14 +192,11 @@ impl Tools {
 
     /// Validate the captured schema and authority before recording the start intent.
     pub(super) fn prepare(&self, call: &ToolCall) -> Result<Value, Value> {
-        let mut args = match crate::mcp::prepare_call(
+        let mut args = crate::mcp::prepare_call(
             &call.fn_name,
             Some(&call.fn_arguments),
             &self.definitions,
-        ) {
-            Ok(args) => args,
-            Err(outcome) => return Err(outcome),
-        };
+        )?;
         let Some(authority) = &self.authority else {
             return Err(error("tool authority is unavailable"));
         };

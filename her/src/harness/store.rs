@@ -1053,7 +1053,7 @@ pub(crate) fn max_attempt_event_seq(
                 |r| r.get(0),
             )
             .map_err(|_| STORAGE_ERROR.to_string()),
-        Some(ids) if ids.is_empty() => Ok(0),
+        Some(&[]) => Ok(0),
         Some(ids) => {
             let mut max_seq = 0i64;
             for chunk in ids.chunks(200) {

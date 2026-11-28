@@ -255,6 +255,7 @@ fn store_file(path: &Path) -> io::Result<()> {
 }
 
 fn task_file_options() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -852,10 +853,11 @@ impl RunHandle {
         let line = LogLine { n: self.line_no, s: stream, t: text };
         let Ok(mut bytes) = serde_json::to_vec(&line) else { return };
         bytes.push(b'\n');
-        if self.log.is_none() {
-            if self.store.validate().is_ok() && store_file(&self.store.log_path(&self.view.run_id)).is_ok() {
-                self.log = task_file_options().create(true).append(true).open(self.store.log_path(&self.view.run_id)).ok();
-            }
+        if self.log.is_none()
+            && self.store.validate().is_ok()
+            && store_file(&self.store.log_path(&self.view.run_id)).is_ok()
+        {
+            self.log = task_file_options().create(true).append(true).open(self.store.log_path(&self.view.run_id)).ok();
         }
         if let Some(file) = self.log.as_mut() {
             if file.write_all(&bytes).is_ok() {

@@ -984,7 +984,7 @@ pub(super) fn bounded_post_body_too_large(req: &Request) -> bool {
                 .get("content-length")
                 .map(|value| decimal_exceeds_limit(value, BOUNDED_POST_MAX_BODY_BYTES))
                 .unwrap_or(false)
-            || req.body.as_bytes().len() > BOUNDED_POST_MAX_BODY_BYTES)
+            || req.body.len() > BOUNDED_POST_MAX_BODY_BYTES)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1161,7 +1161,7 @@ pub(super) enum ConsoleRedirect {
     Path(String),
 }
 
-pub(super) struct ConsoleResponse {
+pub(crate) struct ConsoleResponse {
     pub(super) status: u16,
     pub(super) content_type: String,
     pub(super) body: String,

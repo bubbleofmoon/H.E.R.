@@ -182,7 +182,7 @@ fn account_sid(account: &str) -> Option<Vec<u8>> {
             name,
             Some(sid),
             &mut sid_size,
-            (!domain.is_empty()).then(|| PWSTR(domain.as_mut_ptr())),
+            (!domain.is_empty()).then_some(PWSTR(domain.as_mut_ptr())),
             &mut domain_size,
             &mut usage,
         )
@@ -230,12 +230,14 @@ fn decode_xml(bytes: &[u8]) -> Result<String, String> {
             return Err("task XML has invalid UTF-16".into());
         }
         let words: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|b| {
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| {
                 if big_endian {
-                    u16::from_be_bytes([b[0], b[1]])
+                    u16::from_be_bytes(b)
                 } else {
-                    u16::from_le_bytes([b[0], b[1]])
+                    u16::from_le_bytes(b)
                 }
             })
             .collect();

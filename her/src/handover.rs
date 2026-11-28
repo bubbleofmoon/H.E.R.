@@ -386,7 +386,10 @@ impl Platform for Native {
         if fs::symlink_metadata(&logs_dir)
             .is_ok_and(|meta| meta.is_dir() && !crate::guarded_file::is_link(&meta))
         {
-            for (name, role) in [("rbridge-live.lock", "live"), ("rbridge-console.lock", "console")] {
+            for (name, role) in [
+                ("rbridge-live.lock", "live"),
+                ("rbridge-console.lock", "console"),
+            ] {
                 let lock_path = logs_dir.join(name);
                 if let Some(identity) = crate::update::probe_held_owner_identity(&lock_path, role) {
                     if crate::update::same_release_image(&old.exe, &identity.exe)

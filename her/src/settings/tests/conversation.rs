@@ -607,7 +607,7 @@ fn conversation_settings_are_never_chat_visible_or_writable() {
         assert_eq!(get, Err(SETTINGS_READ_REFUSED.to_string()), "{name}");
     }
     assert!(!settings_db(&root).exists(), "no chat call created the store");
-    assert!(!crate::settings::ENGINE_DEFAULT.chat, "the global default is never chat-writable");
+    const { assert!(!crate::settings::ENGINE_DEFAULT.chat); }
 }
 
 #[test]

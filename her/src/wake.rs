@@ -809,10 +809,7 @@ pub fn normalize_speaker_ids(value: Option<&Value>) -> Vec<String> {
 /// JS 的 `isSleepingConfigV2`：active 或 anyMessage 都不算「沉睡」。
 pub fn is_sleeping_config(wc: &Value) -> bool {
     let tr = wc.get("triggers").map(obj_of).unwrap_or_default();
-    if wc.get("mode").and_then(|v| v.as_str()) == Some("active") || flag_of(&tr, "anyMessage") {
-        return false;
-    }
-    true
+    !(wc.get("mode").and_then(|v| v.as_str()) == Some("active") || flag_of(&tr, "anyMessage"))
 }
 
 /// JS 的 `hasExplicitEndV2`：最后一条别人说的话里有没有明确的结束语。
@@ -1404,10 +1401,12 @@ mod tests {
         // 生产默认是限频开着的（1/分钟、12/小时）。测试默认关掉 ——
         // 否则「连发三条应该排上三条」这类用例会被限频挡住，测的就不是调度了。
         // 限频本身由 test_rate_limit_* 覆盖。
-        let mut cfg = WakeCfg::default();
-        cfg.zone = crate::local_time::beijing_tariff_zone();
-        cfg.max_wake_per_minute = 0;
-        cfg.max_wake_per_hour = 0;
+        let cfg = WakeCfg {
+            zone: crate::local_time::beijing_tariff_zone(),
+            max_wake_per_minute: 0,
+            max_wake_per_hour: 0,
+            ..WakeCfg::default()
+        };
         WakeScheduler::new(cfg, WakeConfig::default())
     }
 
@@ -1678,13 +1677,15 @@ mod tests {
 
     #[test]
     fn wakeable_requires_at_least_one_trigger() {
-        let mut wc = WakeConfig::default();
-        wc.at_mention = false;
-        wc.name_mention = false;
-        wc.poke = false;
-        wc.question_boolean = false;
-        wc.probability = 0.0;
-        wc.infinite = true;
+        let mut wc = WakeConfig {
+            at_mention: false,
+            name_mention: false,
+            poke: false,
+            question_boolean: false,
+            probability: 0.0,
+            infinite: true,
+            ..WakeConfig::default()
+        };
         assert!(!is_wakeable(&wc, 0), "全关 = 会永眠");
         wc.keywords = vec!["大肥鱼".into()];
         assert!(is_wakeable(&wc, 0), "有关键词就能唤醒");
@@ -1692,14 +1693,16 @@ mod tests {
 
     #[test]
     fn wakeable_accepts_live_sleep_until() {
-        let mut wc = WakeConfig::default();
-        wc.at_mention = false;
-        wc.name_mention = false;
-        wc.poke = false;
-        wc.question_boolean = false;
-        wc.probability = 0.0;
-        wc.infinite = false;
-        wc.sleep_until = Some("2026-10-21T05:00:00.000Z".into());
+        let wc = WakeConfig {
+            at_mention: false,
+            name_mention: false,
+            poke: false,
+            question_boolean: false,
+            probability: 0.0,
+            infinite: false,
+            sleep_until: Some("2026-10-21T05:00:00.000Z".into()),
+            ..WakeConfig::default()
+        };
         let now = parse_iso_ms("2026-10-21T04:00:00.000Z").unwrap();
         assert!(is_wakeable(&wc, now));
     }

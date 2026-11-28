@@ -20,8 +20,13 @@ impl Drop for TempRoot {
 }
 
 fn temp_root(label: &str) -> TempRoot {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let path = crate::install_root::development_root(std::env::temp_dir().join(format!("qqbot aux {label} {} {stamp}", std::process::id())));
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = crate::install_root::development_root(
+        std::env::temp_dir().join(format!("qqbot aux {label} {} {stamp}", std::process::id())),
+    );
     for dir in ["config", "data", "resources"] {
         fs::create_dir_all(path.join(dir)).unwrap();
     }
@@ -36,10 +41,19 @@ fn write_root(root: &Path, onebot_url: &str, config: Value) {
     for (k, v) in config.as_object().unwrap() {
         cfg[k] = v.clone();
     }
-    fs::write(root.join("config/config.json"), serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    fs::write(
+        root.join("config/config.json"),
+        serde_json::to_vec_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
     fs::write(root.join("data/social-v2.json"), b"{}").unwrap();
-    let deps = json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2", "onebot": onebot_url});
-    fs::write(root.join("dependencies.json"), serde_json::to_vec_pretty(&deps).unwrap()).unwrap();
+    let deps =
+        json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2", "onebot": onebot_url});
+    fs::write(
+        root.join("dependencies.json"),
+        serde_json::to_vec_pretty(&deps).unwrap(),
+    )
+    .unwrap();
 }
 
 struct Mcp {
@@ -66,7 +80,11 @@ impl Mcp {
         let mut child = command.spawn().expect("start auxiliary MCP process");
         let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self { child, stdin, stdout }
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
     }
 
     fn send(&mut self, request: &Value) {
@@ -78,7 +96,10 @@ impl Mcp {
     fn read(&mut self) -> Value {
         let mut line = String::new();
         self.stdout.read_line(&mut line).unwrap();
-        assert!(!line.is_empty(), "auxiliary MCP process exited before replying");
+        assert!(
+            !line.is_empty(),
+            "auxiliary MCP process exited before replying"
+        );
         serde_json::from_str(&line).expect("MCP response is JSON")
     }
 
@@ -113,7 +134,14 @@ impl Drop for Mcp {
 
 /// Recorded independent expected auxiliary tool answers.
 fn baseline() -> Value {
-    serde_json::from_slice(&fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/spec/aux-baseline.json")).unwrap()).unwrap()
+    serde_json::from_slice(
+        &fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/spec/aux-baseline.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap()
 }
 
 fn default_root(label: &str) -> TempRoot {
@@ -128,10 +156,23 @@ fn web_search_server_enumerates_the_frozen_tools_and_rejects_empty_and_loopback_
     let expected = baseline();
     let mut mcp = Mcp::start("--mcp-web-search-serve", &root.0);
     assert_eq!(mcp.initialize(), expected["search"][0]);
-    assert_eq!(mcp.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})), expected["search"][1]);
-    assert_eq!(mcp.call(3, "web_search", json!({"query": "[CQ:at,qq=123]  "})), expected["search"][2]);
-    assert_eq!(mcp.call(4, "web_fetch", json!({"url": "http://127.0.0.1/"})), expected["search"][3]);
-    assert_eq!(mcp.finish(), Some(0), "stdin EOF must end the server with exit code 0");
+    assert_eq!(
+        mcp.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
+        expected["search"][1]
+    );
+    assert_eq!(
+        mcp.call(3, "web_search", json!({"query": "[CQ:at,qq=123]  "})),
+        expected["search"][2]
+    );
+    assert_eq!(
+        mcp.call(4, "web_fetch", json!({"url": "http://127.0.0.1/"})),
+        expected["search"][3]
+    );
+    assert_eq!(
+        mcp.finish(),
+        Some(0),
+        "stdin EOF must end the server with exit code 0"
+    );
 }
 
 #[test]
@@ -140,15 +181,26 @@ fn host_server_enumerates_the_frozen_status_tool() {
     let expected = baseline();
     let mut mcp = Mcp::start("--mcp-host-serve", &root.0);
     assert_eq!(mcp.initialize(), expected["host"][0]);
-    assert_eq!(mcp.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})), expected["host"][1]);
+    assert_eq!(
+        mcp.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
+        expected["host"][1]
+    );
     assert_eq!(mcp.finish(), Some(0));
 }
 
 // ----- DSH profile entries (`her dsh-mcp-config`) -------------------------------------------------------
 
 fn dsh_config(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_her")).arg("dsh-mcp-config").args(args).output().expect("run dsh-mcp-config");
-    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).trim().to_string(), String::from_utf8_lossy(&out.stderr).trim().to_string())
+    let out = Command::new(env!("CARGO_BIN_EXE_her"))
+        .arg("dsh-mcp-config")
+        .args(args)
+        .output()
+        .expect("run dsh-mcp-config");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
 }
 
 const EXE: &str = "/opt/qq bot/it's her";
@@ -160,9 +212,11 @@ const PORT_ARG: &str = "31999";
 
 fn expected_block() -> String {
     let command = "'/opt/qq bot/it''s her'";
-    let entry = |id: &str, server: &str, arg: &str, extra: &str| format!(
+    let entry = |id: &str, server: &str, arg: &str, extra: &str| {
+        format!(
         "- insert:\n    - id: {id}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server}\n        transport: stdio\n        command: {command}\n        args:\n          - '{arg}'\n          - '--runtime-root'\n          - '{RUNTIME_ARG}'\n          - '--console-port'\n          - '{PORT_ARG}'\n{extra}"
-    );
+    )
+    };
     format!(
         "# === qq-bridge MCP BEGIN ===\n# 由 her dsh-mcp-config 自动管理，运行时会整段覆盖，请勿手动修改此区块。\n{}{}{}# === qq-bridge MCP END ===\n",
         entry("mcp-snowluma", "snowluma", "--mcp-serve", "        toolCallTimeoutMs: 725000\n"),
@@ -380,14 +434,79 @@ fn dsh_config_installs_all_three_servers_pointing_at_the_bridge_and_is_idempoten
     let root = temp_root("dsh-config");
     let file = root.0.join("profiles/web/cordis.patch.yml");
     let file = file.to_str().unwrap();
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "written");
+    assert_eq!(
+        dsh_config(&[
+            "--patch-file",
+            file,
+            "--bridge-exe",
+            EXE,
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG
+        ])
+        .1,
+        "written"
+    );
     assert_eq!(fs::read_to_string(file).unwrap(), expected_block());
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "unchanged");
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG, "--check"]), (0, "unchanged".into(), String::new()));
-    let backups = fs::read_dir(root.0.join("profiles/web")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".bak-")).count();
-    assert_eq!(backups, 0, "an unchanged file must not be rewritten or backed up");
+    assert_eq!(
+        dsh_config(&[
+            "--patch-file",
+            file,
+            "--bridge-exe",
+            EXE,
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG
+        ])
+        .1,
+        "unchanged"
+    );
+    assert_eq!(
+        dsh_config(&[
+            "--patch-file",
+            file,
+            "--bridge-exe",
+            EXE,
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG,
+            "--check"
+        ]),
+        (0, "unchanged".into(), String::new())
+    );
+    let backups = fs::read_dir(root.0.join("profiles/web"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".bak-")
+        })
+        .count();
+    assert_eq!(
+        backups, 0,
+        "an unchanged file must not be rewritten or backed up"
+    );
     // another bridge path: --check reports the difference without touching the file
-    assert_eq!(dsh_config(&["--patch-file", file, "--bridge-exe", "/elsewhere/her", "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG, "--check"]).0, 1);
+    assert_eq!(
+        dsh_config(&[
+            "--patch-file",
+            file,
+            "--bridge-exe",
+            "/elsewhere/her",
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG,
+            "--check"
+        ])
+        .0,
+        1
+    );
     assert_eq!(fs::read_to_string(file).unwrap(), expected_block());
 }
 
@@ -397,10 +516,27 @@ fn dsh_config_replaces_only_its_block_keeps_the_rest_and_backs_up() {
     let file = root.0.join("cordis.patch.yml");
     let before = "\u{feff}# user comment\r\n- insert:\r\n    - id: other-plugin\r\n      name: x\r\n# === qq-bridge MCP BEGIN ===\n- insert:\n    - id: mcp-snowluma-host\n      config:\n        command: 'node'\n# === qq-bridge MCP END ===\n# tail\r\n";
     fs::write(&file, before).unwrap();
-    assert_eq!(dsh_config(&["--patch-file", file.to_str().unwrap(), "--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).1, "written");
+    assert_eq!(
+        dsh_config(&[
+            "--patch-file",
+            file.to_str().unwrap(),
+            "--bridge-exe",
+            EXE,
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG
+        ])
+        .1,
+        "written"
+    );
     let after = fs::read_to_string(&file).unwrap();
     assert_eq!(after, format!("# user comment\r\n- insert:\r\n    - id: other-plugin\r\n      name: x\r\n{}# tail\r\n", expected_block()));
-    let backup = fs::read_dir(&root.0).unwrap().map(|e| e.unwrap().path()).find(|p| p.to_string_lossy().contains(".bak-")).expect("a backup of the original");
+    let backup = fs::read_dir(&root.0)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains(".bak-"))
+        .expect("a backup of the original");
     assert_eq!(fs::read_to_string(backup).unwrap(), before);
 }
 
@@ -420,8 +556,22 @@ fn dsh_config_refuses_unowned_managed_ids_and_broken_markers_without_writing() {
         assert!(stderr.contains("nothing was changed"), "{stderr}");
         assert_eq!(fs::read_to_string(&file).unwrap(), original);
     }
-    assert_eq!(dsh_config(&["--bridge-exe", EXE, "--runtime-root", RUNTIME_ARG, "--console-port", PORT_ARG]).0, 2);
-    assert_eq!(dsh_config(&["--patch-file", file.to_str().unwrap(), "--bogus"]).0, 2);
+    assert_eq!(
+        dsh_config(&[
+            "--bridge-exe",
+            EXE,
+            "--runtime-root",
+            RUNTIME_ARG,
+            "--console-port",
+            PORT_ARG
+        ])
+        .0,
+        2
+    );
+    assert_eq!(
+        dsh_config(&["--patch-file", file.to_str().unwrap(), "--bogus"]).0,
+        2
+    );
 }
 
 // ----- snowluma_status against a started loopback gateway ---------------------------------------------------
@@ -443,10 +593,14 @@ fn fake_gateway(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>) {
     let seen = Arc::clone(&log);
     std::thread::spawn(move || {
         for reply in replies {
-            let Ok((mut stream, _)) = listener.accept() else { return };
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
-            seen.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
             match reply {
                 Reply::Body(status, body) => {
                     let _ = write!(stream, "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
@@ -460,8 +614,14 @@ fn fake_gateway(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>) {
 
 fn status_text(mcp: &mut Mcp, id: u64) -> String {
     let answer = mcp.call(id, "snowluma_status", json!({}));
-    assert!(answer["result"]["isError"].is_null(), "snowluma_status never reports isError: {answer}");
-    answer["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    assert!(
+        answer["result"]["isError"].is_null(),
+        "snowluma_status never reports isError: {answer}"
+    );
+    answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 const UNREACHABLE_HINT: &str = "目前连不上 SnowLuma 网关，请手动检查网关程序是否已跑起（依使用约定本工具不代为下载或拉起进程）。 并且核实一下配置文件里的网关 HTTP 入口与实际监听端口是不是一致。";
@@ -469,19 +629,43 @@ const UNREACHABLE_HINT: &str = "目前连不上 SnowLuma 网关，请手动检�
 #[test]
 fn status_reports_the_online_account_and_authenticates_with_the_configured_token() {
     let (url, log) = fake_gateway(vec![
-        Reply::Body(200, r#"{"status":"ok","retcode":0,"data":{"user_id":10001,"nickname":"机器人"}}"#),
-        Reply::Body(200, r#"{"status":"failed","retcode":1200,"wording":"not logged in"}"#),
+        Reply::Body(
+            200,
+            r#"{"status":"ok","retcode":0,"data":{"user_id":10001,"nickname":"机器人"}}"#,
+        ),
+        Reply::Body(
+            200,
+            r#"{"status":"failed","retcode":1200,"wording":"not logged in"}"#,
+        ),
     ]);
     let root = temp_root("status-online");
-    write_root(&root.0, &url, json!({"snowluma": {"accessToken": "gw-token", "httpUrl": "http://127.0.0.1:1"}}));
+    write_root(
+        &root.0,
+        &url,
+        json!({"snowluma": {"accessToken": "gw-token", "httpUrl": "http://127.0.0.1:1"}}),
+    );
     let mut mcp = Mcp::start("--mcp-host-serve", &root.0);
     mcp.initialize();
     assert_eq!(status_text(&mut mcp, 2), "{\n  \"reachable\": true,\n  \"online\": true,\n  \"user_id\": 10001,\n  \"nickname\": \"机器人\"\n}");
     assert_eq!(status_text(&mut mcp, 3), "{\n  \"reachable\": true,\n  \"online\": false,\n  \"retcode\": 1200,\n  \"wording\": \"not logged in\"\n}");
     let requests = log.lock().unwrap().clone();
-    assert_eq!(requests.len(), 2, "the selected dependency is used, not snowluma.httpUrl");
-    assert!(requests[0].starts_with("GET /get_login_info HTTP/1.1"), "{}", requests[0]);
-    assert!(requests[0].to_ascii_lowercase().contains("authorization: bearer gw-token"), "{}", requests[0]);
+    assert_eq!(
+        requests.len(),
+        2,
+        "the selected dependency is used, not snowluma.httpUrl"
+    );
+    assert!(
+        requests[0].starts_with("GET /get_login_info HTTP/1.1"),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer gw-token"),
+        "{}",
+        requests[0]
+    );
     assert_eq!(mcp.finish(), Some(0));
 }
 
@@ -494,7 +678,11 @@ fn status_survives_a_lone_surrogate_in_the_login_info() {
         r#"{"status":"ok","retcode":0,"data":{"user_id":10001,"nickname":"a\ud83db"}}"#,
     )]);
     let root = temp_root("status-surrogate");
-    write_root(&root.0, &url, json!({"snowluma": {"httpUrl": "http://127.0.0.1:1"}}));
+    write_root(
+        &root.0,
+        &url,
+        json!({"snowluma": {"httpUrl": "http://127.0.0.1:1"}}),
+    );
     let mut mcp = Mcp::start("--mcp-host-serve", &root.0);
     mcp.initialize();
     assert_eq!(
@@ -506,15 +694,30 @@ fn status_survives_a_lone_surrogate_in_the_login_info() {
 
 #[test]
 fn status_reports_gateway_failures_with_the_operator_hint() {
-    let (url, _) = fake_gateway(vec![Reply::Body(426, "upgrade"), Reply::Body(200, "<html>")]);
+    let (url, _) = fake_gateway(vec![
+        Reply::Body(426, "upgrade"),
+        Reply::Body(200, "<html>"),
+    ]);
     let root = temp_root("status-down");
     write_root(&root.0, &url, json!({}));
     let mut mcp = Mcp::start("--mcp-host-serve", &root.0);
     mcp.initialize();
-    assert_eq!(status_text(&mut mcp, 2), format!("{{\n  \"reachable\": false,\n  \"httpStatus\": 426,\n  \"hint\": {}\n}}", serde_json::to_string(UNREACHABLE_HINT).unwrap()));
+    assert_eq!(
+        status_text(&mut mcp, 2),
+        format!(
+            "{{\n  \"reachable\": false,\n  \"httpStatus\": 426,\n  \"hint\": {}\n}}",
+            serde_json::to_string(UNREACHABLE_HINT).unwrap()
+        )
+    );
     let bad_json: Value = serde_json::from_str(&status_text(&mut mcp, 3)).unwrap();
     assert_eq!(bad_json["reachable"], false);
-    assert!(bad_json["error"].as_str().unwrap().starts_with("Unexpected token"), "{bad_json}");
+    assert!(
+        bad_json["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Unexpected token"),
+        "{bad_json}"
+    );
     assert_eq!(bad_json["hint"], UNREACHABLE_HINT);
     drop(mcp);
 
@@ -523,7 +726,11 @@ fn status_reports_gateway_failures_with_the_operator_hint() {
     let dead = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
     let root = temp_root("status-closed");
-    write_root(&root.0, &dead, json!({"snowluma": {"homeDir": "C:/snowluma"}}));
+    write_root(
+        &root.0,
+        &dead,
+        json!({"snowluma": {"homeDir": "C:/snowluma"}}),
+    );
     let mut mcp = Mcp::start("--mcp-host-serve", &root.0);
     mcp.initialize();
     let text = status_text(&mut mcp, 2);
@@ -545,7 +752,11 @@ fn a_stalled_gateway_is_abandoned_after_five_seconds() {
     let parsed: Value = serde_json::from_str(&status_text(&mut mcp, 2)).unwrap();
     let waited = started.elapsed();
     assert_eq!(parsed["error"], "The operation was aborted due to timeout");
-    assert!(waited >= std::time::Duration::from_millis(4900) && waited < std::time::Duration::from_secs(7), "{waited:?}");
+    assert!(
+        waited >= std::time::Duration::from_millis(4900)
+            && waited < std::time::Duration::from_secs(7),
+        "{waited:?}"
+    );
     assert_eq!(mcp.finish(), Some(0));
 }
 
@@ -553,13 +764,47 @@ fn a_stalled_gateway_is_abandoned_after_five_seconds() {
 fn startup_errors_exit_with_code_two_and_write_nothing_to_the_protocol_stream() {
     let root = temp_root("startup");
     for (args, why) in [
-        (vec!["--mcp-host-serve", "--runtime-root", "/nonexistent-aux-root", "--console-port", "31999"], "runtime root is unavailable"),
-        (vec!["--mcp-web-search-serve", "--mcp-serve", "--runtime-root", root.0.to_str().unwrap(), "--console-port", "31999"], "isolated startup mode was selected more than once"),
-        (vec!["--mcp-web-search-serve", "--runtime-root", root.0.to_str().unwrap()], "isolated runtime requires an explicit non-zero console port"),
+        (
+            vec![
+                "--mcp-host-serve",
+                "--runtime-root",
+                "/nonexistent-aux-root",
+                "--console-port",
+                "31999",
+            ],
+            "runtime root is unavailable",
+        ),
+        (
+            vec![
+                "--mcp-web-search-serve",
+                "--mcp-serve",
+                "--runtime-root",
+                root.0.to_str().unwrap(),
+                "--console-port",
+                "31999",
+            ],
+            "isolated startup mode was selected more than once",
+        ),
+        (
+            vec![
+                "--mcp-web-search-serve",
+                "--runtime-root",
+                root.0.to_str().unwrap(),
+            ],
+            "isolated runtime requires an explicit non-zero console port",
+        ),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_her")).args(&args).env_remove("HER_RUNTIME_ROOT").output().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_her"))
+            .args(&args)
+            .env_remove("HER_RUNTIME_ROOT")
+            .output()
+            .unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains(why), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(why),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

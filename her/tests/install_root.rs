@@ -455,6 +455,7 @@ fixture = runpy.run_path(sys.argv[1])
 with fixture['TemporaryDirectory'](prefix='her-guard-fixture-'):
     pass
 "#;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut runners = vec![(
         python_program(),
         vec![
@@ -705,6 +706,7 @@ fn installed_and_development_supervisors_can_own_their_selected_runtime() {
 fn script_helpers_allow_disposable_roots_and_existing_checks() {
     let fixture = Fixture::new();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut runners = vec![(
         "node",
         vec![
@@ -778,7 +780,10 @@ fn affected_native_script_checks_use_disposable_roots() {
 
 #[test]
 fn default_production_root_is_the_one_production_folder() {
-    assert_eq!(install_root::DEFAULT_INSTALL_ROOT, if cfg!(windows) { "C:/qqbot" } else { "/qqbot" });
+    assert_eq!(
+        install_root::DEFAULT_INSTALL_ROOT,
+        if cfg!(windows) { "C:/qqbot" } else { "/qqbot" }
+    );
 }
 
 #[test]
@@ -788,7 +793,11 @@ fn production_root_spellings_are_inside_and_siblings_are_outside() {
     std::fs::create_dir_all(root.join("runtime")).unwrap();
     let install = install_root::InstallRoot::new(&root).unwrap();
     let text = root.to_str().unwrap().to_string();
-    let mut inside = vec![root.join("runtime/data"), PathBuf::from(format!("{text}/runtime/../backups"))];
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut inside = vec![
+        root.join("runtime/data"),
+        PathBuf::from(format!("{text}/runtime/../backups")),
+    ];
     #[cfg(windows)]
     {
         let back = text.replace('/', "\\");
@@ -797,15 +806,26 @@ fn production_root_spellings_are_inside_and_siblings_are_outside() {
         inside.push(PathBuf::from(format!(r"\\?\{back}")).join("runtime"));
         inside.push(PathBuf::from(format!("{back}\\")).join("runtime"));
     }
-    for path in &inside { assert!(install.protects(path).unwrap(), "{path:?} must be inside"); }
-    for path in [fixture.0.join("qqbot-rust/runtime"), fixture.0.join("qqbot2"),
-                 PathBuf::from(format!("{text}/../qqbot-rust"))] {
-        assert!(!install.protects(&path).unwrap(), "{path:?} must be outside");
+    for path in &inside {
+        assert!(install.protects(path).unwrap(), "{path:?} must be inside");
+    }
+    for path in [
+        fixture.0.join("qqbot-rust/runtime"),
+        fixture.0.join("qqbot2"),
+        PathBuf::from(format!("{text}/../qqbot-rust")),
+    ] {
+        assert!(
+            !install.protects(&path).unwrap(),
+            "{path:?} must be outside"
+        );
     }
     #[cfg(windows)]
     {
         let back = text.replace('/', "\\");
-        assert!(install_root::InstallRoot::new(Path::new(&format!(r"\\.\{back}"))).is_err(), "device namespace");
+        assert!(
+            install_root::InstallRoot::new(Path::new(&format!(r"\\.\{back}"))).is_err(),
+            "device namespace"
+        );
     }
 }
 
@@ -815,23 +835,61 @@ fn installed_runtime_backups_stay_inside_the_root() {
     let root = fixture.0.join("qqbot");
     let runtime = root.join("runtime");
     let install = install_root::InstallRoot::new(&root).unwrap();
-    assert_eq!(install.backup_destination(&runtime, Path::new("backups")).unwrap(), root.join("backups"));
-    assert_eq!(install.backup_destination(&runtime, Path::new("archive/daily")).unwrap(), root.join("archive/daily"));
+    assert_eq!(
+        install
+            .backup_destination(&runtime, Path::new("backups"))
+            .unwrap(),
+        root.join("backups")
+    );
+    assert_eq!(
+        install
+            .backup_destination(&runtime, Path::new("archive/daily"))
+            .unwrap(),
+        root.join("archive/daily")
+    );
     for escaping in ["../elsewhere", "backups/../../elsewhere"] {
-        assert!(install.backup_destination(&runtime, Path::new(escaping)).is_err(), "{escaping}");
+        assert!(
+            install
+                .backup_destination(&runtime, Path::new(escaping))
+                .is_err(),
+            "{escaping}"
+        );
     }
     #[cfg(windows)]
-    assert!(install.backup_destination(&runtime, Path::new(r"\elsewhere")).is_err(), "root-relative");
+    assert!(
+        install
+            .backup_destination(&runtime, Path::new(r"\elsewhere"))
+            .is_err(),
+        "root-relative"
+    );
     for area in ["releases/v1", "deps", "runtime/backups"] {
-        assert!(install.backup_destination(&runtime, Path::new(area)).is_err(), "{area}");
+        assert!(
+            install
+                .backup_destination(&runtime, Path::new(area))
+                .is_err(),
+            "{area}"
+        );
     }
     // An absolute destination is the administrator's explicit choice and stays supported.
     let external = fixture.0.join("share");
-    assert_eq!(install.backup_destination(&runtime, &external).unwrap(), external);
+    assert_eq!(
+        install.backup_destination(&runtime, &external).unwrap(),
+        external
+    );
     // A runtime outside the root (a development or standalone runtime) keeps runtime-relative backups, `..` included.
     let outside = fixture.0.join("qqbot-rust/runtime");
-    assert_eq!(install.backup_destination(&outside, Path::new("backups")).unwrap(), outside.join("backups"));
-    assert_eq!(install.backup_destination(&outside, Path::new("../b")).unwrap(), fixture.0.join("qqbot-rust/b"));
+    assert_eq!(
+        install
+            .backup_destination(&outside, Path::new("backups"))
+            .unwrap(),
+        outside.join("backups")
+    );
+    assert_eq!(
+        install
+            .backup_destination(&outside, Path::new("../b"))
+            .unwrap(),
+        fixture.0.join("qqbot-rust/b")
+    );
 }
 
 /// True when `line` carries `// layout-literal: <reason>` as a real comment (an even number of
@@ -840,7 +898,7 @@ fn has_layout_marker(line: &str) -> bool {
     const MARKER: &str = "// layout-literal:";
     line.match_indices(MARKER).any(|(at, _)| {
         let quotes = line[..at].replace("\\\"", "").matches('"').count();
-        quotes % 2 == 0 && !line[at + MARKER.len()..].trim().is_empty()
+        quotes.is_multiple_of(2) && !line[at + MARKER.len()..].trim().is_empty()
     })
 }
 
@@ -849,12 +907,24 @@ fn has_layout_marker(line: &str) -> bool {
 fn production_path_literals(text: &str) -> Vec<usize> {
     let mut lines = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        if has_layout_marker(line) { continue; }
+        if has_layout_marker(line) {
+            continue;
+        }
         let mut spelled = line.to_ascii_lowercase().replace('\\', "/");
-        while spelled.contains("//") { spelled = spelled.replace("//", "/"); }
-        if ["c:/qqbot", "qqbot-rust", "legacy_path!", "join(\".dsh\")", "/.dsh\"", "\".dsh/", "\".dsh\""]
-            .iter()
-            .any(|n| spelled.contains(n))
+        while spelled.contains("//") {
+            spelled = spelled.replace("//", "/");
+        }
+        if [
+            "c:/qqbot",
+            "qqbot-rust",
+            "legacy_path!",
+            "join(\".dsh\")",
+            "/.dsh\"",
+            "\".dsh/",
+            "\".dsh\"",
+        ]
+        .iter()
+        .any(|n| spelled.contains(n))
         {
             lines.push(index + 1);
         }
@@ -869,8 +939,13 @@ fn production_path_findings(folders: Vec<PathBuf>, layout_module: &Path) -> Vec<
     while let Some(folder) = folders.pop() {
         for entry in std::fs::read_dir(&folder).unwrap() {
             let path = entry.unwrap().path();
-            if path.is_dir() { folders.push(path); continue; }
-            if path.extension().is_none_or(|e| e != "rs") || path == layout_module { continue; }
+            if path.is_dir() {
+                folders.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path == layout_module {
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap();
             for line in production_path_literals(&text) {
                 findings.push(format!("{}:{line}", path.display()));
@@ -901,7 +976,10 @@ fn production_path_scanner_flags_unmarked_spellings_and_skips_marked_ones() {
         r#"let p = PathBuf::from("D:/people/alice/.dsh");"#,
     ]
     .join("\n");
-    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16]);
+    assert_eq!(
+        production_path_literals(&text),
+        vec![1, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16]
+    );
 }
 
 #[test]
@@ -935,5 +1013,8 @@ fn production_path_literals_live_only_in_the_layout_module() {
         vec![manifest.join("src"), manifest.join("../her-memory/src")],
         &manifest.join("src").join("install_root.rs"),
     );
-    assert!(findings.is_empty(), "production path literals outside src/install_root.rs: {findings:#?}");
+    assert!(
+        findings.is_empty(),
+        "production path literals outside src/install_root.rs: {findings:#?}"
+    );
 }

@@ -33,7 +33,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
 /// The failure of a turn whose wall deadline (`socialV2.turnTimeoutSecs`) ran out.
 pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
@@ -196,7 +196,7 @@ pub enum Status {
     Paused { reason: String, detail: String },
 }
 
-enum Failure {
+pub(crate) enum Failure {
     Failed(String),
     /// The owner received the timeout notice for this interaction.
     InteractionClosed,
@@ -267,7 +267,6 @@ pub enum Event {
         raw: Value,
         message: ChatMessage,
     },
-    Ended(Status),
 }
 
 pub struct Turn {
@@ -276,7 +275,6 @@ pub struct Turn {
     status: watch::Receiver<Status>,
     cancel: watch::Sender<bool>,
     observation_sleep: Arc<AtomicBool>,
-    events: broadcast::Sender<Event>,
 }
 
 impl Turn {
@@ -302,9 +300,6 @@ impl Turn {
         self.sent.load(Ordering::SeqCst)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.events.subscribe()
-    }
     pub fn status(&self) -> Status {
         self.status.borrow().clone()
     }
@@ -358,6 +353,7 @@ impl Harness {
     }
 
     /// A durable status lookup also works after reopening the runtime.
+    #[cfg(test)]
     pub fn status(&self, turn: &str) -> Result<Option<Status>, String> {
         self.store.status(turn)
     }
@@ -415,8 +411,6 @@ impl Harness {
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
         let (cancel, cancelled) = watch::channel(false);
-        let (events, _) = broadcast::channel(32);
-        let notifications = events.clone();
         let client = self.client.clone();
         let context = self.context.clone();
         let sent = Arc::new(AtomicBool::new(false));
@@ -446,7 +440,6 @@ impl Harness {
                 user,
                 &delivery,
                 instruction,
-                &notifications,
                 &sent_flag,
                 &progress_for_task,
                 deadline,
@@ -478,9 +471,7 @@ impl Harness {
                     None => match TurnDelivery::check_deadline(delivery.reserved2_budget, &context, &request.conversation) {
                         Err(reason) => Status::Failed(reason),
                         Ok(()) => {
-                            let Event::Assistant { text, .. } = &event else {
-                                unreachable!()
-                            };
+                            let Event::Assistant { text, .. } = &event;
                             let status = Status::Completed(text.clone());
                             assistant = Some(event);
                             status
@@ -507,12 +498,10 @@ impl Harness {
             if let Status::Paused { reason, detail } = &result {
                 let _ = request.tools.pause(&request.id, reason, detail);
             }
-            if let Some(event) = assistant {
+            if assistant.is_some() {
                 // Final text counts only after the runner accepts and persists completion.
                 crate::prompt::record_recall_hits(&context, recalled);
-                let _ = notifications.send(event);
             }
-            let _ = notifications.send(Event::Ended(result.clone()));
             let _ = status_tx.send(result);
         });
         Ok(Turn {
@@ -521,7 +510,6 @@ impl Harness {
             status,
             cancel,
             observation_sleep,
-            events,
         })
     }
 }
@@ -626,7 +614,6 @@ async fn tool_loop(
     user: ChatMessage,
     delivery: &TurnDelivery,
     instruction: String,
-    events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
     progress: &std::sync::Mutex<Progress>,
     deadline: tokio::time::Instant,
@@ -695,23 +682,19 @@ async fn tool_loop(
                 return Err(Failure::Failed(summary));
             }
         };
-        let Event::Assistant { message, .. } = &event else {
-            unreachable!()
-        };
+        let Event::Assistant { message, .. } = &event;
         let message = message.clone();
         let exhausted = spent > request.limits.max_tokens
             || (spent == request.limits.max_tokens && !calls.is_empty());
         if calls.is_empty() {
             if exhausted {
                 store.complete_step(&request.id, &event)?;
-                let _ = events.send(event);
                 return Err("harness token limit exceeded".into());
             }
             chain.mark_completed();
             return Ok(event);
         }
         let attempt = store.complete_step(&request.id, &event)?;
-        let _ = events.send(event);
         messages.push(message);
         let mut call_ids = std::collections::HashSet::new();
         if calls
@@ -1291,13 +1274,10 @@ fn model_request_refs(messages: &[ChatMessage]) -> Vec<Value> {
     let mut refs = Vec::new();
     for message in messages {
         for part in &message.content {
-            match part {
-                ContentPart::ToolResponse(response) => {
-                    if let Ok(packet) = serde_json::from_str::<Value>(&response.content) {
-                        tool_refs(&packet, &mut refs);
-                    }
+            if let ContentPart::ToolResponse(response) = part {
+                if let Ok(packet) = serde_json::from_str::<Value>(&response.content) {
+                    tool_refs(&packet, &mut refs);
                 }
-                _ => {}
             }
         }
     }

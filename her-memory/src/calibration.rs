@@ -266,7 +266,8 @@ fn longmemeval_recall_calibration() {
     let strata = [answerable, abstentions];
     assert_eq!((answerable.len(), abstentions.len()), (470, 30));
 
-    let root = TempRoot(std::env::temp_dir().join(format!("her-longmemeval-{}", std::process::id())));
+    let root =
+        TempRoot(std::env::temp_dir().join(format!("her-longmemeval-{}", std::process::id())));
     let resources_dir = root.0.join("resources");
     let model_dir = resources_dir.join(MODEL_DIR);
     fs::create_dir_all(model_dir.join("onnx")).expect("create fixture model directory");

@@ -22,10 +22,12 @@ pub fn append_record_for_runtime(
     LedgerStorage::append_record_for_runtime(context, record)
 }
 
+#[cfg(test)]
 pub fn append_record_to(path: &str, record: &Value) -> Result<(), String> {
     LedgerStorage::append_record_to(path, record)
 }
 
+#[cfg(test)]
 pub(crate) fn append_record_to_durable(path: &str, record: &Value) -> Result<(), String> {
     LedgerStorage::append_record_to_durable(path, record)
 }
@@ -132,6 +134,7 @@ impl Ledger {
     }
 
     /// 合并任意多份账本（单测用临时文件走这条）。
+    #[cfg(test)]
     pub fn load_paths(paths: &[&str]) -> Ledger {
         LedgerStorage::load_paths(paths)
     }
@@ -238,7 +241,7 @@ impl Ledger {
                     return false;
                 };
                 // `b: null` 是「回合跑过但没有 usage 明细」的占位证据：不是计费请求，不产生采样（不计 steps）。
-                if record.get("b").map_or(false, Value::is_null) {
+                if record.get("b").is_some_and(Value::is_null) {
                     return false;
                 }
                 let retry = record.get("retry").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1032,7 +1035,7 @@ pub fn series(&self, table: &PriceTable, hours: i64, max_buckets: i64, at: Optio
     // 与 JS 一致：并列最高时取第一个桶（max_by 会取最后一个）。
     let mut busiest_row: Option<&Row> = None;
     for r in &rows {
-        if r.cost > 0.0 && busiest_row.map_or(true, |b| r.cost > b.cost) {
+        if r.cost > 0.0 && busiest_row.is_none_or(|b| r.cost > b.cost) {
             busiest_row = Some(r);
         }
     }
@@ -1131,6 +1134,7 @@ pub(super) fn now_ms() -> i64 {
     crate::parity_clock::now_ms() as i64
 }
 
+#[cfg(test)]
 pub(super) fn read_rows(paths: &[&str]) -> Vec<(i64, usize, usize, String)> {
     let mut rows: Vec<(i64, usize, usize, String)> = Vec::new();
     for (file_idx, path) in paths.iter().enumerate() {
@@ -1706,7 +1710,7 @@ mod tests {
         let b40 = json!({"cacheMiss": 40, "cacheHit": 10, "cacheWrite": 0, "output": 8});
         let b20 = json!({"cacheMiss": 20, "cacheHit": 0, "cacheWrite": 0, "output": 4});
         let b30 = json!({"cacheMiss": 30, "cacheHit": 0, "cacheWrite": 0, "output": 6});
-        let rows = vec![
+        let rows = [
             json!({"k":"base","t":100,"sid":"s1","seq":2,"key":"group:1",
                 "model":"deepseek-flash","provider":"official","b":b})
             .to_string(),
@@ -1849,7 +1853,7 @@ mod tests {
     #[test]
     fn pure_attribution_and_reconciliation_planner_match_contract() {
         let table = PriceTable::default();
-        let rows = vec![
+        let rows = [
             json!({"k":"turn","t":1_700_000_000_000i64,"sid":"dsh-1","seq":1,"turn":1,"step":1,
                 "retry":0,"key":"group:1","model":"deepseek-flash","provider":"official",
                 "b":{"cacheMiss":100,"cacheHit":0,"cacheWrite":0,"output":10}})
@@ -1938,7 +1942,7 @@ pub fn plan_appends(existing: &Ledger, candidates: &[Value]) -> Vec<Value> {
         match c.get("k").and_then(|k| k.as_str()) {
             Some("turn") => {
                 // 无明细占位：只作证据，不计入采样，每次都写。
-                if c.get("b").map_or(false, Value::is_null) {
+                if c.get("b").is_some_and(Value::is_null) {
                     out.push(c.clone());
                     continue;
                 }

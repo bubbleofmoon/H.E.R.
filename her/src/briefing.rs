@@ -55,7 +55,7 @@ impl Budgets {
 /// Estimated model tokens: one per non-ASCII character (Han text), one per four ASCII characters.
 pub fn estimate_tokens(text: &str) -> usize {
     let ascii = text.chars().filter(|c| c.is_ascii()).count();
-    text.chars().count() - ascii + (ascii + 3) / 4
+    text.chars().count() - ascii + ascii.div_ceil(4)
 }
 
 /// Items per layer.
@@ -84,7 +84,7 @@ impl Counts {
             Layer::Material => self.material += n,
         }
     }
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(self) -> Value {
         Value::Object(Layer::ALL.iter().map(|l| (l.name().to_string(), json!(self.get(*l)))).collect())
     }
 }

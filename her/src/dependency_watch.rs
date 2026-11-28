@@ -101,10 +101,10 @@ pub async fn run(context: RuntimeContext) {
             let (poll_context, poll_cfg) = (context.clone(), cfg.clone());
             let _ = tokio::task::spawn_blocking(move || poll_status(&poll_context, &poll_cfg)).await;
         }
-        if tick % 6 == 0 || tick % 12 == 1 {
+        if tick.is_multiple_of(6) || tick % 12 == 1 {
             edge_report(&context, &cfg);
         }
-        if tick % 12 == 0 {
+        if tick.is_multiple_of(12) {
             recovery_log::flush(&context);
         }
         crate::dsh_health::publish(&context);
@@ -565,7 +565,7 @@ mod tests {
         assert!(body.contains("入站缺口 20 个"), "{body}");
         assert!(body.ends_with("详见管理端 /api/inbound/gaps"), "the pointer survives the cut: {body}");
         assert!(body.contains(&format!("另有 {} 个未列出", 20 - listed)), "the remainder carries the true count: {body}");
-        assert!(listed >= 1 && listed < GAP_NOTICE_LISTED, "{listed}");
+        assert!((1..GAP_NOTICE_LISTED).contains(&listed), "{listed}");
         for i in 0..20 {
             assert_eq!(body.contains(&format!("group:g{i:02}-")), i < listed, "gap {i} listed={listed}: {body}");
         }
@@ -618,7 +618,7 @@ mod tests {
         });
         let body = sent.into_inner();
         let listed = (0..20).filter(|i| body.contains(&format!("group:g{i:02}-"))).count();
-        assert!(listed >= 1 && listed < 20, "{body}");
+        assert!((1..20).contains(&listed), "{body}");
         let journal = crate::inbound::Journal::open(&context).unwrap();
         let left: Vec<i64> = journal.unnotified_gaps().unwrap().iter().map(|g| g.id).collect();
         assert_eq!(left, ids[listed..].to_vec(), "exactly the unlisted gaps stay unnotified; body: {body}");

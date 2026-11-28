@@ -656,20 +656,7 @@ impl RuntimeContext {
         }
     }
 
-    /// Read an optional selected-root file from byte `offset` to its end, with the guards of
-    /// `read_optional_text`. Returns where the read started and the bytes from there: `offset`,
-    /// or 0 when the file is now shorter than `offset` (it was replaced). Absent is `Ok(None)`.
-    pub fn read_optional_tail(
-        &self,
-        area: RuntimeArea,
-        relative: &str,
-        offset: u64,
-    ) -> Result<Option<(u64, Vec<u8>)>, &'static str> {
-        self.read_optional_tail_io(area, relative, offset)
-            .map_err(|_| "runtime path is unavailable")
-    }
-
-    /// `read_optional_tail` keeping the typed OS error, so a caller with a conflict budget can
+    /// `read_optional_tail_io` keeping the typed OS error, so a caller with a conflict budget can
     /// retry Windows sharing/lock violations (32/33) on the read.
     pub(crate) fn read_optional_tail_io(
         &self,
@@ -1194,18 +1181,10 @@ impl RuntimeContext {
         self.normalized_config(&document).map_err(str::to_owned)
     }
 
-    /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
-    /// that file (an access change records the policy it writes before the write). The settings overlay is applied
-    /// first, as `load_config_document` does.
-    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
-        let document = self.overlay_config(raw.clone());
-        self.normalized_config(&document)
-    }
-
     /// #154: the configuration `load_config` returns once `raw` is the stored `config.json` and `changes`
     /// (`settings::preview`) are stored, computed before anything is written, because an access change records the
     /// policy it writes first: `raw` with the stored values applied, then each change at its registry pointer
-    /// (`settings::place_changes`), normalized as `effective_config` does.
+    /// (`settings::place_changes`), normalized as `load_config_document` does.
     pub(crate) fn effective_config_with(
         &self,
         raw: &Value,
@@ -1542,6 +1521,264 @@ pub(crate) fn write_append_all(
         }
     }
     Ok(())
+}
+
+enum ReadAttemptError {
+    Retry,
+    Fatal(&'static str),
+}
+
+const READ_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn transient_read_io(windows: bool, error: &std::io::Error) -> bool {
+    windows
+        && (error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303)))
+}
+
+fn transient_read_resolve(windows: bool, error: &str) -> bool {
+    windows
+        && (error.starts_with("class=leaf/metadata ")
+            || error.starts_with("class=path/canonicalize "))
+        && (error.contains("kind=PermissionDenied")
+            || error.contains("os=Some(5)")
+            || error.contains("os=Some(32)")
+            || error.contains("os=Some(33)")
+            || error.contains("os=Some(303)"))
+}
+
+fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| "runtime layout is incomplete")?;
+    if is_link(&root_metadata) || !root_metadata.is_dir() {
+        return Err("runtime layout is incomplete");
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|_| "runtime layout is incomplete")?;
+    if canonical_root != root {
+        return Err("runtime layout is incomplete");
+    }
+
+    let components: Vec<_> = Path::new(relative).components().collect();
+    if components.is_empty() {
+        return Err("runtime layout is incomplete");
+    }
+    let mut candidate = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err("runtime layout is incomplete");
+        };
+        candidate.push(name);
+        let metadata =
+            fs::symlink_metadata(&candidate).map_err(|_| "runtime layout is incomplete")?;
+        if is_link(&metadata) {
+            return Err("runtime layout is incomplete");
+        }
+        let is_final = index + 1 == components.len();
+        let wrong_type = if is_final {
+            if directory {
+                !metadata.is_dir()
+            } else {
+                !metadata.is_file()
+            }
+        } else {
+            !metadata.is_dir()
+        };
+        if wrong_type {
+            return Err("runtime layout is incomplete");
+        }
+    }
+
+    let canonical = fs::canonicalize(&candidate).map_err(|_| "runtime layout is incomplete")?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("runtime layout is incomplete");
+    }
+    let metadata = fs::metadata(&canonical).map_err(|_| "runtime layout is incomplete")?;
+    if directory && !metadata.is_dir() || !directory && !metadata.is_file() {
+        return Err("runtime layout is incomplete");
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
+    crate::loopback_http::LoopbackEndpoint::parse(url).is_ok()
+}
+
+/// Validates `"model"` in `dependencies.json`: either a literal loopback HTTP endpoint (bare
+/// origin or clean path) or an HTTPS endpoint without userinfo, query, fragment, dot segments,
+/// double slashes, encoded slashes, port 0, or unspecified IP hosts.
+pub(crate) fn is_model_endpoint(url: &str) -> bool {
+    if url.is_empty()
+        || url.trim() != url
+        || url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let after_scheme = match parsed.scheme() {
+        "http" => match url.strip_prefix("http://") {
+            Some(rest) => rest,
+            None => return false,
+        },
+        "https" => match url.strip_prefix("https://") {
+            Some(rest) => rest,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let raw_path = after_scheme.find('/').map(|idx| &after_scheme[idx..]);
+    let authority = &after_scheme[..after_scheme.len() - raw_path.map_or(0, str::len)];
+    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
+        return false;
+    }
+    if let Some(path) = raw_path {
+        if path.contains("//") {
+            return false;
+        }
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return false;
+        }
+        let inner = path.strip_prefix('/').unwrap_or(path);
+        let inner = inner.strip_suffix('/').unwrap_or(inner);
+        if !inner.is_empty()
+            && inner.split('/').any(|seg| {
+                seg.is_empty()
+                    || seg == "."
+                    || seg == ".."
+                    || seg.eq_ignore_ascii_case("%2e")
+                    || seg.eq_ignore_ascii_case("%2e%2e")
+                    || seg.eq_ignore_ascii_case(".%2e")
+                    || seg.eq_ignore_ascii_case("%2e.")
+            })
+        {
+            return false;
+        }
+    }
+    match parsed.scheme() {
+        "http" => {
+            let origin = &url[..url.len() - raw_path.map_or(0, str::len)];
+            crate::loopback_http::LoopbackEndpoint::parse(origin).is_ok()
+        }
+        "https" => {
+            if parsed.port() == Some(0) {
+                return false;
+            }
+            match parsed.host() {
+                Some(url::Host::Domain(domain)) => !domain.is_empty(),
+                Some(url::Host::Ipv4(ip)) => !ip.is_unspecified(),
+                Some(url::Host::Ipv6(ip)) => !ip.is_unspecified(),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Normalizes a validated model endpoint URL by stripping trailing slashes while preserving
+/// explicit path prefixes (such as `/compatible-mode/v1`) and host case sensitivity.
+pub(crate) fn canonical_model_endpoint(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+/// Returns the OpenAI-compatible base URL (no trailing slash) for a validated `"model"` entry:
+/// preserves explicit non-root path prefixes (e.g. `/compatible-mode/v1` or `/v1`) and appends
+/// `/v1` only to bare origins.
+pub(crate) fn model_openai_base_url(model_url: &str) -> String {
+    let trimmed = canonical_model_endpoint(model_url);
+    let has_explicit_path = url::Url::parse(model_url)
+        .ok()
+        .is_some_and(|parsed| !parsed.path().is_empty() && parsed.path() != "/");
+    if has_explicit_path {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+/// Returns the OpenAI-compatible base URL with a trailing `/` for `genai::resolver::Endpoint`
+/// so relative `chat/completions` joins append to the final segment.
+pub(crate) fn model_openai_endpoint(model_url: &str) -> String {
+    format!("{}/", model_openai_base_url(model_url))
+}
+
+/// Validate a single canonical live conversation key from either the CLI or a rollout array.
+pub(crate) fn validate_canonical_live_group(entry: &str) -> Result<(), &'static str> {
+    let (kind, id) = entry
+        .split_once(':')
+        .ok_or("isolated live groups must use canonical group:<id> or private:<id> entries")?;
+    if !matches!(kind, "group" | "private")
+        || id.is_empty()
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("isolated live groups must use canonical group:<id> or private:<id> entries");
+    }
+    let parsed = id
+        .parse::<i64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or("isolated live identifiers must be positive canonical i64 decimal values")?;
+    if parsed.to_string() != id {
+        return Err("isolated live groups must not contain non-canonical or duplicate entries");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_canonical_live_groups(value: &str) -> Result<(), &'static str> {
+    use std::collections::BTreeSet;
+
+    if value.is_empty() {
+        return Err("isolated live runtime requires a non-empty canonical --live-groups list");
+    }
+    let mut seen = BTreeSet::new();
+    for entry in value.split(',') {
+        validate_canonical_live_group(entry)?;
+        if !seen.insert(entry) {
+            return Err("isolated live groups must not contain non-canonical or duplicate entries");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_loopback_websocket_endpoint(url: &str) -> bool {
+    let Some(authority) = url.strip_prefix("ws://") else {
+        return false;
+    };
+    if authority
+        .chars()
+        .any(|ch| matches!(ch, '/' | '?' | '#' | '@' | '\\'))
+    {
+        return false;
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, rest)) = bracketed.split_once(']') else {
+            return false;
+        };
+        let Some(port) = rest.strip_prefix(':') else {
+            return false;
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.split_once(':') else {
+            return false;
+        };
+        (host, port)
+    };
+    if !port.parse::<u16>().map(|value| value != 0).unwrap_or(false) {
+        return false;
+    }
+    host.parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -3231,262 +3468,4 @@ pub(crate) mod tests {
         assert!(!is_ntfs_deleted_path(Path::new("/$Extend/$DeletedExtra/abc123")));
         assert!(!is_ntfs_deleted_path(Path::new("/runtime/data/settings.db-wal")));
     }
-}
-
-enum ReadAttemptError {
-    Retry,
-    Fatal(&'static str),
-}
-
-const READ_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
-
-fn transient_read_io(windows: bool, error: &std::io::Error) -> bool {
-    windows
-        && (error.kind() == std::io::ErrorKind::PermissionDenied
-            || matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303)))
-}
-
-fn transient_read_resolve(windows: bool, error: &str) -> bool {
-    windows
-        && (error.starts_with("class=leaf/metadata ")
-            || error.starts_with("class=path/canonicalize "))
-        && (error.contains("kind=PermissionDenied")
-            || error.contains("os=Some(5)")
-            || error.contains("os=Some(32)")
-            || error.contains("os=Some(33)")
-            || error.contains("os=Some(303)"))
-}
-
-fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {
-    let root_metadata = fs::symlink_metadata(root).map_err(|_| "runtime layout is incomplete")?;
-    if is_link(&root_metadata) || !root_metadata.is_dir() {
-        return Err("runtime layout is incomplete");
-    }
-    let canonical_root = fs::canonicalize(root).map_err(|_| "runtime layout is incomplete")?;
-    if canonical_root != root {
-        return Err("runtime layout is incomplete");
-    }
-
-    let components: Vec<_> = Path::new(relative).components().collect();
-    if components.is_empty() {
-        return Err("runtime layout is incomplete");
-    }
-    let mut candidate = root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            return Err("runtime layout is incomplete");
-        };
-        candidate.push(name);
-        let metadata =
-            fs::symlink_metadata(&candidate).map_err(|_| "runtime layout is incomplete")?;
-        if is_link(&metadata) {
-            return Err("runtime layout is incomplete");
-        }
-        let is_final = index + 1 == components.len();
-        let wrong_type = if is_final {
-            if directory {
-                !metadata.is_dir()
-            } else {
-                !metadata.is_file()
-            }
-        } else {
-            !metadata.is_dir()
-        };
-        if wrong_type {
-            return Err("runtime layout is incomplete");
-        }
-    }
-
-    let canonical = fs::canonicalize(&candidate).map_err(|_| "runtime layout is incomplete")?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err("runtime layout is incomplete");
-    }
-    let metadata = fs::metadata(&canonical).map_err(|_| "runtime layout is incomplete")?;
-    if directory && !metadata.is_dir() || !directory && !metadata.is_file() {
-        return Err("runtime layout is incomplete");
-    }
-    Ok(canonical)
-}
-
-pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
-    crate::loopback_http::LoopbackEndpoint::parse(url).is_ok()
-}
-
-/// Validates `"model"` in `dependencies.json`: either a literal loopback HTTP endpoint (bare
-/// origin or clean path) or an HTTPS endpoint without userinfo, query, fragment, dot segments,
-/// double slashes, encoded slashes, port 0, or unspecified IP hosts.
-pub(crate) fn is_model_endpoint(url: &str) -> bool {
-    if url.is_empty()
-        || url.trim() != url
-        || url
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
-    {
-        return false;
-    }
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return false;
-    }
-    let after_scheme = match parsed.scheme() {
-        "http" => match url.strip_prefix("http://") {
-            Some(rest) => rest,
-            None => return false,
-        },
-        "https" => match url.strip_prefix("https://") {
-            Some(rest) => rest,
-            None => return false,
-        },
-        _ => return false,
-    };
-    let raw_path = after_scheme.find('/').map(|idx| &after_scheme[idx..]);
-    let authority = &after_scheme[..after_scheme.len() - raw_path.map_or(0, str::len)];
-    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
-        return false;
-    }
-    if let Some(path) = raw_path {
-        if path.contains("//") {
-            return false;
-        }
-        let lower = path.to_ascii_lowercase();
-        if lower.contains("%2f") || lower.contains("%5c") {
-            return false;
-        }
-        let inner = path.strip_prefix('/').unwrap_or(path);
-        let inner = inner.strip_suffix('/').unwrap_or(inner);
-        if !inner.is_empty()
-            && inner.split('/').any(|seg| {
-                seg.is_empty()
-                    || seg == "."
-                    || seg == ".."
-                    || seg.eq_ignore_ascii_case("%2e")
-                    || seg.eq_ignore_ascii_case("%2e%2e")
-                    || seg.eq_ignore_ascii_case(".%2e")
-                    || seg.eq_ignore_ascii_case("%2e.")
-            })
-        {
-            return false;
-        }
-    }
-    match parsed.scheme() {
-        "http" => {
-            let origin = &url[..url.len() - raw_path.map_or(0, str::len)];
-            crate::loopback_http::LoopbackEndpoint::parse(origin).is_ok()
-        }
-        "https" => {
-            if parsed.port() == Some(0) {
-                return false;
-            }
-            match parsed.host() {
-                Some(url::Host::Domain(domain)) => !domain.is_empty(),
-                Some(url::Host::Ipv4(ip)) => !ip.is_unspecified(),
-                Some(url::Host::Ipv6(ip)) => !ip.is_unspecified(),
-                None => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Normalizes a validated model endpoint URL by stripping trailing slashes while preserving
-/// explicit path prefixes (such as `/compatible-mode/v1`) and host case sensitivity.
-pub(crate) fn canonical_model_endpoint(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
-}
-
-/// Returns the OpenAI-compatible base URL (no trailing slash) for a validated `"model"` entry:
-/// preserves explicit non-root path prefixes (e.g. `/compatible-mode/v1` or `/v1`) and appends
-/// `/v1` only to bare origins.
-pub(crate) fn model_openai_base_url(model_url: &str) -> String {
-    let trimmed = canonical_model_endpoint(model_url);
-    let has_explicit_path = url::Url::parse(model_url)
-        .ok()
-        .is_some_and(|parsed| !parsed.path().is_empty() && parsed.path() != "/");
-    if has_explicit_path {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
-}
-
-/// Returns the OpenAI-compatible base URL with a trailing `/` for `genai::resolver::Endpoint`
-/// so relative `chat/completions` joins append to the final segment.
-pub(crate) fn model_openai_endpoint(model_url: &str) -> String {
-    format!("{}/", model_openai_base_url(model_url))
-}
-
-/// Validate a single canonical live conversation key from either the CLI or a rollout array.
-pub(crate) fn validate_canonical_live_group(entry: &str) -> Result<(), &'static str> {
-    let (kind, id) = entry
-        .split_once(':')
-        .ok_or("isolated live groups must use canonical group:<id> or private:<id> entries")?;
-    if !matches!(kind, "group" | "private")
-        || id.is_empty()
-        || !id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err("isolated live groups must use canonical group:<id> or private:<id> entries");
-    }
-    let parsed = id
-        .parse::<i64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or("isolated live identifiers must be positive canonical i64 decimal values")?;
-    if parsed.to_string() != id {
-        return Err("isolated live groups must not contain non-canonical or duplicate entries");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_canonical_live_groups(value: &str) -> Result<(), &'static str> {
-    use std::collections::BTreeSet;
-
-    if value.is_empty() {
-        return Err("isolated live runtime requires a non-empty canonical --live-groups list");
-    }
-    let mut seen = BTreeSet::new();
-    for entry in value.split(',') {
-        validate_canonical_live_group(entry)?;
-        if !seen.insert(entry) {
-            return Err("isolated live groups must not contain non-canonical or duplicate entries");
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn is_loopback_websocket_endpoint(url: &str) -> bool {
-    let Some(authority) = url.strip_prefix("ws://") else {
-        return false;
-    };
-    if authority
-        .chars()
-        .any(|ch| matches!(ch, '/' | '?' | '#' | '@' | '\\'))
-    {
-        return false;
-    }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((host, rest)) = bracketed.split_once(']') else {
-            return false;
-        };
-        let Some(port) = rest.strip_prefix(':') else {
-            return false;
-        };
-        (host, port)
-    } else {
-        let Some((host, port)) = authority.split_once(':') else {
-            return false;
-        };
-        (host, port)
-    };
-    if !port.parse::<u16>().map(|value| value != 0).unwrap_or(false) {
-        return false;
-    }
-    host.parse::<IpAddr>()
-        .map(|address| address.is_loopback())
-        .unwrap_or(false)
 }

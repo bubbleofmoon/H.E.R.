@@ -8,9 +8,6 @@
 use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 
-pub const STATUS_POLL_MS: u64 = 60_000;
-pub const REPORT_INTERVAL_MS: u64 = 30_000;
-
 #[derive(Debug, Clone)]
 pub struct GatewayHealth {
     pub connected: bool,

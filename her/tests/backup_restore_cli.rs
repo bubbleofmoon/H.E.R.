@@ -78,7 +78,8 @@ impl Fixture {
             use std::os::windows::process::CommandExt;
             c.creation_flags(0x08000000);
         }
-        c.env_remove("HER_RUNTIME_ROOT").env_remove("HER_TEST_RESTORE_CONTROL");
+        c.env_remove("HER_RUNTIME_ROOT")
+            .env_remove("HER_TEST_RESTORE_CONTROL");
         c
     }
 
@@ -142,7 +143,10 @@ fn cli_preview_and_terminal_confirmation_leave_running_files_untouched() {
         .as_array()
         .unwrap()
         .contains(&json!("data/conversations.db")));
-    assert!(full["preview"]["replaces"].as_array().unwrap().contains(&json!("data/console-token")));
+    assert!(full["preview"]["replaces"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("data/console-token")));
     let output = f.command().output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("not confirmed"));
@@ -309,13 +313,17 @@ mod password_restore {
 
     fn password_cli(fixture: &Fixture, action: &str) -> Command {
         let mut cli = Fixture::cli();
-        cli.args(["console", action, "--runtime-root"]).arg(&fixture.0);
+        cli.args(["console", action, "--runtime-root"])
+            .arg(&fixture.0);
         cli
     }
 
     fn set_password(fixture: &Fixture, password: &str) {
         let mut child = password_cli(fixture, "set-password")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
         let mut input = child.stdin.take().unwrap();
         let wrote = write!(input, "fixture\n{password}\n{password}\n");
         drop(input);
@@ -325,15 +333,25 @@ mod password_restore {
     }
 
     fn reset_password(fixture: &Fixture) -> Output {
-        password_cli(fixture, "reset-password").stdin(Stdio::null()).output().unwrap()
+        password_cli(fixture, "reset-password")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
     }
 
     fn current_hash(fixture: &Fixture) -> Option<String> {
         rusqlite::Connection::open_with_flags(
-            fixture.0.join("data/settings.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ).unwrap().query_row(
-            "SELECT value FROM settings WHERE key='console.administratorPassword'", [], |row| row.get(0),
-        ).optional().unwrap()
+            fixture.0.join("data/settings.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT value FROM settings WHERE key='console.administratorPassword'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
     }
 
     struct RestoreChild(Child);
@@ -382,11 +400,19 @@ mod password_restore {
         );
         let stdout = String::from_utf8(preview.stdout).unwrap();
         let plan: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
-        let mut child = RestoreChild(f.command()
-            .env("HER_TEST_RESTORE_CONTROL", "stdio")
-            .args(["--confirm", plan["preview"]["confirmation"].as_str().unwrap()])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().unwrap());
+        let mut child = RestoreChild(
+            f.command()
+                .env("HER_TEST_RESTORE_CONTROL", "stdio")
+                .args([
+                    "--confirm",
+                    plan["preview"]["confirmation"].as_str().unwrap(),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let stdout = child.0.stdout.take().unwrap();
         let (ready, stages) = mpsc::channel();
         let drain = std::thread::spawn(move || {
@@ -402,7 +428,11 @@ mod password_restore {
                 let reset = reset_password(&f);
                 assert_eq!(reset.status.code(), Some(3),
                     "offline reset must refuse while full restore holds the snapshot and health boundary");
-                assert_eq!(&current_hash(&f), expected, "refused reset must leave the stored hash alone");
+                assert_eq!(
+                    &current_hash(&f),
+                    expected,
+                    "refused reset must leave the stored hash alone"
+                );
                 writeln!(child.0.stdin.as_mut().unwrap(), "continue").unwrap();
             }
         }));
@@ -416,7 +446,11 @@ mod password_restore {
         std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
         assert_eq!(status.code(), Some(1));
         assert!(stderr.contains("rolled back"), "{stderr}");
-        assert_eq!(current_hash(&f), previous, "rollback must reflect the credential at snapshot selection");
+        assert_eq!(
+            current_hash(&f),
+            previous,
+            "rollback must reflect the credential at snapshot selection"
+        );
         assert!(reset_password(&f).status.success());
         assert!(current_hash(&f).is_none());
     }
@@ -453,11 +487,16 @@ mod password_restore {
 
     impl PairWorker {
         fn spawn(mut command: Command) -> Self {
-            let mut child = RestoreChild(command
-                .env("HER_TEST_RESTORE_CONTROL", "stdio")
-                .env("HER_TEST_RESTORE_PAIR_STEPS", "1")
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-                .spawn().unwrap());
+            let mut child = RestoreChild(
+                command
+                    .env("HER_TEST_RESTORE_CONTROL", "stdio")
+                    .env("HER_TEST_RESTORE_PAIR_STEPS", "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
             let stdout = child.0.stdout.take().unwrap();
             let (ready, stages) = mpsc::channel();
             let drain = std::thread::spawn(move || {
@@ -467,11 +506,18 @@ mod password_restore {
                     }
                 }
             });
-            Self { child, stages, drain: Some(drain) }
+            Self {
+                child,
+                stages,
+                drain: Some(drain),
+            }
         }
 
         fn stage(&self, expected: &str) {
-            assert_eq!(self.stages.recv_timeout(Duration::from_secs(30)).unwrap(), expected);
+            assert_eq!(
+                self.stages.recv_timeout(Duration::from_secs(30)).unwrap(),
+                expected
+            );
         }
 
         fn proceed(&mut self) {
@@ -496,21 +542,36 @@ mod password_restore {
     fn begin_pair(f: &Fixture, healthy: bool, memory_only: bool) -> PairWorker {
         let mut preview = f.command();
         preview.arg("--preview");
-        if memory_only { preview.arg("--memory-only"); }
+        if memory_only {
+            preview.arg("--memory-only");
+        }
         let output = preview.output().unwrap();
-        assert!(output.status.success(), "restore preview: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "restore preview: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8(output.stdout).unwrap();
         let plan: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         let mut command = f.command();
-        command.args(["--confirm", plan["preview"]["confirmation"].as_str().unwrap()]);
-        if memory_only { command.arg("--memory-only"); }
-        if healthy { command.env("HER_TEST_RESTORE_HEALTH", "pass"); }
+        command.args([
+            "--confirm",
+            plan["preview"]["confirmation"].as_str().unwrap(),
+        ]);
+        if memory_only {
+            command.arg("--memory-only");
+        }
+        if healthy {
+            command.env("HER_TEST_RESTORE_HEALTH", "pass");
+        }
         PairWorker::spawn(command)
     }
 
     fn recover_pair(f: &Fixture) -> PairWorker {
         let mut command = Fixture::cli();
-        command.args(["backup", "restore", "--recover", "--runtime-root"]).arg(&f.0);
+        command
+            .args(["backup", "restore", "--recover", "--runtime-root"])
+            .arg(&f.0);
         PairWorker::spawn(command)
     }
 
@@ -523,15 +584,25 @@ mod password_restore {
     }
 
     fn place_running(f: &Fixture) {
-        let output = Fixture::cli().args(["lifecycle", "set", "running", "--runtime-root"]).arg(&f.0)
-            .stdout(Stdio::null()).output().unwrap();
-        assert!(output.status.success(), "begin fixture console: {}", String::from_utf8_lossy(&output.stderr));
+        let output = Fixture::cli()
+            .args(["lifecycle", "set", "running", "--runtime-root"])
+            .arg(&f.0)
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "begin fixture console: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     struct PairConsole(Child);
     impl Drop for PairConsole {
         fn drop(&mut self) {
-            if self.0.try_wait().ok().flatten().is_none() { let _ = self.0.kill(); }
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
             let _ = self.0.wait();
         }
     }
@@ -553,23 +624,45 @@ mod password_restore {
         let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = port.local_addr().unwrap().port();
         let mut cmd = Fixture::cli();
-        cmd.args(["--console-serve", "--console-port", &address.to_string(), "--runtime-root"]).arg(&f.0)
-            .stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.args([
+            "--console-serve",
+            "--console-port",
+            &address.to_string(),
+            "--runtime-root",
+        ])
+        .arg(&f.0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
         drop(port);
         let mut console = PairConsole(cmd.spawn().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if let Some((200, reply)) = pair_http(address, "GET", "/api/health", "") {
-                if reply["pid"] == console.0.id() { return (console, address); }
+                if reply["pid"] == console.0.id() {
+                    return (console, address);
+                }
             }
-            assert!(console.0.try_wait().unwrap().is_none(), "fixture console exited before health");
-            assert!(std::time::Instant::now() < deadline, "fixture console did not report liveness");
+            assert!(
+                console.0.try_wait().unwrap().is_none(),
+                "fixture console exited before health"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture console did not report liveness"
+            );
             std::thread::sleep(Duration::from_millis(40));
         }
     }
 
     fn native_pair_status(port: u16, token: &str) -> u16 {
-        pair_http(port, "GET", "/api/status", &format!("X-Console-Token: {token}\r\n")).unwrap().0
+        pair_http(
+            port,
+            "GET",
+            "/api/status",
+            &format!("X-Console-Token: {token}\r\n"),
+        )
+        .unwrap()
+        .0
     }
 
     #[test]
@@ -585,24 +678,53 @@ mod password_restore {
             worker.stage("snapshot");
             worker.proceed();
             worker.stage("forward-pair");
-            assert_eq!(protected_file(&f), if generated_archive { SAVED_GENERATED } else { ARCHIVED_CONFIGURED },
-                "forward restore publishes its corresponding token file");
+            assert_eq!(
+                protected_file(&f),
+                if generated_archive {
+                    SAVED_GENERATED
+                } else {
+                    ARCHIVED_CONFIGURED
+                },
+                "forward restore publishes its corresponding token file"
+            );
             worker.proceed();
             worker.stage("health");
-            assert_eq!(settings_config(&f)["consoleToken"], if generated_archive { "" } else { ARCHIVED_CONFIGURED });
+            assert_eq!(
+                settings_config(&f)["consoleToken"],
+                if generated_archive {
+                    ""
+                } else {
+                    ARCHIVED_CONFIGURED
+                }
+            );
             worker.proceed();
             if !healthy {
                 worker.stage("rollback-before-token");
                 worker.proceed();
                 worker.stage("rollback-pair");
-                assert_eq!(protected_file(&f), SAVED_GENERATED, "rollback republishes the destination generated token");
+                assert_eq!(
+                    protected_file(&f),
+                    SAVED_GENERATED,
+                    "rollback republishes the destination generated token"
+                );
                 worker.proceed();
             }
             assert_eq!(worker.wait(), healthy);
             let (_console, port) = start_pair_console(&f);
-            let live = if healthy && !generated_archive { ARCHIVED_CONFIGURED } else { SAVED_GENERATED };
+            let live = if healthy && !generated_archive {
+                ARCHIVED_CONFIGURED
+            } else {
+                SAVED_GENERATED
+            };
             assert_eq!(native_pair_status(port, live), 200);
-            assert_eq!(settings_config(&f)["consoleToken"], if healthy && !generated_archive { ARCHIVED_CONFIGURED } else { "" });
+            assert_eq!(
+                settings_config(&f)["consoleToken"],
+                if healthy && !generated_archive {
+                    ARCHIVED_CONFIGURED
+                } else {
+                    ""
+                }
+            );
         }
         let (f, before) = pair_fixture(false);
         let mut worker = begin_pair(&f, true, true);
@@ -628,7 +750,10 @@ mod password_restore {
         worker.stage("rollback-before-token");
         worker.cut();
         assert_eq!(protected_file(&f), ARCHIVED_CONFIGURED);
-        assert!(f.0.join("data/console-restore-recovery/destination-token").is_file());
+        assert!(f
+            .0
+            .join("data/console-restore-recovery/destination-token")
+            .is_file());
         let (closed, port) = start_pair_console(&f);
         assert_eq!(native_pair_status(port, ARCHIVED_CONFIGURED), 503);
         drop(closed);
@@ -639,12 +764,19 @@ mod password_restore {
         worker.stage("rollback-before-token");
         worker.proceed();
         worker.stage("rollback-pair");
-        assert_eq!(protected_file(&f), SAVED_GENERATED, "local recovery republishes the saved generated token");
+        assert_eq!(
+            protected_file(&f),
+            SAVED_GENERATED,
+            "local recovery republishes the saved generated token"
+        );
         worker.proceed();
         assert!(worker.wait());
         assert_eq!(settings_config(&f), before);
         assert!(!f.0.join("data/console-restore-recovery/intent").exists());
-        assert!(!f.0.join("data/console-restore-recovery/destination-token").exists());
+        assert!(!f
+            .0
+            .join("data/console-restore-recovery/destination-token")
+            .exists());
         let (_console, port) = start_pair_console(&f);
         assert_eq!(native_pair_status(port, SAVED_GENERATED), 200);
         assert_eq!(native_pair_status(port, ARCHIVED_CONFIGURED), 401);
@@ -665,7 +797,10 @@ mod password_restore {
         drop(closed);
         assert!(!recover_pair(&f).wait());
         assert_eq!(fs::read(dir.join("intent")).unwrap().as_slice(), b"{torn");
-        assert_eq!(fs::read(f.0.join("config/config.json")).unwrap().as_slice(), b"{torn");
+        assert_eq!(
+            fs::read(f.0.join("config/config.json")).unwrap().as_slice(),
+            b"{torn"
+        );
     }
 
     #[test]
@@ -697,10 +832,27 @@ mod password_restore {
             assert_eq!(health["ok"], false);
             assert_eq!(health["administratorReady"], false);
             assert_eq!(health["recoveryReason"], "full restore requires recovery");
-            assert_eq!(native_pair_status(port, SAVED_GENERATED), 503, "pending restore must close administrator routes");
-            assert_eq!(pair_http(port, "POST", "/api/desktop/sign-in", "Content-Type: application/json\r\n").unwrap().0, 503);
+            assert_eq!(
+                native_pair_status(port, SAVED_GENERATED),
+                503,
+                "pending restore must close administrator routes"
+            );
+            assert_eq!(
+                pair_http(
+                    port,
+                    "POST",
+                    "/api/desktop/sign-in",
+                    "Content-Type: application/json\r\n"
+                )
+                .unwrap()
+                .0,
+                503
+            );
             let cookie = format!("Cookie: her_browser_{port}_fixture=fixture\r\n");
-            assert_eq!(pair_http(port, "GET", "/api/status", &cookie).unwrap().0, 503);
+            assert_eq!(
+                pair_http(port, "GET", "/api/status", &cookie).unwrap().0,
+                503
+            );
             assert_eq!(fs::read(&audit_path).unwrap(), audit);
             assert_eq!(fs::read(&config_path).unwrap(), interrupted);
             assert_eq!(fs::read(&intent_path).unwrap(), intent);
@@ -711,10 +863,13 @@ mod password_restore {
             worker.stage("rollback-pair");
             worker.proceed();
             assert!(worker.wait());
-            assert_eq!(settings_config(&f), before, "recovery must restore the complete staged configuration");
+            assert_eq!(
+                settings_config(&f),
+                before,
+                "recovery must restore the complete staged configuration"
+            );
             let (_console, port) = start_pair_console(&f);
             assert_eq!(native_pair_status(port, SAVED_GENERATED), 200);
         }
     }
-
 }

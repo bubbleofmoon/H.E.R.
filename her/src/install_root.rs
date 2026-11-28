@@ -35,9 +35,17 @@ impl InstallRoot {
             // default; explicit selections and every other command retain their boundary.
             if let Ok(image) = std::env::current_exe().and_then(std::fs::canonicalize) {
                 if let Some(releases) = image.parent().and_then(Path::parent) {
-                    if releases.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("releases")) {
-                        if let Some(candidate) = releases.parent().and_then(|path| Self::new(path).ok()) {
-                            if candidate.require_release_image(&image).is_ok() { return Ok(candidate); }
+                    if releases
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("releases"))
+                    {
+                        if let Some(candidate) =
+                            releases.parent().and_then(|path| Self::new(path).ok())
+                        {
+                            if candidate.require_release_image(&image).is_ok() {
+                                return Ok(candidate);
+                            }
                         }
                     }
                 }
@@ -244,7 +252,7 @@ fn comparison_path(path: &Path) -> Result<PathBuf, String> {
         } else {
             text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
         };
-        return Ok(PathBuf::from(text.to_lowercase()));
+        Ok(PathBuf::from(text.to_lowercase()))
     }
     #[cfg(not(windows))]
     Ok(PathBuf::from(text))

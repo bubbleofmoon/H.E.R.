@@ -868,14 +868,10 @@ impl Pipeline {
         //   turn   模型真正干活到回合结束（含工具调用）
         // 不加这个就只能猜，而"猜"今天已经错过好几次了。
         let t0 = std::time::Instant::now();
-        let mut seg_cli: i64 = 0;
-        let mut seg_sess: i64 = 0;
-        let mut seg_model: i64 = 0;
         let mut seg_open: i64 = 0;
-        let mut seg_accept: i64 = 0;
+        let seg_accept: i64 = 0;
         let mut seg_turn: i64 = 0;
         let mut attempts: usize = 0;
-        let mut used_model: Option<String> = None;
         let mut prompt_chars = prompt.chars().count();
         // 会话级**后端**覆盖：`backends.sessions["group:xxx"] = "opencode-free"` 时，
         // 这个会话直接走 CLI 后端，不经过 DSH。
@@ -941,11 +937,11 @@ impl Pipeline {
             return Err(error.into());
         }
         // 按会话取候选链：这个群配了独立模型就用它的，否则回落全局。
-        seg_cli = t0.elapsed().as_millis() as i64;
+        let seg_cli = t0.elapsed().as_millis() as i64;
         let chain = failover::model_chain_for(cfg, key);
         let mut sid = self.ensure_session(key)?;
         self.note_session(&sid);
-        seg_sess = t0.elapsed().as_millis() as i64 - seg_cli;
+        let seg_sess = t0.elapsed().as_millis() as i64 - seg_cli;
         let mut prompt_text = prompt.to_string();
         // The memories the text in `prompt_text` carries as recall, counted when a submission of it is accepted.
         let mut delivered_recall = self.compat_recall.clone();
@@ -994,14 +990,14 @@ impl Pipeline {
             },
         };
         self.prepare_title();
-        seg_model = t0.elapsed().as_millis() as i64 - seg_cli - seg_sess;
+        let seg_model = t0.elapsed().as_millis() as i64 - seg_cli - seg_sess;
 
         loop {
             attempts += 1;
             // A model error noted by an earlier attempt belongs to that attempt: this attempt's own outcome decides what the
             // caller is told, so a stale note can never hide a different failure.
             take_model_error(&self.context, key);
-            used_model = Some(format!("{}/{}", chain[idx].provider, chain[idx].model));
+            let used_model = Some(format!("{}/{}", chain[idx].provider, chain[idx].model));
             self.active_candidate = Some(chain[idx].clone());
             // WS 握手也要有超时：`FollowStream::open` 里没有超时，
             // DSH 换密钥/重启的那一瞬间握手会一直挂着 —— 外面套的兜底超时也救不了，
@@ -1407,7 +1403,7 @@ impl Pipeline {
             let (code, detail) = match &model_failure {
                 Some((code, detail, _)) => (
                     crate::activity::redact(&self.context, code),
-                    crate::activity::redacted_preview(&self.context, &detail, 200),
+                    crate::activity::redacted_preview(&self.context, detail, 200),
                 ),
                 None => ("prompt-refused".to_string(), crate::activity::redacted_preview(&self.context, &why, 200)),
             };
@@ -1537,7 +1533,7 @@ impl Pipeline {
             .next_turn(std::time::Duration::from_secs(timeout_secs))
             .await;
         // turn/end 之后 usage 已收集完：先落账，再关流。
-        self.record_turn_usage(&key, &sid, &follow, None, None);
+        self.record_turn_usage(key, &sid, &follow, None, None);
         follow.close().await;
         reply
     }
@@ -1620,7 +1616,7 @@ impl Pipeline {
     pub async fn handle(&mut self, target: &Target, prompt: &str) -> Result<Option<String>, String> {
         let key = target.key();
         let key: &str = &key;
-        let reply = self.ask(&key, prompt, 180).await?;
+        let reply = self.ask(key, prompt, 180).await?;
         let trimmed = reply.trim().to_string();
         if trimmed.is_empty() {
             return Err("agent 返回了空回复".to_string());

@@ -83,10 +83,12 @@ impl Health {
         self.ready == Some(false)
     }
 
+    #[cfg(test)]
     pub fn ready(&self) -> Option<bool> {
         self.ready
     }
 
+    #[cfg(test)]
     pub fn failures(&self) -> u32 {
         self.failures
     }
@@ -129,14 +131,12 @@ impl<T> BoundedQueue<T> {
     pub fn pop_front(&mut self) -> Option<T> {
         self.items.pop_front()
     }
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.items.len()
     }
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
-    }
-    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
-        self.items.retain(keep);
     }
 }
 
@@ -158,11 +158,6 @@ pub fn dsh_base(context: &RuntimeContext) -> Option<String> {
 
 pub fn is_down(context: &RuntimeContext) -> bool {
     registry().lock().unwrap_or_else(|p| p.into_inner()).get(&scope_of(context)).is_some_and(Health::is_down)
-}
-
-/// The last observed state: `Some(true)` ready, `Some(false)` down, `None` not observed yet.
-pub fn ready(context: &RuntimeContext) -> Option<bool> {
-    registry().lock().unwrap_or_else(|p| p.into_inner()).get(&scope_of(context)).and_then(Health::ready)
 }
 
 /// Feed an observation into the runtime's health and act on the edge: run-record entry, one recovery alert.

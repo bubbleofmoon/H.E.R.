@@ -1,12 +1,12 @@
 //! Supervisor spec seam 1: paired binaries and a loopback release source.
 use support::install_root;
-mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
 #[path = "support/release_signing.rs"]
 mod release_signing;
 #[path = "support/release_signature_tests.rs"]
 mod signed_lists;
+mod support;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -108,14 +108,20 @@ impl Fixture {
         let count = requests.clone();
         let mut replies = HashMap::new();
         let mut assets = Vec::new();
-        let mut sums = format!("# HER-RELEASE v1.2.3 1\n{}", release_signing::keys("primary"));
+        let mut sums = format!(
+            "# HER-RELEASE v1.2.3 1\n{}",
+            release_signing::keys("primary")
+        );
         for name in ["her.exe", "her-cli.exe", "herupdate.exe"] {
             let body = format!("synthetic {name}").into_bytes();
             sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&body)));
             replies.insert(format!("/{name}"), body);
             assets.push(json!({"name":name,"browser_download_url":format!("{url}/{name}")}));
         }
-        replies.insert("/SHA256SUMS.minisig".into(), release_signing::sign(sums.as_bytes(), "primary"));
+        replies.insert(
+            "/SHA256SUMS.minisig".into(),
+            release_signing::sign(sums.as_bytes(), "primary"),
+        );
         replies.insert("/SHA256SUMS".into(), sums.into_bytes());
         assets
             .push(json!({"name":"SHA256SUMS","browser_download_url":format!("{url}/SHA256SUMS")}));
@@ -180,11 +186,15 @@ impl Fixture {
                 let attempt = path_counts.entry(path.to_string()).or_default();
                 *attempt += 1;
                 let replies = responses.lock().unwrap();
-                let body = replies.get(&format!("{path}#{attempt}"))
-                    .or_else(|| replies.get(path)).cloned();
+                let body = replies
+                    .get(&format!("{path}#{attempt}"))
+                    .or_else(|| replies.get(path))
+                    .cloned();
                 let status = if body.is_none() && path == "/SHA256SUMS.minisig" {
                     "404 Not Found"
-                } else { "200 OK" };
+                } else {
+                    "200 OK"
+                };
                 let body = body.unwrap_or_else(|| b"{}".to_vec());
                 drop(replies);
                 let _ = write!(
@@ -228,11 +238,21 @@ impl Fixture {
     }
     fn sign_directory(&self, tag: &str, generation: u64, key: &str) {
         let dir = self.root.join("install/releases").join(tag);
-        let mut sums = format!("# HER-RELEASE {tag} {generation}\n{}", release_signing::keys("primary"));
+        let mut sums = format!(
+            "# HER-RELEASE {tag} {generation}\n{}",
+            release_signing::keys("primary")
+        );
         for name in ["her.exe", "her-cli.exe", "herupdate.exe"] {
-            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(fs::read(dir.join(name)).unwrap())));
+            sums.push_str(&format!(
+                "{:x}  {name}\n",
+                Sha256::digest(fs::read(dir.join(name)).unwrap())
+            ));
         }
-        fs::write(dir.join("SHA256SUMS.minisig"), release_signing::sign(sums.as_bytes(), key)).unwrap();
+        fs::write(
+            dir.join("SHA256SUMS.minisig"),
+            release_signing::sign(sums.as_bytes(), key),
+        )
+        .unwrap();
         fs::write(dir.join("SHA256SUMS"), sums).unwrap();
     }
     fn select_current(&self, tag: &str) {
@@ -244,7 +264,9 @@ impl Fixture {
         create_junction(&next, &root.join("releases").join(tag));
         let current = root.join("current");
         #[cfg(windows)]
-        if current.exists() { fs::remove_dir(&current).unwrap(); }
+        if current.exists() {
+            fs::remove_dir(&current).unwrap();
+        }
         fs::rename(next, current).unwrap();
     }
     fn set_feed(&self, value: Value) {
@@ -365,7 +387,11 @@ fn handover_fixture_generation(trial: bool, healthy: bool, generation: u64) -> (
     {
         let mut replies = f.replies.lock().unwrap();
         let sums = String::from_utf8(replies["/SHA256SUMS"].clone()).unwrap();
-        replies.insert("/SHA256SUMS".into(), sums.replace("v1.2.3 1", &format!("v1.2.3 {generation}")).into_bytes());
+        replies.insert(
+            "/SHA256SUMS".into(),
+            sums.replace("v1.2.3 1", &format!("v1.2.3 {generation}"))
+                .into_bytes(),
+        );
     }
     f.sign("primary");
     assert!(f.run("install").status.success());
@@ -706,7 +732,9 @@ fn handover_success_prunes_automatically_with_new_current_protected() {
 fn unsigned_release_is_refused_before_any_image_download_or_staging() {
     let f = Fixture::new();
     let mut feed = f.feed();
-    feed[0]["assets"].as_array_mut().unwrap()
+    feed[0]["assets"]
+        .as_array_mut()
+        .unwrap()
         .retain(|asset| asset["name"] != "SHA256SUMS.minisig");
     f.set_feed(feed);
     f.replies.lock().unwrap().remove("/SHA256SUMS.minisig");
@@ -720,7 +748,11 @@ fn unsigned_release_is_refused_before_any_image_download_or_staging() {
     assert!(!f.root.join("install/releases/v1.2.3").exists());
     assert!(fs::read_dir(f.root.join("install/releases"))
         .unwrap()
-        .all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".staging-")));
+        .all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".staging-")));
 }
 
 #[test]
@@ -787,10 +819,14 @@ fn verified_release_installs_beside_old_images_and_failures_publish_nothing() {
                     .insert("/her-cli.exe".into(), b"tampered".to_vec());
             }
             "malformed sums" => {
-                f.replies
-                    .lock()
-                    .unwrap()
-                    .insert("/SHA256SUMS".into(), format!("# HER-RELEASE v1.2.3 1\n{}not a checksum file", release_signing::keys("primary")).into_bytes());
+                f.replies.lock().unwrap().insert(
+                    "/SHA256SUMS".into(),
+                    format!(
+                        "# HER-RELEASE v1.2.3 1\n{}not a checksum file",
+                        release_signing::keys("primary")
+                    )
+                    .into_bytes(),
+                );
             }
             "missing checksum" => {
                 let mut replies = f.replies.lock().unwrap();
@@ -821,7 +857,13 @@ fn verified_release_installs_beside_old_images_and_failures_publish_nothing() {
             assert!(out.status.success(), "{out:?}");
             let value: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(value["installed"]["tag"], "v1.2.3");
-            for name in ["her.exe", "her-cli.exe", "herupdate.exe", "SHA256SUMS", "SHA256SUMS.minisig"] {
+            for name in [
+                "her.exe",
+                "her-cli.exe",
+                "herupdate.exe",
+                "SHA256SUMS",
+                "SHA256SUMS.minisig",
+            ] {
                 assert_eq!(
                     fs::read(target.join(name)).unwrap(),
                     f.replies.lock().unwrap()[&format!("/{name}")]
@@ -988,7 +1030,11 @@ fn http(
         ""
     };
     let agent = if agent { "x-agent-call: true\r\n" } else { "" };
-    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") { "her.localhost" } else { "127.0.0.1" };
+    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") {
+        "her.localhost"
+    } else {
+        "127.0.0.1"
+    };
     write!(socket,"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n{token}{agent}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes).unwrap();
@@ -1063,7 +1109,10 @@ fn console_policy_defaults_to_notify_and_only_administrators_can_save_it() {
     assert!(root_page.1.to_ascii_lowercase().contains("<!doctype html>"));
     let schedule_page = http(port, "GET", "/schedule", "", true, false);
     assert_eq!(schedule_page.0, 200);
-    assert!(schedule_page.1.to_ascii_lowercase().contains("<!doctype html>"));
+    assert!(schedule_page
+        .1
+        .to_ascii_lowercase()
+        .contains("<!doctype html>"));
 }
 #[cfg(feature = "parity-clock")]
 #[test]
@@ -1123,7 +1172,10 @@ fn supervisor_checks_every_six_hours_and_notifies_once_across_restarts() {
     {
         let mut replies = f.replies.lock().unwrap();
         let sums = String::from_utf8(replies["/SHA256SUMS"].clone()).unwrap();
-        replies.insert("/SHA256SUMS".into(), sums.replace("v1.2.3 1", "v1.2.4 1").into_bytes());
+        replies.insert(
+            "/SHA256SUMS".into(),
+            sums.replace("v1.2.3 1", "v1.2.4 1").into_bytes(),
+        );
     }
     f.sign("primary");
     let mut next = f.supervisor(start + 18 * 60 * 60 * 1000 + 90_000);
@@ -1504,8 +1556,15 @@ fn handover_executable_release(f: &Fixture) -> PathBuf {
             )
         })
         .collect::<String>();
-    let sums = format!("# HER-RELEASE v1.2.3 1\n{}{sums}", release_signing::keys("primary"));
-    fs::write(target.join("SHA256SUMS.minisig"), release_signing::sign(sums.as_bytes(), "primary")).unwrap();
+    let sums = format!(
+        "# HER-RELEASE v1.2.3 1\n{}{sums}",
+        release_signing::keys("primary")
+    );
+    fs::write(
+        target.join("SHA256SUMS.minisig"),
+        release_signing::sign(sums.as_bytes(), "primary"),
+    )
+    .unwrap();
     fs::write(target.join("SHA256SUMS"), sums).unwrap();
     target
 }

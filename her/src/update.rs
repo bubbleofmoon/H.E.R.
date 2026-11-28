@@ -52,12 +52,14 @@ fn verify_images(root: &InstallRoot, tag: &str, sums: &[u8]) -> Result<Vec<u8>, 
 pub(crate) struct Authority {
     pub current: Option<String>,
     identity: crate::release_signature::Identity,
+    #[allow(dead_code)] // Used by the her/her-cli binaries.
     pub stamp: String,
     checksum: Vec<u8>,
     /// Selected current whose own metadata no longer verifies (authority was recovered).
     pub lost: Option<String>,
 }
 /// Reason recorded once when another installed release supplies current's authority.
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub(crate) const LOST_CURRENT: &str =
     "current release metadata unverifiable; using verified installed authority";
 /// Read-only: callers on read paths never alert. Admission uses `admitted_authority`.
@@ -75,6 +77,7 @@ pub(crate) fn authority(root: &InstallRoot) -> Result<Authority, String> {
 /// Check/install admission records a refusal or recovered authority as one alert.
 /// `restore_gate` is the update-restore gate when the caller already holds it;
 /// `lost_alerted` is the lost current already alerted (`None` alerts it again).
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub(crate) fn admitted_authority(
     root: &InstallRoot,
     restore_gate: Option<&fs::File>,
@@ -86,6 +89,7 @@ pub(crate) fn admitted_authority(
 }
 /// Admission alerts never replace an undelivered alert or a rollback in progress.
 /// A lost current alerts once per `lost_alerted` memory; a refusal on every admission.
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub(crate) fn admission_alert(
     root: &InstallRoot,
     authority: &Result<Authority, String>,
@@ -128,11 +132,13 @@ fn restore_gate_path(root: &InstallRoot) -> PathBuf {
 }
 /// A rollback holds the update-restore gate throughout, so a `pending` alert is still in
 /// progress only while someone else holds that gate; otherwise its helper died and it is stale.
+#[allow(dead_code)] // Used by admission_alert in her/her-cli.
 fn rollback_active(root: &InstallRoot, restore_gate: Option<&fs::File>) -> bool {
     restore_gate.is_none() && release_store::installation_gate(&restore_gate_path(root)).is_err()
 }
 /// Only contention on the update-restore gate means a rollback may still be running; any other
 /// gate failure leaves an alert deliverable, so a broken lock path cannot suppress delivery.
+#[allow(dead_code)] // Used by claim_alert in her/her-cli.
 fn restore_gate_contended(root: &InstallRoot) -> bool {
     release_store::gate_contended(&restore_gate_path(root))
 }
@@ -145,7 +151,7 @@ fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
         .filter_map(|name| link_tag(root, name).ok().flatten())
         .filter_map(|tag| Some((release_store::version(&tag)?, tag)))
         .collect::<Vec<_>>();
-    recorded.sort_by(|a, b| b.0.cmp(&a.0));
+    recorded.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, tag) in recorded {
         if let Ok(authority) = installed_authority(root, &tag) {
             return Ok(authority);
@@ -188,7 +194,7 @@ fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
             }
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, tag) in candidates {
         if let Ok(authority) = installed_authority(root, &tag) {
             return Ok(authority);
@@ -307,6 +313,7 @@ pub(crate) fn verify_rollback(root: &InstallRoot, tag: &str) -> Result<Vec<u8>, 
 /// Crash recovery restores and publishes the helper of an independently verified
 /// last-good only, never the failed release (whose own CLI may still retire its
 /// owners while it verifies, see `retirement_release`).
+#[allow(dead_code)] // Used by the herupdate binary.
 pub(crate) fn recovery_release(
     root: &InstallRoot,
     failed: &str,
@@ -330,6 +337,7 @@ fn recovery_helper(
 }
 /// A failed release retires its owners through its own CLI only while its installed
 /// metadata and images still verify; otherwise through the already verified last-good.
+#[allow(dead_code)] // Used by the herupdate binary.
 pub(crate) fn retirement_release(
     root: &InstallRoot,
     failed: &str,
@@ -341,6 +349,7 @@ pub(crate) fn retirement_release(
         verified_last_good.into()
     }
 }
+#[allow(dead_code)] // Used by the herupdate binary.
 pub(crate) fn verify_handover(root: &InstallRoot, tag: &str, current: &str) -> Result<(), String> {
     verify_candidate(root, tag, &installed_authority(root, current)?).map(drop)
 }
@@ -475,7 +484,8 @@ pub(crate) fn probe_held_owner_identity(
     lock_path: &Path,
     expected_role: &str,
 ) -> Option<ProcessIdentity> {
-    let lock = crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
+    let lock =
+        crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
     match lock.try_lock() {
         Err(fs::TryLockError::WouldBlock) => {}
         _ => return None,
@@ -484,7 +494,8 @@ pub(crate) fn probe_held_owner_identity(
     let mut marker_os = lock_path.as_os_str().to_os_string();
     marker_os.push(".owner.json");
     let marker_path = PathBuf::from(marker_os);
-    let bytes = crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
+    let bytes =
+        crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
     let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     if marker["v"].as_u64() != Some(1) || marker["role"].as_str() != Some(expected_role) {
         return None;
@@ -494,6 +505,7 @@ pub(crate) fn probe_held_owner_identity(
 
 /// Publish the verified helper outside releases and run it hidden. The helper
 /// judges the trial before it retires the existing supervisor.
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub fn launch(root: &InstallRoot, target: &str, old: &ProcessIdentity) -> Result<u32, String> {
     launch_mode(root, target, old, false, false)
 }
@@ -507,6 +519,7 @@ pub fn launch_with_gate(
 ) -> Result<u32, String> {
     launch_mode_with_gate(root, target, old, false, automatic, gate)
 }
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub fn launch_recovery(
     root: &InstallRoot,
     target: &str,
@@ -514,6 +527,7 @@ pub fn launch_recovery(
 ) -> Result<u32, String> {
     launch_mode(root, target, old, true, false)
 }
+#[allow(dead_code)] // Used by launch/launch_recovery in her/her-cli.
 fn launch_mode(
     root: &InstallRoot,
     target: &str,
@@ -682,6 +696,7 @@ pub fn save_alert(root: &InstallRoot, alert: &UpdateAlert) -> Result<(), String>
     store_alert(root, alert)
 }
 /// Finish only this rollback, preserving supervisor delivery claims/completion.
+#[allow(dead_code)] // Used by the herupdate binary.
 pub fn finish_rollback(root: &InstallRoot, id: &str, status: &str) -> Result<(), String> {
     let _gate = alert_gate(root)?;
     let mut alert = read_alert(root)?
@@ -697,6 +712,7 @@ pub fn finish_rollback(root: &InstallRoot, id: &str, status: &str) -> Result<(),
 /// by a supervisor that cannot rule that out: its send would be cut off and its claim would hold
 /// the retry spacing against the restored supervisor. Deferring writes nothing. With the gate free
 /// a `pending` alert is stale and every release may claim it.
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub fn claim_alert(
     root: &InstallRoot,
     now: i64,
@@ -719,6 +735,7 @@ pub fn claim_alert(
     store_alert(root, &alert)?;
     Ok(Some(alert))
 }
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub fn complete_alert(root: &InstallRoot, id: &str) -> Result<(), String> {
     let _gate = alert_gate(root)?;
     if let Some(mut alert) = read_alert(root)?.filter(|alert| alert.id == id) {
@@ -768,6 +785,7 @@ fn save_starts(root: &InstallRoot, starts: &Starts) -> Result<(), String> {
 fn within_window(at: i64, now: i64) -> bool {
     at <= now && now.saturating_sub(at) <= 600_000
 }
+#[allow(dead_code)] // Used by the her/her-cli binaries.
 pub fn record_start(root: &InstallRoot, tag: &str, now: i64) -> Result<usize, String> {
     release_store::version(tag).ok_or("invalid start-history release")?;
     let _gate = starts_gate(root)?;

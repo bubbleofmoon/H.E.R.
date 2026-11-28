@@ -1,9 +1,9 @@
 //! Seam 1: pinned dependency versions through the real supervisor/CLI, disposable fake
 //! dependency programs and a loopback fake npm registry. No real npm registry or DSH is contacted.
 use support::install_root;
-mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
+mod support;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -754,8 +754,7 @@ fn supervisor_refuses_a_dsh_pin_without_contract_coverage() {
     });
     let states = fixture.states();
     assert_eq!(
-        states["dsh"]["reason"],
-        "DSH version 0.3.0 has no credential contract coverage",
+        states["dsh"]["reason"], "DSH version 0.3.0 has no credential contract coverage",
         "the supervisor must refuse a DSH pin without contract coverage: {states}"
     );
     assert!(fixture.dsh_records().is_empty());

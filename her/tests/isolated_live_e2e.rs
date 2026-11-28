@@ -1,9 +1,9 @@
 #![cfg_attr(not(windows), allow(dead_code))] // helpers of the Windows-only CLI test
-use support::install_root;
 use support::hide_window as hide_process_window;
-mod support;
+use support::install_root;
 #[path = "fixtures/model_copy.rs"]
 mod model_copy;
+mod support;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -178,15 +178,22 @@ fn serve_model(listener: TcpListener, stop: Arc<AtomicBool>) -> Result<HttpObser
     let mut first = None;
     // Keep serving until candidate shutdown, including an already queued wake reminder.
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-        let mut stream = match accept_with_deadline(&listener, Instant::now() + Duration::from_millis(100)) {
-            Ok(stream) => stream,
-            Err(error) if error.contains("timed out") => continue,
-            Err(error) => return Err(error),
-        };
+        let mut stream =
+            match accept_with_deadline(&listener, Instant::now() + Duration::from_millis(100)) {
+                Ok(stream) => stream,
+                Err(error) if error.contains("timed out") => continue,
+                Err(error) => return Err(error),
+            };
         let (request_line, headers, raw_body) = read_http_request(&mut stream)?;
         let body = response_text(&raw_body)?;
         send_http_json(&mut stream, "200 OK", &json!({"text": MODEL_REPLY}))?;
-        if first.is_none() { first = Some(HttpObservation { request_line, headers, body }); }
+        if first.is_none() {
+            first = Some(HttpObservation {
+                request_line,
+                headers,
+                body,
+            });
+        }
     }
     first.ok_or_else(|| "timed out waiting for fake model request".into())
 }
@@ -200,8 +207,7 @@ fn serve_onebot(
     // The console refreshes its catalog during startup; serve it before the live/model fakes
     // begin their own deadlines, then remain available through the complete CLI turn.
     let deadline = Instant::now() + CONSOLE_START_TIMEOUT + FAKE_TURN_TIMEOUT;
-    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline
-    {
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         let mut stream =
             match accept_with_deadline(&listener, Instant::now() + Duration::from_millis(250)) {
                 Ok(stream) => stream,
@@ -260,41 +266,70 @@ fn serve_dsh_connection(
     // Independent sockets: an idle connection or a monitor waiting to send its open
     // frame must not block HTTP readiness requests on another connection.
     stream.set_nonblocking(false).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|e| e.to_string())?;
     let mut first = [0u8; 1];
     loop {
-        if stop.load(Ordering::SeqCst) { return Ok(()); }
-        if Instant::now() >= deadline { return Err("fake DSH initial byte deadline".into()); }
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("fake DSH initial byte deadline".into());
+        }
         match stream.peek(&mut first) {
             Ok(0) => return Ok(()),
             Ok(_) => break,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {},
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(format!("fake DSH initial peek: {e}")),
         }
     }
-    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
     if first[0] == b'G' {
         let mut path = String::new();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio_tungstenite::tungstenite::accept_hdr(
             stream,
             |request: &Request, response: Response| {
                 path = request.uri().path().to_string();
                 Ok(response)
             },
-        ).map_err(|e| format!("fake DSH websocket handshake: {e}"))?;
-        socket.get_mut().set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| format!("fake DSH websocket handshake: {e}"))?;
+        socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| e.to_string())?;
         let frame = loop {
-            if stop.load(Ordering::SeqCst) { return Ok(()); }
-            if Instant::now() >= deadline { return Err("fake DSH open frame deadline".into()); }
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("fake DSH open frame deadline".into());
+            }
             match socket.read() {
                 Ok(frame) => break frame,
                 Err(tokio_tungstenite::tungstenite::Error::Io(e))
-                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {},
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
                 Err(e) => return Err(format!("fake DSH websocket open frame: {e}")),
             }
         };
-        let open: Value = serde_json::from_str(frame.to_text().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        requests.lock().unwrap().push(format!("GET {path} stream:{}", open["endpoint"].as_str().unwrap_or("<missing>")));
+        let open: Value = serde_json::from_str(frame.to_text().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        requests.lock().unwrap().push(format!(
+            "GET {path} stream:{}",
+            open["endpoint"].as_str().unwrap_or("<missing>")
+        ));
         let _ = socket.close(None);
     } else {
         let (line, _, _) = read_http_request(&mut stream)?;
@@ -319,7 +354,9 @@ fn serve_dsh_probe(
         match listener.accept() {
             Ok((stream, _)) => {
                 let (stop, requests) = (stop.clone(), requests.clone());
-                workers.push(thread::spawn(move || serve_dsh_connection(stream, stop, requests, deadline)));
+                workers.push(thread::spawn(move || {
+                    serve_dsh_connection(stream, stop, requests, deadline)
+                }));
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -334,8 +371,13 @@ fn serve_dsh_probe(
         }
     }
     for worker in workers {
-        let finished = worker.join().map_err(|_| "fake DSH connection worker panicked".to_string()).and_then(|r| r);
-        if result.is_ok() { result = finished; }
+        let finished = worker
+            .join()
+            .map_err(|_| "fake DSH connection worker panicked".to_string())
+            .and_then(|r| r);
+        if result.is_ok() {
+            result = finished;
+        }
     }
     result
 }
@@ -443,6 +485,8 @@ fn serve_ws(
             .map_err(|error| format!("accept live candidate WS connection: {error}"))?;
         let auth_slot = Arc::new(Mutex::new(None::<String>));
         let callback_auth = auth_slot.clone();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio::time::timeout(
             Duration::from_secs(5),
             accept_hdr_async(socket, move |request: &Request, response: Response| {
@@ -588,13 +632,12 @@ fn selected_runtime_fixture(root: &Path, dependencies: &Value) {
     fs::write(root.join("dependencies.json"), dependencies.to_string())
         .expect("write selected loopback dependencies");
 
-    let model_script = format!(
-        r#"
+    let model_script = r#"
 $ErrorActionPreference = 'Stop'
 # .NET Framework file APIs need the ordinary form of the canonical Rust path.
 $fixtureRoot = $env:HER_RUNTIME_ROOT
-if ($fixtureRoot.StartsWith('\\?\UNC\')) {{ $fixtureRoot = '\\' + $fixtureRoot.Substring(8) }}
-elseif ($fixtureRoot.StartsWith('\\?\')) {{ $fixtureRoot = $fixtureRoot.Substring(4) }}
+if ($fixtureRoot.StartsWith('\\?\UNC\')) { $fixtureRoot = '\\' + $fixtureRoot.Substring(8) }
+elseif ($fixtureRoot.StartsWith('\\?\')) { $fixtureRoot = $fixtureRoot.Substring(4) }
 $fixtureLog = [IO.Path]::Combine($fixtureRoot, 'data', 'logs', 'model-fixture.log')
 [IO.File]::WriteAllText($fixtureLog, "started`n")
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -608,7 +651,7 @@ $stdin.Dispose()
 $PSModuleAutoLoadingPreference = 'None'
 Import-Module ([IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1'))
 [IO.File]::AppendAllText($fixtureLog, "utility-imported`n")
-$probe = @{{
+$probe = @{
   prompt = $prompt
   modelBase = $env:ANTHROPIC_BASE_URL
   apiKey = $env:OPENCODE_GO_API_KEY
@@ -628,7 +671,7 @@ $probe = @{{
   runtimeRoot = $env:HER_RUNTIME_ROOT
   cwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path
   ambientSentinel = [Environment]::GetEnvironmentVariable('TICKET04_AMBIENT_SENTINEL')
-}}
+}
 $endpoint = ($env:ANTHROPIC_BASE_URL).TrimEnd('/') + '/ticket04/generate'
 $request = [Net.HttpWebRequest]::Create($endpoint)
 $request.Proxy = $null
@@ -651,23 +694,15 @@ $reader.Close()
 $response.Close()
 [Console]::Out.Write([string]$result.text)
 [IO.File]::AppendAllText($fixtureLog, "completed`n")
-"#
-    );
+"#;
     fs::write(root.join("resources/model-fixture.ps1"), model_script)
         .expect("write selected model CLI fixture");
 }
 
-fn spawn_candidate(root: &Path, console_port: u16) -> Child {
-    let ambient = crate::install_root::development_root(std::env::temp_dir().join(format!(
-        "ticket04 ambient profile sentinel {}",
-        std::process::id()
-    )));
-    spawn_candidate_with_ambient(root, console_port, &ambient)
-}
-
 fn spawn_candidate_with_ambient(root: &Path, console_port: u16, ambient: &Path) -> Child {
     candidate_command(root, console_port, ambient)
-        .spawn().expect("spawn selected-root live candidate")
+        .spawn()
+        .expect("spawn selected-root live candidate")
 }
 
 fn candidate_command(root: &Path, console_port: u16, ambient: &Path) -> Command {
@@ -711,17 +746,18 @@ struct CompanionConsole(Child);
 
 impl CompanionConsole {
     fn start(root: &Path, ambient: &Path, epoch: i64) -> (Self, u16) {
-        let (child, console_port) = crate::support::ports::start_console(CONSOLE_START_TIMEOUT, |port| {
-            let mut command = runtime_command(root, ambient);
-            command
-                .args(["--console-serve", "--console-port", &port.to_string()])
-                .env("HER_PARITY_EPOCH_MS", epoch.to_string())
-                .stdout(fs::File::create(root.join("data/logs/console-out.log")).unwrap())
-                .stderr(fs::File::create(root.join("data/logs/console-err.log")).unwrap());
-            command
-                .spawn()
-                .expect("spawn selected-root companion console")
-        });
+        let (child, console_port) =
+            crate::support::ports::start_console(CONSOLE_START_TIMEOUT, |port| {
+                let mut command = runtime_command(root, ambient);
+                command
+                    .args(["--console-serve", "--console-port", &port.to_string()])
+                    .env("HER_PARITY_EPOCH_MS", epoch.to_string())
+                    .stdout(fs::File::create(root.join("data/logs/console-out.log")).unwrap())
+                    .stderr(fs::File::create(root.join("data/logs/console-err.log")).unwrap());
+                command
+                    .spawn()
+                    .expect("spawn selected-root companion console")
+            });
         let console = Self(child);
         let deadline = Instant::now() + CONSOLE_START_TIMEOUT;
         loop {
@@ -935,7 +971,10 @@ fn wait_candidate_with_ws_probe(
 
 fn assert_selected_gate_released(root: &Path) {
     let gate_path = root.join("data/logs/rbridge-live.lock");
-    assert!(gate_path.is_file(), "selected-root gate file should persist");
+    assert!(
+        gate_path.is_file(),
+        "selected-root gate file should persist"
+    );
     let gate = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -985,23 +1024,37 @@ fn run_isolated_preflight_failure(
     }
     let sessions_before = fs::read(&session_path).expect("read selected session sentinel");
 
-    let child = spawn_candidate_with_ambient(root.path(), console_port_reservation.release(), ambient.path());
-    let (output, candidate_error, ws_contacted) = wait_candidate_with_ws_probe(
-        child,
-        &ws_listener,
-        Duration::from_secs(10),
+    let child = spawn_candidate_with_ambient(
+        root.path(),
+        console_port_reservation.release(),
+        ambient.path(),
     );
+    let (output, candidate_error, ws_contacted) =
+        wait_candidate_with_ws_probe(child, &ws_listener, Duration::from_secs(10));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(candidate_error.is_none(), "{candidate_error:?}; stdout={stdout}; stderr={stderr}");
-    assert!(!ws_contacted, "preflight failure contacted selected OneBot WS; stdout={stdout}; stderr={stderr}");
-    assert!(!output.status.success(), "invalid selected-root preflight unexpectedly succeeded");
+    assert!(
+        candidate_error.is_none(),
+        "{candidate_error:?}; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        !ws_contacted,
+        "preflight failure contacted selected OneBot WS; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "invalid selected-root preflight unexpectedly succeeded"
+    );
     assert!(
         output.status.code().is_some_and(|code| code != 0),
         "failed candidate must have a non-zero process exit"
     );
     if let Some(expected) = expected_exit_code {
-        assert_eq!(output.status.code(), Some(expected), "candidate exited through the wrong failure path");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "candidate exited through the wrong failure path"
+        );
     }
     let all_output = format!("{stdout}\n{stderr}");
     for expected in expected_diagnostics {
@@ -1169,9 +1222,8 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
         fs::write(ambient_root.path().join(relative), contents)
             .unwrap_or_else(|error| panic!("write decoy artifact {relative}: {error}"));
     }
-    let decoy_credentials =
-        fs::read(ambient_root.path().join("user/dsh/.credentials.yaml"))
-            .expect("read second-runtime credential sentinel");
+    let decoy_credentials = fs::read(ambient_root.path().join("user/dsh/.credentials.yaml"))
+        .expect("read second-runtime credential sentinel");
 
     let sent = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1184,7 +1236,10 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     let onebot_thread = thread::spawn(move || {
         serve_onebot(onebot_listener, onebot_sent, onebot_records, onebot_stop)
     });
-    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     let (_console, console_port) = CompanionConsole::start(root.path(), ambient_root.path(), epoch);
     let provision = (|| -> std::io::Result<()> {
         let body = json!({"setting": "cliModel.apiKey", "value": MODEL_KEY}).to_string();
@@ -1194,7 +1249,9 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
         let mut reply = String::new();
         settings.read_to_string(&mut reply)?;
         if !reply.starts_with("HTTP/1.1 200 ") || reply.contains(MODEL_KEY) {
-            return Err(std::io::Error::other("fixture credential provisioning failed"));
+            return Err(std::io::Error::other(
+                "fixture credential provisioning failed",
+            ));
         }
         Ok(())
     })();
@@ -1214,7 +1271,8 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
 
     let child = candidate_command(root.path(), console_port, ambient_root.path())
         .env("HER_PARITY_EPOCH_MS", epoch.to_string())
-        .spawn().expect("spawn selected-root live candidate");
+        .spawn()
+        .expect("spawn selected-root live candidate");
     let candidate_pid = child.id();
     // Observe the backend's own bounded result before the outer watchdog fires.
     let (output, candidate_error) = wait_candidate(child, Duration::from_secs(60));
@@ -1251,7 +1309,10 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("cli-") && (name.ends_with(".out") || name.ends_with(".err")) {
                 let bytes = fs::read(entry.path()).unwrap_or_default();
-                selected_log_files.push((name, String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]).into_owned()));
+                selected_log_files.push((
+                    name,
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]).into_owned(),
+                ));
             }
         }
     }
@@ -1298,12 +1359,22 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     assert_eq!(model.body["apiKey"], MODEL_KEY);
     assert_eq!(model.body["sessionKey"], "group:420042");
     assert_eq!(model.body["sessionToken"], SESSION_TOKEN);
-    let received_prompt = model.body["prompt"].as_str()
-        .unwrap_or_else(|| panic!("fake model received no text prompt; request body={}", model.body));
+    let received_prompt = model.body["prompt"].as_str().unwrap_or_else(|| {
+        panic!(
+            "fake model received no text prompt; request body={}",
+            model.body
+        )
+    });
     model_copy::assert_snapshot(received_prompt);
-    assert!(received_prompt.contains("不要调用工具"), "the CLI instruction must survive: {received_prompt}");
+    assert!(
+        received_prompt.contains("不要调用工具"),
+        "the CLI instruction must survive: {received_prompt}"
+    );
     let stored: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    assert!(stored["conversations"]["group:420042"]["recentMessages"].as_array().unwrap().contains(&strip_fixture));
+    assert!(stored["conversations"]["group:420042"]["recentMessages"]
+        .as_array()
+        .unwrap()
+        .contains(&strip_fixture));
     assert!(
         received_prompt.contains("fixture-persona-from-selected-root"),
         "fake model received no selected-root persona; received prompt={received_prompt:?}"
@@ -1312,12 +1383,22 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
         !received_prompt.contains("ticket04-decoy-persona"),
         "fake model received the decoy persona; received prompt={received_prompt:?}"
     );
-    let snapshot: Value = serde_json::from_str(received_prompt.split("【本次消息快照】\n")
-        .nth(1).expect("CLI model must receive the selected wake snapshot").lines().next().unwrap())
-        .expect("CLI wake snapshot JSON");
+    let snapshot: Value = serde_json::from_str(
+        received_prompt
+            .split("【本次消息快照】\n")
+            .nth(1)
+            .expect("CLI model must receive the selected wake snapshot")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .expect("CLI wake snapshot JSON");
     assert_eq!(snapshot["messages"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["messages"][0]["userId"], "8808");
-    assert!(snapshot["messages"][0]["text"].as_str().unwrap().contains(INBOUND_TEXT));
+    assert!(snapshot["messages"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains(INBOUND_TEXT));
     assert_eq!(snapshot["includedUnreadCount"], 1);
     assert_eq!(snapshot["readThroughSeq"], snapshot["messages"][0]["seq"]);
     assert_eq!(snapshot["partial"], false);
@@ -1437,7 +1518,10 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     // JS plainContent excludes quoted originals, but retains resolved @ mentions
     // (bridge.js segmentsToText -> feedSlangWindow).
     assert_eq!(learned_messages[0]["sender"], "ticket04-fixture-user");
-    assert_eq!(learned_messages[0]["text"], format!("@selected-fixture-card {INBOUND_TEXT}"));
+    assert_eq!(
+        learned_messages[0]["text"],
+        format!("@selected-fixture-card {INBOUND_TEXT}")
+    );
     assert!(
         !learned_messages
             .iter()

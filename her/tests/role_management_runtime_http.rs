@@ -21,8 +21,9 @@ impl FixtureWorkspace {
             .duration_since(UNIX_EPOCH)
             .expect("clock is after epoch")
             .as_nanos();
-        let root =
-            crate::install_root::development_root(std::env::temp_dir().join(format!("qqbot-role-http-{}-{stamp}", std::process::id())));
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("qqbot-role-http-{}-{stamp}", std::process::id())),
+        );
         fs::create_dir_all(&root).expect("create synthetic role HTTP workspace");
         Self(root)
     }
@@ -229,7 +230,10 @@ impl ConsoleProcess {
                     .stop()
                     .map(|()| "child stopped after failed health check".to_string())
                     .unwrap_or_else(|cleanup_error| format!("cleanup failed: {cleanup_error}"));
-                panic!("{}", process.startup_failure_diagnostics(&format!("{error}; {cleanup}")));
+                panic!(
+                    "{}",
+                    process.startup_failure_diagnostics(&format!("{error}; {cleanup}"))
+                );
             }
         };
         assert_eq!(
@@ -248,7 +252,8 @@ impl ConsoleProcess {
             health["runtime"]["mode"],
             "isolated",
             "{}",
-            process.startup_failure_diagnostics("health response reported a different runtime mode")
+            process
+                .startup_failure_diagnostics("health response reported a different runtime mode")
         );
         assert_eq!(
             health["runtime"]["configLoaded"],
@@ -341,7 +346,7 @@ fn http_request_raw_body(
         .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{token_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| "connect to selected console port".to_string())?;
@@ -410,7 +415,6 @@ fn http_request_chunked_body(
         .map_err(|_| "finish selected console chunked body".to_string())?;
     read_http_response(&mut stream)
 }
-
 
 fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse, String> {
     let mut raw = Vec::new();
@@ -551,12 +555,12 @@ fn create_directory_reparse_point(link: &Path, target: &Path) -> Result<(), Stri
         if output.status.success() {
             return Ok(());
         }
-        return Err(format!(
+        Err(format!(
             "synthetic junction creation failed with {:?}; stdout={:?}; stderr={:?}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -604,18 +608,10 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
     let outside_sentinel_before = fs::read(&outside_sentinel).expect("snapshot outside sentinel");
 
     let (port_a, port_b) = reserve_distinct_ports();
-    let mut console_a = ConsoleProcess::start(
-        "role lifecycle root A",
-        &root_a,
-        port_a,
-        &dsh_home_a,
-    );
-    let mut console_b = ConsoleProcess::start(
-        "role lifecycle root B",
-        &root_b,
-        port_b,
-        &dsh_home_b,
-    );
+    let mut console_a =
+        ConsoleProcess::start("role lifecycle root A", &root_a, port_a, &dsh_home_a);
+    let mut console_b =
+        ConsoleProcess::start("role lifecycle root B", &root_b, port_b, &dsh_home_b);
     assert_ne!(console_a.port, console_b.port);
 
     let initial_a = "A original persona\nselected-root alpha";
@@ -936,14 +932,9 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
         &["Shared"],
         Some("Shared"),
     );
-    let mode_b_active_response = http_request_raw_body(
-        port_b,
-        "POST",
-        "/api/role-mode",
-        Some(token_b),
-        "",
-    )
-    .expect("POST /api/role-mode blank-body request must reach selected console");
+    let mode_b_active_response =
+        http_request_raw_body(port_b, "POST", "/api/role-mode", Some(token_b), "")
+            .expect("POST /api/role-mode blank-body request must reach selected console");
     let mode_b_active = expect_json(mode_b_active_response, 200, "blank POST /api/role-mode");
     assert_eq!(mode_b_active, json!({ "ok": true, "roleMode": "active" }));
     assert_role_names(
@@ -958,7 +949,10 @@ fn role_management_lifecycle_uses_each_selected_runtime_root() {
         &json!({ "mode": "unexpected" }),
         200,
     );
-    assert_eq!(mode_b_unsupported_value, json!({ "ok": true, "roleMode": "active" }));
+    assert_eq!(
+        mode_b_unsupported_value,
+        json!({ "ok": true, "roleMode": "active" })
+    );
     assert_role_names(
         &get_json(port_b, token_b, "/api/roles", 200),
         &["Shared"],
@@ -1182,18 +1176,10 @@ fn role_mode_accepts_chunked_body_and_changes_only_selected_mode() {
         .expect("write selected B role state");
     let state_b_before = fs::read(&state_b).expect("snapshot selected B state");
     let (port_a, port_b) = reserve_distinct_ports();
-    let mut console_a = ConsoleProcess::start(
-        "chunked role-mode root A",
-        &root_a,
-        port_a,
-        &dsh_home_a,
-    );
-    let mut console_b = ConsoleProcess::start(
-        "chunked role-mode root B",
-        &root_b,
-        port_b,
-        &dsh_home_b,
-    );
+    let mut console_a =
+        ConsoleProcess::start("chunked role-mode root A", &root_a, port_a, &dsh_home_a);
+    let mut console_b =
+        ConsoleProcess::start("chunked role-mode root B", &root_b, port_b, &dsh_home_b);
 
     let response = http_request_chunked_body(
         port_a,
@@ -1343,12 +1329,36 @@ fn role_management_rejects_bad_json_shapes_without_selected_root_writes() {
         "请求体过大（超过 1MB）",
         "POST /api/role-mode with oversized declared Content-Length",
     );
-    assert_eq!(fs::read(&state_a).unwrap(), state_a_before, "A state after oversized request");
-    assert_eq!(fs::read(&state_b).unwrap(), state_b_before, "B state after oversized request");
-    assert_eq!(fs::read(&config_a).unwrap(), config_a_before, "A config after oversized request");
-    assert_eq!(fs::read(&config_b).unwrap(), config_b_before, "B config after oversized request");
-    assert_eq!(fs::read(&role_a).unwrap(), role_a_before, "A role after oversized request");
-    assert_eq!(fs::read(&role_b).unwrap(), role_b_before, "B role after oversized request");
+    assert_eq!(
+        fs::read(&state_a).unwrap(),
+        state_a_before,
+        "A state after oversized request"
+    );
+    assert_eq!(
+        fs::read(&state_b).unwrap(),
+        state_b_before,
+        "B state after oversized request"
+    );
+    assert_eq!(
+        fs::read(&config_a).unwrap(),
+        config_a_before,
+        "A config after oversized request"
+    );
+    assert_eq!(
+        fs::read(&config_b).unwrap(),
+        config_b_before,
+        "B config after oversized request"
+    );
+    assert_eq!(
+        fs::read(&role_a).unwrap(),
+        role_a_before,
+        "A role after oversized request"
+    );
+    assert_eq!(
+        fs::read(&role_b).unwrap(),
+        role_b_before,
+        "B role after oversized request"
+    );
 
     assert_role_names(
         &get_json(port_a, token_a, "/api/roles", 200),
@@ -1393,10 +1403,18 @@ fn role_management_rejects_invalid_selected_state_before_mutations() {
     let role_b_before = fs::read(&role_b).expect("snapshot selected B role");
 
     let (port_a, port_b) = reserve_distinct_ports();
-    let mut console_a =
-        ConsoleProcess::start("invalid selected-state root A", &root_a, port_a, &dsh_home_a);
-    let mut console_b =
-        ConsoleProcess::start("invalid selected-state root B", &root_b, port_b, &dsh_home_b);
+    let mut console_a = ConsoleProcess::start(
+        "invalid selected-state root A",
+        &root_a,
+        port_a,
+        &dsh_home_a,
+    );
+    let mut console_b = ConsoleProcess::start(
+        "invalid selected-state root B",
+        &root_b,
+        port_b,
+        &dsh_home_b,
+    );
 
     fs::remove_file(&state_a).expect("remove only A current-role fixture");
     let missing_a = get_json(port_a, token_a, "/api/roles", 200);
@@ -1473,8 +1491,11 @@ fn role_management_rejects_invalid_selected_state_before_mutations() {
     #[cfg(windows)]
     // Retain the live owner's locked handle while allowing this synthetic data
     // directory to move. No second owner starts during this replacement.
-    fs::rename(data_a.join("logs/rbridge-console.lock"), root_a.join("parked-console.lock"))
-        .expect("park the synthetic owner file before replacing its data directory");
+    fs::rename(
+        data_a.join("logs/rbridge-console.lock"),
+        root_a.join("parked-console.lock"),
+    )
+    .expect("park the synthetic owner file before replacing its data directory");
     fs::rename(&data_a, &saved_data_a).expect("move A data aside for a reparse fixture");
     fs::create_dir_all(&outside_data_a).expect("create synthetic outside data directory");
     let outside_state = outside_data_a.join("current-role.json");

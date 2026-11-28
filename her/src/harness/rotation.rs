@@ -77,7 +77,7 @@ fn ceil_fraction_ms(frac: f64) -> i128 {
         return 1; // num < 2^70, so the value is above 0 and below 1
     }
     let den = 1u128 << shift;
-    ((num + den - 1) / den) as i128
+    num.div_ceil(den) as i128
 }
 
 #[cfg(test)]

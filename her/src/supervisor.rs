@@ -328,13 +328,13 @@ impl Executor for RuntimeExecutor {
     }
 }
 
-/// Construct the same fixed registry and store for the supervisor and the authenticated console.
 #[cfg(test)]
 thread_local! {
     pub(crate) static TASK_ADMISSION_TEST: std::cell::RefCell<Option<Box<dyn Fn() + Send + Sync>>> =
         std::cell::RefCell::new(None);
 }
 
+/// Construct the same fixed registry and store for the supervisor and the authenticated console.
 pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_tasks::TasksApi, String> {
     task_api_with_clock(context, cfg, Arc::new(SystemClock))
 }
@@ -854,11 +854,19 @@ pub fn run_cli(args: &[String]) -> i32 {
         dispatch_restart(&restart_context, &restart_dispatcher);
         let current = desired_observation(&change_context);
         let mut last = last_state.lock().unwrap_or_else(|p| p.into_inner());
-        if *last != current {
-            if matches!(change_dispatcher.start(tasks::task_def(TaskId::Watchdog), RunSource::Recovery, None, None, "desired-state"),
-                tasks::Trigger::Started(_)) {
-                *last = current;
-            }
+        if *last != current
+            && matches!(
+                change_dispatcher.start(
+                    tasks::task_def(TaskId::Watchdog),
+                    RunSource::Recovery,
+                    None,
+                    None,
+                    "desired-state"
+                ),
+                tasks::Trigger::Started(_)
+            )
+        {
+            *last = current;
         }
         drop(last);
         if let Ok(cfg) = refresh_context.load_config() {

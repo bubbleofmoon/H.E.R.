@@ -563,19 +563,21 @@ mod tests {
             "rollout": {"rustGroups": ["group:1"]}
         });
         let unused = Path::new("/unused");
-        let mut fake = FakeLifecycle::default();
-        fake.now_ms = 510_000;
-        // Leftover fresh-looking heartbeat from a previous live owner (pid 100).
-        fake.heartbeat = Some(Ok(json!({
-            "ts": 505_000,
-            "pid": 100,
-            "live": true,
-            "groups": ["group:1"],
-            "state": "ready",
-            "gatewayConnected": true
-        })
-        .to_string()
-        .into_bytes()));
+        let mut fake = FakeLifecycle {
+            now_ms: 510_000,
+            // Leftover fresh-looking heartbeat from a previous live owner (pid 100).
+            heartbeat: Some(Ok(json!({
+                "ts": 505_000,
+                "pid": 100,
+                "live": true,
+                "groups": ["group:1"],
+                "state": "ready",
+                "gatewayConnected": true
+            })
+            .to_string()
+            .into_bytes())),
+            ..FakeLifecycle::default()
+        };
 
         // 1. Live gate is free: must report not-running, never ready or pid 100.
         let status =

@@ -10,7 +10,11 @@ use support::{write_dependencies, RuntimeRoot, CLOSED};
 
 fn runtime() -> RuntimeRoot {
     let root = RuntimeRoot::new("upstream-capture");
-    std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"fixture-token-183"}"#).unwrap();
+    std::fs::write(
+        root.join("config/config.json"),
+        r#"{"consoleToken":"fixture-token-183"}"#,
+    )
+    .unwrap();
     std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
     write_dependencies(&root, CLOSED, CLOSED, CLOSED, None);
     root
@@ -30,7 +34,12 @@ fn cli(root: &Path, args: &[&str]) -> (i32, Value, String, String) {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
-    (output.status.code().unwrap_or(-1), json, stdout, String::from_utf8_lossy(&output.stderr).to_string())
+    (
+        output.status.code().unwrap_or(-1),
+        json,
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
 }
 
 #[test]
@@ -38,15 +47,25 @@ fn a_capture_is_armed_swept_into_counts_and_paths_and_gone() {
     let root = runtime();
     let (code, status, _, _) = cli(&root, &["status"]);
     assert_eq!(code, 0);
-    assert_eq!((status["armed"].clone(), status["captured"].clone()), (json!(false), json!(false)));
+    assert_eq!(
+        (status["armed"].clone(), status["captured"].clone()),
+        (json!(false), json!(false))
+    );
     let (code, _, _, error) = cli(&root, &["sweep"]);
     assert_eq!(code, 1, "{error}");
     assert!(error.contains("nothing was captured"), "{error}");
 
     let (code, armed, _, error) = cli(&root, &["arm", "--route", "dsh", "--minutes", "5"]);
     assert_eq!(code, 0, "{error}");
-    assert_eq!((armed["armed"].clone(), armed["route"].clone()), (json!(true), json!("dsh")));
-    assert_eq!(cli(&root, &["arm", "--route", "harness"]).0, 1, "a second arming is refused");
+    assert_eq!(
+        (armed["armed"].clone(), armed["route"].clone()),
+        (json!(true), json!("dsh"))
+    );
+    assert_eq!(
+        cli(&root, &["arm", "--route", "harness"]).0,
+        1,
+        "a second arming is refused"
+    );
     assert_eq!(cli(&root, &["status"]).1["route"], "dsh");
 
     // The record a DSH capture writes: the envelope, with one denied term in the message and one in
@@ -67,19 +86,37 @@ fn a_capture_is_armed_swept_into_counts_and_paths_and_gone() {
     assert_eq!(report["route"], "dsh");
     assert_eq!(report["deniedTotal"], 2);
     assert_eq!(report["counts"], json!({"dsh": 1, "harness": 1}));
-    assert_eq!(report["fields"], json!([
-        {"path": "/payload/args/request/content/0/text", "part": "value", "terms": ["dsh"]},
-        {"path": "/payload/args/request/<key>", "part": "key", "terms": ["harness"]},
-    ]));
+    assert_eq!(
+        report["fields"],
+        json!([
+            {"path": "/payload/args/request/content/0/text", "part": "value", "terms": ["dsh"]},
+            {"path": "/payload/args/request/<key>", "part": "key", "terms": ["harness"]},
+        ])
+    );
     assert_eq!(report["removed"], true);
-    for text in ["今天天气不错", "你好", "fixture chat line", "s-183", "rpc-183"] {
-        assert!(!stdout.contains(text), "the sweep printed message content: {text}");
+    for text in [
+        "今天天气不错",
+        "你好",
+        "fixture chat line",
+        "s-183",
+        "rpc-183",
+    ] {
+        assert!(
+            !stdout.contains(text),
+            "the sweep printed message content: {text}"
+        );
     }
-    assert!(!root.join("data/upstream-capture/captured.json").exists(), "the capture was not deleted");
+    assert!(
+        !root.join("data/upstream-capture/captured.json").exists(),
+        "the capture was not deleted"
+    );
     assert_eq!(cli(&root, &["sweep"]).0, 1, "a capture is swept once");
     let (code, status, _, _) = cli(&root, &["status"]);
     assert_eq!(code, 0);
-    assert_eq!((status["armed"].clone(), status["captured"].clone()), (json!(false), json!(false)));
+    assert_eq!(
+        (status["armed"].clone(), status["captured"].clone()),
+        (json!(false), json!(false))
+    );
 }
 
 #[test]
@@ -101,9 +138,16 @@ fn disarm_removes_an_unused_arming_and_usage_errors_exit_2() {
     ] {
         assert_eq!(cli(&root, args).0, 2, "{args:?}");
     }
-    assert_eq!(cli(&root, &["arm", "--route", "dsh", "--minutes", "1440"]).0, 0);
+    assert_eq!(
+        cli(&root, &["arm", "--route", "dsh", "--minutes", "1440"]).0,
+        0
+    );
     let mut command = Command::new(env!("CARGO_BIN_EXE_her-cli"));
     support::hide_window(&mut command);
-    let missing_root = command.args(["upstream-capture", "status"]).env_remove("HER_RUNTIME_ROOT").output().unwrap();
+    let missing_root = command
+        .args(["upstream-capture", "status"])
+        .env_remove("HER_RUNTIME_ROOT")
+        .output()
+        .unwrap();
     assert_eq!(missing_root.status.code(), Some(2));
 }

@@ -223,7 +223,7 @@ impl Miss {
             Miss::RateLimited { .. } => "quota",
             Miss::Empty => "empty-response",
             Miss::Dropped => "network",
-            Miss::Failed { class } => *class,
+            Miss::Failed { class } => class,
         }
     }
 }
@@ -580,6 +580,7 @@ impl ModelRoute {
     }
 
     /// The selected runtime's relay route for `model` alone, authenticated with the harness credential.
+    #[cfg(test)]
     pub fn for_model(context: &RuntimeContext, model: &str) -> Result<Self, String> {
         let chain = vec![RouteSpec::implicit(model.to_string())];
         Self::for_specs(context, chain.clone(), chain)
@@ -635,17 +636,13 @@ impl ModelRoute {
         })
     }
 
-    /// The first route's target.
-    pub(crate) fn target(&self) -> ServiceTarget {
-        self.routes[0].target.clone()
-    }
-
     /// `text` with this route's harness credential redacted (`redact_credentials`).
     pub(crate) fn redact(&self, text: &str) -> String {
         redact_credentials(text, &self.credentials)
     }
 
     /// Mask a copy of the delivered request using this chain's credential snapshot.
+    #[cfg(test)]
     pub(crate) fn capture_request(&self, model: &str, max_tokens: u32, request: &ChatRequest) -> Value {
         let mut capture = serde_json::json!({
             "model": model,
@@ -787,6 +784,7 @@ impl Cancellation {
         Self { watch: Some(rx), abandoned: None }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_flag(flag: Arc<AtomicBool>) -> Self {
         Self { watch: None, abandoned: Some(flag) }
     }
@@ -1336,7 +1334,7 @@ impl ChainExecutor {
                         false
                     } else if self.cfg.track_steps {
                         self.step + 1 < self.cfg.max_steps
-                            && self.cfg.max_tokens.map_or(true, |max| self.spent_tokens < max)
+                            && self.cfg.max_tokens.is_none_or(|max| self.spent_tokens < max)
                     } else {
                         true
                     };

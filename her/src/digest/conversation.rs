@@ -38,7 +38,7 @@ impl DigestError {
             Self::Storage => "memory-write", Self::Cancelled => "cancel" }
     }
     pub(crate) fn kind(&self) -> &'static str {
-        match self { Self::Evidence | Self::Storage => "storage", Self::Model(kind) | Self::Output(kind) => *kind, Self::Cancelled => "cancelled" }
+        match self { Self::Evidence | Self::Storage => "storage", Self::Model(kind) | Self::Output(kind) => kind, Self::Cancelled => "cancelled" }
     }
 }
 

@@ -500,7 +500,7 @@ fn assert_state_summary(value: &Value, marker: &str) {
     assert_eq!(value["unreadCount"], 4);
     assert_eq!(value["recentCount"], 4);
     assert_eq!(value["lastWakeReason"], format!("{marker}-wake-reason"));
-    assert_eq!(value["wakeSafety"].is_object(), true);
+    assert!(value["wakeSafety"].is_object());
     assert!(value.get("noActionCount").is_none());
     assert!(value.get("recentMessages").is_none());
     assert!(value.get("unread").is_none());
@@ -861,23 +861,33 @@ fn social_state_routes_use_each_selected_runtime_root() {
     let first_after_recent = get_json(
         port_a,
         &format!("/api/socialV2/unread?key={KEY_QUERY}&afterSeq=0&limit=2"),
-        Some(token_a), Some(agent_a), 200,
+        Some(token_a),
+        Some(agent_a),
+        200,
     );
     assert_eq!(first_after_recent["messages"][0]["seq"], 1);
     assert_eq!(first_after_recent["messages"][1]["seq"], 2);
-    assert_eq!(first_after_recent["readThroughSeq"], 4,
-        "the earlier recent read must have receipted overlapping unread 3 and 4");
+    assert_eq!(
+        first_after_recent["readThroughSeq"], 4,
+        "the earlier recent read must have receipted overlapping unread 3 and 4"
+    );
     assert_eq!(bytes(&state_path_a), initial_state_a);
-    console_a.stop().expect("stop A to discard process-local receipts");
+    console_a
+        .stop()
+        .expect("stop A to discard process-local receipts");
     console_a = ConsoleProcess::start(&root_a, port_a, &legacy_a);
     let after_restart = get_json(
         port_a,
         &format!("/api/socialV2/unread?key={KEY_QUERY}&afterSeq=4&limit=1"),
-        Some(token_a), Some(agent_a), 200,
+        Some(token_a),
+        Some(agent_a),
+        200,
     );
     assert_eq!(after_restart["messages"], json!([]));
-    assert_eq!(after_restart["readThroughSeq"], 0,
-        "the new console must ignore both old process receipts and legacy disk receipts");
+    assert_eq!(
+        after_restart["readThroughSeq"], 0,
+        "the new console must ignore both old process receipts and legacy disk receipts"
+    );
 
     let page_one = get_json(
         port_a,
@@ -902,7 +912,8 @@ fn social_state_routes_use_each_selected_runtime_root() {
     assert_eq!(page_two["messages"][1]["seq"], 4);
     assert_eq!(page_two["readThroughSeq"], 4);
     assert_eq!(
-        bytes(&state_path_a), initial_state_a,
+        bytes(&state_path_a),
+        initial_state_a,
         "unread paging must not persist the model's receipts"
     );
     assert_eq!(bytes(&state_path_b), initial_state_b);
@@ -925,10 +936,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
         "agent session outside selected allow list",
     );
 
-    for path in [
-        "/api/socialV2/states",
-        "/api/socialV2/activity",
-    ] {
+    for path in ["/api/socialV2/states", "/api/socialV2/activity"] {
         let before_a = bytes(&state_path_a);
         let before_b = bytes(&state_path_b);
         let agent_response = request(port_a, path, Some(token_a), Some(agent_a))
@@ -1328,11 +1336,15 @@ fn social_state_key_and_integral_float_boundaries_match_frozen_contract() {
     let float_after_restart = get_json(
         port_a,
         &format!("/api/socialV2/unread?key={KEY_QUERY}&afterSeq=1&limit=1"),
-        Some(token_a), Some(agent_a), 200,
+        Some(token_a),
+        Some(agent_a),
+        200,
     );
     assert_eq!(float_after_restart["messages"], json!([]));
-    assert_eq!(float_after_restart["readThroughSeq"], 0,
-        "the float receipt must not survive the console restart");
+    assert_eq!(
+        float_after_restart["readThroughSeq"], 0,
+        "the float receipt must not survive the console restart"
+    );
     let recent = get_json(
         port_a,
         &format!("/api/socialV2/recent?key={KEY_QUERY}&limit=1&offset=0"),

@@ -389,7 +389,7 @@ impl RunRecordWriter {
             ts: now,
             run_id: input
                 .run_id
-                .map(|r| event_slug_id(r))
+                .map(event_slug_id)
                 .unwrap_or_else(|| self.process_run_id.clone()),
             trigger: input.trigger,
             component: input.component,

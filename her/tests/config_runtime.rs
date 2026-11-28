@@ -1,6 +1,6 @@
 //! Runtime configuration behavior through an isolated console process.
-use support::install_root;
 use support::hide_window;
+use support::install_root;
 mod support;
 #[path = "support/selftest.rs"]
 mod support_selftest;
@@ -58,10 +58,24 @@ fn write_runtime(root: &Path) {
     for dir in ["config", "data", "resources", "user/dsh"] {
         fs::create_dir_all(root.join(dir)).unwrap();
     }
-    fs::write(root.join("config/config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::write(
+        root.join("config/config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
     fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
-    fs::write(root.join("data/mode.json"), r#"{"mode":"simulation","closedAgentPreset":""}"#).unwrap();
-    crate::support::write_dependencies(root, crate::support::CLOSED, crate::support::CLOSED, crate::support::CLOSED, None);
+    fs::write(
+        root.join("data/mode.json"),
+        r#"{"mode":"simulation","closedAgentPreset":""}"#,
+    )
+    .unwrap();
+    crate::support::write_dependencies(
+        root,
+        crate::support::CLOSED,
+        crate::support::CLOSED,
+        crate::support::CLOSED,
+        None,
+    );
 }
 fn isolate_env(command: &mut Command, home: &Path) {
     command
@@ -72,10 +86,6 @@ fn isolate_env(command: &mut Command, home: &Path) {
         .env("DSH_HOME", home)
         .env("USERPROFILE", home.join("synthetic-user-profile"));
     hide_window(command);
-}
-
-fn path_arg(path: &Path) -> &str {
-    path.to_str().expect("utf-8 fixture path")
 }
 
 /// Console home directories of one start. Whatever is still in the list is removed on drop, so a start
@@ -168,7 +178,9 @@ fn http_with_agent(
     let token_header = token
         .map(|t| format!("X-Console-Token: {t}\r\n"))
         .unwrap_or_default();
-    let agent_header = agent.map(|t| format!("X-Agent-Token: {t}\r\n")).unwrap_or_default();
+    let agent_header = agent
+        .map(|t| format!("X-Agent-Token: {t}\r\n"))
+        .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{token_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -280,4 +292,3 @@ fn simulation_alias_is_the_reserved2_gate() {
         "chat must fail the gate: {text}"
     );
 }
-

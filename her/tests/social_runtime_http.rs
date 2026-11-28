@@ -12,8 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_KEY: &str = "private:7001";
 const OWNER_ID: i64 = 7001;
-const ACTIVE_MEMORY_PATH: &str =
-    "/api/socialV2/memory?key=private%3A7001&category=activeTopic";
+const ACTIVE_MEMORY_PATH: &str = "/api/socialV2/memory?key=private%3A7001&category=activeTopic";
 const FULL_MEMORY_PATH: &str = "/api/socialV2/memory?key=private%3A7001";
 
 struct FixtureWorkspace(PathBuf);
@@ -24,8 +23,9 @@ impl FixtureWorkspace {
             .duration_since(UNIX_EPOCH)
             .expect("clock is after epoch")
             .as_nanos();
-        let root =
-            crate::install_root::development_root(std::env::temp_dir().join(format!("qqbot-social-http-{}-{stamp}", std::process::id())));
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("qqbot-social-http-{}-{stamp}", std::process::id())),
+        );
         fs::create_dir_all(&root).expect("create synthetic social HTTP workspace");
         Self(root)
     }
@@ -266,7 +266,7 @@ fn http_request(
         .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| "connect to selected console port".to_string())?;
@@ -405,8 +405,7 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
     let agent_token_b = "synthetic-social-agent-token-beta-0002";
     let dsh_home_a =
         prepare_runtime_root(&root_a, console_token_a, agent_token_a, "alpha", 111_000);
-    let dsh_home_b =
-        prepare_runtime_root(&root_b, console_token_b, agent_token_b, "beta", 222_000);
+    let dsh_home_b = prepare_runtime_root(&root_b, console_token_b, agent_token_b, "beta", 222_000);
 
     let state_a_path = root_a.join("data/social-v2.json");
     let state_b_path = root_b.join("data/social-v2.json");
@@ -1015,7 +1014,10 @@ fn social_memory_and_config_use_each_selected_runtime_root() {
         config_a_before_mode_probe
     );
     assert_eq!(fs::read(&state_b_path).unwrap(), state_b_before_mode_probe);
-    assert_eq!(fs::read(&config_b_path).unwrap(), config_b_before_mode_probe);
+    assert_eq!(
+        fs::read(&config_b_path).unwrap(),
+        config_b_before_mode_probe
+    );
     mode_console_a
         .stop()
         .expect("stop mode-probe console process within cleanup bound");

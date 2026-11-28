@@ -84,7 +84,7 @@ fn change(before: &Value, after: &Value) -> (Value, Value) {
 }
 
 fn nothing(added: &Value, removed: &Value) -> bool {
-    [added, removed].iter().all(|side| LISTS.iter().all(|list| side[*list].as_array().map_or(true, Vec::is_empty)))
+    [added, removed].iter().all(|side| LISTS.iter().all(|list| side[*list].as_array().is_none_or(Vec::is_empty)))
 }
 
 /// Appends `entry` with the next id to `conversation.wakeWordLog`, keeping the newest `LOG_MAX`.

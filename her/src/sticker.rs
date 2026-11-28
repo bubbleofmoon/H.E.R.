@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn isolated_sticker_gate_busy_retry_is_bounded() {
-        let (root, context) = sticker_runtime_root(
+        let (_root, context) = sticker_runtime_root(
             "bounded sticker gate 中文",
             "http://127.0.0.1:1",
             "selected-bounded-gate-token-fixture",

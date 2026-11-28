@@ -28,7 +28,7 @@ impl Candidate {
 const DEFAULT_EFFORT: &str = "max";
 
 /// JS truthiness for a string setting: `cfg.x || default` falls back on a missing, non-string or empty value.
-fn non_empty<'a>(v: Option<&'a Value>) -> Option<&'a str> {
+fn non_empty(v: Option<&Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
 }
 
@@ -57,7 +57,7 @@ pub fn model_chain_for(cfg: &Value, key: &str) -> Vec<Candidate> {
     let over = cfg
         .get("sessions")
         .and_then(|s| s.get(key))
-        .filter(|v| v.get("model").and_then(|m| m.as_str()).unwrap_or("").trim().len() > 0);
+        .filter(|v| !v.get("model").and_then(|m| m.as_str()).unwrap_or("").trim().is_empty());
     let Some(over) = over else {
         return model_chain(cfg);
     };

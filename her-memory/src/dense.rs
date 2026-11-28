@@ -173,7 +173,11 @@ struct ModelState {
 }
 
 impl ModelState {
-    fn model(&mut self, resources: &dyn ModelResources, load: &LoadModel) -> Option<&mut LocalModel> {
+    fn model(
+        &mut self,
+        resources: &dyn ModelResources,
+        load: &LoadModel,
+    ) -> Option<&mut LocalModel> {
         let path = resources.resources_dir();
         if self.active.as_ref().is_some_and(|(root, _)| root == path) {
             return self.active.as_mut().map(|(_, model)| model);
@@ -226,7 +230,9 @@ fn receive_before<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<
 }
 
 impl ModelRunner {
-    fn new(load: impl Fn(&dyn ModelResources) -> Option<LocalModel> + Send + Sync + 'static) -> Self {
+    fn new(
+        load: impl Fn(&dyn ModelResources) -> Option<LocalModel> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             state: Mutex::new(Some(ModelState::default())),
             load: Box::new(load),

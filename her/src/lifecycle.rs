@@ -163,6 +163,7 @@ fn source_transition(address: &std::net::SocketAddr, shared: bool) -> Result<Fil
     #[cfg(not(unix))]
     let directory = std::env::temp_dir().join("qqbot-source-transitions-v1");
     crate::install_root::check_development_path(&directory)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
@@ -2136,8 +2137,10 @@ mod tests {
 
     #[test]
     fn verify_live_heartbeat_rejects_stale_pid_groups_and_expired_heartbeats() {
-        let mut fake = FakeLifecycle::default();
-        fake.now_ms = 550_000;
+        let mut fake = FakeLifecycle {
+            now_ms: 550_000,
+            ..Default::default()
+        };
         let expected = vec!["group:1".to_string(), "private:2".to_string()];
         let marker = fake_owner_marker(OwnerRole::Live, 42, "/opt/her/her", 500_000, Some(vec!["group:1", "private:2"]));
         let unused = Path::new("/unused");
@@ -2242,8 +2245,10 @@ mod tests {
 
     #[test]
     fn foreign_image_and_health_only_policy_refused_for_process_control() {
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(1);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(1),
+            ..Default::default()
+        };
         fake.default_probes.insert(
             OwnerRole::Live,
             OwnerProbe::Held {
@@ -2371,8 +2376,10 @@ mod tests {
                 &owner,
             ));
 
-            let mut fake = FakeLifecycle::default();
-            fake.caller = Ok(ProcessIdentity { pid: 900, start: 900, exe: caller.clone() });
+            let mut fake = FakeLifecycle {
+                caller: Ok(ProcessIdentity { pid: 900, start: 900, exe: caller.clone() }),
+                ..Default::default()
+            };
             fake.default_probes.insert(
                 OwnerRole::Supervisor,
                 OwnerProbe::Held {
@@ -2481,8 +2488,10 @@ mod tests {
         let unused = Path::new("/unused");
 
         // 1. Happy path: lock-desired -> read -> unlock-desired -> hold-tasks -> lock-desired -> read -> kill -> poll Free
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(5);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(5),
+            ..Default::default()
+        };
         let live_marker = fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None);
         let console_marker = fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None);
         fake.probes.insert(
@@ -2520,8 +2529,10 @@ mod tests {
         assert!(kill_live_pos < sleep_pos && sleep_pos < kill_console_pos, "wait for live gate Free before console kill: {events:?}");
 
         // 2. Revision supersession while holding task gates aborts before any kill.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(5);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(5),
+            ..Default::default()
+        };
         fake.default_probes.insert(
             OwnerRole::Live,
             OwnerProbe::Held { marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)) },
@@ -2542,8 +2553,10 @@ mod tests {
         assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
 
         // 3. Task-gate failure aborts before any kill.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(5);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(5),
+            ..Default::default()
+        };
         fake.task_gate_errors.push_back(Err("running tasks did not stop".into()));
         let err = stop_verified_owners_transaction(
             &mut fake,
@@ -2558,8 +2571,10 @@ mod tests {
         assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
 
         // 4. Gate-release timeout fails once monotonic deadline passes.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(5);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(5),
+            ..Default::default()
+        };
         fake.default_probes.insert(
             OwnerRole::Live,
             OwnerProbe::Held { marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)) },
@@ -2619,8 +2634,10 @@ mod tests {
         assert!(!fake.events.lock().unwrap().iter().any(|e| e == "kill:202"));
 
         // 6. quiesce_stopped_gates verifies revision and acquires owner gates.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(9);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(9),
+            ..Default::default()
+        };
         assert!(matches!(
             quiesce_stopped_gates(&mut fake, unused, 8, &[OwnerRole::Live, OwnerRole::Console], "restore"),
             Err(QuiesceError::Superseded(_))
@@ -2684,8 +2701,10 @@ mod tests {
         let unused = Path::new("/unused");
 
         // Console restarted with a new PID while waiting on task gates: must refuse without killing 999.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(3);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(3),
+            ..Default::default()
+        };
         fake.default_probes.insert(
             OwnerRole::Console,
             OwnerProbe::Held {
@@ -2717,8 +2736,10 @@ mod tests {
         );
 
         // Free console gate when an explicit PID was expected is also refused.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(3);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(3),
+            ..Default::default()
+        };
         let err = stop_verified_owners_with_pids(
             &mut fake,
             unused,
@@ -2732,8 +2753,10 @@ mod tests {
         assert!(err.contains("console owner is no longer verified"), "{err}");
 
         // Matching PID under the lock succeeds.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(3);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(3),
+            ..Default::default()
+        };
         fake.probes.insert(
             OwnerRole::Console,
             std::collections::VecDeque::from([
@@ -2761,8 +2784,10 @@ mod tests {
         let unused = Path::new("/unused");
 
         // 1. Happy path: Stopped rev 4, drains tasks without holding lifecycle.lock, kills live & console, waits for Free.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(4);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(4),
+            ..Default::default()
+        };
         let live_marker = fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None);
         fake.probes.insert(
             OwnerRole::Live,
@@ -2792,8 +2817,10 @@ mod tests {
         assert!(unlock_pos < tasks_pos && tasks_pos < sleep_pos, "{events:?}");
 
         // 2. Desired revision changed while waiting on task gates: refuses all stops.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(4);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(4),
+            ..Default::default()
+        };
         fake.default_probes.insert(
             OwnerRole::Live,
             OwnerProbe::Held {
@@ -2808,8 +2835,10 @@ mod tests {
         assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
 
         // 3. Failed task-gate hold leaves console running while still stopping live.
-        let mut fake = FakeLifecycle::default();
-        fake.default_desired = desired_stopped(4);
+        let mut fake = FakeLifecycle {
+            default_desired: desired_stopped(4),
+            ..Default::default()
+        };
         fake.task_gate_errors.push_back(Err("busy".into()));
         fake.probes.insert(
             OwnerRole::Live,

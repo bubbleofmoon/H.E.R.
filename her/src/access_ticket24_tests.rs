@@ -938,7 +938,7 @@ fn hold_append_lock(
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (locked, ready) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
-        let handle = std::fs::OpenOptions::new().read(true).write(true).append(true).open(path).unwrap();
+        let handle = std::fs::OpenOptions::new().read(true).append(true).open(path).unwrap();
         handle.lock().unwrap();
         locked.send(()).unwrap();
         let bound = std::time::Instant::now() + std::time::Duration::from_secs(30);

@@ -54,7 +54,7 @@ fn ticket24_console_front_refuses_foreign_hosts_non_json_writes_and_cross_site_o
     assert_eq!(body["security"]["interceptNotify"], false);
     let (status, _) = raw_request(port, &format!("GET /api/security HTTP/1.1\r\nHost: [::1]:{port}\r\nx-console-token: {token}\r\n"), "");
     assert_eq!(status, 200);
-    let (status, _) = raw_request(port, &format!("GET /api/health HTTP/1.1\r\nHost: probe.invalid\r\n"), "");
+    let (status, _) = raw_request(port, "GET /api/health HTTP/1.1\r\nHost: probe.invalid\r\n", "");
     assert_eq!(status, 200, "the health probe stays a token-free, host-free liveness check");
     server.join().unwrap();
 }

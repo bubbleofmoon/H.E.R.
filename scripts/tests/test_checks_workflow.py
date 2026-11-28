@@ -271,6 +271,11 @@ class WorkflowContract(unittest.TestCase):
         lint = self.job_block(text, "lint")
         self.assertNotIn("install-node.py", lint)
         self.assertNotIn("npm run build", lint)
+        self.assertNotIn("report-only", lint)
+        self.assertNotIn("set +e", lint)
+        self.assertIn("cargo fmt --all --check", lint)
+        self.assertIn("cargo clippy --workspace --all-targets", lint)
+        self.assertIn("-- -D warnings", lint)
 
         for job in ("tests", "tests-windows"):
             block = self.job_block(text, job)

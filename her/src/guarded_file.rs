@@ -31,9 +31,6 @@ fn step(name: &'static str) -> io::Result<()> {
 
 /// A symlink, or any Windows reparse point (junction, mount point, symlink).
 pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -41,7 +38,7 @@ pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
             return true;
         }
     }
-    false
+    metadata.file_type().is_symlink()
 }
 
 /// Open the final component itself, never a link's target:
@@ -81,7 +78,9 @@ impl From<GateError> for io::Error {
     fn from(error: GateError) -> Self {
         match error {
             GateError::Open(error) => error,
-            GateError::Redirected => io::Error::new(io::ErrorKind::PermissionDenied, "gate is redirected"),
+            GateError::Redirected => {
+                io::Error::new(io::ErrorKind::PermissionDenied, "gate is redirected")
+            }
             GateError::Unsafe => io::Error::new(io::ErrorKind::PermissionDenied, "gate is unsafe"),
         }
     }
@@ -91,7 +90,11 @@ impl From<GateError> for io::Error {
 /// The caller takes the OS lock and keeps the handle; gates are never replaced or unlinked.
 pub(crate) fn open_gate(path: &Path, gate: Gate) -> Result<File, GateError> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(gate != Gate::Existing).truncate(false);
+    options
+        .read(true)
+        .write(true)
+        .create(gate != Gate::Existing)
+        .truncate(false);
     no_follow(&mut options);
     #[cfg(unix)]
     if gate == Gate::Private {
@@ -107,7 +110,10 @@ pub(crate) fn open_gate(path: &Path, gate: Gate) -> Result<File, GateError> {
     if gate == Gate::Private {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+        {
             return Err(GateError::Unsafe);
         }
     }
@@ -116,7 +122,10 @@ pub(crate) fn open_gate(path: &Path, gate: Gate) -> Result<File, GateError> {
 
 #[derive(Debug)]
 pub(crate) enum Failure {
-    Io { class: &'static str, error: io::Error },
+    Io {
+        class: &'static str,
+        error: io::Error,
+    },
     Refused(String),
 }
 
@@ -133,7 +142,12 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { class, error } => {
-                write!(f, "class={class} kind={:?} os={:?}", error.kind(), error.raw_os_error())
+                write!(
+                    f,
+                    "class={class} kind={:?} os={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                )
             }
             Self::Refused(message) => f.write_str(message),
         }
@@ -154,15 +168,23 @@ fn io_failure(class: &'static str) -> impl FnOnce(io::Error) -> Failure {
 }
 
 fn folder(target: &Path) -> &Path {
-    target.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."))
+    target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn check_target(target: &Path) -> Result<(), Failure> {
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.is_file() && !is_link(&metadata) => Ok(()),
-        Ok(_) => Err(Failure::Refused("guarded file target is a link or not a regular file".into())),
+        Ok(_) => Err(Failure::Refused(
+            "guarded file target is a link or not a regular file".into(),
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Failure::Io { class: "leaf/metadata", error }),
+        Err(error) => Err(Failure::Io {
+            class: "leaf/metadata",
+            error,
+        }),
     }
 }
 
@@ -175,7 +197,11 @@ pub(crate) struct Staged {
 
 /// Write `input` to a new sibling temporary file and fsync it. `unix_mode` sets the temporary
 /// file's permissions on Unix (default: the process umask); Windows ignores it.
-pub(crate) fn stage(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>) -> Result<Staged, Failure> {
+pub(crate) fn stage(
+    target: &Path,
+    input: &mut dyn Read,
+    unix_mode: Option<u32>,
+) -> Result<Staged, Failure> {
     stage_with(target, input, |temp| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -207,10 +233,18 @@ pub(crate) fn stage_with(
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let mut file = open(&temp).map_err(io_failure("temp/create"))?;
-    let staged = Staged { temp, target: target.to_path_buf(), published: false };
+    let staged = Staged {
+        temp,
+        target: target.to_path_buf(),
+        published: false,
+    };
     let written = io::copy(input, &mut file)
         .map_err(io_failure("temp/write"))
-        .and_then(|_| step("temp/sync").and_then(|()| file.sync_all()).map_err(io_failure("temp/sync")));
+        .and_then(|_| {
+            step("temp/sync")
+                .and_then(|()| file.sync_all())
+                .map_err(io_failure("temp/sync"))
+        });
     drop(file);
     written.map(|()| staged)
 }
@@ -222,7 +256,10 @@ impl Staged {
 
     /// Replace the target, then fsync its folder. `before_each` runs before every attempt and its
     /// refusal is never retried; only Windows access/sharing/lock violations retry, for at most one second.
-    pub(crate) fn commit(mut self, before_each: &mut dyn FnMut() -> Result<(), String>) -> Result<(), Failure> {
+    pub(crate) fn commit(
+        mut self,
+        before_each: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), Failure> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             before_each().map_err(Failure::Refused)?;
@@ -232,7 +269,12 @@ impl Staged {
                 Err(error) if transient(&error) && Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => return Err(Failure::Io { class: "leaf/replace", error }),
+                Err(error) => {
+                    return Err(Failure::Io {
+                        class: "leaf/replace",
+                        error,
+                    })
+                }
             }
         }
         self.published = true;
@@ -276,11 +318,20 @@ pub(crate) fn transient(error: &io::Error) -> bool {
 #[cfg(windows)]
 fn replace(temp: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
     let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
     let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: both vectors are NUL-terminated and live through the call.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
         return Ok(());
     }
     let error = io::Error::last_os_error();
@@ -309,7 +360,9 @@ pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
 #[cfg(windows)]
 pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
     // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
@@ -327,14 +380,22 @@ pub(crate) fn ensure_plain_directory(path: &Path) -> Result<(), Failure> {
         }
         match fs::symlink_metadata(part) {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::create_dir(part) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(Failure::Io { class: "dir/create", error }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(part) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(Failure::Io {
+                        class: "dir/create",
+                        error,
+                    })
                 }
+            },
+            Err(error) => {
+                return Err(Failure::Io {
+                    class: "dir/inspect",
+                    error,
+                })
             }
-            Err(error) => return Err(Failure::Io { class: "dir/inspect", error }),
         }
         let metadata = fs::symlink_metadata(part).map_err(io_failure("dir/inspect"))?;
         if !metadata.is_dir() || is_link(&metadata) {
@@ -481,7 +542,13 @@ mod tests {
         let dir = temp_dir("file-sync");
         let path = dir.join("state.json");
         fs::write(&path, b"old").unwrap();
-        let hook = Hook::set(|step| if step == "temp/sync" { Err(io::Error::other("injected")) } else { Ok(()) });
+        let hook = Hook::set(|step| {
+            if step == "temp/sync" {
+                Err(io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        });
         let error = write_atomic(&path, b"new").unwrap_err();
         drop(hook);
         assert_eq!(error.class(), "temp/sync", "{error}");
@@ -495,11 +562,21 @@ mod tests {
         let dir = temp_dir("dir-sync");
         let path = dir.join("state.json");
         fs::write(&path, b"old").unwrap();
-        let hook = Hook::set(|step| if step == "dir/sync" { Err(io::Error::other("injected")) } else { Ok(()) });
+        let hook = Hook::set(|step| {
+            if step == "dir/sync" {
+                Err(io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        });
         let error = write_atomic(&path, b"new").unwrap_err();
         drop(hook);
         assert_eq!(error.class(), "dir/sync", "{error}");
-        assert_eq!(fs::read(&path).unwrap(), b"new", "the replacement is already published");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"new",
+            "the replacement is already published"
+        );
         assert!(temps(&dir).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
@@ -525,7 +602,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &path).unwrap();
         let error = write_atomic(&path, b"new").unwrap_err();
         assert_eq!(error.class(), "refused", "{error}");
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
         assert!(temps(&dir).is_empty());
         let _ = fs::remove_dir_all(dir);
@@ -538,17 +618,28 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("gates");
         let gate = dir.join("a.lock");
-        assert!(matches!(open_gate(&gate, Gate::Existing), Err(GateError::Open(e)) if e.kind() == io::ErrorKind::NotFound));
+        assert!(
+            matches!(open_gate(&gate, Gate::Existing), Err(GateError::Open(e)) if e.kind() == io::ErrorKind::NotFound)
+        );
         open_gate(&gate, Gate::Create).unwrap();
         open_gate(&gate, Gate::Existing).unwrap();
         let link = dir.join("link.lock");
         std::os::unix::fs::symlink(&gate, &link).unwrap();
-        assert!(open_gate(&link, Gate::Create).is_err(), "a linked gate is never followed");
+        assert!(
+            open_gate(&link, Gate::Create).is_err(),
+            "a linked gate is never followed"
+        );
         let private = dir.join("private.lock");
         open_gate(&private, Gate::Private).unwrap();
-        assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::hard_link(&private, dir.join("alias.lock")).unwrap();
-        assert!(matches!(open_gate(&private, Gate::Private), Err(GateError::Unsafe)));
+        assert!(matches!(
+            open_gate(&private, Gate::Private),
+            Err(GateError::Unsafe)
+        ));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -560,7 +651,10 @@ mod tests {
         let gate = dir.join("mode.lock");
         fs::write(&gate, b"").unwrap();
         fs::set_permissions(&gate, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(open_gate(&gate, Gate::Private), Err(GateError::Unsafe)));
+        assert!(matches!(
+            open_gate(&gate, Gate::Private),
+            Err(GateError::Unsafe)
+        ));
         fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
         open_gate(&gate, Gate::Private).unwrap();
         let _ = fs::remove_dir_all(dir);
@@ -581,8 +675,18 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &path).unwrap();
         let error = staged.commit(&mut || Ok::<(), String>(())).unwrap_err();
         assert_eq!(error.class(), "refused", "{error}");
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink(), "the link itself stays");
-        assert_eq!(fs::read(&outside).unwrap(), b"outside", "the link target is untouched");
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself stays"
+        );
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"outside",
+            "the link target is untouched"
+        );
         assert!(!temp.exists(), "the staged temporary file is removed");
         assert!(temps(&dir).is_empty());
         let _ = fs::remove_dir_all(dir);
@@ -643,7 +747,9 @@ mod tests {
         let dir = temp_dir("bounded-read");
         let missing = dir.join("missing.bin");
         assert!(open_no_follow_regular(&missing, true).unwrap().is_none());
-        assert!(read_bounded_no_follow(&missing, 16, true).unwrap().is_none());
+        assert!(read_bounded_no_follow(&missing, 16, true)
+            .unwrap()
+            .is_none());
 
         let target = dir.join("data.bin");
         publish_atomic_with(
@@ -653,7 +759,10 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        assert_eq!(read_bounded_no_follow(&target, 11, true).unwrap(), Some(b"hello world".to_vec()));
+        assert_eq!(
+            read_bounded_no_follow(&target, 11, true).unwrap(),
+            Some(b"hello world".to_vec())
+        );
         let oversized = read_bounded_no_follow(&target, 10, true).unwrap_err();
         assert_eq!(oversized.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(dir);

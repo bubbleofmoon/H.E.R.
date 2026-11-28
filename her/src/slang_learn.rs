@@ -111,6 +111,7 @@ struct WindowState {
 struct LearningInner {
     context: RuntimeContext,
     state: Mutex<WindowState>,
+    #[cfg(test)]
     sync_lock: Mutex<()>,
 }
 
@@ -128,6 +129,7 @@ fn runtime_inner(context: &RuntimeContext) -> Arc<LearningInner> {
             Arc::new(LearningInner {
                 context: context.clone(),
                 state: Mutex::new(WindowState::default()),
+                #[cfg(test)]
                 sync_lock: Mutex::new(()),
             })
         })
@@ -154,21 +156,19 @@ impl SlangLearning {
             inner: Arc::new(LearningInner {
                 context: context.clone(),
                 state: Mutex::new(WindowState::default()),
+                #[cfg(test)]
                 sync_lock: Mutex::new(()),
             }),
         }
     }
 
+    #[cfg(test)]
     pub fn feed_window(&self, key: &str, sender: &str, text: &str) -> bool {
         self.try_feed_window(key, sender, text).unwrap_or(false)
     }
 
     pub fn try_feed_window(&self, key: &str, sender: &str, text: &str) -> Result<bool, String> {
         feed_window_with_runtime(&self.inner.context, &self.inner.state, key, sender, text)
-    }
-
-    pub fn maybe_trigger(&self, cfg: &Value, key: &str) -> bool {
-        self.try_maybe_trigger(cfg, key).unwrap_or(false)
     }
 
     pub fn try_maybe_trigger(&self, cfg: &Value, key: &str) -> Result<bool, String> {
@@ -260,6 +260,7 @@ impl SlangLearning {
         }
     }
 
+    #[cfg(all(test, windows))]
     pub async fn run_auto(&self, cfg: Value, key: String) {
         let ticket = match reserve_job(&self.inner.context) {
             Ok(ticket) => ticket,
@@ -298,6 +299,7 @@ impl SlangLearning {
         report_auto_result(result, &key);
     }
 
+    #[cfg(test)]
     pub fn extract_now(
         &self,
         cfg: &Value,
@@ -644,12 +646,15 @@ fn read_windows_file(context: &RuntimeContext) -> Result<DiskWindows, String> {
     if !v.is_object() {
         return Err("候选黑话窗口结构损坏".to_string());
     }
-    let mut out = DiskWindows::default();
-    out.generation = match v.get("generation") {
+    let generation = match v.get("generation") {
         Some(value) => value
             .as_u64()
             .ok_or_else(|| "候选黑话窗口 generation 结构异常".to_string())?,
         None => 0,
+    };
+    let mut out = DiskWindows {
+        generation,
+        ..Default::default()
     };
     // Missing fields are accepted for older selected-root snapshots, but a present field
     // with the wrong shape must not be treated as an empty window. The next feed would
@@ -1232,6 +1237,7 @@ fn parse_one(v: &Value) -> Option<ExtractedItem> {
 }
 
 /// Fault-tolerant extractor that strips code fences, scans JSON arrays, and returns empty on parse errors.
+#[cfg(test)]
 pub fn parse_extraction(raw: &str) -> Vec<ExtractedItem> {
     parse_extraction_checked(raw).unwrap_or_default()
 }
@@ -2131,6 +2137,7 @@ fn report_auto_result(out: Result<Value, tokio::task::JoinError>, key: &str) {
 ///
 /// `dry_run` 只数窗口、不调模型（回归脚本用它验证端点形状，避免真花钱）。
 /// `force` 跳过冷却与拒绝退避（默认不跳，保证「连续调两次，第二次不发模型调用」）。
+#[cfg(test)]
 pub fn extract_now(
     context: &RuntimeContext,
     cfg: &Value,
@@ -2152,6 +2159,7 @@ pub fn extract_now(
     )
 }
 
+#[cfg(test)]
 fn extract_now_with_runtime(
     context: &RuntimeContext,
     window_state: &Mutex<WindowState>,

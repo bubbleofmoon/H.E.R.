@@ -95,7 +95,7 @@ pub(crate) fn candidate(
             .pointer("/dsh/cacheTtlMinutes")
             .and_then(|v| v.get(provider))
             .and_then(Value::as_f64)
-            .or_else(|| match provider {
+            .or(match provider {
                 "local-relay" => Some(5.0),
                 "opencode-go" => Some(120.0),
                 _ => None,

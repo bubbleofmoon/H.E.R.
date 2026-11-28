@@ -53,8 +53,6 @@ use serde_json::Value;
 
 pub(crate) use kinds::{daily_parts, SettingKind};
 #[cfg(test)]
-pub(crate) use kinds::ID_LIST_MAX;
-#[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, HARNESS_API_KEY, WEB_SEARCH_API_KEY};

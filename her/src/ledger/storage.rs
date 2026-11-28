@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{compact_jsonl, now_ms, order_merged, plan_appends, read_rows, Ledger};
+use super::{compact_jsonl, now_ms, plan_appends, Ledger};
+#[cfg(test)]
+use super::{order_merged, read_rows};
 use crate::pricing::PriceTable;
 use crate::runtime::{
-    append_io, lock_append_file, runtime_io_error, write_append_all, PathIntent, RuntimeArea,
-    RuntimeContext, APPEND_CONFLICT_WAIT,
+    runtime_io_error, PathIntent, RuntimeArea, RuntimeContext, APPEND_CONFLICT_WAIT,
 };
+#[cfg(test)]
+use crate::runtime::{append_io, lock_append_file, write_append_all};
 
 pub const DEFAULT_MAX_LINES: usize = 20_000;
 const DEFAULT_KEEP_SAMPLES: usize = 10_000;
@@ -44,11 +47,13 @@ impl LedgerStorage {
     }
 
     /// Append one usage record to an explicit ledger path.
+    #[cfg(test)]
     pub fn append_record_to(path: &str, record: &Value) -> Result<(), String> {
         append_record_at(Path::new(path), record, false, None)
     }
 
     /// Append and sync one usage record under lock (guarded files).
+    #[cfg(test)]
     pub(crate) fn append_record_to_durable(path: &str, record: &Value) -> Result<(), String> {
         append_record_at(Path::new(path), record, true, None)
     }
@@ -74,6 +79,7 @@ impl LedgerStorage {
     }
 
     /// Load and merge explicit ledger file paths.
+    #[cfg(test)]
     pub fn load_paths(paths: &[&str]) -> Ledger {
         let mut ledger = Ledger::empty(
             paths.first().copied().unwrap_or(JS_LEDGER_NAME),
@@ -195,35 +201,6 @@ impl LedgerStorage {
                 Self::advance_reconcile_seq(context, max_seq)?;
             }
         }
-        Ok(true)
-    }
-
-    /// Compact an explicit ledger file under an OS file lock (test helper).
-    #[cfg(test)]
-    pub(crate) fn compact_file(
-        path: &Path,
-        table: &PriceTable,
-        max_lines: usize,
-        keep_samples: usize,
-    ) -> Result<bool, String> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("打开账本失败：{}", runtime_io_error("compact/open", &e)))?;
-        lock_append_file(&file, None)
-            .map_err(|e| format!("锁账本失败：{}", runtime_io_error("compact/lock", &e)))?;
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)
-            .map_err(|e| format!("读取账本失败：{}", runtime_io_error("compact/read", &e)))?;
-        if raw.split('\n').filter(|l| !l.is_empty()).count() < max_lines {
-            return Ok(false);
-        }
-        let plan = compact_jsonl(&raw, None, table, keep_samples, now_ms());
-        if !plan.compacted {
-            return Ok(false);
-        }
-        write_locked_handle(&mut file, plan.jsonl.as_bytes())?;
         Ok(true)
     }
 
@@ -351,6 +328,7 @@ fn open_locked_file_retry(
     }
 }
 
+#[cfg(test)]
 fn append_record_at(
     path: &Path,
     record: &Value,

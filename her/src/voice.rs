@@ -287,7 +287,6 @@ pub struct Inspect {
     pub size: Option<u64>,
     pub duration: Option<f64>,
     pub codec: String,
-    pub format_name: String,
     pub sample_rate: f64,
     pub channels: f64,
     pub warnings: Vec<String>,
@@ -350,7 +349,6 @@ fn run_tool(program: &str, args: &[String], timeout: Duration) -> Run {
 
 pub struct ProbeOk {
     pub duration: f64,
-    pub format_name: String,
     pub codec: String,
     pub sample_rate: f64,
     pub channels: f64,
@@ -417,7 +415,6 @@ pub fn probe_audio(file: &Path, ffprobe: &str, tmp_dir: Option<&Path>) -> Result
         let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_string();
         Ok(ProbeOk {
             duration,
-            format_name: text(json.pointer("/format/format_name")),
             codec: text(audio.and_then(|a| a.get("codec_name"))),
             sample_rate: number_of(audio.and_then(|a| a.get("sample_rate"))),
             channels: number_of(audio.and_then(|a| a.get("channels"))),
@@ -471,7 +468,6 @@ fn probe_silk(file: &Path) -> Result<ProbeOk, String> {
     let packets = parse().map_err(|reason| format!("SILK 格式无效：{reason}"))?;
     Ok(ProbeOk {
         duration: packets as f64 / 10.0,
-        format_name: "silk".into(),
         codec: "silk".into(),
         sample_rate: 0.0,
         channels: 0.0,
@@ -544,7 +540,6 @@ pub fn inspect_audio(file: &Path, max_bytes: u64, max_seconds: f64, ffprobe: &st
         size: Some(size),
         duration: Some(probe.duration),
         codec: probe.codec,
-        format_name: probe.format_name,
         sample_rate: probe.sample_rate,
         channels: probe.channels,
         warnings,

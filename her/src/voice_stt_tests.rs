@@ -128,7 +128,7 @@ fn big_silk(bytes: usize) -> Vec<u8> {
     record.extend_from_slice(b"#!SILK_V3");
     while record.len() < bytes {
         record.extend_from_slice(&32_000i16.to_le_bytes());
-        record.extend(std::iter::repeat(0xA5u8).take(32_000));
+        record.extend(std::iter::repeat_n(0xA5u8, 32_000));
     }
     record
 }

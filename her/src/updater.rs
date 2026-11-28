@@ -3,8 +3,8 @@ mod guarded_file;
 mod handover;
 mod install_root;
 mod process_identity;
-mod release_store;
 mod release_signature;
+mod release_store;
 mod subprocess;
 mod update;
 

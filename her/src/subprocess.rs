@@ -4,29 +4,50 @@ use std::process::Command;
 /// Ordinary filesystem spelling for a process/config boundary. Never use this for pinning
 /// or containment: those comparisons must keep their canonical paths.
 pub(crate) fn external_path(path: impl AsRef<std::path::Path>) -> Result<String, String> {
-    let text = path.as_ref().to_str().ok_or("external path is not Unicode")?;
-    let Some(rest) = text.strip_prefix(r"\\?\") else { return Ok(text.to_string()) };
-    let ordinary = if rest.get(..4).is_some_and(|s| s.eq_ignore_ascii_case(r"UNC\")) {
+    let text = path
+        .as_ref()
+        .to_str()
+        .ok_or("external path is not Unicode")?;
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return Ok(text.to_string());
+    };
+    let ordinary = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case(r"UNC\"))
+    {
         let tail = &rest[4..];
         if tail.split('\\').take(2).filter(|s| !s.is_empty()).count() != 2 {
             return Err("verbatim UNC path has no server/share".into());
         }
         format!(r"\\{tail}")
     } else if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-        && rest.as_bytes().get(1..3) == Some(b":\\") {
+        && rest.as_bytes().get(1..3) == Some(b":\\")
+    {
         rest.to_string()
-    } else { return Err("verbatim device path has no ordinary filesystem spelling".into()) };
+    } else {
+        return Err("verbatim device path has no ordinary filesystem spelling".into());
+    };
     // Removing the prefix must not change Win32 name resolution or require long-path opt-in
     // from external tools (notably Windows PowerShell 5.1).
-    let tail = if ordinary.starts_with(r"\\") { &ordinary[2..] } else { &ordinary[3..] };
-    if ordinary.encode_utf16().count() >= 260 || tail.split('\\').any(|part| {
-        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
-        part.ends_with([' ', '.']) || part.contains(['/', ':', '"', '<', '>', '|', '?', '*'])
-            || part.chars().any(|c| c < ' ')
-            || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
-            || (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && matches!(&stem[3..], "1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9"|"¹"|"²"|"³")
-    }) { return Err("verbatim path cannot be represented safely for external tools".into()); }
+    let tail = ordinary
+        .strip_prefix(r"\\")
+        .unwrap_or_else(|| &ordinary[3..]);
+    if ordinary.encode_utf16().count() >= 260
+        || tail.split('\\').any(|part| {
+            let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            part.ends_with([' ', '.'])
+                || part.contains(['/', ':', '"', '<', '>', '|', '?', '*'])
+                || part.chars().any(|c| c < ' ')
+                || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
+                || (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && matches!(
+                        &stem[3..],
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+        })
+    {
+        return Err("verbatim path cannot be represented safely for external tools".into());
+    }
     Ok(ordinary)
 }
 
@@ -83,6 +104,7 @@ pub(crate) fn prevent_stdio_inheritance() {
 /// Keep stdio configuration and lifecycle management at each call site so this
 /// only changes window creation. Other platforms retain Command::new behavior.
 pub(crate) fn command_without_console(program: impl AsRef<OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
@@ -246,6 +268,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     struct WindowSample {
+        #[allow(dead_code)] // Included in Debug failure assertions.
         hwnd: usize,
         process_id: u32,
     }

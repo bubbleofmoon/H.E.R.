@@ -244,6 +244,127 @@ fn read_legacy(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// The DSH route's briefing-delivery store (`briefing_delivery.rs`). Briefing evidence shares the mapping
+/// gate. The social gate pins the epoch while writing; a late collector cannot acknowledge a replacement
+/// session or a rotated token. A new session's record starts with `briefing_delivery::begin`.
+pub fn update_context(
+    context: &RuntimeContext, key: &str, sid: &str, epoch: &str,
+    change: impl FnOnce(&mut Value),
+) -> Result<bool, String> {
+    let _social = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
+    if crate::conversation_state::read_agent_token(context, key)?.as_deref() != Some(epoch) {
+        return Ok(false);
+    }
+    modify(context, |doc| {
+        if doc.get("sessions").and_then(|s| s.get(key)).and_then(session_of).as_deref() != Some(sid) {
+            return false;
+        }
+        let record = object(doc, "briefings").entry(key.to_string()).or_insert_with(|| json!({}));
+        crate::briefing_delivery::begin(record, sid, epoch);
+        let before = record.clone();
+        change(record);
+        *record != before
+    })
+}
+
+pub fn context_record(context: &RuntimeContext, key: &str, sid: &str, epoch: &str) -> Result<Value, String> {
+    let doc = read(context)?;
+    let record = doc.get("briefings").and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
+    Ok(if crate::briefing_delivery::belongs(&record, sid, epoch) {
+        record
+    } else { json!({"generation":0}) })
+}
+
+/// A rotation may have removed its mapping before the replacement token write failed.
+/// Its retained checkpoint owns retirement until that exact epoch is durably revoked.
+pub(crate) fn unrevoked_rotation(
+    context: &RuntimeContext, key: &str, epoch: &str,
+) -> Result<Option<String>, String> {
+    let doc = read(context)?;
+    let r = doc.get("briefings").and_then(|v| v.get(key)).unwrap_or(&Value::Null);
+    Ok(if !epoch.is_empty() && r["epoch"] == epoch && r["format"] == 1
+        && r["rotation"]["phase"] == "rotate"
+        && r["rotation"]["turnSeq"].as_i64().is_some_and(|seq| seq > 0)
+        && r["rotation"]["turnSeq"] == r["lastTurnSeq"] {
+        r["sid"].as_str().filter(|sid| !sid.is_empty()).map(str::to_string)
+    } else { None })
+}
+
+/// Last failure remains available after briefing replacement and session retirement.
+pub(crate) fn record_rotation_failure(
+    context: &RuntimeContext,
+    key: &str,
+    value: Value,
+) -> Result<(), String> {
+    modify(context, |doc| {
+        object(doc, "rotationFailures").insert(key.into(), value);
+        true
+    })
+    .map(|_| ())
+}
+
+/// Failure alerts survive restarts and session retirement, at most once per local day.
+#[cfg(test)]
+pub(crate) fn mark_rotation_alert(
+    context: &RuntimeContext,
+    key: &str,
+    _sid: &str,
+) -> Result<bool, String> {
+    let cfg = context.load_config_document().unwrap_or_default();
+    mark_rotation_alert_day(context, key, rotation_alert_day(&cfg))
+}
+
+pub(crate) fn rotation_alert_day(cfg: &Value) -> i64 {
+    let zone = crate::local_time::configured_zone(cfg);
+    let date = crate::local_time::at(crate::parity_clock::now_ms(), &zone).date();
+    date.to_zoned(jiff::tz::TimeZone::UTC).expect("current date is representable")
+        .timestamp().as_millisecond().div_euclid(86_400_000)
+}
+
+pub(crate) fn mark_rotation_alert_day(
+    context: &RuntimeContext,
+    key: &str,
+    day: i64,
+) -> Result<bool, String> {
+    // The independent claim survives an unreadable sessions document. Serialize
+    // both files under the same gate, before any possibly uncertain notification.
+    const ALERT_FILE: &str = "rotation-alerts.json";
+    let _gate = lock(context)?;
+    let mut sessions = read(context);
+    let mut independent = context
+        .read_optional_text(RuntimeArea::Data, ALERT_FILE)
+        .map_err(str::to_string)
+        .and_then(parse);
+    let markers: Vec<_> = [&independent, &sessions]
+        .into_iter()
+        .filter_map(|store| store.as_ref().ok()?.get("rotationAlerts")?.get(key))
+        .collect();
+    let last = markers.iter().filter_map(|v| v["day"].as_i64()).max();
+    // Adopt legacy string markers conservatively for today, as before.
+    let claimed = !last.is_some_and(|last| last >= day) && !markers.iter().any(|v| v.is_string());
+    let stamp = last.unwrap_or(day).max(day);
+    let mut durable = false;
+    for (file, store) in [(ALERT_FILE, &mut independent), (FILE, &mut sessions)] {
+        if let Ok(doc) = store {
+            let alerts = object(doc, "rotationAlerts");
+            if alerts.get(key).and_then(|v| v["day"].as_i64()) == Some(stamp) {
+                durable = true;
+            } else {
+                alerts.insert(key.into(), json!({"day":stamp}));
+                let bytes = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
+                durable |= context
+                    .write_atomic(RuntimeArea::Data, file, &bytes)
+                    .is_ok();
+            }
+        }
+    }
+    if durable || !claimed {
+        Ok(claimed)
+    } else {
+        Err("rotation notice claim storage unavailable".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,125 +468,5 @@ mod tests {
         assert_eq!(record["gapThrough"], 3, "the new session's record started fresh, then took the reported gap: {record}");
         assert!(record["installed"].is_null(), "{record}");
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-/// The DSH route's briefing-delivery store (`briefing_delivery.rs`). Briefing evidence shares the mapping
-/// gate. The social gate pins the epoch while writing; a late collector cannot acknowledge a replacement
-/// session or a rotated token. A new session's record starts with `briefing_delivery::begin`.
-pub fn update_context(
-    context: &RuntimeContext, key: &str, sid: &str, epoch: &str,
-    change: impl FnOnce(&mut Value),
-) -> Result<bool, String> {
-    let _social = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
-    if crate::conversation_state::read_agent_token(context, key)?.as_deref() != Some(epoch) {
-        return Ok(false);
-    }
-    modify(context, |doc| {
-        if doc.get("sessions").and_then(|s| s.get(key)).and_then(session_of).as_deref() != Some(sid) {
-            return false;
-        }
-        let record = object(doc, "briefings").entry(key.to_string()).or_insert_with(|| json!({}));
-        crate::briefing_delivery::begin(record, sid, epoch);
-        let before = record.clone();
-        change(record);
-        *record != before
-    })
-}
-
-pub fn context_record(context: &RuntimeContext, key: &str, sid: &str, epoch: &str) -> Result<Value, String> {
-    let doc = read(context)?;
-    let record = doc.get("briefings").and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
-    Ok(if crate::briefing_delivery::belongs(&record, sid, epoch) {
-        record
-    } else { json!({"generation":0}) })
-}
-
-/// A rotation may have removed its mapping before the replacement token write failed.
-/// Its retained checkpoint owns retirement until that exact epoch is durably revoked.
-pub(crate) fn unrevoked_rotation(
-    context: &RuntimeContext, key: &str, epoch: &str,
-) -> Result<Option<String>, String> {
-    let doc = read(context)?;
-    let r = doc.get("briefings").and_then(|v| v.get(key)).unwrap_or(&Value::Null);
-    Ok(if !epoch.is_empty() && r["epoch"] == epoch && r["format"] == 1
-        && r["rotation"]["phase"] == "rotate"
-        && r["rotation"]["turnSeq"].as_i64().is_some_and(|seq| seq > 0)
-        && r["rotation"]["turnSeq"] == r["lastTurnSeq"] {
-        r["sid"].as_str().filter(|sid| !sid.is_empty()).map(str::to_string)
-    } else { None })
-}
-
-/// Last failure remains available after briefing replacement and session retirement.
-pub(crate) fn record_rotation_failure(
-    context: &RuntimeContext,
-    key: &str,
-    value: Value,
-) -> Result<(), String> {
-    modify(context, |doc| {
-        object(doc, "rotationFailures").insert(key.into(), value);
-        true
-    })
-    .map(|_| ())
-}
-
-/// Failure alerts survive restarts and session retirement, at most once per local day.
-pub(crate) fn mark_rotation_alert(
-    context: &RuntimeContext,
-    key: &str,
-    _sid: &str,
-) -> Result<bool, String> {
-    let cfg = context.load_config_document().unwrap_or_default();
-    mark_rotation_alert_day(context, key, rotation_alert_day(&cfg))
-}
-
-pub(crate) fn rotation_alert_day(cfg: &Value) -> i64 {
-    let zone = crate::local_time::configured_zone(cfg);
-    let date = crate::local_time::at(crate::parity_clock::now_ms(), &zone).date();
-    date.to_zoned(jiff::tz::TimeZone::UTC).expect("current date is representable")
-        .timestamp().as_millisecond().div_euclid(86_400_000)
-}
-
-pub(crate) fn mark_rotation_alert_day(
-    context: &RuntimeContext,
-    key: &str,
-    day: i64,
-) -> Result<bool, String> {
-    // The independent claim survives an unreadable sessions document. Serialize
-    // both files under the same gate, before any possibly uncertain notification.
-    const ALERT_FILE: &str = "rotation-alerts.json";
-    let _gate = lock(context)?;
-    let mut sessions = read(context);
-    let mut independent = context
-        .read_optional_text(RuntimeArea::Data, ALERT_FILE)
-        .map_err(str::to_string)
-        .and_then(parse);
-    let markers: Vec<_> = [&independent, &sessions]
-        .into_iter()
-        .filter_map(|store| store.as_ref().ok()?.get("rotationAlerts")?.get(key))
-        .collect();
-    let last = markers.iter().filter_map(|v| v["day"].as_i64()).max();
-    // Adopt legacy string markers conservatively for today, as before.
-    let claimed = !last.is_some_and(|last| last >= day) && !markers.iter().any(|v| v.is_string());
-    let stamp = last.unwrap_or(day).max(day);
-    let mut durable = false;
-    for (file, store) in [(ALERT_FILE, &mut independent), (FILE, &mut sessions)] {
-        if let Ok(doc) = store {
-            let alerts = object(doc, "rotationAlerts");
-            if alerts.get(key).and_then(|v| v["day"].as_i64()) == Some(stamp) {
-                durable = true;
-            } else {
-                alerts.insert(key.into(), json!({"day":stamp}));
-                let bytes = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
-                durable |= context
-                    .write_atomic(RuntimeArea::Data, file, &bytes)
-                    .is_ok();
-            }
-        }
-    }
-    if durable || !claimed {
-        Ok(claimed)
-    } else {
-        Err("rotation notice claim storage unavailable".into())
     }
 }

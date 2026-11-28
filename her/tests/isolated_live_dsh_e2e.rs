@@ -5,8 +5,8 @@
 //! the public isolated console HTTP route. This proves the bridge-to-console boundary and selected
 //! runtime paths; it does not claim to exercise a real DSH model or its tool planner.
 
-use support::install_root;
 use support::hide_window as hide_process_window;
+use support::install_root;
 mod support;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -158,7 +158,9 @@ struct DshShared {
 
 fn bind_loopback() -> (TcpListener, String) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback fixture listener");
-    let address = listener.local_addr().expect("read fixture listener address");
+    let address = listener
+        .local_addr()
+        .expect("read fixture listener address");
     (listener, format!("127.0.0.1:{}", address.port()))
 }
 
@@ -434,9 +436,10 @@ async fn send_async_json(
 }
 
 async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Result<(), String> {
-    let request = tokio::time::timeout(Duration::from_secs(8), read_async_http_request(&mut stream))
-        .await
-        .map_err(|_| "timed out reading a fake DSH RPC".to_string())??;
+    let request =
+        tokio::time::timeout(Duration::from_secs(8), read_async_http_request(&mut stream))
+            .await
+            .map_err(|_| "timed out reading a fake DSH RPC".to_string())??;
     let path = parse_path(&request.request_line).to_string();
     let cookie = request.headers.get("cookie").map(String::as_str);
     let cookie_valid = cookie_uses_secret(cookie, &shared.selected_secret, &shared.authority);
@@ -458,11 +461,18 @@ async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Resu
         selected_cookie_valid: cookie_valid,
     });
     if !cookie_valid {
-        send_async_json(&mut stream, 401, &json!({"error":"fixture rejected non-selected DSH cookie"})).await?;
+        send_async_json(
+            &mut stream,
+            401,
+            &json!({"error":"fixture rejected non-selected DSH cookie"}),
+        )
+        .await?;
         return Ok(());
     }
     if path != format!("/api/{method}") {
-        return Err(format!("DSH request path/method mismatch: {path} / {method}"));
+        return Err(format!(
+            "DSH request path/method mismatch: {path} / {method}"
+        ));
     }
     // Frozen JS `checkDsh` requires a matching server-response envelope over successful HTTP
     // before it dispatches work. The selected DSH is healthy in this scenario.
@@ -515,7 +525,12 @@ async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Resu
         "session/create" => json!({"sessionId":SESSION_ID}),
         "workspace/rename" | "session/selectModel" => json!({}),
         _ => {
-            send_async_json(&mut stream, 404, &json!({"error":"unexpected fixture DSH method"})).await?;
+            send_async_json(
+                &mut stream,
+                404,
+                &json!({"error":"unexpected fixture DSH method"}),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -527,9 +542,11 @@ async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Resu
     .await
 }
 
-async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Result<(), String> {
+async fn handle_dsh_ws(stream: TokioStream, shared: Arc<DshShared>) -> Result<(), String> {
     let auth = Arc::new(Mutex::new(None::<String>));
     let callback_auth = auth.clone();
+    #[allow(clippy::result_large_err)]
+    // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
     let mut socket = tokio::time::timeout(
         Duration::from_secs(5),
         accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -545,7 +562,11 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
     .map_err(|_| "timed out upgrading selected DSH WebSocket".to_string())?
     .map_err(|error| format!("upgrade fake DSH WebSocket: {error}"))?;
     let cookie = auth.lock().unwrap().clone();
-    let cookie_valid = cookie_uses_secret(cookie.as_deref(), &shared.selected_secret, &shared.authority);
+    let cookie_valid = cookie_uses_secret(
+        cookie.as_deref(),
+        &shared.selected_secret,
+        &shared.authority,
+    );
     let open_message = tokio::time::timeout(Duration::from_secs(5), socket.next())
         .await
         .map_err(|_| "timed out waiting for DSH follow open frame".to_string())?
@@ -574,8 +595,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
                     "streamId":stream_id,
                     "value":{"type":"ready","clientId":"fixture-events-client"}
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|error| format!("send DSH $events ready: {error}"))?;
@@ -608,8 +628,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
                 "streamId":stream_id,
                 "value":{"type":"snapshot","records":[]}
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .map_err(|error| format!("send DSH follow snapshot: {error}"))?;
@@ -639,7 +658,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
         }),
     ] {
         socket
-            .send(Message::Text(frame.to_string().into()))
+            .send(Message::Text(frame.to_string()))
             .await
             .map_err(|error| format!("send DSH follow event: {error}"))?;
     }
@@ -662,7 +681,10 @@ async fn handle_dsh_connection(stream: TokioStream, shared: Arc<DshShared>) -> R
                 // nothing to classify and nothing for the fixture to reject.
                 return Ok::<String, String>(String::new());
             }
-            if let Some(end) = prefix[..count].windows(2).position(|window| window == b"\r\n") {
+            if let Some(end) = prefix[..count]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            {
                 return Ok(String::from_utf8_lossy(&prefix[..end]).to_string());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -751,7 +773,10 @@ fn spawn_dsh_server(
             Ok(capture_dsh(&thread_shared))
         })
     });
-    ServerThread { stop, handle: Some(handle) }
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 fn accept_fixture(listener: &TcpListener, deadline: Instant) -> Result<TcpStream, String> {
@@ -788,12 +813,16 @@ fn serve_onebot_http(
         .map_err(|error| format!("set fake OneBot listener nonblocking: {error}"))?;
     let deadline = Instant::now() + Duration::from_secs(38);
     let mut observations = Vec::new();
-    while (!expect_send || !sent.load(Ordering::SeqCst)) && !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-        let mut stream = match accept_fixture(&listener, Instant::now() + Duration::from_millis(250)) {
-            Ok(stream) => stream,
-            Err(error) if error.contains("timed out") => continue,
-            Err(error) => return Err(error),
-        };
+    while (!expect_send || !sent.load(Ordering::SeqCst))
+        && !stop.load(Ordering::SeqCst)
+        && Instant::now() < deadline
+    {
+        let mut stream =
+            match accept_fixture(&listener, Instant::now() + Duration::from_millis(250)) {
+                Ok(stream) => stream,
+                Err(error) if error.contains("timed out") => continue,
+                Err(error) => return Err(error),
+            };
         let request = parse_sync_http_request(&mut stream)?;
         let path = parse_path(&request.request_line).to_string();
         let body = serde_json::from_slice(&request.body)
@@ -854,7 +883,11 @@ fn serve_unused_model_endpoint(
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
                 count += 1;
-                let _ = send_sync_json(&mut stream, 404, &json!({"error":"unexpected model dependency request"}));
+                let _ = send_sync_json(
+                    &mut stream,
+                    404,
+                    &json!({"error":"unexpected model dependency request"}),
+                );
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -891,6 +924,8 @@ fn serve_onebot_ws(
             .map_err(|error| format!("accept fake OneBot WS connection: {error}"))?;
         let auth = Arc::new(Mutex::new(None::<String>));
         let callback_auth = auth.clone();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio::time::timeout(
             Duration::from_secs(5),
             accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -915,15 +950,19 @@ fn serve_onebot_ws(
         };
         let login: Value = serde_json::from_str(&login_text)
             .map_err(|error| format!("OneBot login request was not JSON: {error}"))?;
-        let login_action = login.get("action").and_then(Value::as_str).map(str::to_string);
+        let login_action = login
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if login_action.as_deref() != Some("get_login_info") {
-            return Err(format!("unexpected OneBot initial action: {login_action:?}"));
+            return Err(format!(
+                "unexpected OneBot initial action: {login_action:?}"
+            ));
         }
         socket
             .send(Message::Text(
                 json!({"echo":"login","data":{"user_id":SELF_ID,"nickname":"ticket04-dsh-bot"}})
-                    .to_string()
-                    .into(),
+                    .to_string(),
             ))
             .await
             .map_err(|error| format!("reply to fake OneBot login: {error}"))?;
@@ -943,8 +982,7 @@ fn serve_onebot_ws(
                     ],
                     "sender":{"nickname":"ticket04-dsh-user"}
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|error| format!("send selected fake incoming message: {error}"))?;
@@ -952,18 +990,26 @@ fn serve_onebot_ws(
         // A tool send happens inside session/prompt, before DSH publishes turn/end. Closing
         // here on the send alone makes --no-reconnect exit while its collector is still
         // writing usage/timing. The terminal ledger record follows that bookkeeping.
-        let finished = || sent.load(Ordering::SeqCst) && completed_root.as_ref().is_none_or(|root| {
-            fs::read_to_string(root.join("data/turn-ledger.jsonl")).unwrap_or_default()
-                .lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|record| record["k"] == "ended")
-        });
+        let finished = || {
+            sent.load(Ordering::SeqCst)
+                && completed_root.as_ref().is_none_or(|root| {
+                    fs::read_to_string(root.join("data/turn-ledger.jsonl"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|record| record["k"] == "ended")
+                })
+        };
         while !finished() && !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // A failure scenario holds the connection for a bounded window and then closes it, so the
         // `--no-reconnect` candidate exits without a send; the caller asserts that no send happened.
         if hold_without_send.is_none() && !finished() {
-            return Err("public isolated send and collector completion did not finish before deadline".into());
+            return Err(
+                "public isolated send and collector completion did not finish before deadline"
+                    .into(),
+            );
         }
         let _ = socket.send(Message::Close(None)).await;
         let authorization = auth.lock().unwrap().clone();
@@ -982,7 +1028,11 @@ struct ServerThread<T> {
 impl<T> ServerThread<T> {
     fn finish(mut self) -> T {
         self.stop.store(true, Ordering::SeqCst);
-        self.handle.take().expect("server thread handle").join().expect("fixture server thread panicked")
+        self.handle
+            .take()
+            .expect("server thread handle")
+            .join()
+            .expect("fixture server thread panicked")
     }
 }
 
@@ -995,7 +1045,10 @@ impl<T> Drop for ServerThread<T> {
     }
 }
 
-fn spawn_onebot_http(listener: TcpListener, sent: Arc<AtomicBool>) -> ServerThread<Result<Vec<OneBotObservation>, String>> {
+fn spawn_onebot_http(
+    listener: TcpListener,
+    sent: Arc<AtomicBool>,
+) -> ServerThread<Result<Vec<OneBotObservation>, String>> {
     spawn_onebot_http_with(listener, sent, true)
 }
 
@@ -1007,14 +1060,20 @@ fn spawn_onebot_http_with(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = thread::spawn(move || serve_onebot_http(listener, sent, thread_stop, expect_send));
-    ServerThread { stop, handle: Some(handle) }
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 fn spawn_model_sentinel(listener: TcpListener) -> ServerThread<Result<usize, String>> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = thread::spawn(move || serve_unused_model_endpoint(listener, thread_stop));
-    ServerThread { stop, handle: Some(handle) }
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 fn spawn_onebot_ws(
@@ -1025,8 +1084,13 @@ fn spawn_onebot_ws(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let completed_root = completed_root.to_path_buf();
-    let handle = thread::spawn(move || serve_onebot_ws(listener, sent, thread_stop, None, Some(completed_root)));
-    ServerThread { stop, handle: Some(handle) }
+    let handle = thread::spawn(move || {
+        serve_onebot_ws(listener, sent, thread_stop, None, Some(completed_root))
+    });
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 fn spawn_onebot_ws_holding(
@@ -1036,8 +1100,12 @@ fn spawn_onebot_ws_holding(
 ) -> ServerThread<Result<OneBotWsObservation, String>> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    let handle = thread::spawn(move || serve_onebot_ws(listener, sent, thread_stop, Some(hold), None));
-    ServerThread { stop, handle: Some(handle) }
+    let handle =
+        thread::spawn(move || serve_onebot_ws(listener, sent, thread_stop, Some(hold), None));
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 struct ChildCapture {
@@ -1103,8 +1171,18 @@ impl ChildCapture {
         self.child.take();
         ChildOutput {
             status,
-            stdout: self.stdout.take().expect("stdout reader").join().expect("stdout drain thread"),
-            stderr: self.stderr.take().expect("stderr reader").join().expect("stderr drain thread"),
+            stdout: self
+                .stdout
+                .take()
+                .expect("stdout reader")
+                .join()
+                .expect("stdout drain thread"),
+            stderr: self
+                .stderr
+                .take()
+                .expect("stderr reader")
+                .join()
+                .expect("stderr drain thread"),
             timeout: timed_out,
         }
     }
@@ -1116,8 +1194,18 @@ impl ChildCapture {
         self.child.take();
         ChildOutput {
             status,
-            stdout: self.stdout.take().expect("stdout reader").join().expect("stdout drain thread"),
-            stderr: self.stderr.take().expect("stderr reader").join().expect("stderr drain thread"),
+            stdout: self
+                .stdout
+                .take()
+                .expect("stdout reader")
+                .join()
+                .expect("stdout drain thread"),
+            stderr: self
+                .stderr
+                .take()
+                .expect("stderr reader")
+                .join()
+                .expect("stderr drain thread"),
             timeout: None,
         }
     }
@@ -1146,7 +1234,10 @@ fn child_command(root: &Path, ambient: &Path) -> Command {
         .arg(root)
         .env_remove("HER_RUNTIME_ROOT")
         .env_remove("HER_FAIL_FIRST")
-        .env("TICKET04_AMBIENT_SENTINEL", "synthetic ambient profile only")
+        .env(
+            "TICKET04_AMBIENT_SENTINEL",
+            "synthetic ambient profile only",
+        )
         .env("DSH_HOME", ambient.join("user/dsh"))
         .env("HOME", ambient)
         .env("USERPROFILE", ambient)
@@ -1160,7 +1251,10 @@ fn child_command(root: &Path, ambient: &Path) -> Command {
 
 fn spawn_console(root: &Path, ambient: &Path, port: u16) -> ChildCapture {
     let mut command = child_command(root, ambient);
-    command.arg("--console-serve").arg("--console-port").arg(port.to_string());
+    command
+        .arg("--console-serve")
+        .arg("--console-port")
+        .arg(port.to_string());
     ChildCapture::spawn(command)
 }
 
@@ -1197,14 +1291,18 @@ fn wait_console_health(port: u16) -> Result<(), String> {
             if stream.write_all(request.as_bytes()).is_ok() {
                 if let Ok((status, body)) = read_http_response(&mut stream) {
                     if status == 200 {
-                        let payload: Value = serde_json::from_slice(&body)
-                            .map_err(|error| format!("console health body was not JSON: {error}"))?;
-                        if payload.pointer("/runtime/mode").and_then(Value::as_str) == Some("isolated")
+                        let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+                            format!("console health body was not JSON: {error}")
+                        })?;
+                        if payload.pointer("/runtime/mode").and_then(Value::as_str)
+                            == Some("isolated")
                             && payload.get("port").and_then(Value::as_u64) == Some(port.into())
                         {
                             return Ok(());
                         }
-                        return Err(format!("console health did not report the selected runtime/port: {payload}"));
+                        return Err(format!(
+                            "console health did not report the selected runtime/port: {payload}"
+                        ));
                     }
                 }
             }
@@ -1245,8 +1343,21 @@ impl FixtureOptions {
     }
 }
 
-fn selected_fixture(root: &Path, dsh_url: &str, model_url: &str, onebot_url: &str, onebot_ws_url: &str) {
-    selected_fixture_with(root, dsh_url, model_url, onebot_url, onebot_ws_url, &FixtureOptions::original());
+fn selected_fixture(
+    root: &Path,
+    dsh_url: &str,
+    model_url: &str,
+    onebot_url: &str,
+    onebot_ws_url: &str,
+) {
+    selected_fixture_with(
+        root,
+        dsh_url,
+        model_url,
+        onebot_url,
+        onebot_ws_url,
+        &FixtureOptions::original(),
+    );
 }
 
 fn selected_fixture_with(
@@ -1317,12 +1428,10 @@ fn selected_fixture_with(
     );
     fs::write(
         root.join("data/social-v2.json"),
-        json!({"conversations":conversations})
-        .to_string(),
+        json!({"conversations":conversations}).to_string(),
     )
     .expect("write selected social state");
-    fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#)
-        .expect("write selected mode");
+    fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("write selected mode");
     fs::write(
         root.join("data/personas.json"),
         r#"{"format":1,"nextId":2,"default":"p1","overrides":{},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"ticket04-selected-dsh-persona","core":"selected-root persona core"}]}}}"#,
@@ -1333,7 +1442,8 @@ fn selected_fixture_with(
         fs::write(root.join("data/slang.json"), bytes).expect("write selected slang store");
     }
     if let Some(bytes) = &options.slang_windows {
-        fs::write(root.join("data/slang-windows.json"), bytes).expect("write selected slang windows");
+        fs::write(root.join("data/slang-windows.json"), bytes)
+            .expect("write selected slang windows");
     }
     fs::write(
         root.join("user/dsh/.credentials.yaml"),
@@ -1342,7 +1452,8 @@ fn selected_fixture_with(
     .expect("write synthetic selected DSH credential");
     fs::write(
         root.join("dependencies.json"),
-        json!({"dsh":dsh_url,"model":model_url,"onebot":onebot_url,"onebot_ws":onebot_ws_url}).to_string(),
+        json!({"dsh":dsh_url,"model":model_url,"onebot":onebot_url,"onebot_ws":onebot_ws_url})
+            .to_string(),
     )
     .expect("write selected local dependencies");
 }
@@ -1403,7 +1514,8 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     let console_reservation = crate::support::ports::reserve();
     let console_port = console_reservation.port();
     assert_ne!(
-        onebot_url, onebot_ws_url.replace("ws://", "http://"),
+        onebot_url,
+        onebot_ws_url.replace("ws://", "http://"),
         "HTTP and WebSocket dependencies need distinct explicitly configured ports"
     );
     selected_fixture(
@@ -1415,10 +1527,11 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     );
 
     let onebot_sent = Arc::new(AtomicBool::new(false));
-    let mut dsh_server = spawn_dsh_server(dsh_listener, dsh_authority.clone(), console_port);
-    let mut model_server = spawn_model_sentinel(model_listener);
-    let mut onebot_http_server = spawn_onebot_http(onebot_listener, onebot_sent.clone());
-    let mut onebot_ws_server = spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected);
+    let dsh_server = spawn_dsh_server(dsh_listener, dsh_authority.clone(), console_port);
+    let model_server = spawn_model_sentinel(model_listener);
+    let onebot_http_server = spawn_onebot_http(onebot_listener, onebot_sent.clone());
+    let onebot_ws_server =
+        spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected);
 
     drop(console_reservation); // free the held port on the line before the console spawn
     let mut console = spawn_console(&roots.selected, &roots.ambient, console_port);
@@ -1489,7 +1602,8 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
         String::from_utf8_lossy(&console_output.stdout),
         String::from_utf8_lossy(&console_output.stderr)
     );
-    let candidate_output = candidate_output.expect("candidate starts only after console health succeeds");
+    let candidate_output =
+        candidate_output.expect("candidate starts only after console health succeeds");
     let candidate_stdout = String::from_utf8_lossy(&candidate_output.stdout);
     let candidate_stderr = String::from_utf8_lossy(&candidate_output.stderr);
     assert!(
@@ -1512,7 +1626,11 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     assert!(dsh.errors.is_empty(), "fake DSH errors: {:?}", dsh.errors);
     let onebot_http = onebot_http_result.expect("fake OneBot HTTP fixture must complete");
     let onebot_ws = onebot_ws_result.expect("fake OneBot WS fixture must complete");
-    assert_eq!(model_result.expect("model sentinel fixture must finish"), 0, "DSH path must not use the unrelated selected model endpoint");
+    assert_eq!(
+        model_result.expect("model sentinel fixture must finish"),
+        0,
+        "DSH path must not use the unrelated selected model endpoint"
+    );
 
     let expected_paths = [
         "/api/workspace/create",
@@ -1521,32 +1639,91 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
         "/api/session/selectModel",
         "/api/session/prompt",
     ];
-    let actual_paths: Vec<&str> = dsh.rpc.iter().map(|request| request.path.as_str()).collect();
+    let actual_paths: Vec<&str> = dsh
+        .rpc
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect();
     for expected in expected_paths {
-        assert!(actual_paths.contains(&expected), "missing selected DSH request {expected}: {actual_paths:?}");
+        assert!(
+            actual_paths.contains(&expected),
+            "missing selected DSH request {expected}: {actual_paths:?}"
+        );
     }
     assert!(
         dsh.rpc.iter().all(|request| request.selected_cookie_valid),
         "every selected DSH RPC must use a cookie signed by user/dsh/.credentials.yaml"
     );
-    assert!(dsh.ws.as_ref().is_some_and(|ws| ws.selected_cookie_valid), "DSH follow WebSocket must use the selected signed cookie");
-    let workspace = dsh.rpc.iter().find(|request| request.method == "workspace/create").expect("workspace create RPC");
-    let workspace_path = workspace.args.pointer("/request/path").and_then(Value::as_str).expect("workspace path in DSH request");
+    assert!(
+        dsh.ws.as_ref().is_some_and(|ws| ws.selected_cookie_valid),
+        "DSH follow WebSocket must use the selected signed cookie"
+    );
+    let workspace = dsh
+        .rpc
+        .iter()
+        .find(|request| request.method == "workspace/create")
+        .expect("workspace create RPC");
+    let workspace_path = workspace
+        .args
+        .pointer("/request/path")
+        .and_then(Value::as_str)
+        .expect("workspace path in DSH request");
     assert_eq!(
         normalize_path(workspace_path),
         normalize_path(&roots.selected.join("data/agents").to_string_lossy()),
         "workspace creation must use the selected runtime data area"
     );
-    let session_create = dsh.rpc.iter().find(|request| request.method == "session/create").expect("session create RPC");
-    assert_eq!(session_create.args.pointer("/request/agentPreset").and_then(Value::as_str), Some("ticket04-selected-group-preset"));
-    let model_select = dsh.rpc.iter().find(|request| request.method == "session/selectModel").expect("model selection RPC");
-    assert_eq!(model_select.args.pointer("/request/provider").and_then(Value::as_str), Some(PROVIDER));
-    assert_eq!(model_select.args.pointer("/request/model").and_then(Value::as_str), Some(MODEL));
-    assert_eq!(model_select.args.pointer("/request/reasoningEffort").and_then(Value::as_str), Some("medium"));
-    let prompt = dsh.prompt.as_deref().expect("actual prompt delivered through session/prompt");
+    let session_create = dsh
+        .rpc
+        .iter()
+        .find(|request| request.method == "session/create")
+        .expect("session create RPC");
+    assert_eq!(
+        session_create
+            .args
+            .pointer("/request/agentPreset")
+            .and_then(Value::as_str),
+        Some("ticket04-selected-group-preset")
+    );
+    let model_select = dsh
+        .rpc
+        .iter()
+        .find(|request| request.method == "session/selectModel")
+        .expect("model selection RPC");
+    assert_eq!(
+        model_select
+            .args
+            .pointer("/request/provider")
+            .and_then(Value::as_str),
+        Some(PROVIDER)
+    );
+    assert_eq!(
+        model_select
+            .args
+            .pointer("/request/model")
+            .and_then(Value::as_str),
+        Some(MODEL)
+    );
+    assert_eq!(
+        model_select
+            .args
+            .pointer("/request/reasoningEffort")
+            .and_then(Value::as_str),
+        Some("medium")
+    );
+    let prompt = dsh
+        .prompt
+        .as_deref()
+        .expect("actual prompt delivered through session/prompt");
     // The fixture conversation has never woken (`bootstrapSent` absent), so this first wake is the bootstrap wake.
-    assert!(prompt.contains(&format!("【引导唤醒】已接入 QQ 对话：group:{GROUP_ID}")), "selected group key missing from prompt");
-    assert!(prompt.contains(INBOUND_TEXT), "real OneBot inbound text missing from the DSH prompt");
+    assert!(
+        prompt.contains(&format!("【引导唤醒】已接入 QQ 对话：group:{GROUP_ID}")),
+        "selected group key missing from prompt"
+    );
+    assert!(
+        prompt.contains(INBOUND_TEXT),
+        "real OneBot inbound text missing from the DSH prompt"
+    );
     // Live 114e5c25 replaces the compatibility full render at DSH submission, including
     // bootstrap wakes: concise status plus one authenticated packet carry the live event.
     assert!(
@@ -1558,29 +1735,45 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
         1,
         "the live event appears in full once in the authenticated wake snapshot"
     );
-    let snapshot_start = prompt.find("【本次消息快照】").expect("wake snapshot section");
+    let snapshot_start = prompt
+        .find("【本次消息快照】")
+        .expect("wake snapshot section");
     assert_eq!(
         prompt[snapshot_start..].matches(INBOUND_TEXT).count(),
         1,
         "the wake snapshot carries the inbound text exactly once"
     );
     let wake_start = prompt.find("【当前唤醒】").expect("existing wake section");
-    let snapshot: Value = serde_json::Deserializer::from_str(
-        &prompt[snapshot_start + "【本次消息快照】".len()..],
-    )
-    .into_iter::<Value>()
-    .next()
-    .expect("wake snapshot JSON")
-    .expect("valid wake snapshot JSON");
-    let messages = snapshot["messages"].as_array().expect("snapshot unread messages");
-    assert_eq!(messages.len(), 1, "same message ID appears once in the authenticated packet");
+    let snapshot: Value =
+        serde_json::Deserializer::from_str(&prompt[snapshot_start + "【本次消息快照】".len()..])
+            .into_iter::<Value>()
+            .next()
+            .expect("wake snapshot JSON")
+            .expect("valid wake snapshot JSON");
+    let messages = snapshot["messages"]
+        .as_array()
+        .expect("snapshot unread messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "same message ID appears once in the authenticated packet"
+    );
     let event = &messages[0];
     assert_eq!(event["messageId"], "990042");
-    assert_eq!(event["sender"], "ticket04-dsh-user", "snapshot must use the selected live sender");
+    assert_eq!(
+        event["sender"], "ticket04-dsh-user",
+        "snapshot must use the selected live sender"
+    );
     assert_eq!(event["userId"], "8808");
-    assert_eq!(event["text"], INBOUND_RENDERED, "snapshot must carry the complete rendered live event");
+    assert_eq!(
+        event["text"], INBOUND_RENDERED,
+        "snapshot must carry the complete rendered live event"
+    );
     assert_eq!(event["seq"], 1);
-    assert_eq!(event["inboundKey"], format!("group:{GROUP_ID}|message:990042"));
+    assert_eq!(
+        event["inboundKey"],
+        format!("group:{GROUP_ID}|message:990042")
+    );
     assert_eq!(snapshot["unreadCount"], 1);
     assert_eq!(snapshot["includedUnreadCount"], 1);
     assert_eq!(snapshot["readThroughSeq"], 1);
@@ -1589,14 +1782,40 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
         .find(INBOUND_RENDERED)
         .map(|offset| snapshot_start + offset)
         .expect("actual selected OneBot event in authenticated snapshot");
-    assert!(wake_start < snapshot_start && snapshot_start < event_line, "live wake/snapshot ordering changed: {prompt}");
-    assert!(prompt.contains("【人设】ticket04-selected-dsh-persona\nselected-root persona core"), "selected-root persona missing from DSH prompt");
-    assert!(prompt.contains(SESSION_TOKEN), "selected session token missing from actual DSH prompt");
-    assert_eq!(dsh.ws.as_ref().unwrap().open_frame.pointer("/payload/args/request/address/sessionId").and_then(Value::as_str), Some(SESSION_ID));
+    assert!(
+        wake_start < snapshot_start && snapshot_start < event_line,
+        "live wake/snapshot ordering changed: {prompt}"
+    );
+    assert!(
+        prompt.contains("【人设】ticket04-selected-dsh-persona\nselected-root persona core"),
+        "selected-root persona missing from DSH prompt"
+    );
+    assert!(
+        prompt.contains(SESSION_TOKEN),
+        "selected session token missing from actual DSH prompt"
+    );
+    assert_eq!(
+        dsh.ws
+            .as_ref()
+            .unwrap()
+            .open_frame
+            .pointer("/payload/args/request/address/sessionId")
+            .and_then(Value::as_str),
+        Some(SESSION_ID)
+    );
 
-    let tool = dsh.tool.as_ref().expect("fake DSH observed a real prompt and attempted the public tool route").as_ref().expect("public console send-message request was sent");
+    let tool = dsh
+        .tool
+        .as_ref()
+        .expect("fake DSH observed a real prompt and attempted the public tool route")
+        .as_ref()
+        .expect("public console send-message request was sent");
     assert_eq!(tool.path, "/api/socialV2/send-message");
-    assert_eq!(tool.status, 200, "public selected-root route rejected the prompt-derived tool call: {}", tool.response);
+    assert_eq!(
+        tool.status, 200,
+        "public selected-root route rejected the prompt-derived tool call: {}",
+        tool.response
+    );
     assert_eq!(tool.request["key"], format!("group:{GROUP_ID}"));
     assert_eq!(tool.request["messages"][0], OUTBOUND_TEXT);
     assert_eq!(tool.console_token_header, CONSOLE_TOKEN);
@@ -1606,41 +1825,96 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     assert_eq!(tool.response["sent"], 1);
 
     let expected_authorization = format!("Bearer {ONEBOT_TOKEN}");
-    assert_eq!(onebot_ws.authorization.as_deref(), Some(expected_authorization.as_str()));
+    assert_eq!(
+        onebot_ws.authorization.as_deref(),
+        Some(expected_authorization.as_str())
+    );
     assert_eq!(onebot_ws.login_action.as_deref(), Some("get_login_info"));
-    let send = onebot_http.iter().find(|observation| observation.request_line.starts_with("POST /send_group_msg ")).expect("public route's selected OneBot send");
-    assert!(send.headers.to_ascii_lowercase().contains(&format!("authorization: bearer {ONEBOT_TOKEN}").to_ascii_lowercase()), "OneBot HTTP request did not use the selected token: {}", send.headers);
+    let send = onebot_http
+        .iter()
+        .find(|observation| {
+            observation
+                .request_line
+                .starts_with("POST /send_group_msg ")
+        })
+        .expect("public route's selected OneBot send");
+    assert!(
+        send.headers
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {ONEBOT_TOKEN}").to_ascii_lowercase()),
+        "OneBot HTTP request did not use the selected token: {}",
+        send.headers
+    );
     assert_eq!(send.body["group_id"], GROUP_ID);
-    assert!(send.body["message"].as_array().is_some_and(|segments| segments.iter().any(|segment| segment.pointer("/data/text").and_then(Value::as_str) == Some(OUTBOUND_TEXT))), "OneBot did not receive the actual prompt-derived outbound text: {}", send.body);
+    assert!(
+        send.body["message"]
+            .as_array()
+            .is_some_and(|segments| segments.iter().any(|segment| segment
+                .pointer("/data/text")
+                .and_then(Value::as_str)
+                == Some(OUTBOUND_TEXT))),
+        "OneBot did not receive the actual prompt-derived outbound text: {}",
+        send.body
+    );
 
     let session_file = roots.selected.join("data/sessions.json");
-    let sessions: Value = serde_json::from_slice(&fs::read(&session_file).expect("selected Rust session map")).expect("selected session map JSON");
+    let sessions: Value =
+        serde_json::from_slice(&fs::read(&session_file).expect("selected Rust session map"))
+            .expect("selected session map JSON");
     assert_eq!(sessions["workspaceId"], WORKSPACE_ID);
     let key = format!("group:{GROUP_ID}");
-    let stored_session = sessions["sessions"].get(key.as_str()).expect("stored selected group session");
-    assert_eq!(stored_session, SESSION_ID, "the unified mapping stores the JS format: key -> sessionId");
-    assert!(roots.selected.join("data/agents").is_dir(), "selected DSH workspace directory missing");
+    let stored_session = sessions["sessions"]
+        .get(key.as_str())
+        .expect("stored selected group session");
+    assert_eq!(
+        stored_session, SESSION_ID,
+        "the unified mapping stores the JS format: key -> sessionId"
+    );
+    assert!(
+        roots.selected.join("data/agents").is_dir(),
+        "selected DSH workspace directory missing"
+    );
 
     let selected_state_path = roots.selected.join("data/social-v2.json");
-    let selected_state: Value = serde_json::from_slice(&fs::read(&selected_state_path).expect("selected social state after public send")).expect("selected social state JSON");
+    let selected_state: Value = serde_json::from_slice(
+        &fs::read(&selected_state_path).expect("selected social state after public send"),
+    )
+    .expect("selected social state JSON");
     let conversation = selected_state["conversations"]
         .get(key.as_str())
         .expect("selected conversation remains in selected social state");
     assert_eq!(conversation["agentToken"], SESSION_TOKEN);
-    assert!(conversation["lastAiReplyAt"].as_i64().unwrap_or(0) > 0, "public send did not update the selected conversation state");
-    assert!(conversation["sendTimes"].as_array().is_some_and(|times| !times.is_empty()), "selected conversation did not record the successful send");
+    assert!(
+        conversation["lastAiReplyAt"].as_i64().unwrap_or(0) > 0,
+        "public send did not update the selected conversation state"
+    );
+    assert!(
+        conversation["sendTimes"]
+            .as_array()
+            .is_some_and(|times| !times.is_empty()),
+        "selected conversation did not record the successful send"
+    );
 
-    let heartbeat: Value = serde_json::from_slice(&fs::read(roots.selected.join("data/rust-heartbeat-live.json")).expect("selected live heartbeat")).expect("heartbeat JSON");
+    let heartbeat: Value = serde_json::from_slice(
+        &fs::read(roots.selected.join("data/rust-heartbeat-live.json"))
+            .expect("selected live heartbeat"),
+    )
+    .expect("heartbeat JSON");
     assert_eq!(heartbeat["live"], true);
     assert_eq!(heartbeat["groups"][0], format!("group:{GROUP_ID}"));
-    let decision = fs::read_to_string(roots.selected.join("data/logs/rbridge-live.jsonl")).expect("selected decision log");
-    let wakes = fs::read_to_string(roots.selected.join("data/logs/rbridge-live-wakes.jsonl")).expect("selected wake log");
-    let timing = fs::read_to_string(roots.selected.join("data/logs/turn-timing.jsonl")).expect("selected turn timing log");
+    let decision = fs::read_to_string(roots.selected.join("data/logs/rbridge-live.jsonl"))
+        .expect("selected decision log");
+    let wakes = fs::read_to_string(roots.selected.join("data/logs/rbridge-live-wakes.jsonl"))
+        .expect("selected wake log");
+    let timing = fs::read_to_string(roots.selected.join("data/logs/turn-timing.jsonl"))
+        .expect("selected turn timing log");
     assert!(decision.contains("\"type\":\"start\""));
     assert!(wakes.contains(&format!("group:{GROUP_ID}")));
     assert!(timing.contains(&format!("group:{GROUP_ID}")) && timing.contains("\"ok\":true"));
-    let ledger = fs::read_to_string(roots.selected.join("data/token-usage-rust.jsonl")).expect("selected DSH usage ledger");
-    let ledger_record: Value = serde_json::from_str(ledger.lines().next().expect("ledger row")).expect("ledger row JSON");
+    let ledger = fs::read_to_string(roots.selected.join("data/token-usage-rust.jsonl"))
+        .expect("selected DSH usage ledger");
+    let ledger_record: Value =
+        serde_json::from_str(ledger.lines().next().expect("ledger row")).expect("ledger row JSON");
     assert_eq!(ledger_record["sid"], SESSION_ID);
     assert_eq!(ledger_record["key"], format!("group:{GROUP_ID}"));
     assert_eq!(ledger_record["model"], MODEL);
@@ -1648,7 +1922,8 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     assert_eq!(ledger_record["b"]["output"], 3.0);
 
     assert_eq!(
-        fs::read(roots.ambient.join("user/dsh/.credentials.yaml")).expect("ambient synthetic DSH credential remains"),
+        fs::read(roots.ambient.join("user/dsh/.credentials.yaml"))
+            .expect("ambient synthetic DSH credential remains"),
         ambient_original,
         "selected runtime must not modify ambient DSH credentials"
     );
@@ -1694,11 +1969,12 @@ fn serve_failing_dsh(
     let deadline = Instant::now() + Duration::from_secs(42);
     let mut requests = Vec::new();
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-        let mut stream = match accept_fixture(&listener, Instant::now() + Duration::from_millis(250)) {
-            Ok(stream) => stream,
-            Err(error) if error.contains("timed out") => continue,
-            Err(error) => return Err(error),
-        };
+        let mut stream =
+            match accept_fixture(&listener, Instant::now() + Duration::from_millis(250)) {
+                Ok(stream) => stream,
+                Err(error) if error.contains("timed out") => continue,
+                Err(error) => return Err(error),
+            };
         // A connection that never sends a byte (the bridge closes a reconnect in flight at exit)
         // carries no request; skip it instead of failing the whole fixture.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
@@ -1723,7 +1999,11 @@ fn serve_failing_dsh(
                 &json!({"type":"server-response","rpcId":envelope["rpcId"],"result":{"ok":true,"value":{"namespaces":[]}}}),
             )?;
         } else {
-            send_sync_json(&mut stream, 503, &json!({"error":"selected fixture DSH is unavailable"}))?;
+            send_sync_json(
+                &mut stream,
+                503,
+                &json!({"error":"selected fixture DSH is unavailable"}),
+            )?;
         }
     }
     Ok(requests)
@@ -1736,13 +2016,18 @@ fn spawn_failing_dsh(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = thread::spawn(move || serve_failing_dsh(listener, authority, thread_stop));
-    ServerThread { stop, handle: Some(handle) }
+    ServerThread {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 /// Relative paths of every file below `root`, sorted, using `/` separators.
 fn file_inventory(root: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -1800,11 +2085,21 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
     options.config_dsh_base = config_dsh_url;
     options.config_onebot_http = config_http_url;
     options.config_onebot_ws = config_ws_url;
-    selected_fixture_with(&roots.selected, &dsh_url, &model_url, &onebot_url, &onebot_ws_url, &options);
+    selected_fixture_with(
+        &roots.selected,
+        &dsh_url,
+        &model_url,
+        &onebot_url,
+        &onebot_ws_url,
+        &options,
+    );
 
     let onebot_sent = Arc::new(AtomicBool::new(false));
     let (mut dsh_server, mut failing_server) = match mode {
-        DshMode::Working => (Some(spawn_dsh_server(dsh_listener, dsh_authority, console_port)), None),
+        DshMode::Working => (
+            Some(spawn_dsh_server(dsh_listener, dsh_authority, console_port)),
+            None,
+        ),
         DshMode::Failing => (None, Some(spawn_failing_dsh(dsh_listener, dsh_authority))),
     };
     let model_server = spawn_model_sentinel(model_listener);
@@ -1816,10 +2111,14 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
         DshMode::Failing => spawn_onebot_http_with(onebot_listener, onebot_sent.clone(), false),
     };
     let onebot_ws_server = match mode {
-        DshMode::Working => spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected),
-        DshMode::Failing => {
-            spawn_onebot_ws_holding(onebot_ws_listener, onebot_sent.clone(), Duration::from_secs(10))
+        DshMode::Working => {
+            spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected)
         }
+        DshMode::Failing => spawn_onebot_ws_holding(
+            onebot_ws_listener,
+            onebot_sent.clone(),
+            Duration::from_secs(10),
+        ),
     };
 
     drop(console_reservation); // free the held port on the line before the console spawn
@@ -1870,7 +2169,11 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
         "{:?}",
         run.dsh
             .as_ref()
-            .map(|result| result.as_ref().map(|capture| (&capture.rpc, &capture.errors, &capture.tool)))
+            .map(|result| result.as_ref().map(|capture| (
+                &capture.rpc,
+                &capture.errors,
+                &capture.tool
+            )))
     );
     eprintln!(
         "ticket04 background scenario diagnostics\nhealth={:?}\nconsole stdout:\n{}\nconsole stderr:\n{}\ncandidate:\n{candidate_diagnostic}\nDSH={}\nfailing DSH={:?}\nmodel={:?} configDsh={:?} configHttp={:?} configWs={:?}\nOneBot HTTP={:?}\nOneBot WS={:?}\nselected files={:?}\nambient files={:?}",
@@ -1893,10 +2196,25 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
 
 impl ScenarioRun {
     fn assert_candidate_exited_cleanly(&self) -> String {
-        assert!(self.health.is_ok(), "selected isolated console startup failed: {:?}", self.health);
-        let output = self.candidate.as_ref().expect("candidate starts after console health");
-        assert!(output.timeout.is_none(), "candidate did not exit in time: {:?}", output.timeout);
-        assert!(output.status.success(), "isolated live candidate exited {:?}", output.status.code());
+        assert!(
+            self.health.is_ok(),
+            "selected isolated console startup failed: {:?}",
+            self.health
+        );
+        let output = self
+            .candidate
+            .as_ref()
+            .expect("candidate starts after console health");
+        assert!(
+            output.timeout.is_none(),
+            "candidate did not exit in time: {:?}",
+            output.timeout
+        );
+        assert!(
+            output.status.success(),
+            "isolated live candidate exited {:?}",
+            output.status.code()
+        );
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
@@ -1981,21 +2299,38 @@ impl ScenarioRun {
             .expect("fake DSH relayed a tool call")
             .as_ref()
             .expect("public send-message request sent");
-        assert_eq!(tool.status, 200, "public selected send-message route rejected the relay: {}", tool.response);
-        let sends = self.onebot_http.as_ref().expect("fake OneBot HTTP completes");
+        assert_eq!(
+            tool.status, 200,
+            "public selected send-message route rejected the relay: {}",
+            tool.response
+        );
+        let sends = self
+            .onebot_http
+            .as_ref()
+            .expect("fake OneBot HTTP completes");
         let send = sends
             .iter()
-            .find(|observation| observation.request_line.starts_with("POST /send_group_msg "))
+            .find(|observation| {
+                observation
+                    .request_line
+                    .starts_with("POST /send_group_msg ")
+            })
             .expect("selected OneBot receives the relayed send");
         assert_eq!(send.body["group_id"], GROUP_ID);
-        assert!(self.onebot_ws.is_ok(), "fake OneBot WS: {:?}", self.onebot_ws);
+        assert!(
+            self.onebot_ws.is_ok(),
+            "fake OneBot WS: {:?}",
+            self.onebot_ws
+        );
         let ledger = String::from_utf8(self.selected_bytes("data/token-usage-rust.jsonl"))
             .expect("selected usage ledger text");
-        let row: Value = serde_json::from_str(ledger.lines().next().expect("ledger row"))
-            .expect("ledger JSON");
+        let row: Value =
+            serde_json::from_str(ledger.lines().next().expect("ledger row")).expect("ledger JSON");
         assert_eq!(row["sid"], SESSION_ID);
         assert_eq!(row["key"], format!("group:{GROUP_ID}"));
-        dsh.prompt.clone().expect("actual prompt delivered through session/prompt")
+        dsh.prompt
+            .clone()
+            .expect("actual prompt delivered through session/prompt")
     }
 }
 
@@ -2020,21 +2355,39 @@ fn isolated_live_dsh_background_io_stays_in_selected_root_and_ignores_config_end
 
     run.assert_candidate_exited_cleanly();
     let prompt = run.working_prompt();
-    assert!(prompt.contains("【可用表情包】"), "enabled sticker context missing from the live DSH prompt");
-    assert!(prompt.contains(STICKER_SENTINEL), "live DSH prompt did not read the selected sticker store");
+    assert!(
+        prompt.contains("【可用表情包】"),
+        "enabled sticker context missing from the live DSH prompt"
+    );
+    assert!(
+        prompt.contains(STICKER_SENTINEL),
+        "live DSH prompt did not read the selected sticker store"
+    );
     assert!(
         prompt.contains("已收录 1 个表情"),
         "sticker context counted entries outside the selected store"
     );
-    assert_eq!(run.selected_bytes("data/stickers.json"), stickers, "prompt sticker read rewrote the selected store");
-    assert_eq!(run.selected_bytes("data/slang.json"), slang, "learning-window feed rewrote the selected slang store");
+    assert_eq!(
+        run.selected_bytes("data/stickers.json"),
+        stickers,
+        "prompt sticker read rewrote the selected store"
+    );
+    assert_eq!(
+        run.selected_bytes("data/slang.json"),
+        slang,
+        "learning-window feed rewrote the selected slang store"
+    );
 
     let windows: Value = serde_json::from_slice(&run.selected_bytes("data/slang-windows.json"))
         .expect("selected learning windows JSON");
     let window = windows["windows"][format!("group:{GROUP_ID}")]
         .as_array()
         .expect("selected group learning window");
-    assert_eq!(window.len(), 1, "selected learning window holds exactly the live inbound message");
+    assert_eq!(
+        window.len(),
+        1,
+        "selected learning window holds exactly the live inbound message"
+    );
     assert_eq!(window[0]["text"], INBOUND_RENDERED);
     let learning_gate = fs::OpenOptions::new()
         .read(true)
@@ -2070,8 +2423,16 @@ fn isolated_live_dsh_corrupt_selected_background_stores_fail_closed_without_fall
         stdout.contains("[slang] 候选黑话窗口读写失败"),
         "corrupt selected learning window was not reported"
     );
-    assert_eq!(run.selected_bytes("data/stickers.json"), CORRUPT_STICKERS, "corrupt selected sticker store was rewritten");
-    assert_eq!(run.selected_bytes("data/slang.json"), CORRUPT_SLANG, "corrupt selected slang store was rewritten");
+    assert_eq!(
+        run.selected_bytes("data/stickers.json"),
+        CORRUPT_STICKERS,
+        "corrupt selected sticker store was rewritten"
+    );
+    assert_eq!(
+        run.selected_bytes("data/slang.json"),
+        CORRUPT_SLANG,
+        "corrupt selected slang store was rewritten"
+    );
     assert_eq!(
         run.selected_bytes("data/slang-windows.json"),
         CORRUPT_WINDOWS,
@@ -2095,7 +2456,9 @@ fn isolated_live_dsh_selected_dsh_failure_does_not_fall_back_to_config_or_ambien
         .as_ref()
         .expect("failing DSH fixture completes");
     assert!(
-        requests.iter().any(|request| request.path == "/api/workspace/create"),
+        requests
+            .iter()
+            .any(|request| request.path == "/api/workspace/create"),
         "the live turn did not reach the selected DSH dependency: {requests:?}"
     );
     assert!(
@@ -2108,12 +2471,18 @@ fn isolated_live_dsh_selected_dsh_failure_does_not_fall_back_to_config_or_ambien
         stdout.contains(&format!("[reserved2] group:{GROUP_ID} turn ended: Err(")),
         "selected DSH failure was not reported as a failed turn"
     );
-    assert!(!run.onebot_sent, "a failed selected DSH turn must not send to QQ");
-    let onebot = run.onebot_http.as_ref().expect("fake OneBot HTTP completes");
     assert!(
-        !onebot
-            .iter()
-            .any(|observation| observation.request_line.starts_with("POST /send_group_msg ")),
+        !run.onebot_sent,
+        "a failed selected DSH turn must not send to QQ"
+    );
+    let onebot = run
+        .onebot_http
+        .as_ref()
+        .expect("fake OneBot HTTP completes");
+    assert!(
+        !onebot.iter().any(|observation| observation
+            .request_line
+            .starts_with("POST /send_group_msg ")),
         "a failed selected DSH turn sent through OneBot: {onebot:?}"
     );
     assert!(run.onebot_ws.is_ok(), "fake OneBot WS: {:?}", run.onebot_ws);
@@ -2122,7 +2491,10 @@ fn isolated_live_dsh_selected_dsh_failure_does_not_fall_back_to_config_or_ambien
         "a failed workspace creation must not persist a selected session map"
     );
     assert!(
-        !run.roots.selected.join("data/token-usage-rust.jsonl").exists(),
+        !run.roots
+            .selected
+            .join("data/token-usage-rust.jsonl")
+            .exists(),
         "a turn that never reached the model must not write a ledger row"
     );
 

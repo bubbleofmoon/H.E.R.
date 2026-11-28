@@ -66,6 +66,7 @@ pub fn ledger_len(context: &RuntimeContext) -> Result<u64, String> {
 /// the records since `offset`, not the ledger's history. An offset inside a line (taken while
 /// another writer appended) skips to the next whole line; a ledger now shorter than `offset`
 /// (replaced) is read from the start.
+#[cfg(test)]
 pub fn read_records_since(context: &RuntimeContext, offset: u64) -> Result<Vec<Value>, String> {
     read_records_since_until(context, offset, None)
 }
@@ -783,6 +784,7 @@ impl Recorder {
         self.put(json!({"k": "applied"}))
     }
 
+    #[cfg(test)]
     pub fn resolved(&self, action: &str) -> Result<(), String> {
         self.resolved_by(action, "console")
     }

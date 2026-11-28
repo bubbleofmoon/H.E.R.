@@ -457,7 +457,7 @@ fn save_state_for(
         "releases.json",
         &serde_json::to_vec(state).map_err(|_| "release state cannot be serialized")?,
     )?;
-    crate::release_store::sync_directory(&context.data_dir())
+    crate::release_store::sync_directory(context.data_dir())
 }
 fn newer(release: &Release, current: Option<&str>) -> bool {
     version(&release.tag).is_some_and(|next| current.and_then(version).is_none_or(|old| next > old))
@@ -1365,7 +1365,7 @@ fn handover_with_policy_gate(
     let current_tag = current(&root).ok_or("current image unavailable")?;
     let old = match verify_owner(
         &mut LiveLifecycle,
-        &context.data_dir(),
+        context.data_dir(),
         OwnerRole::Supervisor,
         &ImagePolicy::ReleaseTag {
             root: root.clone(),

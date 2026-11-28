@@ -3,7 +3,7 @@
 macro_rules! safe_println {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-        let line = crate::activity::redact_log_line(&format!($($arg)*));
+        let line = $crate::activity::redact_log_line(&format!($($arg)*));
         let _ = writeln!(std::io::stdout(), "{line}");
     }};
 }
@@ -12,7 +12,7 @@ macro_rules! safe_println {
 macro_rules! safe_eprintln {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-        let line = crate::activity::redact_log_line(&format!($($arg)*));
+        let line = $crate::activity::redact_log_line(&format!($($arg)*));
         let _ = writeln!(std::io::stderr(), "{line}");
     }};
 }

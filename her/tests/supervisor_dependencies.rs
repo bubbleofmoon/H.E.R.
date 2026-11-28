@@ -1,8 +1,8 @@
 //! Seam 1: real supervisor/CLI and disposable fake dependency programs.
 use support::install_root;
-mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
+mod support;
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -226,7 +226,9 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
             .output()
             .unwrap();
         assert!(task.status.success(), "fixture scheduler: {task:?}");
-        reservations.into_iter().for_each(crate::support::ports::hold);
+        reservations
+            .into_iter()
+            .for_each(crate::support::ports::hold);
         fixture
     }
     fn relay(&mut self, mode: &str) -> PathBuf {
@@ -473,7 +475,10 @@ impl Drop for Fixture {
 }
 
 fn count_lines(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path).unwrap_or_default().lines().count()
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .count()
 }
 
 fn reply_to_relay_probe(folder: &std::path::Path, response: impl std::fmt::Display) {
@@ -2638,8 +2643,13 @@ fn an_installed_release_starts_dependencies_inside_a_throwaway_install_root() {
         assert_eq!(fixture.states()[name]["state"], "started");
     }
     // #179: in the install root's runtime the supervisor writes the guarded DSH profile rows before it starts DSH.
-    let profile = std::fs::read_to_string(fixture.root.join("user/dsh/profiles/web/cordis.patch.yml")).unwrap();
-    assert!(profile.contains("# === her profile guard BEGIN ==="), "{profile}");
+    let profile =
+        std::fs::read_to_string(fixture.root.join("user/dsh/profiles/web/cordis.patch.yml"))
+            .unwrap();
+    assert!(
+        profile.contains("# === her profile guard BEGIN ==="),
+        "{profile}"
+    );
 }
 
 #[test]
@@ -3584,7 +3594,10 @@ fn approval_refuses_a_dsh_candidate_without_contract_coverage() {
     );
     assert_eq!(
         (code, result["error"].as_str()),
-        (409, Some("DSH version 0.3.0 has no credential contract coverage")),
+        (
+            409,
+            Some("DSH version 0.3.0 has no credential contract coverage")
+        ),
         "approval must refuse a discovered DSH candidate without contract coverage: {result}"
     );
     let (_, status) = dependency_api(&f, "GET", "/api/dependencies", Value::Null, false);
@@ -4303,14 +4316,12 @@ fn recovery_retires_an_unlisted_dsh_candidate_and_checks_the_rollback_pin() {
         std::fs::write(&config_path, cfg.to_string()).unwrap();
         std::fs::write(&journal_path, journal.to_string()).unwrap();
         f.start();
-        let read_journal = || {
-            serde_json::from_slice::<Value>(&std::fs::read(&journal_path).unwrap()).unwrap()
-        };
+        let read_journal =
+            || serde_json::from_slice::<Value>(&std::fs::read(&journal_path).unwrap()).unwrap();
         f.wait(|| read_journal()["result"]["status"] != "running");
         let journal = read_journal();
         assert_eq!(
-            journal["result"]["reason"],
-            "DSH version 0.3.0 has no credential contract coverage",
+            journal["result"]["reason"], "DSH version 0.3.0 has no credential contract coverage",
             "recovery must refuse to accept an unlisted running DSH candidate: {journal}"
         );
         assert_eq!(
@@ -4426,7 +4437,10 @@ fn snowluma_default_source_full_windows_asset_and_github_digest_are_enforced() {
     f.wait(|| std::net::TcpStream::connect(("127.0.0.1", f.ports[2])).is_ok());
     let (code, status) = dependency_api(&f, "GET", "/api/dependencies", Value::Null, false);
     assert_eq!(code, 200, "{status}");
-    assert!(status["dependencies"]["snowluma"]["source"].is_null(), "{status}");
+    assert!(
+        status["dependencies"]["snowluma"]["source"].is_null(),
+        "{status}"
+    );
     assert_eq!(
         status["dependencies"]["snowluma"]["sourceUnavailable"],
         "Automatic SnowLuma release discovery is disabled because no feedUrl is configured; upgrade from a local verified archive with `her-cli dependencies upgrade snowluma`."
@@ -4661,7 +4675,11 @@ fn build_local_snowluma_release(
     use sha2::{Digest, Sha256};
     use std::io::Write;
     let destination = f.root.join("deps/snowluma").join(version);
-    let bundled_rel = if cfg!(windows) { "node.exe" } else { "bin/node" };
+    let bundled_rel = if cfg!(windows) {
+        "node.exe"
+    } else {
+        "bin/node"
+    };
     let script = std::fs::read_to_string(f.root.join("snow/index.mjs")).unwrap();
     let bundled_check = if with_bundled_node {
         format!(
@@ -4758,8 +4776,16 @@ fn prepare_local_snowluma_upgrade(
     for dir in ["config", "data/session", "data/home", "bin"] {
         std::fs::create_dir_all(f.root.join("snow").join(dir)).unwrap();
     }
-    std::fs::write(f.root.join("snow/config/account.json"), "synthetic-config-462").unwrap();
-    std::fs::write(f.root.join("snow/data/session/login"), "synthetic-login-462").unwrap();
+    std::fs::write(
+        f.root.join("snow/config/account.json"),
+        "synthetic-config-462",
+    )
+    .unwrap();
+    std::fs::write(
+        f.root.join("snow/data/session/login"),
+        "synthetic-login-462",
+    )
+    .unwrap();
     std::fs::write(f.root.join("config/config.json"), f.config.to_string()).unwrap();
 
     let (destination, from_dir, digest) =
@@ -4785,8 +4811,14 @@ fn snowluma_cli_upgrade_from_dir_rewrites_bundled_node_and_snowluma_paths_and_ke
     // Unset feedUrl checks cleanly without HTTP noise.
     let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
     assert_eq!(code, 200, "{checked}");
-    assert!(checked["dependencies"]["snowluma"]["source"].is_null(), "{checked}");
-    assert!(checked["dependencies"]["snowluma"]["error"].is_null(), "{checked}");
+    assert!(
+        checked["dependencies"]["snowluma"]["source"].is_null(),
+        "{checked}"
+    );
+    assert!(
+        checked["dependencies"]["snowluma"]["error"].is_null(),
+        "{checked}"
+    );
 
     // Bad checksum via --archive fails pre-lock with zero mutation.
     let zip_path = from_dir.join("SnowLuma-v2.4.2-win-x64.zip");
@@ -4820,13 +4852,21 @@ fn snowluma_cli_upgrade_from_dir_rewrites_bundled_node_and_snowluma_paths_and_ke
 
     f.healthy();
     assert!(destination.join("carried-verified").exists());
-    assert!(f.root.join("snow/index.mjs").exists(), "1.14.22 must stay side-by-side");
+    assert!(
+        f.root.join("snow/index.mjs").exists(),
+        "1.14.22 must stay side-by-side"
+    );
     assert_ne!(f.states()["snowluma"]["identity"], previous);
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
-    let bundled_rel = if cfg!(windows) { "node.exe" } else { "bin/node" };
+    let bundled_rel = if cfg!(windows) {
+        "node.exe"
+    } else {
+        "bin/node"
+    };
     assert_eq!(
-        std::fs::canonicalize(cfg["dependencies"]["snowluma"]["program"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(cfg["dependencies"]["snowluma"]["program"].as_str().unwrap())
+            .unwrap(),
         std::fs::canonicalize(destination.join(bundled_rel)).unwrap()
     );
     assert_eq!(
@@ -4864,7 +4904,10 @@ fn snowluma_cli_upgrade_from_dir_rewrites_bundled_node_and_snowluma_paths_and_ke
     let cfg2: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
     // Without bundled node in 2.4.3 archive, program remains the previous (2.4.2 bundled) node.
-    assert_eq!(cfg2["dependencies"]["snowluma"]["program"], cfg["dependencies"]["snowluma"]["program"]);
+    assert_eq!(
+        cfg2["dependencies"]["snowluma"]["program"],
+        cfg["dependencies"]["snowluma"]["program"]
+    );
     assert_eq!(
         std::fs::canonicalize(cfg2["snowluma"]["homeDir"].as_str().unwrap()).unwrap(),
         std::fs::canonicalize(dest2.join("data/home")).unwrap()
@@ -4902,7 +4945,10 @@ fn snowluma_cli_upgrade_health_failure_rolls_back_bundled_program_and_snowluma_p
 
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
-    assert_eq!(cfg["dependencies"]["snowluma"], f.config["dependencies"]["snowluma"]);
+    assert_eq!(
+        cfg["dependencies"]["snowluma"],
+        f.config["dependencies"]["snowluma"]
+    );
     assert_eq!(cfg["snowluma"]["homeDir"], old_home);
     assert_eq!(cfg["snowluma"]["launcherPath"], old_launcher);
     assert_eq!(cfg["snowluma"]["accessToken"], "fixture-snow");
@@ -4955,7 +5001,10 @@ fn snowluma_cli_upgrade_crash_at_pin_changed_recovers_program_and_snowluma_paths
     std::thread::sleep(Duration::from_millis(350));
     let mid_states = f.states();
     assert!(mid_states["configuration"].is_null(), "{mid_states}");
-    assert!(!f.root.join("data/logs/dependency-configuration.err.log").exists());
+    assert!(!f
+        .root
+        .join("data/logs/dependency-configuration.err.log")
+        .exists());
 
     // Simulate crash of CLI + supervisor, then recover on supervisor restart.
     drop(cli_child);
@@ -4969,7 +5018,10 @@ fn snowluma_cli_upgrade_crash_at_pin_changed_recovers_program_and_snowluma_paths
 
     let cfg: Value =
         serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
-    assert_eq!(cfg["dependencies"]["snowluma"], f.config["dependencies"]["snowluma"]);
+    assert_eq!(
+        cfg["dependencies"]["snowluma"],
+        f.config["dependencies"]["snowluma"]
+    );
     assert_eq!(cfg["snowluma"]["homeDir"], old_home);
     assert_eq!(cfg["snowluma"]["launcherPath"], old_launcher);
     assert_eq!(cfg["snowluma"]["accessToken"], "fixture-snow");

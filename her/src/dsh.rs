@@ -336,7 +336,7 @@ impl Rpc {
         Self { base, credential }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn from_credential(base: &str, credential: Credential) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
@@ -500,8 +500,8 @@ impl Rpc {
         self.call_bounded(method, payload, deadline, Some(cancelled))
     }
 
-    /// `call_with_cancellation` with a caller-chosen JSON-RPC id, recorded before the call so a
-    /// later run can ask DSH whether it holds that exact prompt (`probe_prompt_bounded`).
+    /// `call_with_cancellation` with a caller-chosen JSON-RPC id.
+    #[cfg(test)]
     pub fn call_with_cancellation_as(
         &self,
         method: &str,
@@ -1109,7 +1109,7 @@ impl FollowStream {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         let baseline_seq: i64;
         let snapshot: Snapshot;
-        let mut sel: (Option<String>, Option<String>) = (None, None);
+        let sel: (Option<String>, Option<String>);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -1421,7 +1421,6 @@ impl FollowStream {
     }
 }
 
-/// 诊断用：订阅会话并把收到的帧类型打印出来（不做解析）。
 // ── 回合核对：某条 prompt 在 DSH 里到底发生了什么（ticket 10）──────────────────────
 
 /// `projections.values.inbox` 待处理的入站请求条目。
@@ -1536,13 +1535,6 @@ pub fn is_session_gone(error: &str) -> bool {
     matches!(refusal_code(error), Some("session-not-found" | "session/not-found"))
 }
 
-/// DSH answered the request with an explicit refusal (`ok:false`), or refused it with 401 after
-/// the single re-authentication: the request was not carried out. Transport loss, HTTP errors,
-/// unreadable or mismatched responses are not refusals; their outcome is unknown.
-pub fn is_refused(error: &str) -> bool {
-    refusal_code(error).is_some() || error.starts_with("401 ")
-}
-
 /// Loose match for idempotent cleanup only (`stop_session_work`, `archive_session`); never a proof.
 fn is_not_found(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
@@ -1614,71 +1606,6 @@ fn probe_of_snapshot(snapshot: &Snapshot, inbox: Option<Vec<serde_json::Value>>,
         return PromptProbe::Queued;
     }
     PromptProbe::NotFound { proved: inbox.is_some() && snapshot.covers_whole_log() }
-}
-
-/// Drive `future` until it finishes, `deadline` passes ("probe timed out") or `cancelled` turns true
-/// ("cancelled", polled at most every 50 ms).
-async fn bounded_until<T>(
-    future: impl std::future::Future<Output = T>,
-    deadline: std::time::Instant,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<T, String> {
-    tokio::pin!(future);
-    loop {
-        if cancelled() {
-            return Err("cancelled".to_string());
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("probe timed out".to_string());
-        }
-        tokio::select! {
-            output = &mut future => return Ok(output),
-            _ = tokio::time::sleep(remaining.min(std::time::Duration::from_millis(50))) => {}
-        }
-    }
-}
-
-/// `probe_prompt` for synchronous jobs (memory digest): every step is bounded by `deadline` and
-/// polls `cancelled` at most every 50 ms. A cancelled or timed-out probe is `Unreachable`.
-pub fn probe_prompt_bounded(
-    rpc: &Rpc,
-    session_id: &str,
-    rpc_ids: &[String],
-    deadline: std::time::Instant,
-    cancelled: &dyn Fn() -> bool,
-) -> PromptProbe {
-    let inbox = match rpc.call_with_cancellation(
-        "session/projections",
-        serde_json::json!({ "sessionId": session_id }),
-        deadline,
-        cancelled,
-    ) {
-        Ok(value) if value.is_null() => Some(Vec::new()),
-        Ok(value) => Some(inbox_of_values(value.get("values")).unwrap_or_default()),
-        Err(error) if is_session_gone(&error) => return PromptProbe::SessionGone,
-        Err(_) if cancelled() => return PromptProbe::Unreachable("cancelled".to_string()),
-        Err(_) => None,
-    };
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => return PromptProbe::Unreachable(format!("probe runtime unavailable: {error}")),
-    };
-    let cookie = rpc.cookie();
-    let opened = runtime.block_on(bounded_until(
-        FollowStream::open_with_max(&rpc.base, &cookie, session_id, 200),
-        deadline,
-        cancelled,
-    ));
-    let follow = match opened {
-        Ok(Ok(follow)) => follow,
-        Ok(Err(error)) if is_session_gone(&error) => return PromptProbe::SessionGone,
-        Ok(Err(error)) | Err(error) => return PromptProbe::Unreachable(error),
-    };
-    let snapshot = follow.snapshot.clone();
-    // The snapshot is in hand: closing the stream is best effort, never past the deadline or a cancel.
-    let _ = runtime.block_on(bounded_until(follow.close(), deadline, cancelled));
-    probe_of_snapshot(&snapshot, inbox, rpc_ids)
 }
 
 /// 等某条 prompt 的回合结束（重启后的重新接入）。每次都先看快照再等 live 事件，所以
@@ -1981,7 +1908,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     stream.set_nonblocking(false).expect("set fake stream blocking");
                     return stream;
                 }
@@ -2334,10 +2261,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(300));
             let _ = fallback.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-                )
-                .as_bytes(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
             );
         });
 
