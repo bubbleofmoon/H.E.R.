@@ -2164,7 +2164,21 @@ fn reconcile(
         {
             return Ok(());
         }
-        let _launch_gate = os::launch_gate(context)?;
+        let _launch_gate = match os::launch_gate(context) {
+            Ok(gate) => gate,
+            Err(err) => {
+                // An active dependency upgrade holds launch_gate under update-restore.lock;
+                // yield quietly instead of publishing a spurious configuration refusal.
+                let update_restore_lock = context.data_dir().join("locks/update-restore.lock");
+                if blocked.is_some()
+                    || upgrades::blocked(context).ok().flatten().is_some()
+                    || crate::release_store::gate_contended(&update_restore_lock)
+                {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
         let mut refusals = RelayRefusals::read(context)?;
         refusals.deliver(context, &cfg);
         // Replay a contended threshold before another observation or a backoff transition.

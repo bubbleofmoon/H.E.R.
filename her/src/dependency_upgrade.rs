@@ -7,7 +7,9 @@ use std::fs;
 
 const FILE: &str = "lifecycle/dependency-upgrades.json";
 const LOCK: &str = "locks/dependency-upgrades.lock";
-const SNOWLUMA_RELEASES: &str = "https://api.github.com/repos/SnowLuma/SnowLuma/releases";
+const MAX_LOCAL_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RELEASE_JSON_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CHECKSUMS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +20,8 @@ struct Candidate {
     directory: Value,
     current: String,
     archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_archive: Option<String>,
     digest: Option<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -46,6 +50,14 @@ enum Phase {
     RestoringPin,
     RestartingOld,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnowlumaPathUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_dir: Option<(Value, Value)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher_path: Option<(Value, Value)>,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Transaction {
@@ -58,6 +70,8 @@ struct Transaction {
     identity: Option<ProcessIdentity>,
     reason: Option<String>,
     alert_scheduled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snowluma_paths: Option<SnowlumaPathUpdate>,
 }
 fn checkpoint(context: &RuntimeContext, transaction: &Transaction) -> Result<(), String> {
     let _gate = gate(context)?;
@@ -117,12 +131,12 @@ fn source(cfg: &Value, name: &str) -> Result<Option<String>, String> {
             url.set_fragment(None);
             Some(url.to_string())
         }
-        "snowluma" => Some(
-            cfg["dependencies"][name]["feedUrl"]
-                .as_str()
-                .unwrap_or(SNOWLUMA_RELEASES)
-                .to_string(),
-        ),
+        "snowluma" => match cfg["dependencies"][name].get("feedUrl") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(raw)) if raw.trim().is_empty() => None,
+            Some(Value::String(raw)) => Some(raw.trim().to_string()),
+            Some(_) => return Err("dependencies.snowluma.feedUrl must be a string".into()),
+        },
         _ => None,
     };
     if name != "dsh" {
@@ -134,6 +148,10 @@ fn source(cfg: &Value, name: &str) -> Result<Option<String>, String> {
 }
 fn exact(raw: &str) -> bool {
     pinned_version(&json!({"dependencies":{"dsh":{"version":raw}}}), "dsh").is_ok()
+}
+fn normalize_sha256(raw: &str) -> Option<String> {
+    (raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
 }
 // Semver precedence, including numeric prerelease identifiers, without lossy integer parsing.
 fn compare(a: &str, b: &str) -> std::cmp::Ordering {
@@ -243,9 +261,9 @@ fn discover(cfg: &Value, name: &str, source: &str) -> Result<Value, String> {
         let digest = assets[0]["digest"]
             .as_str()
             .and_then(|v| v.strip_prefix("sha256:"))
-            .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(normalize_sha256)
             .ok_or("SnowLuma ZIP needs a sha256 asset digest")?;
-        Ok((Some(archive.into()), Some(digest.to_ascii_lowercase())))
+        Ok((Some(archive.into()), Some(digest)))
     })();
     let (archive, digest) = match package {
         Ok(package) => package,
@@ -258,6 +276,7 @@ fn discover(cfg: &Value, name: &str, source: &str) -> Result<Value, String> {
         directory: cfg["dependencies"]["directory"].clone(),
         current,
         archive,
+        local_archive: None,
         digest,
     };
     Ok(json!({"latest":version,"candidate":candidate}))
@@ -269,14 +288,23 @@ pub fn status(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     for name in ["snowluma", "dsh", "relay"] {
         let source = source(cfg, name)?;
         let current = pinned_version(cfg, name)?;
-        let matches = state.configuration == cfg["dependencies"]
+        let matches = source.is_some()
+            && state.configuration == cfg["dependencies"]
             && crate::release::settings(cfg)?["policy"] != "off";
         let found = if matches {
             state.dependencies[name].clone()
         } else {
             Value::Null
         };
-        dependencies[name] = json!({"current":current,"source":source,"sourceUnavailable":if source.is_none(){Some("No discoverable source is defined for relay; its pinned folder is administrator-installed.")}else{None},"latest":found["latest"],"available":found["candidate"]["version"],"error":found["error"]});
+        let source_unavailable = if source.is_none() {
+            Some(match name {
+                "snowluma" => "Automatic SnowLuma release discovery is disabled because no feedUrl is configured; upgrade from a local verified archive with `her-cli dependencies upgrade snowluma`.",
+                _ => "No discoverable source is defined for relay; its pinned folder is administrator-installed.",
+            })
+        } else {
+            None
+        };
+        dependencies[name] = json!({"current":current,"source":source,"sourceUnavailable":source_unavailable,"latest":found["latest"],"available":found["candidate"]["version"],"error":found["error"]});
     }
     Ok(
         json!({"ok":true,"dependencies":dependencies,"approval":state.approval.as_ref().map(|(name,c)|json!({"name":name,"current":c.current,"version":c.version})),"lastCheckedAt":state.checked_at,"updateError":state.error,"result":state.result}),
@@ -427,11 +455,12 @@ struct PendingAlert {
     retry_after: i64,
 }
 fn valid(cfg: &Value, name: &str, candidate: &Candidate) -> Result<(), String> {
-    if cfg["dependencies"][name] != candidate.configuration
-        || cfg["dependencies"]["directory"] != candidate.directory
-        || source(cfg, name)?.as_deref() != Some(candidate.source.as_str())
-        || crate::release::settings(cfg)?["policy"] == "off"
-    {
+    let base_mismatch = cfg["dependencies"][name] != candidate.configuration
+        || cfg["dependencies"]["directory"] != candidate.directory;
+    let feed_mismatch = candidate.local_archive.is_none()
+        && (source(cfg, name)?.as_deref() != Some(candidate.source.as_str())
+            || crate::release::settings(cfg)?["policy"] == "off");
+    if base_mismatch || feed_mismatch {
         return Err("approved dependency configuration changed before execution".into());
     }
     Ok(())
@@ -512,6 +541,8 @@ fn change_pin(
     name: &str,
     expected: &Value,
     replacement: &Value,
+    snowluma_paths: Option<&SnowlumaPathUpdate>,
+    reverse: bool,
 ) -> Result<(), String> {
     let _gate = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
     let current = context.load_config().map_err(str::to_string)?;
@@ -525,6 +556,27 @@ fn change_pin(
     let mut raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|_| "runtime config is invalid")?;
     raw["dependencies"][name] = replacement.clone();
+    if let Some(paths) = snowluma_paths {
+        for (field, pair) in [
+            ("homeDir", paths.home_dir.as_ref()),
+            ("launcherPath", paths.launcher_path.as_ref()),
+        ] {
+            let Some((old_val, new_val)) = pair else {
+                continue;
+            };
+            let (expected_val, target_val) = if reverse {
+                (new_val, old_val)
+            } else {
+                (old_val, new_val)
+            };
+            if raw.pointer(&format!("/snowluma/{field}")) == Some(expected_val) {
+                if !raw["snowluma"].is_object() {
+                    raw["snowluma"] = json!({});
+                }
+                raw["snowluma"][field] = target_val.clone();
+            }
+        }
+    }
     context.write_atomic(
         RuntimeArea::Config,
         "config.json",
@@ -636,13 +688,17 @@ fn install_snow(
             crate::guarded_fs::AclPolicy::OwnerOnly,
         )
         .map_err(String::from)?;
-        let bytes = crate::release::fetch(
-            candidate
-                .archive
-                .as_deref()
-                .ok_or("approved SnowLuma archive is missing")?,
-            256 * 1024 * 1024,
-        )?;
+        let bytes = if let Some(local) = candidate.local_archive.as_deref() {
+            read_local_archive(Path::new(local))?
+        } else {
+            crate::release::fetch(
+                candidate
+                    .archive
+                    .as_deref()
+                    .ok_or("approved SnowLuma archive is missing")?,
+                256 * 1024 * 1024,
+            )?
+        };
         if Some(format!("{:x}", Sha256::digest(&bytes)).as_str()) != candidate.digest.as_deref() {
             return Err("SnowLuma archive checksum mismatch".into());
         }
@@ -701,13 +757,23 @@ fn install_snow(
                 }
             }
         }
-        let relative = old
-            .script()?
-            .strip_prefix(&old.cwd)
-            .map_err(|_| "SnowLuma entry must be inside its working directory for upgrade")?;
-        if !plain(&staging.join(relative))?.is_file() {
+        let relative = strip_path_within(old.script()?, &old.cwd)
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .ok_or("SnowLuma entry must be inside its working directory for upgrade")?;
+        if !plain(&staging.join(&relative))?.is_file() {
             return Err("SnowLuma ZIP does not contain its configured entry".into());
         }
+        let bundled_rel = if cfg!(windows) {
+            "node.exe"
+        } else {
+            "bin/node"
+        };
+        let has_bundled_node = match fs::symlink_metadata(staging.join(bundled_rel)) {
+            Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => true,
+            Ok(_) => return Err("SnowLuma bundled node path is not a regular file".into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err("SnowLuma bundled node cannot be inspected".into()),
+        };
         relay::restrict(&staging)?;
         guard_destination(&folder)?;
         fs::rename(&staging, &folder).map_err(|_| "SnowLuma version cannot be published")?;
@@ -715,7 +781,9 @@ fn install_snow(
         next["version"] = json!(candidate.version);
         next["script"] = json!(folder.join(relative));
         next["workingDirectory"] = json!(folder);
-        // Node is an independently configured interpreter; keep its exact program path.
+        if has_bundled_node {
+            next["program"] = json!(crate::subprocess::external_path(folder.join(bundled_rel))?);
+        }
         Ok((next, folder.clone()))
     })();
     if staging.exists() && guard_destination(&staging).is_ok() {
@@ -796,6 +864,11 @@ fn transaction(
         .transaction
         .ok_or("dependency transaction is missing")?;
     recovery.next = next_cfg["dependencies"][name].clone();
+    recovery.snowluma_paths = if let Some(folder) = &snow_folder {
+        compute_snowluma_path_updates(&cfg, &old.cwd, folder)?
+    } else {
+        None
+    };
     recovery.phase = Phase::RetiringOld;
     checkpoint(context, &recovery)?;
     let result = (|| {
@@ -820,6 +893,8 @@ fn transaction(
             name,
             &cfg["dependencies"][name],
             &next_cfg["dependencies"][name],
+            recovery.snowluma_paths.as_ref(),
+            false,
         )?;
         transaction_barrier(context, "pin-changed")?;
         states = previous.clone();
@@ -879,7 +954,14 @@ fn rollback(
     }
     if transaction.phase == Phase::RestoringPin {
         if pin == &transaction.next {
-            change_pin(context, name, &transaction.next, &transaction.previous)?;
+            change_pin(
+                context,
+                name,
+                &transaction.next,
+                &transaction.previous,
+                transaction.snowluma_paths.as_ref(),
+                true,
+            )?;
         }
         transaction.phase = Phase::RestartingOld;
         checkpoint(context, transaction)?;
@@ -1050,19 +1132,38 @@ pub(super) fn apply_pending(context: &RuntimeContext) -> Result<bool, String> {
             identity: None,
             reason: None,
             alert_scheduled: false,
+            snowluma_paths: None,
         });
         state.result = json!({"name":approval.0,"from":approval.1.current,"to":approval.1.version,"status":"running"});
         save(context, &state)?;
         approval
     };
-    let result=transaction(context,name(&raw)?,&candidate,&Clock::new()).unwrap_or_else(|reason|json!({"name":raw,"from":candidate.current,"to":candidate.version,"status":"failed","rollback":"not-needed","reason":reason}));
+    let (_result, complete) = run_transaction_and_finish(context, &raw, &candidate)?;
+    Ok(complete)
+}
+fn run_transaction_and_finish(
+    context: &RuntimeContext,
+    raw: &str,
+    candidate: &Candidate,
+) -> Result<(Value, bool), String> {
+    let dep = name(raw)?;
+    let result = transaction(context, dep, candidate, &Clock::new()).unwrap_or_else(|reason| {
+        json!({
+            "name": raw,
+            "from": candidate.current,
+            "to": candidate.version,
+            "status": "failed",
+            "rollback": "not-needed",
+            "reason": reason,
+        })
+    });
     let pending = read(context)?.transaction.is_some_and(|tx| {
         tx.phase != Phase::Staging
             && result["status"] != "succeeded"
             && !matches!(result["rollback"].as_str(), Some("succeeded" | "pin-restored"))
     });
-    finish(context, &raw, &candidate, result, !pending)?;
-    Ok(!pending)
+    finish(context, raw, candidate, result.clone(), !pending)?;
+    Ok((result, !pending))
 }
 /// An unfinished transaction fences its selected dependency, while siblings can still heal.
 pub(super) fn blocked(context: &RuntimeContext) -> Result<Option<&'static str>, String> {
@@ -1171,4 +1272,1165 @@ fn notify_available(context: &RuntimeContext) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn read_plain_bounded(path: &Path, max: u64, label: &str) -> Result<Vec<u8>, String> {
+    crate::install_root::check_runtime(path, false)?;
+    let meta = fs::symlink_metadata(path).map_err(|_| format!("{label} is unavailable"))?;
+    if crate::guarded_file::is_link(&meta) || !meta.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    if meta.len() > max {
+        return Err(format!("{label} exceeds its maximum allowed size"));
+    }
+    crate::guarded_file::read_bounded_no_follow(path, max, false)
+        .map_err(|_| format!("{label} cannot be read"))?
+        .ok_or_else(|| format!("{label} is unavailable"))
+}
+
+fn read_local_archive(path: &Path) -> Result<Vec<u8>, String> {
+    read_plain_bounded(path, MAX_LOCAL_ARCHIVE_BYTES, "local SnowLuma archive")
+}
+
+fn strip_verbatim_and_slashes(path: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let text = path.to_str()?.replace('/', "\\");
+        let stripped = if text
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            format!(r"\\{}", &text[8..])
+        } else {
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+        };
+        Some(PathBuf::from(stripped))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path.to_str()?;
+        Some(path.to_path_buf())
+    }
+}
+
+fn normalize_path_for_strip(path: &Path, resolve: bool) -> Option<PathBuf> {
+    let cleaned = strip_verbatim_and_slashes(path)?;
+    if !cleaned.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in cleaned.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop only a normal segment so `..` never erases the root/prefix.
+                let can_pop = matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if !can_pop {
+                    return None;
+                }
+                out.pop();
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                if resolve {
+                    match fs::symlink_metadata(&out) {
+                        Ok(_) => out = strip_verbatim_and_slashes(&fs::canonicalize(&out).ok()?)?,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return None,
+                    }
+                }
+            }
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+fn strip_clean_components(target: &Path, base: &Path) -> Option<PathBuf> {
+    let mut t_comps = target.components();
+    let mut b_comps = base.components();
+    loop {
+        match (b_comps.next(), t_comps.next()) {
+            (None, Some(first_rest)) => {
+                let mut rel = PathBuf::new();
+                rel.push(first_rest.as_os_str());
+                for comp in t_comps {
+                    rel.push(comp.as_os_str());
+                }
+                return Some(rel);
+            }
+            (None, None) => return Some(PathBuf::new()),
+            (Some(_), None) => return None,
+            (Some(bc), Some(tc)) => {
+                let equal = if cfg!(windows) {
+                    bc.as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&tc.as_os_str().to_string_lossy())
+                } else {
+                    bc == tc
+                };
+                if !equal {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn strip_path_within(target: &Path, base: &Path) -> Option<PathBuf> {
+    let b_lex = normalize_path_for_strip(base, false)?;
+    match fs::canonicalize(&b_lex) {
+        Ok(b_canon) => {
+            let b_canon = strip_verbatim_and_slashes(&b_canon)?;
+            let t_canon = normalize_path_for_strip(target, true)?;
+            strip_clean_components(&t_canon, &b_canon)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let t_lex = normalize_path_for_strip(target, false)?;
+            strip_clean_components(&t_lex, &b_lex)
+        }
+        Err(_) => None,
+    }
+}
+
+fn compute_snowluma_path_updates(
+    cfg: &Value,
+    old_cwd: &Path,
+    new_cwd: &Path,
+) -> Result<Option<SnowlumaPathUpdate>, String> {
+    let Some(snowluma) = cfg.get("snowluma").filter(|v| v.is_object()) else {
+        return Ok(None);
+    };
+    let rewrite_field = |field: &str| -> Result<Option<(Value, Value)>, String> {
+        let Some(raw) = snowluma.get(field).and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(rel) = strip_path_within(Path::new(raw), old_cwd) else {
+            return Ok(None);
+        };
+        let rebased = if rel.as_os_str().is_empty() {
+            new_cwd.to_path_buf()
+        } else {
+            new_cwd.join(rel)
+        };
+        let external = crate::subprocess::external_path(&rebased)?;
+        crate::install_root::check_runtime(Path::new(&external), false)?;
+        Ok(Some((Value::String(raw.to_string()), json!(external))))
+    };
+    let update = SnowlumaPathUpdate {
+        home_dir: rewrite_field("homeDir")?,
+        launcher_path: rewrite_field("launcherPath")?,
+    };
+    if update.home_dir.is_none() && update.launcher_path.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(update))
+    }
+}
+
+fn resolve_from_dir(dir: &Path) -> Result<(PathBuf, String, String), String> {
+    crate::install_root::check_runtime(dir, false)?;
+    let dir_meta =
+        fs::symlink_metadata(dir).map_err(|_| "SnowLuma release directory is unavailable")?;
+    if crate::guarded_file::is_link(&dir_meta) || !dir_meta.is_dir() {
+        return Err("SnowLuma release directory must be a plain directory".into());
+    }
+    let rel_bytes = read_plain_bounded(
+        &dir.join("release.json"),
+        MAX_RELEASE_JSON_BYTES,
+        "SnowLuma release.json",
+    )?;
+    let doc: Value =
+        serde_json::from_slice(&rel_bytes).map_err(|_| "SnowLuma release.json is invalid JSON")?;
+    if !doc.is_object() {
+        return Err("SnowLuma release.json must be a JSON object".into());
+    }
+    if doc["draft"] != false || doc["prerelease"] != false {
+        return Err("SnowLuma release.json must describe a published stable release".into());
+    }
+    let version = doc["tag_name"]
+        .as_str()
+        .map(|v| v.strip_prefix('v').unwrap_or(v))
+        .filter(|v| exact(v) && !v.contains('-'))
+        .ok_or("SnowLuma release.json tag_name must be an exact stable semver")?
+        .to_string();
+    let zip_name = format!("SnowLuma-v{version}-win-x64.zip");
+    let assets: Vec<_> = doc["assets"]
+        .as_array()
+        .ok_or("SnowLuma release.json assets must be an array")?
+        .iter()
+        .filter(|asset| asset["name"].as_str() == Some(zip_name.as_str()))
+        .collect();
+    if assets.len() != 1 {
+        return Err("SnowLuma release.json needs one full Windows x64 ZIP asset".into());
+    }
+    let release_digest = assets[0]["digest"]
+        .as_str()
+        .and_then(|v| v.strip_prefix("sha256:"))
+        .and_then(normalize_sha256)
+        .ok_or("SnowLuma release.json asset needs a sha256 digest")?;
+
+    let sums_bytes = read_plain_bounded(
+        &dir.join("checksums.sha256"),
+        MAX_CHECKSUMS_BYTES,
+        "SnowLuma checksums.sha256",
+    )?;
+    let sums_text = String::from_utf8(sums_bytes)
+        .map_err(|_| "SnowLuma checksums.sha256 must be valid UTF-8")?;
+    let mut matched = Vec::new();
+    for line in sums_text.trim_start_matches('\u{feff}').lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() <= 64 || !bytes[..64].iter().all(|b| b.is_ascii_hexdigit()) {
+            return Err("SnowLuma checksums.sha256 contains an invalid line".into());
+        }
+        let hex = &line[..64];
+        let rest = &line[64..];
+        if !rest.starts_with([' ', '\t']) {
+            return Err("SnowLuma checksums.sha256 contains an invalid line".into());
+        }
+        let after_ws = rest.trim_start_matches([' ', '\t']);
+        let file = after_ws.strip_prefix('*').unwrap_or(after_ws);
+        if file.is_empty() || file.contains(['\0', '\r', '\n']) {
+            return Err("SnowLuma checksums.sha256 contains an invalid line".into());
+        }
+        if file == zip_name {
+            matched.push(hex.to_ascii_lowercase());
+        }
+    }
+    if matched.len() != 1 {
+        return Err("SnowLuma checksums.sha256 must contain one entry for the ZIP asset".into());
+    }
+    if matched[0] != release_digest {
+        return Err("SnowLuma checksums.sha256 digest does not match release.json".into());
+    }
+
+    let zip_path = dir.join(&zip_name);
+    crate::install_root::check_runtime(&zip_path, false)?;
+    let zip_meta = fs::symlink_metadata(&zip_path)
+        .map_err(|_| "SnowLuma ZIP archive in release directory is unavailable")?;
+    if crate::guarded_file::is_link(&zip_meta) || !zip_meta.is_file() {
+        return Err("SnowLuma ZIP archive must be a regular file".into());
+    }
+    Ok((zip_path, release_digest, version))
+}
+
+const CLI_USAGE: &str = "\
+usage: her-cli dependencies upgrade snowluma --runtime-root <abs> --archive <zip> --sha256 <64-hex> --version <semver>
+       her-cli dependencies upgrade snowluma --runtime-root <abs> --from-dir <dir>";
+
+enum CliUpgradeSource {
+    FromDir(PathBuf),
+    Archive {
+        archive: PathBuf,
+        digest: String,
+        version: String,
+    },
+}
+
+fn resolve_cli_path(raw: &str) -> Result<PathBuf, String> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .map_err(|_| "working directory is unavailable")?
+            .join(path))
+    }
+}
+
+fn retry_lock<T>(
+    busy_errors: &[&str],
+    mut acquire: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match acquire() {
+            Ok(guard) => return Ok(guard),
+            Err(err) if busy_errors.iter().any(|busy| err == *busy) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn parse_cli_args(args: &[String]) -> Result<Option<(PathBuf, CliUpgradeSource)>, String> {
+    if matches!(args, [a] if a == "--help" || a == "-h")
+        || matches!(args, [a, b] if a == "upgrade" && (b == "--help" || b == "-h"))
+    {
+        return Ok(None);
+    }
+    if args.len() < 2 || args[0] != "upgrade" || args[1] != "snowluma" {
+        return Err(CLI_USAGE.into());
+    }
+    let mut runtime_root: Option<String> = None;
+    let mut from_dir: Option<String> = None;
+    let mut archive: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    let mut version: Option<String> = None;
+    let rest = &args[2..];
+    let mut i = 0;
+    while i < rest.len() {
+        let take_value = |slot: &mut Option<String>, flag: &str, idx: &mut usize| -> Result<(), String> {
+            if slot.is_some() {
+                return Err(format!("duplicate {flag}"));
+            }
+            let Some(val) = rest.get(*idx + 1).filter(|v| !v.is_empty()) else {
+                return Err(format!("missing value for {flag}"));
+            };
+            *slot = Some(val.clone());
+            *idx += 1;
+            Ok(())
+        };
+        match rest[i].as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--runtime-root" => take_value(&mut runtime_root, "--runtime-root", &mut i)?,
+            "--from-dir" => take_value(&mut from_dir, "--from-dir", &mut i)?,
+            "--archive" => take_value(&mut archive, "--archive", &mut i)?,
+            "--sha256" => take_value(&mut sha256, "--sha256", &mut i)?,
+            "--version" => take_value(&mut version, "--version", &mut i)?,
+            other => return Err(format!("unknown argument: {other}\n{CLI_USAGE}")),
+        }
+        i += 1;
+    }
+    let Some(root_raw) = runtime_root else {
+        return Err(format!("missing --runtime-root\n{CLI_USAGE}"));
+    };
+    let root = PathBuf::from(&root_raw);
+    if !root.is_absolute() {
+        return Err("--runtime-root must be absolute".into());
+    }
+    let source = if let Some(dir_raw) = from_dir {
+        if archive.is_some() || sha256.is_some() || version.is_some() {
+            return Err("cannot combine --from-dir with --archive, --sha256, or --version".into());
+        }
+        CliUpgradeSource::FromDir(resolve_cli_path(&dir_raw)?)
+    } else {
+        let (Some(archive_raw), Some(sha_raw), Some(ver_raw)) = (archive, sha256, version) else {
+            return Err(format!(
+                "missing --archive, --sha256, or --version (or use --from-dir)\n{CLI_USAGE}"
+            ));
+        };
+        let normalized_version = ver_raw.strip_prefix('v').unwrap_or(&ver_raw);
+        if !exact(normalized_version) || normalized_version.contains('-') {
+            return Err("--version must be an exact stable semver".into());
+        }
+        let digest = normalize_sha256(sha_raw.strip_prefix("sha256:").unwrap_or(&sha_raw))
+            .ok_or_else(|| "--sha256 must be 64 hexadecimal characters".to_string())?;
+        CliUpgradeSource::Archive {
+            archive: resolve_cli_path(&archive_raw)?,
+            digest,
+            version: normalized_version.to_string(),
+        }
+    };
+    Ok(Some((root, source)))
+}
+
+fn validate_cli_snowluma_target(
+    context: &RuntimeContext,
+    version: &str,
+) -> Result<(Value, String), String> {
+    let cfg = context.load_config().map_err(str::to_string)?;
+    if !cfg["dependencies"]["snowluma"].is_object() {
+        return Err("dependencies.snowluma must be configured as an object".into());
+    }
+    let current = pinned_version(&cfg, "snowluma")?;
+    if current.as_deref() == Some(version) {
+        return Err(format!("SnowLuma is already pinned to {version}"));
+    }
+    let _ = existing(context, &cfg, "snowluma")?;
+    Ok((cfg, current.unwrap_or_else(|| "unpinned".into())))
+}
+
+fn execute_cli_upgrade(
+    context: &RuntimeContext,
+    source: CliUpgradeSource,
+) -> Result<Value, String> {
+    let (archive_path, digest, version) = match source {
+        CliUpgradeSource::FromDir(dir) => resolve_from_dir(&dir)?,
+        CliUpgradeSource::Archive {
+            archive,
+            digest,
+            version,
+        } => (archive, digest, version),
+    };
+    let bytes = read_local_archive(&archive_path)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        return Err("local SnowLuma archive checksum mismatch".into());
+    }
+    drop(bytes);
+
+    let _ = validate_cli_snowluma_target(context, &version)?;
+
+    let installation_path = context
+        .resolve_path(
+            RuntimeArea::Data,
+            "locks/update-restore.lock",
+            PathIntent::WriteFile,
+        )
+        .map_err(str::to_string)?;
+    let _installation = retry_lock(
+        &["another release installation or restore is running"],
+        || crate::release_store::installation_gate(&installation_path),
+    )?;
+    let _turn = retry_lock(&["runtime file is already locked"], || {
+        context.open_locked_file(RuntimeArea::Data, "locks/turn-update.lock")
+    })?;
+    let _launch = retry_lock(
+        &["a start operation for this runtime is already running", "gate is busy"],
+        || os::launch_gate(context),
+    )?;
+
+    let (cfg, current) = validate_cli_snowluma_target(context, &version)?;
+    let external_archive = crate::subprocess::external_path(&archive_path)?;
+
+    let desired = match DesiredStore::new(context.data_dir().join("lifecycle")).read() {
+        lifecycle::DesiredRead::Absent => None,
+        lifecycle::DesiredRead::Present(record) => Some(record),
+        lifecycle::DesiredRead::Unreadable(_) => {
+            return Err("desired state is unreadable".into());
+        }
+    };
+    if !wanted(context) {
+        return Err("desired state does not permit dependency upgrade".into());
+    }
+
+    let candidate = Candidate {
+        version: version.clone(),
+        source: "local-archive".into(),
+        configuration: cfg["dependencies"]["snowluma"].clone(),
+        directory: cfg["dependencies"]["directory"].clone(),
+        current,
+        archive: None,
+        local_archive: Some(external_archive),
+        digest: Some(digest),
+    };
+    {
+        let _gate = gate(context)?;
+        let mut state = read(context)?;
+        if state.approval.is_some() || state.transaction.is_some() {
+            return Err("a dependency upgrade is already pending".into());
+        }
+        state.transaction = Some(Transaction {
+            name: "snowluma".into(),
+            candidate: candidate.clone(),
+            previous: cfg["dependencies"]["snowluma"].clone(),
+            next: Value::Null,
+            desired,
+            phase: Phase::Staging,
+            identity: None,
+            reason: None,
+            alert_scheduled: false,
+            snowluma_paths: None,
+        });
+        state.result = json!({
+            "name": "snowluma",
+            "from": candidate.current,
+            "to": candidate.version,
+            "status": "running",
+        });
+        save(context, &state)?;
+    }
+
+    let (result, _complete) = run_transaction_and_finish(context, "snowluma", &candidate)?;
+    Ok(result)
+}
+
+pub fn run_cli(args: &[String]) -> i32 {
+    let (root, source) = match parse_cli_args(args) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => {
+            println!("{CLI_USAGE}");
+            return 0;
+        }
+        Err(err) => {
+            eprintln!("[dependencies] {err}");
+            return 2;
+        }
+    };
+    if let Err(err) = crate::install_root::check_runtime(&root, false) {
+        eprintln!("[dependencies] {err}");
+        return 2;
+    }
+    let context = match RuntimeContext::from_root(&root) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!("[dependencies] {err}");
+            return 2;
+        }
+    };
+    match execute_cli_upgrade(&context, source) {
+        Ok(result) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+            );
+            if result["status"] == "succeeded" {
+                0
+            } else {
+                1
+            }
+        }
+        Err(err) => {
+            eprintln!("[dependencies] {err}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod dependency_upgrade_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp(tag: &str) -> PathBuf {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "her462-{tag}-{}-{seq}",
+            std::process::id()
+        ))
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8], u32)]) -> String {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes, mode) in entries {
+            let options = zip::write::FileOptions::default().unix_permissions(*mode);
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+    }
+
+    fn create_dir_link_or_junction(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            crate::subprocess::command_without_console("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+    }
+
+    #[test]
+    fn unset_null_and_empty_snowluma_feed_url_disable_discovery_without_http_errors() {
+        let root = unique_temp("disabled-feed");
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root,
+            &json!({
+                "consoleToken": "fixture-console",
+                "update": {"policy": "notify"},
+                "dependencies": {
+                    "snowluma": {
+                        "version": "1.14.22",
+                        "program": "C:/node.exe",
+                        "script": "C:/snow/index.mjs",
+                        "workingDirectory": "C:/snow"
+                    }
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        for feed_value in [None, Some(Value::Null), Some(json!("")), Some(json!("   "))] {
+            let mut cfg = context.load_config().unwrap();
+            match feed_value {
+                None => {
+                    cfg["dependencies"]["snowluma"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("feedUrl");
+                }
+                Some(v) => {
+                    cfg["dependencies"]["snowluma"]["feedUrl"] = v;
+                }
+            }
+            context
+                .write_atomic(
+                    RuntimeArea::Config,
+                    "config.json",
+                    &serde_json::to_vec(&cfg).unwrap(),
+                )
+                .unwrap();
+
+            assert_eq!(source(&cfg, "snowluma").unwrap(), None);
+            let st = status(&context, &cfg).unwrap();
+            assert!(st["dependencies"]["snowluma"]["source"].is_null(), "{st}");
+            assert_eq!(
+                st["dependencies"]["snowluma"]["sourceUnavailable"],
+                "Automatic SnowLuma release discovery is disabled because no feedUrl is configured; upgrade from a local verified archive with `her-cli dependencies upgrade snowluma`."
+            );
+            assert!(st["dependencies"]["snowluma"]["error"].is_null(), "{st}");
+
+            let checked = check(&context, &cfg).unwrap();
+            assert!(checked["dependencies"]["snowluma"]["source"].is_null(), "{checked}");
+            assert!(checked["dependencies"]["snowluma"]["error"].is_null(), "{checked}");
+            assert!(checked["dependencies"]["snowluma"]["available"].is_null(), "{checked}");
+            assert!(checked["dependencies"]["snowluma"]["latest"].is_null(), "{checked}");
+        }
+
+        let mut cfg = context.load_config().unwrap();
+        cfg["dependencies"]["snowluma"]["feedUrl"] = json!(" https://127.0.0.1:9999/releases ");
+        assert_eq!(
+            source(&cfg, "snowluma").unwrap().as_deref(),
+            Some("https://127.0.0.1:9999/releases")
+        );
+        let st = status(&context, &cfg).unwrap();
+        assert!(st["dependencies"]["snowluma"]["sourceUnavailable"].is_null());
+
+        cfg["dependencies"]["snowluma"]["feedUrl"] = json!(123);
+        assert!(source(&cfg, "snowluma").is_err());
+    }
+
+    #[test]
+    fn status_hides_stale_snowluma_candidate_and_error_when_feed_url_is_unset() {
+        let root = unique_temp("stale-unset-feed");
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root,
+            &json!({
+                "consoleToken": "fixture-console",
+                "update": {"policy": "notify"},
+                "dependencies": {
+                    "snowluma": {
+                        "version": "1.14.22",
+                        "program": "C:/node.exe",
+                        "script": "C:/snow/index.mjs",
+                        "workingDirectory": "C:/snow"
+                    }
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        let cfg = context.load_config().unwrap();
+        let stale_state = State {
+            configuration: cfg["dependencies"].clone(),
+            dependencies: json!({
+                "snowluma": {
+                    "latest": "2.4.2",
+                    "candidate": {
+                        "version": "2.4.2",
+                        "source": "https://127.0.0.1:9/releases",
+                        "configuration": cfg["dependencies"]["snowluma"],
+                        "directory": Value::Null,
+                        "current": "1.14.22"
+                    },
+                    "error": "HTTP 404"
+                }
+            }),
+            ..State::default()
+        };
+        save(&context, &stale_state).unwrap();
+
+        let st = status(&context, &cfg).unwrap();
+        assert!(st["dependencies"]["snowluma"]["source"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["latest"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["available"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["error"].is_null(), "{st}");
+    }
+
+    #[test]
+    fn strip_path_within_handles_exact_subdir_sibling_slashes_case_and_canonical_symlinks() {
+        let base_root = crate::install_root::development_root(unique_temp("strip-within"));
+        let old_cwd = base_root.join("deps/snowluma/1.14.22");
+        let outside = base_root.join("outside");
+        fs::create_dir_all(old_cwd.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            strip_path_within(&old_cwd, &old_cwd),
+            Some(PathBuf::new())
+        );
+        assert_eq!(
+            strip_path_within(&old_cwd.join("data/home"), &old_cwd),
+            Some(PathBuf::from("data/home"))
+        );
+        assert_eq!(
+            strip_path_within(&old_cwd.join("./sub/../home"), &old_cwd),
+            Some(PathBuf::from("home"))
+        );
+
+        let slash_target = PathBuf::from(old_cwd.join("home").to_string_lossy().replace('\\', "/"));
+        assert_eq!(
+            strip_path_within(&slash_target, &old_cwd),
+            Some(PathBuf::from("home"))
+        );
+
+        let sibling = PathBuf::from(format!("{}-extra/home", old_cwd.display()));
+        assert_eq!(strip_path_within(&sibling, &old_cwd), None);
+        assert_eq!(strip_path_within(&outside.join("home"), &old_cwd), None);
+        assert_eq!(strip_path_within(Path::new("relative/home"), &old_cwd), None);
+
+        #[cfg(windows)]
+        {
+            let ext = crate::subprocess::external_path(&old_cwd).unwrap();
+            let verbatim = PathBuf::from(format!(r"\\?\{ext}\Home"));
+            assert_eq!(
+                strip_path_within(&verbatim, &old_cwd),
+                Some(PathBuf::from("Home"))
+            );
+            let upper_base = PathBuf::from(ext.to_ascii_uppercase().replace('\\', "/"));
+            assert_eq!(
+                strip_path_within(&old_cwd.join("Launcher.exe"), &upper_base),
+                Some(PathBuf::from("Launcher.exe"))
+            );
+        }
+
+        let escape_link = old_cwd.join("escape");
+        if create_dir_link_or_junction(&escape_link, &outside) {
+            assert_eq!(
+                strip_path_within(&escape_link.join("secret"), &old_cwd),
+                None,
+                "symlink/junction escaping old_cwd must not match"
+            );
+        }
+
+        // Pure lexical paths that do not exist on disk still resolve cleanly.
+        let virtual_base = base_root.join("virtual/snow/1.14.22");
+        assert_eq!(
+            strip_path_within(&virtual_base.join("home"), &virtual_base),
+            Some(PathBuf::from("home"))
+        );
+        assert_eq!(
+            strip_path_within(&base_root.join("virtual/snow/1.14.22-other/home"), &virtual_base),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&base_root);
+    }
+
+    #[test]
+    fn compute_snowluma_path_updates_rewrites_inside_old_cwd_only() {
+        let base_root = crate::install_root::development_root(unique_temp("path-updates"));
+        let old_cwd = base_root.join("deps/snowluma/1.14.22");
+        let new_cwd = base_root.join("deps/snowluma/2.4.2");
+        let sibling_cwd = base_root.join("deps/snowluma/1.14.22-extra");
+        fs::create_dir_all(&old_cwd).unwrap();
+        fs::create_dir_all(&new_cwd).unwrap();
+
+        let cfg_both = json!({
+            "snowluma": {
+                "accessToken": "keep-token",
+                "homeDir": old_cwd.join("home").to_string_lossy().replace('\\', "/"),
+                "launcherPath": old_cwd.join("bin/SnowLuma.exe")
+            }
+        });
+        let update = compute_snowluma_path_updates(&cfg_both, &old_cwd, &new_cwd)
+            .unwrap()
+            .expect("both paths inside old_cwd");
+        assert_eq!(
+            update.home_dir,
+            Some((
+                cfg_both["snowluma"]["homeDir"].clone(),
+                json!(crate::subprocess::external_path(new_cwd.join("home")).unwrap()),
+            ))
+        );
+        assert_eq!(
+            update.launcher_path,
+            Some((
+                cfg_both["snowluma"]["launcherPath"].clone(),
+                json!(crate::subprocess::external_path(new_cwd.join("bin").join("SnowLuma.exe")).unwrap()),
+            ))
+        );
+
+        let cfg_partial = json!({
+            "snowluma": {
+                "homeDir": old_cwd,
+                "launcherPath": sibling_cwd.join("SnowLuma.exe")
+            }
+        });
+        let partial = compute_snowluma_path_updates(&cfg_partial, &old_cwd, &new_cwd)
+            .unwrap()
+            .expect("homeDir exact match inside old_cwd");
+        assert_eq!(
+            partial.home_dir,
+            Some((
+                cfg_partial["snowluma"]["homeDir"].clone(),
+                json!(crate::subprocess::external_path(&new_cwd).unwrap()),
+            ))
+        );
+        assert_eq!(partial.launcher_path, None);
+
+        let cfg_outside = json!({
+            "snowluma": {
+                "homeDir": base_root.join("external/home"),
+                "launcherPath": sibling_cwd.join("SnowLuma.exe")
+            }
+        });
+        assert_eq!(
+            compute_snowluma_path_updates(&cfg_outside, &old_cwd, &new_cwd).unwrap(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&base_root);
+    }
+
+    #[test]
+    fn resolve_from_dir_validates_release_json_checksums_and_plain_zip() {
+        let dir = crate::install_root::development_root(unique_temp("from-dir"));
+        fs::create_dir_all(&dir).unwrap();
+        let zip_name = "SnowLuma-v2.4.2-win-x64.zip";
+        let zip_path = dir.join(zip_name);
+        let digest = write_zip(&zip_path, &[("index.mjs", b"console.log(1);", 0o644)]);
+
+        let write_meta = |draft: bool, prerelease: bool, rel_digest: &str, sums: &str| {
+            fs::write(
+                dir.join("release.json"),
+                json!({
+                    "tag_name": "v2.4.2",
+                    "draft": draft,
+                    "prerelease": prerelease,
+                    "assets": [
+                        {
+                            "name": "SnowLuma-v2.4.2-win-x64-lite.zip",
+                            "digest": format!("sha256:{}", "a".repeat(64))
+                        },
+                        {
+                            "name": zip_name,
+                            "digest": format!("sha256:{rel_digest}")
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(dir.join("checksums.sha256"), sums).unwrap();
+        };
+
+        let upper_digest = digest.to_ascii_uppercase();
+        let valid_sums = format!(
+            "{}  SnowLuma-v2.4.2-win-x64-lite.zip\n{upper_digest} *{zip_name}\n\n",
+            "a".repeat(64)
+        );
+        write_meta(false, false, &upper_digest, &valid_sums);
+        let (resolved_zip, resolved_digest, resolved_version) = resolve_from_dir(&dir).unwrap();
+        assert_eq!(resolved_zip, zip_path);
+        assert_eq!(resolved_digest, digest);
+        assert_eq!(resolved_version, "2.4.2");
+
+        // Draft and prerelease rejected.
+        write_meta(true, false, &digest, &valid_sums);
+        assert!(resolve_from_dir(&dir).is_err());
+        write_meta(false, true, &digest, &valid_sums);
+        assert!(resolve_from_dir(&dir).is_err());
+
+        // Checksum mismatch between release.json and checksums.sha256 rejected.
+        write_meta(
+            false,
+            false,
+            &digest,
+            &format!("{}  {zip_name}\n", "0".repeat(64)),
+        );
+        assert!(resolve_from_dir(&dir).is_err());
+
+        // Malformed checksum line rejected.
+        write_meta(false, false, &digest, &format!("not-hex  {zip_name}\n"));
+        assert!(resolve_from_dir(&dir).is_err());
+
+        // Missing zip rejected.
+        write_meta(false, false, &digest, &valid_sums);
+        fs::remove_file(&zip_path).unwrap();
+        assert!(resolve_from_dir(&dir).is_err());
+
+        // Non-regular zip (directory / junction) rejected.
+        let outside = dir.parent().unwrap().join("from-dir-outside");
+        fs::create_dir_all(&outside).unwrap();
+        if !create_dir_link_or_junction(&zip_path, &outside) {
+            fs::create_dir(&zip_path).unwrap();
+        }
+        assert!(resolve_from_dir(&dir).is_err());
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_archive_valid_and_install_snow_bundled_node_rewrite() {
+        let root = unique_temp("install-snow-local");
+        let old_cwd = root.join("snow-old");
+        let deps_dir = root.join("deps");
+        let old_node = old_cwd.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let old_script = old_cwd.join("index.mjs");
+        let snow_cfg = json!({
+            "version": "1.14.22",
+            "program": old_node,
+            "script": old_script,
+            "workingDirectory": old_cwd
+        });
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root.clone(),
+            &json!({
+                "consoleToken": "fixture-console",
+                "update": {"policy": "off"},
+                "snowluma": {
+                    "accessToken": "tok",
+                    "homeDir": old_cwd.join("home"),
+                    "launcherPath": old_cwd.join("launcher.exe")
+                },
+                "dependencies": {
+                    "directory": deps_dir,
+                    "snowluma": snow_cfg
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        fs::create_dir_all(&old_cwd).unwrap();
+        fs::write(&old_node, b"old-node").unwrap();
+        fs::write(&old_script, b"console.log('old');").unwrap();
+
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        let cfg = context.load_config().unwrap();
+        let old = existing(&context, &cfg, "snowluma").unwrap();
+
+        let bundled_rel = if cfg!(windows) { "node.exe" } else { "bin/node" };
+        let zip_with_node = fixture.0.join("with-node.zip");
+        let digest_with_node = write_zip(
+            &zip_with_node,
+            &[
+                ("index.mjs", b"console.log('new');", 0o644),
+                (bundled_rel, b"bundled-node-binary", 0o755),
+            ],
+        );
+        let cand_with_node = Candidate {
+            version: "2.4.2".into(),
+            source: "local-archive".into(),
+            configuration: cfg["dependencies"]["snowluma"].clone(),
+            directory: cfg["dependencies"]["directory"].clone(),
+            current: "1.14.22".into(),
+            archive: None,
+            local_archive: Some(crate::subprocess::external_path(&zip_with_node).unwrap()),
+            digest: Some(digest_with_node),
+        };
+        assert!(valid(&cfg, "snowluma", &cand_with_node).is_ok());
+
+        let (next, folder) = install_snow(&context, &cfg, &cand_with_node, &old).unwrap();
+        assert_eq!(
+            next["program"],
+            json!(crate::subprocess::external_path(folder.join(bundled_rel)).unwrap())
+        );
+        assert_eq!(next["version"], "2.4.2");
+
+        // Without bundled node, existing program is preserved.
+        let zip_no_node = fixture.0.join("no-node.zip");
+        let digest_no_node = write_zip(&zip_no_node, &[("index.mjs", b"console.log('no-node');", 0o644)]);
+        let cand_no_node = Candidate {
+            version: "2.4.3".into(),
+            source: "local-archive".into(),
+            configuration: cfg["dependencies"]["snowluma"].clone(),
+            directory: cfg["dependencies"]["directory"].clone(),
+            current: "1.14.22".into(),
+            archive: None,
+            local_archive: Some(crate::subprocess::external_path(&zip_no_node).unwrap()),
+            digest: Some(digest_no_node),
+        };
+        let (next_no_node, _) = install_snow(&context, &cfg, &cand_no_node, &old).unwrap();
+        assert_eq!(next_no_node["program"], cfg["dependencies"]["snowluma"]["program"]);
+    }
+
+    #[test]
+    fn cli_rejects_bad_flags_and_pre_lock_checksum_mismatch_with_zero_mutation() {
+        let root = unique_temp("cli-precheck");
+        let old_cwd = root.join("snow");
+        let old_node = old_cwd.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let old_script = old_cwd.join("index.mjs");
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root,
+            &json!({
+                "consoleToken": "fixture-console",
+                "update": {"policy": "off"},
+                "dependencies": {
+                    "directory": "C:/unused-deps",
+                    "snowluma": {
+                        "version": "1.14.22",
+                        "program": old_node,
+                        "script": old_script,
+                        "workingDirectory": old_cwd
+                    }
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        fs::create_dir_all(&old_cwd).unwrap();
+        fs::write(&old_node, b"node").unwrap();
+        fs::write(&old_script, b"console.log(1);").unwrap();
+        let zip_path = fixture.0.join("snow.zip");
+        let _real_digest = write_zip(&zip_path, &[("index.mjs", b"console.log(2);", 0o644)]);
+
+        let s = |v: &str| v.to_string();
+        let rt = fixture.0.to_string_lossy().into_owned();
+        let zp = zip_path.to_string_lossy().into_owned();
+
+        assert_eq!(run_cli(&[s("--help")]), 0);
+        assert_eq!(run_cli(&[s("upgrade"), s("snowluma"), s("-h")]), 0);
+        assert_eq!(run_cli(&[s("upgrade"), s("dsh")]), 2);
+        assert_eq!(run_cli(&[s("upgrade"), s("snowluma"), s("--unknown")]), 2);
+        assert_eq!(
+            run_cli(&[
+                s("upgrade"),
+                s("snowluma"),
+                s("--runtime-root"),
+                s("relative/path"),
+                s("--from-dir"),
+                rt.clone(),
+            ]),
+            2
+        );
+        assert_eq!(
+            run_cli(&[
+                s("upgrade"),
+                s("snowluma"),
+                s("--runtime-root"),
+                rt.clone(),
+                s("--from-dir"),
+                rt.clone(),
+                s("--version"),
+                s("2.4.2"),
+            ]),
+            2
+        );
+        assert_eq!(
+            run_cli(&[
+                s("upgrade"),
+                s("snowluma"),
+                s("--runtime-root"),
+                rt.clone(),
+                s("--archive"),
+                zp.clone(),
+                s("--sha256"),
+                "0".repeat(64),
+                s("--version"),
+                s("2.4.2-rc.1"),
+            ]),
+            2
+        );
+
+        let cfg_before = fs::read(fixture.0.join("config/config.json")).unwrap();
+        let bad_code = run_cli(&[
+            s("upgrade"),
+            s("snowluma"),
+            s("--runtime-root"),
+            rt.clone(),
+            s("--archive"),
+            zp.clone(),
+            s("--sha256"),
+            "0".repeat(64),
+            s("--version"),
+            s("v2.4.2"),
+        ]);
+        assert_eq!(bad_code, 1);
+        assert!(!fixture.0.join("data/lifecycle/dependency-upgrades.json").exists());
+        assert!(!fixture.0.join("data/locks/dependency-upgrades.lock").exists());
+        assert_eq!(fs::read(fixture.0.join("config/config.json")).unwrap(), cfg_before);
+
+        let same_ver_code = run_cli(&[
+            s("upgrade"),
+            s("snowluma"),
+            s("--runtime-root"),
+            rt,
+            s("--archive"),
+            zp,
+            s("--sha256"),
+            _real_digest,
+            s("--version"),
+            s("1.14.22"),
+        ]);
+        assert_eq!(same_ver_code, 1);
+        assert!(!fixture.0.join("data/lifecycle/dependency-upgrades.json").exists());
+        assert_eq!(fs::read(fixture.0.join("config/config.json")).unwrap(), cfg_before);
+    }
+
+    #[test]
+    fn change_pin_atomically_rewrites_and_restores_snowluma_paths_preserving_siblings() {
+        let root = unique_temp("change-pin-paths");
+        let old_cwd = root.join("deps/snowluma/1.14.22");
+        let new_cwd = root.join("deps/snowluma/2.4.2");
+        let old_pin = json!({
+            "version": "1.14.22",
+            "program": old_cwd.join("node.exe"),
+            "script": old_cwd.join("index.mjs"),
+            "workingDirectory": old_cwd
+        });
+        let new_pin = json!({
+            "version": "2.4.2",
+            "program": new_cwd.join("node.exe"),
+            "script": new_cwd.join("index.mjs"),
+            "workingDirectory": new_cwd
+        });
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root,
+            &json!({
+                "consoleToken": "fixture-console",
+                "snowluma": {
+                    "accessToken": "keep-access",
+                    "baseUrl": "http://127.0.0.1:3000",
+                    "homeDir": old_cwd.join("home"),
+                    "launcherPath": old_cwd.join("SnowLuma.exe")
+                },
+                "dependencies": {
+                    "snowluma": old_pin
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        let cfg = context.load_config().unwrap();
+        let updates = compute_snowluma_path_updates(&cfg, &old_cwd, &new_cwd)
+            .unwrap()
+            .expect("updates expected");
+
+        change_pin(
+            &context,
+            "snowluma",
+            &old_pin,
+            &new_pin,
+            Some(&updates),
+            false,
+        )
+        .unwrap();
+        let after_forward = context.load_config().unwrap();
+        assert_eq!(after_forward["dependencies"]["snowluma"], new_pin);
+        assert_eq!(after_forward["snowluma"]["homeDir"], updates.home_dir.as_ref().unwrap().1);
+        assert_eq!(
+            after_forward["snowluma"]["launcherPath"],
+            updates.launcher_path.as_ref().unwrap().1
+        );
+        assert_eq!(after_forward["snowluma"]["accessToken"], "keep-access");
+        assert_eq!(after_forward["snowluma"]["baseUrl"], "http://127.0.0.1:3000");
+
+        change_pin(
+            &context,
+            "snowluma",
+            &new_pin,
+            &old_pin,
+            Some(&updates),
+            true,
+        )
+        .unwrap();
+        let after_reverse = context.load_config().unwrap();
+        assert_eq!(after_reverse["dependencies"]["snowluma"], old_pin);
+        assert_eq!(after_reverse["snowluma"]["homeDir"], updates.home_dir.as_ref().unwrap().0);
+        assert_eq!(
+            after_reverse["snowluma"]["launcherPath"],
+            updates.launcher_path.as_ref().unwrap().0
+        );
+        assert_eq!(after_reverse["snowluma"]["accessToken"], "keep-access");
+        assert_eq!(after_reverse["snowluma"]["baseUrl"], "http://127.0.0.1:3000");
+    }
 }
