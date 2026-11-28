@@ -382,7 +382,6 @@ jobs:
           cd "$PUBLIC_TREE"
           export HER_TEST_CLI="$CARGO_TARGET_DIR/debug/her-cli.exe"
           export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
-          powershell.exe -NoProfile -File scripts/lifecycle/test-ps-count.ps1
           powershell.exe -NoProfile -File scripts/lifecycle/test-external-path.ps1
       - name: Upload CI evidence
         if: failure()

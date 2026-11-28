@@ -89,15 +89,24 @@ function Find-UncachedProcessExit([System.Management.Automation.Language.Ast]$As
 
 function Find-Utf8BomWrite([System.Management.Automation.Language.Ast]$Ast) {
   foreach ($cmd in $Ast.FindAll({ param($node)
-    $node -is [System.Management.Automation.Language.CommandAst] -and
-    $node.GetCommandName() -in @('Set-Content', 'Out-File')
+    if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+    $name = $node.GetCommandName()
+    if (-not $name) { return $false }
+    $leaf = $name.Split('\')[-1]
+    $leaf -in @('Set-Content', 'Out-File', 'Add-Content', 'sc', 'ac')
   }, $true)) {
     $elements = @($cmd.CommandElements)
     for ($i = 1; $i -lt $elements.Count; $i++) {
       if ($elements[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
-      if ($elements[$i].ParameterName -ine 'Encoding') { continue }
+      $paramName = $elements[$i].ParameterName
+      if ($paramName.Length -lt 2 -or -not 'Encoding'.StartsWith($paramName, [StringComparison]::OrdinalIgnoreCase)) { continue }
       $arg = $elements[$i].Argument
       if ($null -eq $arg -and ($i + 1) -lt $elements.Count) { $arg = $elements[$i + 1] }
+      while ($arg -is [System.Management.Automation.Language.ParenExpressionAst] -and
+          $arg.Pipeline.PipelineElements.Count -eq 1 -and
+          $arg.Pipeline.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        $arg = $arg.Pipeline.PipelineElements[0].Expression
+      }
       if ($null -eq $arg) { continue }
       $enc = if ($arg -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
         $arg.Value
@@ -161,7 +170,11 @@ $bomCases = @(
   @{Text='Set-Content -LiteralPath $p -Value $v -Encoding UTF8'; Expected=1},
   @{Text='ConvertTo-Json | Set-Content $p -Encoding:UTF8'; Expected=1},
   @{Text='Out-File -FilePath $p -Encoding utf8'; Expected=1},
+  @{Text='Add-Content -LiteralPath $p -Value $v -Encoding UTF8'; Expected=1},
+  @{Text='sc $p $v -Enc UTF8'; Expected=1},
+  @{Text='Microsoft.PowerShell.Management\Set-Content -LiteralPath $p -Value $v -Encoding ("UTF8")'; Expected=1},
   @{Text='Set-Content -LiteralPath $p -Value $v -Encoding ASCII'; Expected=0},
+  @{Text='Add-Content -LiteralPath $p -Value $v -Encoding ASCII'; Expected=0},
   @{Text='[IO.File]::WriteAllText($p, $v, [Text.UTF8Encoding]::new($false))'; Expected=0},
   @{Text='# Set-Content -LiteralPath $p -Encoding UTF8'; Expected=0},
   @{Text='"Set-Content -LiteralPath $p -Encoding UTF8"'; Expected=0}

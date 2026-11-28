@@ -178,6 +178,9 @@ function Test-TargetLocked([string]$Name) {
   }
   return $false
 }
+function Append-Utf8Line([string]$Path, [string]$Line) {
+  [IO.File]::AppendAllText($Path, $Line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+}
 function Invoke-TargetPrune([double]$MinimumBytes) {
   $receipt = Join-Path $EvidenceDir "$RunName.prune.txt"
   $maxAge = if ($env:QQBOT_TARGET_MAX_AGE_DAYS) { [double]$env:QQBOT_TARGET_MAX_AGE_DAYS } else { 2.0 }
@@ -188,20 +191,20 @@ function Invoke-TargetPrune([double]$MinimumBytes) {
   Assert-PlainTargetPath $root
   $ownTarget = [IO.Path]::GetFullPath((Join-Path $root $Ticket))
   $goal = $MinimumBytes + 20GB
-  Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "prune root=$root max_age_days=$maxAge goal_bytes=$goal"
+  Append-Utf8Line $receipt "prune root=$root max_age_days=$maxAge goal_bytes=$goal"
   if (-not (Test-Path -LiteralPath $root)) { return }
   $candidates = @(
     foreach ($directory in Get-ChildItem -LiteralPath $root -Directory -Force) {
       if ($ownTarget -eq $directory.FullName -or $ownTarget.StartsWith($directory.FullName + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
       try {
         if (Test-TargetLocked $directory.Name) {
-          Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "skipped locked path=$($directory.FullName)"
+          Append-Utf8Line $receipt "skipped locked path=$($directory.FullName)"
           continue
         }
         $tree = Get-TargetTree $directory.FullName
         if (([DateTime]::UtcNow - $tree.LastWrite).TotalDays -gt $maxAge) { $tree }
       } catch {
-        Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "skipped path=$($directory.FullName) error=$($_.Exception.Message)"
+        Append-Utf8Line $receipt "skipped path=$($directory.FullName) error=$($_.Exception.Message)"
       }
     }
   )
@@ -211,7 +214,7 @@ function Invoke-TargetPrune([double]$MinimumBytes) {
       $name = Split-Path -Leaf $candidate.Path
       # Recheck after scanning/sorting: the tree may have been written or claimed in the meantime.
       if (Test-TargetLocked $name) {
-        Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "skipped locked path=$($candidate.Path)"
+        Append-Utf8Line $receipt "skipped locked path=$($candidate.Path)"
         continue
       }
       $tree = Get-TargetTree $candidate.Path
@@ -228,9 +231,9 @@ function Invoke-TargetPrune([double]$MinimumBytes) {
         Assert-PlainTargetPath $directory
         [IO.Directory]::Delete($directory, $false)
       }
-      Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "removed path=$($tree.Path) size_bytes=$($tree.Size) age_days=$([math]::Round($age, 3))"
+      Append-Utf8Line $receipt "removed path=$($tree.Path) size_bytes=$($tree.Size) age_days=$([math]::Round($age, 3))"
     } catch {
-      Add-Content -LiteralPath $receipt -Encoding UTF8 -Value "failed path=$($candidate.Path) size_bytes=$($candidate.Size) age_days=$([math]::Round(([DateTime]::UtcNow - $candidate.LastWrite).TotalDays, 3)) error=$($_.Exception.Message)"
+      Append-Utf8Line $receipt "failed path=$($candidate.Path) size_bytes=$($candidate.Size) age_days=$([math]::Round(([DateTime]::UtcNow - $candidate.LastWrite).TotalDays, 3)) error=$($_.Exception.Message)"
     }
   }
 }
@@ -252,7 +255,7 @@ function Test-TargetDisk {
   } catch {
     $message = "Cargo refused: cannot check target disk '$targetRoot': $($_.Exception.Message). Exit 123."
   } finally { $targetMaintenance.ReleaseMutex() }
-  Add-Content -LiteralPath $diskReceipt -Value $message -Encoding UTF8
+  Append-Utf8Line $diskReceipt $message
   [Console]::Error.WriteLine($message)
   return $false
 }
@@ -266,7 +269,7 @@ function Invoke-Cargo([string[]]$Slots, [string]$Line, [long[]]$Cpus, [Diagnosti
   try {
     if (-not (Test-TargetDisk)) {
       Set-Content -LiteralPath $Out -Value '' -Encoding ASCII
-      [IO.File]::WriteAllText($Err, [string](Get-Content -LiteralPath (Join-Path $EvidenceDir "$RunName.disk.txt") -Raw), [Text.UTF8Encoding]::new($false))
+      [IO.File]::WriteAllText($Err, [IO.File]::ReadAllText((Join-Path $EvidenceDir "$RunName.disk.txt")), [Text.UTF8Encoding]::new($false))
       return '123'
     }
     $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo'

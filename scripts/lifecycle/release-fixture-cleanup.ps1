@@ -121,6 +121,7 @@ public sealed class ReleaseCleanupJob : IDisposable {
 } catch { $failures += $_.Exception.Message; throw }
 finally {
   $summary = @{ remainingTasks=@($remainingTasks); remainingProcesses=@($remainingProcesses); errors=@($failures) } | ConvertTo-Json -Depth 4
+  if ([string]::IsNullOrEmpty($summary)) { throw 'Cleanup summary JSON was empty.' }
   [IO.File]::WriteAllText($Output, $summary, [Text.UTF8Encoding]::new($false))
 }
 if ($remainingTasks.Count -or $remainingProcesses.Count) { throw 'Fixture cleanup incomplete.' }

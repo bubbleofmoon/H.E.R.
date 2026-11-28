@@ -15,7 +15,7 @@ Read by reviewers and merge gates; each rule is a judgement call no automated ch
 ## Concurrency
 
 - A new lock states its acquisition order against every existing lock it can be held with, in a comment where it is defined, and each path takes the locks in that order. Nothing waits while holding the store-style gate (the lock that serialises a store's reads and writes): no await, channel receive, other lock, sleep or I/O to another store. A path that can take two locks in opposite orders, or waits under the gate, is a required finding.
-- When a CLI command or route acquires a non-blocking supervisor gate (`launch_gate` or `installation_gate`), verify how the background supervisor loop handles contention while the gate is held so concurrent ticks do not publish false refusals or alerts.
+- When a CLI command or route acquires a non-blocking supervisor gate (`launch_gate` or `installation_gate`), verify how the background supervisor loop handles contention while the gate is held; unhandled contention that publishes a false refusal or alert is a required finding.
 
 ## Comparisons
 
