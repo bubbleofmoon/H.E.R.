@@ -149,6 +149,10 @@ fn source(cfg: &Value, name: &str) -> Result<Option<String>, String> {
 fn exact(raw: &str) -> bool {
     pinned_version(&json!({"dependencies":{"dsh":{"version":raw}}}), "dsh").is_ok()
 }
+fn normalize_sha256(raw: &str) -> Option<String> {
+    (raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
+}
 // Semver precedence, including numeric prerelease identifiers, without lossy integer parsing.
 fn compare(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -257,9 +261,9 @@ fn discover(cfg: &Value, name: &str, source: &str) -> Result<Value, String> {
         let digest = assets[0]["digest"]
             .as_str()
             .and_then(|v| v.strip_prefix("sha256:"))
-            .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(normalize_sha256)
             .ok_or("SnowLuma ZIP needs a sha256 asset digest")?;
-        Ok((Some(archive.into()), Some(digest.to_ascii_lowercase())))
+        Ok((Some(archive.into()), Some(digest)))
     })();
     let (archive, digest) = match package {
         Ok(package) => package,
@@ -284,7 +288,8 @@ pub fn status(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     for name in ["snowluma", "dsh", "relay"] {
         let source = source(cfg, name)?;
         let current = pinned_version(cfg, name)?;
-        let matches = state.configuration == cfg["dependencies"]
+        let matches = source.is_some()
+            && state.configuration == cfg["dependencies"]
             && crate::release::settings(cfg)?["policy"] != "off";
         let found = if matches {
             state.dependencies[name].clone()
@@ -1133,14 +1138,32 @@ pub(super) fn apply_pending(context: &RuntimeContext) -> Result<bool, String> {
         save(context, &state)?;
         approval
     };
-    let result=transaction(context,name(&raw)?,&candidate,&Clock::new()).unwrap_or_else(|reason|json!({"name":raw,"from":candidate.current,"to":candidate.version,"status":"failed","rollback":"not-needed","reason":reason}));
+    let (_result, complete) = run_transaction_and_finish(context, &raw, &candidate)?;
+    Ok(complete)
+}
+fn run_transaction_and_finish(
+    context: &RuntimeContext,
+    raw: &str,
+    candidate: &Candidate,
+) -> Result<(Value, bool), String> {
+    let dep = name(raw)?;
+    let result = transaction(context, dep, candidate, &Clock::new()).unwrap_or_else(|reason| {
+        json!({
+            "name": raw,
+            "from": candidate.current,
+            "to": candidate.version,
+            "status": "failed",
+            "rollback": "not-needed",
+            "reason": reason,
+        })
+    });
     let pending = read(context)?.transaction.is_some_and(|tx| {
         tx.phase != Phase::Staging
             && result["status"] != "succeeded"
             && !matches!(result["rollback"].as_str(), Some("succeeded" | "pin-restored"))
     });
-    finish(context, &raw, &candidate, result, !pending)?;
-    Ok(!pending)
+    finish(context, raw, candidate, result.clone(), !pending)?;
+    Ok((result, !pending))
 }
 /// An unfinished transaction fences its selected dependency, while siblings can still heal.
 pub(super) fn blocked(context: &RuntimeContext) -> Result<Option<&'static str>, String> {
@@ -1448,9 +1471,8 @@ fn resolve_from_dir(dir: &Path) -> Result<(PathBuf, String, String), String> {
     let release_digest = assets[0]["digest"]
         .as_str()
         .and_then(|v| v.strip_prefix("sha256:"))
-        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or("SnowLuma release.json asset needs a sha256 digest")?
-        .to_ascii_lowercase();
+        .and_then(normalize_sha256)
+        .ok_or("SnowLuma release.json asset needs a sha256 digest")?;
 
     let sums_bytes = read_plain_bounded(
         &dir.join("checksums.sha256"),
@@ -1600,17 +1622,31 @@ fn parse_cli_args(args: &[String]) -> Result<Option<(PathBuf, CliUpgradeSource)>
         if !exact(normalized_version) || normalized_version.contains('-') {
             return Err("--version must be an exact stable semver".into());
         }
-        let normalized_sha = sha_raw.strip_prefix("sha256:").unwrap_or(&sha_raw);
-        if normalized_sha.len() != 64 || !normalized_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("--sha256 must be 64 hexadecimal characters".into());
-        }
+        let digest = normalize_sha256(sha_raw.strip_prefix("sha256:").unwrap_or(&sha_raw))
+            .ok_or_else(|| "--sha256 must be 64 hexadecimal characters".to_string())?;
         CliUpgradeSource::Archive {
             archive: resolve_cli_path(&archive_raw)?,
-            digest: normalized_sha.to_ascii_lowercase(),
+            digest,
             version: normalized_version.to_string(),
         }
     };
     Ok(Some((root, source)))
+}
+
+fn validate_cli_snowluma_target(
+    context: &RuntimeContext,
+    version: &str,
+) -> Result<(Value, String), String> {
+    let cfg = context.load_config().map_err(str::to_string)?;
+    if !cfg["dependencies"]["snowluma"].is_object() {
+        return Err("dependencies.snowluma must be configured as an object".into());
+    }
+    let current = pinned_version(&cfg, "snowluma")?;
+    if current.as_deref() == Some(version) {
+        return Err(format!("SnowLuma is already pinned to {version}"));
+    }
+    let _ = existing(context, &cfg, "snowluma")?;
+    Ok((cfg, current.unwrap_or_else(|| "unpinned".into())))
 }
 
 fn execute_cli_upgrade(
@@ -1631,15 +1667,7 @@ fn execute_cli_upgrade(
     }
     drop(bytes);
 
-    let cfg = context.load_config().map_err(str::to_string)?;
-    if !cfg["dependencies"]["snowluma"].is_object() {
-        return Err("dependencies.snowluma must be configured as an object".into());
-    }
-    let current = pinned_version(&cfg, "snowluma")?;
-    if current.as_deref() == Some(version.as_str()) {
-        return Err(format!("SnowLuma is already pinned to {version}"));
-    }
-    let _ = existing(context, &cfg, "snowluma")?;
+    let _ = validate_cli_snowluma_target(context, &version)?;
 
     let installation_path = context
         .resolve_path(
@@ -1660,15 +1688,7 @@ fn execute_cli_upgrade(
         || os::launch_gate(context),
     )?;
 
-    let cfg = context.load_config().map_err(str::to_string)?;
-    if !cfg["dependencies"]["snowluma"].is_object() {
-        return Err("dependencies.snowluma must be configured as an object".into());
-    }
-    let current = pinned_version(&cfg, "snowluma")?;
-    if current.as_deref() == Some(version.as_str()) {
-        return Err(format!("SnowLuma is already pinned to {version}"));
-    }
-    let _ = existing(context, &cfg, "snowluma")?;
+    let (cfg, current) = validate_cli_snowluma_target(context, &version)?;
     let external_archive = crate::subprocess::external_path(&archive_path)?;
 
     let desired = match DesiredStore::new(context.data_dir().join("lifecycle")).read() {
@@ -1687,7 +1707,7 @@ fn execute_cli_upgrade(
         source: "local-archive".into(),
         configuration: cfg["dependencies"]["snowluma"].clone(),
         directory: cfg["dependencies"]["directory"].clone(),
-        current: current.unwrap_or_else(|| "unpinned".into()),
+        current,
         archive: None,
         local_archive: Some(external_archive),
         digest: Some(digest),
@@ -1719,24 +1739,7 @@ fn execute_cli_upgrade(
         save(context, &state)?;
     }
 
-    let result = transaction(context, "snowluma", &candidate, &Clock::new()).unwrap_or_else(
-        |reason| {
-            json!({
-                "name": "snowluma",
-                "from": candidate.current,
-                "to": candidate.version,
-                "status": "failed",
-                "rollback": "not-needed",
-                "reason": reason,
-            })
-        },
-    );
-    let pending = read(context)?.transaction.is_some_and(|tx| {
-        tx.phase != Phase::Staging
-            && result["status"] != "succeeded"
-            && !matches!(result["rollback"].as_str(), Some("succeeded" | "pin-restored"))
-    });
-    finish(context, "snowluma", &candidate, result.clone(), !pending)?;
+    let (result, _complete) = run_transaction_and_finish(context, "snowluma", &candidate)?;
     Ok(result)
 }
 
@@ -1894,6 +1897,53 @@ mod dependency_upgrade_tests {
 
         cfg["dependencies"]["snowluma"]["feedUrl"] = json!(123);
         assert!(source(&cfg, "snowluma").is_err());
+    }
+
+    #[test]
+    fn status_hides_stale_snowluma_candidate_and_error_when_feed_url_is_unset() {
+        let root = unique_temp("stale-unset-feed");
+        let fixture = crate::runtime::tests::runtime_fixture(
+            root,
+            &json!({
+                "consoleToken": "fixture-console",
+                "update": {"policy": "notify"},
+                "dependencies": {
+                    "snowluma": {
+                        "version": "1.14.22",
+                        "program": "C:/node.exe",
+                        "script": "C:/snow/index.mjs",
+                        "workingDirectory": "C:/snow"
+                    }
+                }
+            }),
+            &json!({"onebot":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","model":"http://127.0.0.1:3"}),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        let cfg = context.load_config().unwrap();
+        let stale_state = State {
+            configuration: cfg["dependencies"].clone(),
+            dependencies: json!({
+                "snowluma": {
+                    "latest": "2.4.2",
+                    "candidate": {
+                        "version": "2.4.2",
+                        "source": "https://127.0.0.1:9/releases",
+                        "configuration": cfg["dependencies"]["snowluma"],
+                        "directory": Value::Null,
+                        "current": "1.14.22"
+                    },
+                    "error": "HTTP 404"
+                }
+            }),
+            ..State::default()
+        };
+        save(&context, &stale_state).unwrap();
+
+        let st = status(&context, &cfg).unwrap();
+        assert!(st["dependencies"]["snowluma"]["source"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["latest"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["available"].is_null(), "{st}");
+        assert!(st["dependencies"]["snowluma"]["error"].is_null(), "{st}");
     }
 
     #[test]

@@ -4950,6 +4950,13 @@ fn snowluma_cli_upgrade_crash_at_pin_changed_recovers_program_and_snowluma_paths
     assert_ne!(mid_cfg["snowluma"]["homeDir"], old_home);
     assert_ne!(mid_cfg["snowluma"]["launcherPath"], old_launcher);
 
+    // Live supervisor reconcile ticks (100ms under parity-clock) must not publish
+    // configuration refusal or err logs while the CLI upgrade holds launch_gate.
+    std::thread::sleep(Duration::from_millis(350));
+    let mid_states = f.states();
+    assert!(mid_states["configuration"].is_null(), "{mid_states}");
+    assert!(!f.root.join("data/logs/dependency-configuration.err.log").exists());
+
     // Simulate crash of CLI + supervisor, then recover on supervisor restart.
     drop(cli_child);
     f.supervisor.take();
