@@ -7121,6 +7121,78 @@
       "value": "5-4-9-6-1-4-5-3-6",
       "line_sha256": "8553-6246-a371-4362-6ba3-30a1-747d-ddde-f395-3b47-df69-4c1f-426f-a873-761f-c6eb",
       "reason": "SHA256 of the crates.io wit-bindgen 0.57.1 archive"
+    },
+    {
+      "path": "her/tests/chat_mode_e2e.rs",
+      "value": "0-1-2-3-4-5-6-7-8-9",
+      "line_sha256": "523b-5041-afb6-4bfb-8f91-2578-714c-4e1c-e535-ff1e-2bc1-926c-fecc-6563-1019-4a17",
+      "reason": "Runtime random-character alphabet contains decimal digits; preserving runtime behavior"
+    },
+    {
+      "path": "her/tests/chat_mode_e2e.rs",
+      "value": "0-1-2-3-4-5-6-7-8-9",
+      "line_sha256": "0d8f-699c-5a78-3ca4-4038-efb7-4f98-6c8b-48a4-6fb8-9a16-d405-a8a4-a69f-a8cb-4144",
+      "reason": "Runtime random-character alphabet contains decimal digits; preserving runtime behavior"
+    },
+    {
+      "path": "her/tests/console_runtime_routes.rs",
+      "value": "0-1-0-1-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0",
+      "line_sha256": "18bf-41b6-0532-0bd4-7e47-6f59-c18e-15e5-8498-f4ac-d5d6-e256-a0fc-7809-4642-2cde",
+      "reason": "Binary Windows Null SID S-1-0-0 hex encoding in foreign-identity refusal fixture"
+    },
+    {
+      "path": "her/tests/her_binaries.rs",
+      "value": "0-8-0-0-0-0-0-0",
+      "line_sha256": "1c63-e02d-eb70-67a7-1896-0109-d1af-ad22-5e46-8683-471b-ce33-2cb8-a637-7606-ff50",
+      "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her/tests/her_binaries.rs",
+      "value": "0-8-0-0-0-0-0-0",
+      "line_sha256": "7a12-80d1-a7eb-725c-32d0-8041-f6a8-8165-2905-ed8f-b548-d88d-ea33-c524-69b9-ccc0",
+      "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her/tests/her_binaries.rs",
+      "value": "0-8-0-0-0-0-0-0",
+      "line_sha256": "e802-297f-e393-e36b-19f9-a1ee-b5e7-b778-66c4-975b-143f-7e34-b379-9cb6-a899-3221",
+      "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her/tests/lifecycle_cli.rs",
+      "value": "0-8-0-0-0-0-0-0",
+      "line_sha256": "bf1f-0ff2-d21b-702b-eae9-4bfd-94e9-e72f-8332-6515-e1cf-bbed-956c-8923-c427-bc11",
+      "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her/tests/mcp_core_e2e.rs",
+      "value": "7-4-7-7-9-6-4-0-5",
+      "line_sha256": "a9ac-b470-8258-fc27-9462-1680-74a8-fd20-694b-3329-ad9e-5b41-9aa3-944e-062d-0f09",
+      "reason": "Pseudorandom generator multiplier or modulus"
+    },
+    {
+      "path": "her/tests/mcp_core_e2e.rs",
+      "value": "2-8-9-1-3-3-6-4-5-3",
+      "line_sha256": "a9ac-b470-8258-fc27-9462-1680-74a8-fd20-694b-3329-ad9e-5b41-9aa3-944e-062d-0f09",
+      "reason": "Pseudorandom generator multiplier or modulus"
+    },
+    {
+      "path": "her/tests/mcp_core_e2e.rs",
+      "value": "2-7-7-8-0-3-7-3-7",
+      "line_sha256": "a9ac-b470-8258-fc27-9462-1680-74a8-fd20-694b-3329-ad9e-5b41-9aa3-944e-062d-0f09",
+      "reason": "Pseudorandom generator multiplier or modulus"
+    },
+    {
+      "path": "her/tests/mcp_core_e2e.rs",
+      "value": "1-7-6-0-0-0-0-0-0-0",
+      "line_sha256": "adc5-20f3-a7b4-9855-cdb4-fedd-dc11-2bae-235d-c85f-1518-59a0-90d0-d349-4189-c45d",
+      "reason": "Synthetic Unix epoch in seconds"
+    },
+    {
+      "path": "her/tests/voice_e2e.rs",
+      "value": "2-0-9-7-1-5-2-0",
+      "line_sha256": "5620-2559-3b66-1dc6-0faa-42d1-b735-2e72-a591-eb4b-4b16-8991-067f-577e-5d07-4b06",
+      "reason": "Byte or token count limit"
     }
   ],
   "path_exceptions": [
@@ -7192,6 +7264,16 @@
     {
       "path": "her/tests/support/chat.rs",
       "line_sha256": "786d-b73e-d0db-86eb-6daf-d94f-5569-818d-00d9-8da9-7bff-4ff6-479f-4d23-b232-0897",
+      "reason": "Synthetic fixture reply carrying a path-like string"
+    },
+    {
+      "path": "her/tests/chat_mode_e2e.rs",
+      "line_sha256": "b03c-b97e-5537-9016-dc4c-5805-6c9a-fe43-f79e-1968-ab51-b2c7-dd8f-2489-7148-4736",
+      "reason": "Synthetic fixture reply carrying a path-like string"
+    },
+    {
+      "path": "her/tests/chat_mode_e2e.rs",
+      "line_sha256": "d759-391e-0144-d1ec-9dca-3d64-6706-dfcb-2c41-7885-5649-3b48-6015-35c1-dd66-245f",
       "reason": "Synthetic fixture reply carrying a path-like string"
     }
   ]

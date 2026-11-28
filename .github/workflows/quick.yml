@@ -3,7 +3,7 @@ run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.f
 # Batch test targets per step and OS. Dispatch check and lint separately. The coordinator dispatches and waits for runs.
 # A second run with the same ref, target, os, filter and sha cancels the first. `-f sha=<commit>` runs an older commit instead of the ref head (a red receipt); the step fails unless it is an ancestor of the head.
 # Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
-# `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
+# `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (diagnostic only; `checks.yml` `lint` is the blocking gate) and uploads the
 # `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
 # (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then apply only ticket-authorized hunks for owned files (see docs/agents/rust-validation.md).
 # `console_ui` also runs alone. It builds the console fixture candidate and uploads the Playwright report.

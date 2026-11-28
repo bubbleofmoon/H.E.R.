@@ -134,7 +134,7 @@ jobs:
           path: ${{ env.PUBLIC_TREE }}/her-ui/dist
           retention-days: 1
           if-no-files-found: error
-  # Formatting and clippy on both OSes; report-only for now (the job stays green, the output is in the log).
+  # Formatting and clippy on both OSes; blocking on fmt diffs and any clippy warning.
   lint:
     name: lint (${{ matrix.os }})
     needs: [changes, ui-build]
@@ -194,28 +194,26 @@ jobs:
           workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ matrix.target_rel }}
           key: lint-${{ matrix.os }}
           cache-on-failure: true
-      - name: Format and clippy (report-only)
+      - name: Format and clippy
         run: |
-          set +e
+          set -uo pipefail
+          status=0
           lint_crate() {
-            local crate=$1 code count
+            local crate=$1
             shift
-            (cd "$PUBLIC_TREE/$crate" && cargo fmt --all --check)
-            echo "fmt check $crate exit $?"
-            (cd "$PUBLIC_TREE/$crate" && cargo clippy --workspace --all-targets "$@" 2>&1) | tee "$RUNNER_TEMP/clippy-$crate.log"
-            code=${PIPESTATUS[0]}
-            echo "clippy $crate exit $code"
-            if [ "$code" -ne 0 ]; then
-              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): incomplete, clippy exit $code"
-            else
-              # One line per warning; the per-crate "generated N warnings" summaries are not warnings.
-              count=$(grep -E '^warning: ' "$RUNNER_TEMP/clippy-$crate.log" | grep -Ecv 'generated [0-9]+ warnings?')
-              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): $count"
+            if ! (cd "$PUBLIC_TREE/$crate" && cargo fmt --all --check); then
+              echo "::error::rustfmt check failed for $crate (${RUNNER_OS})"
+              status=1
+            fi
+            if ! (cd "$PUBLIC_TREE/$crate" && cargo clippy --workspace --all-targets "$@" -- -D warnings); then
+              echo "::error::clippy check failed for $crate (${RUNNER_OS})"
+              status=1
             fi
           }
           # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
           lint_crate her --features parity-clock,release-test-keys
           lint_crate her-memory
+          exit "$status"
   # Linux test shards run on every pull request and every push to main.
   tests:
     name: tests (ubuntu-24.04, shard ${{ matrix.shard }}/5)
