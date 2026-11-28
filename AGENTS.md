@@ -6,7 +6,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Public and vault
 
-- This repository, `bubbleofmoon/H.E.R.`, is where development happens: code, docs, agent docs, CI, issues, batons and handoffs. Every ticket merges through a pull request gated by the hosted checks workflow (CI first: `docs/agents/issue-tracker.md` "Pull requests and merging").
+- This repository, `bubbleofmoon/H.E.R.`, is where development happens: code, docs, agent docs, CI and issues. Every ticket merges through a pull request gated by the hosted checks workflow (CI first: `docs/agents/issue-tracker.md` "Pull requests and merging").
 - `bubbleofmoon/H.E.R.-vault`, checked out at `C:/her-vault` (Linux `/root/her-vault`), is the vault: specs, raw validation evidence, `.scratch/`, bot memory, chat and session samples, the patched copy of SnowLuma's non-commercial code and production incident detail stay there. No vault material moves into this repository or its history, except the owner-approved default persona text (ADR 0002). Coordinators commit to the vault with the repository-level git identity set in the vault checkout by the owner, on both hosts: user name `bubbleofmoon` and the owner's GitHub noreply address.
 - A public ticket, comment or commit names vault files by path only. Post every issue, comment or pull-request body through `scripts/gh-public.sh` / `.ps1`, never a bare `gh` write (`docs/agents/issue-tracker.md`); `.githooks/pre-push` scans everything a push publishes.
 - The scan refuses secrets, digit runs of 7 or more without a reviewed exception, account-home paths and lines that look like quoted chat or session records. It prints a finding's kind and position, never the matched text. Fix the text; do not widen a rule.
@@ -32,7 +32,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Agent skills
 
-- Issues: GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (issue `#N` = ticket `N`), see `docs/agents/issue-tracker.md` and `docs/agents/baton.md`. GitHub owns ticket state and blockers.
+- Issues: GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (issue `#N` = ticket `N`), see `docs/agents/issue-tracker.md`. GitHub owns ticket state and blockers.
 - Domain docs: single-context, `GLOSSARY.md` + `docs/adr/`, see `docs/agents/domain.md`.
 - Staged tracks (`implement-spec`): specs and task-graph indexes live in the vault at `C:/her-vault/.scratch/tracks/INDEX.md`; each track executes open GitHub issues on a CI-gated branch (`docs/agents/coordinator.md`).
 
@@ -44,7 +44,6 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - `docs/adr/0001-cleanup-retention.md`: Repository retention.
 - `docs/adr/0002-public-repo-polyform-noncommercial.md`: Public development repo, vault and license.
 - `docs/adr/0011-gpl-3-0-license.md`: GPL-3.0 license adoption.
-- `docs/agents/baton.md`: Single-coordinator operation, owner batons and shared ground rules.
 - `docs/agents/coordinator.md`: Coordinator workflow, model selection and GitHub API budget.
 - `docs/agents/issue-tracker.md`: GitHub Issues, claims, the scanned-text rule (published text versus numeric relation and state operations), wayfinding operations and ready queries.
 - `docs/agents/implementer-protocol.md`: Subagent worker context, evidence and reports.
