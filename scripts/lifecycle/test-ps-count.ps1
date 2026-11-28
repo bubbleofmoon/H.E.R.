@@ -150,7 +150,7 @@ while ($pending.Count -gt 0) {
   foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force) {
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
     if ($item.PSIsContainer) {
-      if ($item.Name -notin @('.git','.scratch','backups','qq-bridge','graphify-out','node_modules','target','.venv')) { $pending.Push($item.FullName) }
+      if ($item.Name -notin @('.git','.scratch','backups','qq-bridge','node_modules','target','.venv')) { $pending.Push($item.FullName) }
     } elseif ($item.Extension -ieq '.ps1') {
       $tokens = $null; $errors = $null
       # Read repository UTF-8 explicitly: PS 5.1 ParseFile otherwise assumes ANSI for BOM-less sources.
