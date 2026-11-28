@@ -54,7 +54,7 @@ Applies to install root's runtime only.
 
 ## Public recall calibration
 
-Linux coordinator records owner approval at exact revision before running; runtime cosine ceiling (0.22) stays provisional until both folds pass:
+Coordinator records owner approval at exact revision before running; runtime cosine ceiling (0.22) stays provisional until both folds pass:
 - **Inputs:** pinned [cleaned LongMemEval small](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/tree/98d7416c24c778c2fee6e6f3006e7a073259d48f) (`longmemeval_s_cleaned.json`) + [CPU BGE-small-zh-v1.5](https://huggingface.co/Xenova/bge-small-zh-v1.5/tree/75c43b069aac4d136ba6bc1122f995fedcfd2781) (`onnx/model.onnx` + 4 tokenizer/config JSONs) under `HER_LONGMEMEVAL_DIR` with compatible local CPU ONNX Runtime.
 - **Method:** 1 memory/session in fresh in-memory SQLite per question, 5-item cap, fully backfilled cache; slice 1 = sparse-only. Split answerable & abstention -> sort each by `SHA-256(question_id)` -> indexes `0, 5, 10, ...` calibration, rest holdout.
 - **Sweep:** cosine ceiling `0.16..0.32` step `0.02` on calibration -> must gain `>= +2 pp` evidence-session recall@5 AND add `<= +5 pp` abstention retrieval vs slice 1 (highest recall wins, ties -> strictest ceiling). Verify same two checks on holdout for that single candidate; stop without calibrated ceiling if either fold fails.

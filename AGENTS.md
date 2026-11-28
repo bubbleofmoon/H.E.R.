@@ -34,6 +34,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 - Issues: GitHub Issues on the public repo `bubbleofmoon/H.E.R.` (issue `#N` = ticket `N`), see `docs/agents/issue-tracker.md` and `docs/agents/baton.md`. GitHub owns ticket state and blockers.
 - Domain docs: single-context, `GLOSSARY.md` + `docs/adr/`, see `docs/agents/domain.md`.
+- Staged tracks (`implement-spec`): specs and task-graph indexes live in the vault at `C:/her-vault/.scratch/tracks/INDEX.md`; each track executes open GitHub issues on a CI-gated branch (`docs/agents/coordinator.md`).
 
 ## Child DOX Index
 
