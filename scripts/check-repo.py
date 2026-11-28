@@ -68,23 +68,51 @@ def _eol_style(raw):
     return 'LF'
 
 
+def _resolve_eol_base(ref):
+    res = subprocess.run(['git', 'merge-base', ref, 'HEAD'], cwd=root, env=clean_env, capture_output=True, text=True)
+    merged = res.stdout.strip()
+    return merged if res.returncode == 0 and merged else ref
+
+
+def _is_autocrlf():
+    res = subprocess.run(['git', 'config', '--get', 'core.autocrlf'], cwd=root, env=clean_env, capture_output=True, text=True)
+    return res.returncode == 0 and res.stdout.strip().lower() == 'true'
+
+
+def _autocrlf_allows_work_crlf(rel):
+    res = subprocess.run(['git', 'check-attr', '-z', 'text', 'eol', '--', rel], cwd=root, env=clean_env, capture_output=True, check=True)
+    parts = res.stdout.decode('utf-8').split('\0')
+    attrs = {parts[i + 1]: parts[i + 2] for i in range(0, len(parts) - 2, 3)}
+    return attrs.get('text') != 'unset' and attrs.get('eol') != 'lf'
+
+
 eol_findings = []
 if args.eol_base and (root / '.git').exists():
-    diff_res = subprocess.run(
-        ['git', 'diff', '--name-only', '--diff-filter=M', '-z', args.eol_base],
-        cwd=root, env=clean_env, capture_output=True, check=True,
-    )
+    base_rev = _resolve_eol_base(args.eol_base)
+    autocrlf = _is_autocrlf()
+    diff_cmd = ['git', 'diff', '--name-only', '--diff-filter=M', '-z']
+    if staged:
+        diff_cmd.append('--cached')
+    diff_cmd.append(base_rev)
+    diff_res = subprocess.run(diff_cmd, cwd=root, env=clean_env, capture_output=True, check=True)
     for rel_b in sorted(p for p in diff_res.stdout.split(b'\0') if p):
         rel = rel_b.decode('utf-8')
-        work = root / rel
-        if not work.is_file():
-            continue
-        base_raw = subprocess.check_output(['git', 'show', f'{args.eol_base}:{rel}'], cwd=root, env=clean_env)
-        work_raw = work.read_bytes()
+        base_raw = subprocess.check_output(['git', 'show', f'{base_rev}:{rel}'], cwd=root, env=clean_env)
         base_style = _eol_style(base_raw)
-        work_style = _eol_style(work_raw)
-        if base_style and work_style and base_style != work_style:
-            eol_findings.append(f'eol: {rel} changed from {base_style} to {work_style}')
+        if base_style is None:
+            continue
+        index_raw = subprocess.check_output(['git', 'show', f':{rel}'], cwd=root, env=clean_env)
+        index_style = _eol_style(index_raw)
+        if index_style and index_style != base_style:
+            eol_findings.append(f'eol: {rel} changed from {base_style} to {index_style}')
+            continue
+        work = root / rel
+        if not staged and work.is_file():
+            work_style = _eol_style(work.read_bytes())
+            if work_style and work_style != base_style:
+                if autocrlf and base_style == 'LF' and work_style == 'CRLF' and _autocrlf_allows_work_crlf(rel):
+                    continue
+                eol_findings.append(f'eol: {rel} changed from {base_style} to {work_style}')
     for finding in eol_findings:
         print(finding)
     print(f'EOL-parity scan: {len(eol_findings)} findings')

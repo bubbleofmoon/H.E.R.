@@ -126,6 +126,39 @@ class EolParityCheck(unittest.TestCase):
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
         self.assertIn('EOL-parity scan: 0 findings', clean.stdout)
 
+    def test_eol_parity_uses_merge_base_when_base_branch_advances(self):
+        default = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=self.repo, env=self.env, text=True,
+        ).strip()
+        self.git('checkout', '-qb', 'feature')
+        self.git('checkout', '-q', default)
+        (self.repo / 'b.rs').write_bytes(b'fn b() {}\n')
+        self.git('add', 'b.rs')
+        self.git('commit', '-qm', 'advance-base')
+        self.git('checkout', '-q', 'feature')
+
+        res = self.run_eol(default)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('EOL-parity scan: 0 findings', res.stdout)
+
+    def test_eol_parity_respects_autocrlf_checkout_without_hiding_eol_lf_drift(self):
+        self.git('config', 'core.autocrlf', 'true')
+        (self.repo / '.gitattributes').write_bytes(b'*.md text eol=lf\n')
+        (self.repo / 'c.rs').write_bytes(b'fn c() {}\n')
+        self.git('add', '.gitattributes', 'c.rs')
+        self.git('commit', '-qm', 'attrs-and-rust')
+
+        (self.repo / 'c.rs').write_bytes(b'fn c() { let _ = 1; }\r\n')
+        ok = self.run_eol()
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn('EOL-parity scan: 0 findings', ok.stdout)
+
+        (self.repo / 'a.md').write_bytes(b'# A\r\nchanged\r\n')
+        bad = self.run_eol()
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn('eol: a.md changed from LF to CRLF', bad.stdout)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
