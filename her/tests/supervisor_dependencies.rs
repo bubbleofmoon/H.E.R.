@@ -4426,11 +4426,11 @@ fn snowluma_default_source_full_windows_asset_and_github_digest_are_enforced() {
     f.wait(|| std::net::TcpStream::connect(("127.0.0.1", f.ports[2])).is_ok());
     let (code, status) = dependency_api(&f, "GET", "/api/dependencies", Value::Null, false);
     assert_eq!(code, 200, "{status}");
+    assert!(status["dependencies"]["snowluma"]["source"].is_null(), "{status}");
     assert_eq!(
-        status["dependencies"]["snowluma"]["source"],
-        "https://api.github.com/repos/SnowLuma/SnowLuma/releases"
+        status["dependencies"]["snowluma"]["sourceUnavailable"],
+        "Automatic SnowLuma release discovery is disabled because no feedUrl is configured; upgrade from a local verified archive with `her-cli dependencies upgrade snowluma`."
     );
-    assert!(status["dependencies"]["snowluma"]["sourceUnavailable"].is_null());
     assert!(status["dependencies"]["relay"]["sourceUnavailable"].is_string());
     let destination = snow_upgrade(&mut f, &url, true);
     f.config["dependencies"]["snowluma"]["feedUrl"] =
@@ -4650,4 +4650,325 @@ fn stop_still_refuses_while_a_same_name_process_cannot_be_read() {
         );
     }
     drop(hidden_image);
+}
+
+fn build_local_snowluma_release(
+    f: &Fixture,
+    version: &str,
+    healthy: bool,
+    with_bundled_node: bool,
+) -> (PathBuf, PathBuf, String) {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let destination = f.root.join("deps/snowluma").join(version);
+    let bundled_rel = if cfg!(windows) { "node.exe" } else { "bin/node" };
+    let script = std::fs::read_to_string(f.root.join("snow/index.mjs")).unwrap();
+    let bundled_check = if with_bundled_node {
+        format!(
+            "if(path.resolve(process.execPath)!==path.resolve(fileURLToPath(new URL('./{bundled_rel}',import.meta.url))))throw Error('wrong node binary: '+process.execPath);"
+        )
+    } else {
+        String::new()
+    };
+    let script = format!("import {{fileURLToPath}} from 'node:url';\n{script}")
+        .replace(
+            "const server=http",
+            &format!(
+                "{bundled_check}
+if(fs.readFileSync(new URL('./config/account.json',import.meta.url),'utf8')!=='synthetic-config-462')throw Error('config not carried');
+if(fs.readFileSync(new URL('./data/session/login',import.meta.url),'utf8')!=='synthetic-login-462')throw Error('login not carried');
+fs.writeFileSync(new URL('./carried-verified',import.meta.url),'verified');
+const server=http"
+            ),
+        )
+        .replace(
+            "online:true,good:true",
+            &format!("online:{healthy},good:{healthy}"),
+        );
+
+    let from_dir = f.root.join(format!("local-release-{version}"));
+    std::fs::create_dir_all(&from_dir).unwrap();
+    let zip_name = format!("SnowLuma-v{version}-win-x64.zip");
+    let zip_path = from_dir.join(&zip_name);
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let stored = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        zip.start_file("index.mjs", stored).unwrap();
+        zip.write_all(script.as_bytes()).unwrap();
+        zip.start_file("fixture.json", stored).unwrap();
+        zip.write_all(&std::fs::read(f.root.join("snow/fixture.json")).unwrap())
+            .unwrap();
+        if with_bundled_node {
+            let node_bytes = std::fs::read(f.root.join(if cfg!(windows) {
+                "snow/node.exe"
+            } else {
+                "snow/node"
+            }))
+            .unwrap();
+            let node_opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o755);
+            zip.start_file(bundled_rel, node_opts).unwrap();
+            zip.write_all(&node_bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let digest = format!("{:x}", Sha256::digest(std::fs::read(&zip_path).unwrap()));
+    std::fs::write(
+        from_dir.join("release.json"),
+        json!({
+            "tag_name": format!("v{version}"),
+            "draft": false,
+            "prerelease": false,
+            "assets": [{
+                "name": zip_name,
+                "browser_download_url": "https://example.invalid/unused.zip",
+                "digest": format!("sha256:{digest}")
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        from_dir.join("checksums.sha256"),
+        format!("{digest}  {zip_name}\n"),
+    )
+    .unwrap();
+    (destination, from_dir, digest)
+}
+
+fn prepare_local_snowluma_upgrade(
+    f: &mut Fixture,
+    version: &str,
+    healthy: bool,
+    with_bundled_node: bool,
+    launcher_inside_old: bool,
+) -> (PathBuf, PathBuf, String, Value, Value) {
+    f.config["dependencies"]["directory"] = json!(f.root.join("deps"));
+    f.config["dependencies"]["snowluma"]["version"] = json!("1.14.22");
+    f.config["snowluma"]["homeDir"] = json!(f.root.join("snow/data/home"));
+    f.config["snowluma"]["launcherPath"] = if launcher_inside_old {
+        json!(f.root.join("snow/bin/SnowLuma.exe"))
+    } else {
+        json!(f.root.join("external/SnowLuma.exe"))
+    };
+    for dir in ["config", "data/session", "data/home", "bin"] {
+        std::fs::create_dir_all(f.root.join("snow").join(dir)).unwrap();
+    }
+    std::fs::write(f.root.join("snow/config/account.json"), "synthetic-config-462").unwrap();
+    std::fs::write(f.root.join("snow/data/session/login"), "synthetic-login-462").unwrap();
+    std::fs::write(f.root.join("config/config.json"), f.config.to_string()).unwrap();
+
+    let (destination, from_dir, digest) =
+        build_local_snowluma_release(f, version, healthy, with_bundled_node);
+    (
+        destination,
+        from_dir,
+        digest,
+        f.config["snowluma"]["homeDir"].clone(),
+        f.config["snowluma"]["launcherPath"].clone(),
+    )
+}
+
+#[test]
+fn snowluma_cli_upgrade_from_dir_rewrites_bundled_node_and_snowluma_paths_and_keeps_old_install() {
+    let mut f = Fixture::new();
+    f.config["update"]["policy"] = json!("notify");
+    let (destination, from_dir, digest, old_home, old_launcher) =
+        prepare_local_snowluma_upgrade(&mut f, "2.4.2", true, true, true);
+    f.start();
+    f.healthy();
+
+    // Unset feedUrl checks cleanly without HTTP noise.
+    let (code, checked) = dependency_api(&f, "POST", "/api/dependencies/check", json!({}), false);
+    assert_eq!(code, 200, "{checked}");
+    assert!(checked["dependencies"]["snowluma"]["source"].is_null(), "{checked}");
+    assert!(checked["dependencies"]["snowluma"]["error"].is_null(), "{checked}");
+
+    // Bad checksum via --archive fails pre-lock with zero mutation.
+    let zip_path = from_dir.join("SnowLuma-v2.4.2-win-x64.zip");
+    let bad = f
+        .command(&f.cli)
+        .args(["dependencies", "upgrade", "snowluma", "--runtime-root"])
+        .arg(&f.root)
+        .arg("--archive")
+        .arg(&zip_path)
+        .args(["--sha256", &"0".repeat(64), "--version", "2.4.2"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+    assert!(!destination.exists());
+
+    // Valid --from-dir upgrade succeeds.
+    let previous = f.states()["snowluma"]["identity"].clone();
+    let output = f
+        .command(&f.cli)
+        .args(["dependencies", "upgrade", "snowluma", "--runtime-root"])
+        .arg(&f.root)
+        .arg("--from-dir")
+        .arg(&from_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["from"], "1.14.22");
+    assert_eq!(body["to"], "2.4.2");
+
+    f.healthy();
+    assert!(destination.join("carried-verified").exists());
+    assert!(f.root.join("snow/index.mjs").exists(), "1.14.22 must stay side-by-side");
+    assert_ne!(f.states()["snowluma"]["identity"], previous);
+    let cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    let bundled_rel = if cfg!(windows) { "node.exe" } else { "bin/node" };
+    assert_eq!(
+        std::fs::canonicalize(cfg["dependencies"]["snowluma"]["program"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(destination.join(bundled_rel)).unwrap()
+    );
+    assert_eq!(
+        std::fs::canonicalize(cfg["snowluma"]["homeDir"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(destination.join("data/home")).unwrap()
+    );
+    assert_ne!(cfg["snowluma"]["homeDir"], old_home);
+    assert_ne!(cfg["snowluma"]["launcherPath"], old_launcher);
+    assert_eq!(cfg["snowluma"]["accessToken"], "fixture-snow");
+
+    // Second upgrade with --archive/--sha256/--version and external launcherPath keeps external launcherPath untouched.
+    let mut current_cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    let ext_launcher = json!(f.root.join("external/SnowLuma.exe"));
+    current_cfg["snowluma"]["launcherPath"] = ext_launcher.clone();
+    std::fs::write(f.root.join("config/config.json"), current_cfg.to_string()).unwrap();
+
+    let (dest2, from_dir2, digest2) = build_local_snowluma_release(&f, "2.4.3", true, false);
+    let zip2 = from_dir2.join("SnowLuma-v2.4.3-win-x64.zip");
+    let out2 = f
+        .command(&f.cli)
+        .args(["dependencies", "upgrade", "snowluma", "--runtime-root"])
+        .arg(&f.root)
+        .arg("--archive")
+        .arg(&zip2)
+        .args(["--sha256", &digest2, "--version", "2.4.3"])
+        .output()
+        .unwrap();
+    assert!(out2.status.success(), "{out2:?}");
+    let body2: Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(body2["status"], "succeeded", "{body2}");
+    assert_eq!(body2["from"], "2.4.2");
+    assert_eq!(body2["to"], "2.4.3");
+    f.healthy();
+    let cfg2: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    // Without bundled node in 2.4.3 archive, program remains the previous (2.4.2 bundled) node.
+    assert_eq!(cfg2["dependencies"]["snowluma"]["program"], cfg["dependencies"]["snowluma"]["program"]);
+    assert_eq!(
+        std::fs::canonicalize(cfg2["snowluma"]["homeDir"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(dest2.join("data/home")).unwrap()
+    );
+    assert_eq!(cfg2["snowluma"]["launcherPath"], ext_launcher);
+    assert_eq!(cfg2["snowluma"]["accessToken"], "fixture-snow");
+    let _ = digest;
+}
+
+#[test]
+fn snowluma_cli_upgrade_health_failure_rolls_back_bundled_program_and_snowluma_paths() {
+    let mut f = Fixture::new();
+    f.config["ownerQQ"] = json!(42);
+    let (destination, from_dir, digest, old_home, old_launcher) =
+        prepare_local_snowluma_upgrade(&mut f, "2.4.2", false, true, true);
+    f.start();
+    f.healthy();
+
+    let zip_path = from_dir.join("SnowLuma-v2.4.2-win-x64.zip");
+    let output = f
+        .command(&f.cli)
+        .args(["dependencies", "upgrade", "snowluma", "--runtime-root"])
+        .arg(&f.root)
+        .arg("--archive")
+        .arg(&zip_path)
+        .args(["--sha256", &digest, "--version", "2.4.2"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["status"], "rolled-back", "{body}");
+    assert_eq!(body["rollback"], "succeeded", "{body}");
+    assert!(destination.join("carried-verified").exists());
+    f.healthy();
+
+    let cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["dependencies"]["snowluma"], f.config["dependencies"]["snowluma"]);
+    assert_eq!(cfg["snowluma"]["homeDir"], old_home);
+    assert_eq!(cfg["snowluma"]["launcherPath"], old_launcher);
+    assert_eq!(cfg["snowluma"]["accessToken"], "fixture-snow");
+    f.wait(|| {
+        std::fs::read_to_string(f.root.join("snow/alerts"))
+            .unwrap_or_default()
+            .contains("依赖升级失败")
+    });
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn snowluma_cli_upgrade_crash_at_pin_changed_recovers_program_and_snowluma_paths() {
+    let mut f = Fixture::new();
+    f.config["ownerQQ"] = json!(42);
+    let (_destination, from_dir, _digest, old_home, old_launcher) =
+        prepare_local_snowluma_upgrade(&mut f, "2.4.2", true, true, true);
+    f.start();
+    f.healthy();
+
+    let control = f.root.join("data/lifecycle/dependency-upgrade-pause");
+    std::fs::write(&control, "pin-changed").unwrap();
+    let cli_child = Owned::new(
+        f.command(&f.cli)
+            .args(["dependencies", "upgrade", "snowluma", "--runtime-root"])
+            .arg(&f.root)
+            .arg("--from-dir")
+            .arg(&from_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    f.wait(|| {
+        std::fs::read_to_string(f.root.join("data/lifecycle/dependency-upgrade-reached"))
+            .ok()
+            .as_deref()
+            == Some("pin-changed")
+    });
+
+    // Pin + bundled program + snowluma.homeDir/launcherPath are already rewritten before crash.
+    let mid_cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    assert_eq!(mid_cfg["dependencies"]["snowluma"]["version"], "2.4.2");
+    assert_ne!(mid_cfg["snowluma"]["homeDir"], old_home);
+    assert_ne!(mid_cfg["snowluma"]["launcherPath"], old_launcher);
+
+    // Simulate crash of CLI + supervisor, then recover on supervisor restart.
+    drop(cli_child);
+    f.supervisor.take();
+    std::fs::remove_file(&control).unwrap();
+    f.start();
+
+    let result = await_upgrade(&f, "rolled-back");
+    assert_eq!(result["result"]["rollback"], "succeeded", "{result}");
+    f.healthy();
+
+    let cfg: Value =
+        serde_json::from_slice(&std::fs::read(f.root.join("config/config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["dependencies"]["snowluma"], f.config["dependencies"]["snowluma"]);
+    assert_eq!(cfg["snowluma"]["homeDir"], old_home);
+    assert_eq!(cfg["snowluma"]["launcherPath"], old_launcher);
+    assert_eq!(cfg["snowluma"]["accessToken"], "fixture-snow");
+    f.wait(|| {
+        std::fs::read_to_string(f.root.join("snow/alerts"))
+            .unwrap_or_default()
+            .contains("依赖升级失败")
+    });
 }

@@ -199,6 +199,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("release") {
         std::process::exit(release::run_cli(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("dependencies") {
+        std::process::exit(supervisor_dependencies::upgrades::run_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("install") {
         std::process::exit(scheduled_task::install_cli(&args[2..]));
     }
