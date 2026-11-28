@@ -260,7 +260,7 @@ impl SlangLearning {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub async fn run_auto(&self, cfg: Value, key: String) {
         let ticket = match reserve_job(&self.inner.context) {
             Ok(ticket) => ticket,
