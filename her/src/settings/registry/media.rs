@@ -20,7 +20,7 @@ macro_rules! setting {
 
 setting!(
     MEDIA_BYTES, "socialV2.media.maxBytes", "/socialV2/media/maxBytes",
-    Integer { min: 262_144, max: 20_971_520, default: Some(8_388_608), file: FileRule::Media },
+    Integer { min: 262_144, max: 20_971_520, default: Some(20_971_520), file: FileRule::Media },
     "Media size", "Maximum source image bytes before normalization.", false
 );
 setting!(

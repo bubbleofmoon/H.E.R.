@@ -65,9 +65,13 @@ fn settings_batch_tools_seed_and_mirror_without_changing_the_effective_switch() 
 #[test]
 fn settings_batch_media_uses_the_live_limits_at_both_edges() {
     let (root, context) = settings_fixture("settings media");
+    assert_eq!(
+        context.load_config().unwrap()["socialV2"]["media"]["maxBytes"],
+        20_971_520
+    );
     write_config(&root, |cfg| cfg["socialV2"]["media"] = json!({"maxBytes":0,"maxPixels":99_999_999,"maxCount":"2.4"}));
     let loaded = context.load_config().unwrap();
-    assert_eq!(loaded["socialV2"]["media"], json!({"maxBytes":8_388_608,"maxPixels":64_000_000,"maxCount":2}));
+    assert_eq!(loaded["socialV2"]["media"], json!({"maxBytes":20_971_520,"maxPixels":64_000_000,"maxCount":2}));
     for (key, min, max) in [
         ("maxBytes", 262_144, 20_971_520),
         ("maxPixels", 1_000_000, 64_000_000),
