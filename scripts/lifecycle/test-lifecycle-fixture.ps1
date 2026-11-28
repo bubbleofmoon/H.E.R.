@@ -160,13 +160,14 @@ try {
   Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings @principalArguments -ErrorAction Stop | Out-Null
   $registered = $true
   $registeredPrincipal = (Get-ScheduledTask -TaskName $taskName -ErrorAction Stop).Principal
-  @{
+  $principalJson = @{
     callerElevated=$callerElevated; callerAccount=$callerIdentity.Name; callerSid=$callerIdentity.User.Value
     callerSessionId=$callerSession; inheritedUsername=$inheritedUsername; username=$env:USERNAME
     requestedHighest=[bool]$RunLevelHighest; taskName=$taskName
     principal=@{userId=[string]$registeredPrincipal.UserId; logonType=[string]$registeredPrincipal.LogonType; runLevel=[string]$registeredPrincipal.RunLevel}
     readBeforeTrigger=$true
-  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $FixtureRoot 'task-principal.json') -Encoding UTF8
+  } | ConvertTo-Json -Depth 4
+  [IO.File]::WriteAllText((Join-Path $FixtureRoot 'task-principal.json'), $principalJson, [Text.UTF8Encoding]::new($false))
   if ($RunLevelHighest) {
     $registeredUser = [string]$registeredPrincipal.UserId
     $registeredSid = if ($registeredUser -match '^S-1-') { [Security.Principal.SecurityIdentifier]::new($registeredUser).Value } else {
@@ -187,7 +188,7 @@ try {
   $trigger = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddSeconds(10))
   Set-ScheduledTask -TaskName $taskName -Trigger $trigger -ErrorAction Stop | Out-Null
   Wait-For { (Get-Status).owners.supervisor.state -ceq 'held' } 'fixture supervisor ownership'
-  Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop | Select-Object LastRunTime,LastTaskResult | ConvertTo-Json | Set-Content (Join-Path $FixtureRoot 'scheduled-task-info.json') -Encoding UTF8
+  [IO.File]::WriteAllText((Join-Path $FixtureRoot 'scheduled-task-info.json'), (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop | Select-Object LastRunTime,LastTaskResult | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
   $initial = Get-Status
   $script:supervisorPid = [int]$initial.owners.supervisor.owner.identity.pid
   if ($initial.desired.state -cne 'stopped' -or $initial.owners.live.state -cne 'free' -or $initial.owners.console.state -cne 'free') {
@@ -229,18 +230,18 @@ try {
     $dependencyState = Get-Content -LiteralPath (Join-Path $runtime 'data/lifecycle/dependencies.json') -Raw | ConvertFrom-Json
     $replacementDsh = @(Get-NetTCPConnection -State Listen -LocalPort $dshPort -ErrorAction Stop)[0].OwningProcess
     if ($dependencyState.dsh.state -ne 'started' -or $dependencyState.dsh.identity.pid -ne $replacementDsh -or $replacementDsh -eq $oldDsh) { throw 'No successful native dependency recovery was recorded.' }
-    $dependencyState | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $FixtureRoot 'dependency-state.json') -Encoding UTF8
-    $runs | ConvertTo-Json -Depth 15 | Set-Content (Join-Path $FixtureRoot 'task-runs.json') -Encoding UTF8
+    [IO.File]::WriteAllText((Join-Path $FixtureRoot 'dependency-state.json'), ($dependencyState | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $FixtureRoot 'task-runs.json'), ($runs | ConvertTo-Json -Depth 15), [Text.UTF8Encoding]::new($false))
     $chains = Get-Content (Join-Path $FixtureRoot 'chains.json') -Raw | ConvertFrom-Json
     $chains | Add-Member -NotePropertyName manual -NotePropertyValue $true
     $chains | Add-Member -NotePropertyName recovery -NotePropertyValue $true
-    $chains | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $FixtureRoot 'chains.json') -Encoding UTF8
+    [IO.File]::WriteAllText((Join-Path $FixtureRoot 'chains.json'), ($chains | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
   }
   [void](Invoke-Bridge @('lifecycle','set','stopped','--confirm','--runtime-root',$runtime,'--by','fixture'))
   Wait-For { (Get-Status).owners.console.state -ceq 'free' } 'console stops after stopped'
   Wait-For { (Get-Status).owners.live.state -ceq 'free' } 'live owner stops after stopped'
   $status = Get-Status
-  $status | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $FixtureRoot 'result.json') -Encoding UTF8
+  [IO.File]::WriteAllText((Join-Path $FixtureRoot 'result.json'), ($status | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText($observerDone, 'done')
   if (-not $observer.WaitForExit(15000)) { throw 'Window observer did not finish.' }
   if ($observer.ExitCode -ne 0) { throw 'A fixture window or foreground owner was observed, or window sampling failed.' }

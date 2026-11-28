@@ -120,7 +120,7 @@ public sealed class ReleaseCleanupJob : IDisposable {
   }
 } catch { $failures += $_.Exception.Message; throw }
 finally {
-  @{ remainingTasks=@($remainingTasks); remainingProcesses=@($remainingProcesses); errors=@($failures) } |
-    ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Output -Encoding UTF8
+  $summary = @{ remainingTasks=@($remainingTasks); remainingProcesses=@($remainingProcesses); errors=@($failures) } | ConvertTo-Json -Depth 4
+  [IO.File]::WriteAllText($Output, $summary, [Text.UTF8Encoding]::new($false))
 }
 if ($remainingTasks.Count -or $remainingProcesses.Count) { throw 'Fixture cleanup incomplete.' }

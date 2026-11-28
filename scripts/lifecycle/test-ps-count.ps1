@@ -87,6 +87,31 @@ function Find-UncachedProcessExit([System.Management.Automation.Language.Ast]$As
   }
 }
 
+function Find-Utf8BomWrite([System.Management.Automation.Language.Ast]$Ast) {
+  foreach ($cmd in $Ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -in @('Set-Content', 'Out-File')
+  }, $true)) {
+    $elements = @($cmd.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+      if ($elements[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+      if ($elements[$i].ParameterName -ine 'Encoding') { continue }
+      $arg = $elements[$i].Argument
+      if ($null -eq $arg -and ($i + 1) -lt $elements.Count) { $arg = $elements[$i + 1] }
+      if ($null -eq $arg) { continue }
+      $enc = if ($arg -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        $arg.Value
+      } else {
+        $arg.Extent.Text.Trim('"', "'")
+      }
+      if ($enc -ieq 'UTF8') {
+        $cmd
+        break
+      }
+    }
+  }
+}
+
 # Parser examples are data: never invoke host process/task/network commands.
 $cases = @(
   @{Text='(Get-CimInstance Win32_Process | Where-Object Name -eq node.exe).Count'; Expected=1},
@@ -132,6 +157,21 @@ foreach ($case in $exitCases) {
   if (@($errors).Count -ne 0 -or @(Find-UncachedProcessExit $ast).Count -ne $case.Expected) { throw "Process parser regression: $($case.Text)" }
 }
 
+$bomCases = @(
+  @{Text='Set-Content -LiteralPath $p -Value $v -Encoding UTF8'; Expected=1},
+  @{Text='ConvertTo-Json | Set-Content $p -Encoding:UTF8'; Expected=1},
+  @{Text='Out-File -FilePath $p -Encoding utf8'; Expected=1},
+  @{Text='Set-Content -LiteralPath $p -Value $v -Encoding ASCII'; Expected=0},
+  @{Text='[IO.File]::WriteAllText($p, $v, [Text.UTF8Encoding]::new($false))'; Expected=0},
+  @{Text='# Set-Content -LiteralPath $p -Encoding UTF8'; Expected=0},
+  @{Text='"Set-Content -LiteralPath $p -Encoding UTF8"'; Expected=0}
+)
+foreach ($case in $bomCases) {
+  $tokens = $null; $errors = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseInput($case.Text, [ref]$tokens, [ref]$errors)
+  if (@($errors).Count -ne 0 -or @(Find-Utf8BomWrite $ast).Count -ne $case.Expected) { throw "BOM parser regression: $($case.Text)" }
+}
+
 # Exact fixture predicate: zero, one and several matching JSON run records.
 foreach ($count in @(0,1,2)) {
   $rows = @([pscustomobject]@{source='scheduled';state='succeeded'})
@@ -162,9 +202,12 @@ while ($pending.Count -gt 0) {
       foreach ($spawn in Find-UncachedProcessExit $ast) {
         $violations += ('{0}:{1}: cache .Handle immediately after -PassThru before reading/returning process exit status: {2}' -f $item.FullName.Substring($repo.Length + 1), $spawn.Extent.StartLineNumber, $spawn.Left.Extent.Text)
       }
+      foreach ($bomWrite in Find-Utf8BomWrite $ast) {
+        $violations += ('{0}:{1}: PowerShell 5.1 -Encoding UTF8 writes a BOM; use [IO.File]::WriteAllText(..., [Text.UTF8Encoding]::new($false)): {2}' -f $item.FullName.Substring($repo.Length + 1), $bomWrite.Extent.StartLineNumber, $bomWrite.Extent.Text)
+      }
       $scanned++
     }
   }
 }
 if ($violations.Count -gt 0) { $violations | Write-Output; throw "Unsafe PowerShell accesses: $($violations.Count)" }
-Write-Host "PASS PowerShell 5.1: $scanned scripts parsed; collection/Process exit scans; parser cases; 0/1/2 manual-success matches."
+Write-Host "PASS PowerShell 5.1: $scanned scripts parsed; collection/Process exit/UTF-8 BOM scans; parser cases; 0/1/2 manual-success matches."

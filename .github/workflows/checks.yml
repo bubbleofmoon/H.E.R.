@@ -92,6 +92,9 @@ jobs:
           python -I scripts/ci/run-scans.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
+          if [ "$RUNNER_OS" = Windows ]; then
+            powershell.exe -NoProfile -File scripts/lifecycle/test-ps-count.ps1
+          fi
   ui-build:
     name: ui-build (ubuntu-24.04)
     needs: changes

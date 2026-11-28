@@ -266,7 +266,7 @@ function Invoke-Cargo([string[]]$Slots, [string]$Line, [long[]]$Cpus, [Diagnosti
   try {
     if (-not (Test-TargetDisk)) {
       Set-Content -LiteralPath $Out -Value '' -Encoding ASCII
-      Set-Content -LiteralPath $Err -Value (Get-Content -LiteralPath (Join-Path $EvidenceDir "$RunName.disk.txt") -Raw) -Encoding UTF8
+      [IO.File]::WriteAllText($Err, [string](Get-Content -LiteralPath (Join-Path $EvidenceDir "$RunName.disk.txt") -Raw), [Text.UTF8Encoding]::new($false))
       return '123'
     }
     $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo'

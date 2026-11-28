@@ -236,6 +236,7 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("python -I scripts/ci/run-scans.py", scans)
         self.assertIn("python -I scripts/scan-public.py", scans)
         self.assertIn('"$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner', scans)
+        self.assertIn("powershell.exe -NoProfile -File scripts/lifecycle/test-ps-count.ps1", scans)
 
         ui_build = self.job_block(text, "ui-build")
         self.assertIn("name: ui-build (ubuntu-24.04)", ui_build)
