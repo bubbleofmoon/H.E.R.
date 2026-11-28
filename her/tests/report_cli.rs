@@ -289,7 +289,7 @@ fn filters_the_window_and_key_but_keeps_current_pauses_and_reports_refusals_and_
         json!({"ts":t+3000,"key":"private:43","turnMs":77777}),
     ]);
     let sample = json!({"k":"turn","t":t,"sid":"s","key":"group:42","seq":2,"turn":1,"step":1,"retry":0,"model":"p/b","b":{"cacheMiss":20,"cacheHit":10,"output":4}});
-    f.write("data/token-usage.jsonl", &[sample.clone()]);
+    f.write("data/token-usage.jsonl", std::slice::from_ref(&sample));
     let mut updated = sample.clone();
     updated["seq"] = json!(3);
     updated["b"]["output"] = json!(6);

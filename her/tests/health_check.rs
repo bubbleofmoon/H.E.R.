@@ -55,7 +55,7 @@ impl Drain {
     fn closed(&self) -> bool {
         self.reader
             .as_ref()
-            .map_or(true, |reader| reader.is_finished())
+            .is_none_or(|reader| reader.is_finished())
     }
     fn bytes(&self) -> Vec<u8> {
         self.bytes
@@ -202,14 +202,12 @@ impl Server {
             }
             let (status, mut body) = if !matches_path {
                 (404, json!({}))
-            } else if path == "/get_status"
-                && req.header("Authorization") != Some("Bearer fixture-snow")
-            {
-                (401, json!({}))
-            } else if path == "/api/settings/describe"
-                && !req
-                    .header("Cookie")
-                    .is_some_and(|cookie| cookie.contains("dsh-auth-"))
+            } else if (path == "/get_status"
+                && req.header("Authorization") != Some("Bearer fixture-snow"))
+                || (path == "/api/settings/describe"
+                    && !req
+                        .header("Cookie")
+                        .is_some_and(|cookie| cookie.contains("dsh-auth-")))
             {
                 (401, json!({}))
             } else {

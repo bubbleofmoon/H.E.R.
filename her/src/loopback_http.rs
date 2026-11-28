@@ -106,10 +106,12 @@ impl LoopbackEndpoint {
         self.addr
     }
 
+    #[cfg(test)]
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
 
+    #[cfg(test)]
     pub(crate) fn port(&self) -> u16 {
         self.port
     }

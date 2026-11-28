@@ -2690,7 +2690,7 @@ fn canonical_tool_rounds_and_reasoning_replay_after_restart_with_attempt_scoped_
         4,
         "canonical call/result groups were lost on reopen"
     );
-    for pair in rounds.chunks_exact(2) {
+    for pair in rounds.as_chunks::<2>().0 {
         assert_eq!(pair[0]["role"], "assistant");
         assert_eq!(pair[0]["tool_calls"][0]["id"], "provider-call-0");
         assert_eq!(pair[0]["reasoning_content"], "tool plan");

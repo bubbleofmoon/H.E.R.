@@ -4,8 +4,8 @@ mod storage;
 
 pub(crate) use storage::{
     administrator_password_is_set_in, admit_browser, archive_credentials, auth_status,
-    scrub_auth_snapshot, start_browser_clock, ArchivedCredentials, AuthStatusSnapshot,
-    BrowserAdmission, BrowserSessionView, IssuedSession, SCHEMA_V3_ADDED, SCHEMA_V3_IMPLICIT,
+    scrub_auth_snapshot, start_browser_clock, ArchivedCredentials, BrowserSessionView,
+    IssuedSession, SCHEMA_V3_ADDED, SCHEMA_V3_IMPLICIT,
 };
 #[cfg(test)]
 pub(crate) use storage::{
@@ -71,7 +71,8 @@ pub(crate) fn decode_digest<const N: usize>(text: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut digest = [0; N];
-    for (value, pair) in digest.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+    let (pairs, _) = text.as_bytes().as_chunks::<2>();
+    for (value, pair) in digest.iter_mut().zip(pairs) {
         *value = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(digest)

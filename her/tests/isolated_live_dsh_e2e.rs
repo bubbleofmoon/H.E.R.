@@ -542,9 +542,11 @@ async fn handle_dsh_rpc(mut stream: TokioStream, shared: Arc<DshShared>) -> Resu
     .await
 }
 
-async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Result<(), String> {
+async fn handle_dsh_ws(stream: TokioStream, shared: Arc<DshShared>) -> Result<(), String> {
     let auth = Arc::new(Mutex::new(None::<String>));
     let callback_auth = auth.clone();
+    #[allow(clippy::result_large_err)]
+    // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
     let mut socket = tokio::time::timeout(
         Duration::from_secs(5),
         accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -593,8 +595,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
                     "streamId":stream_id,
                     "value":{"type":"ready","clientId":"fixture-events-client"}
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|error| format!("send DSH $events ready: {error}"))?;
@@ -627,8 +628,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
                 "streamId":stream_id,
                 "value":{"type":"snapshot","records":[]}
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .map_err(|error| format!("send DSH follow snapshot: {error}"))?;
@@ -658,7 +658,7 @@ async fn handle_dsh_ws(mut stream: TokioStream, shared: Arc<DshShared>) -> Resul
         }),
     ] {
         socket
-            .send(Message::Text(frame.to_string().into()))
+            .send(Message::Text(frame.to_string()))
             .await
             .map_err(|error| format!("send DSH follow event: {error}"))?;
     }
@@ -924,6 +924,8 @@ fn serve_onebot_ws(
             .map_err(|error| format!("accept fake OneBot WS connection: {error}"))?;
         let auth = Arc::new(Mutex::new(None::<String>));
         let callback_auth = auth.clone();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio::time::timeout(
             Duration::from_secs(5),
             accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -960,8 +962,7 @@ fn serve_onebot_ws(
         socket
             .send(Message::Text(
                 json!({"echo":"login","data":{"user_id":SELF_ID,"nickname":"ticket04-dsh-bot"}})
-                    .to_string()
-                    .into(),
+                    .to_string(),
             ))
             .await
             .map_err(|error| format!("reply to fake OneBot login: {error}"))?;
@@ -981,8 +982,7 @@ fn serve_onebot_ws(
                     ],
                     "sender":{"nickname":"ticket04-dsh-user"}
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|error| format!("send selected fake incoming message: {error}"))?;
@@ -1527,10 +1527,10 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     );
 
     let onebot_sent = Arc::new(AtomicBool::new(false));
-    let mut dsh_server = spawn_dsh_server(dsh_listener, dsh_authority.clone(), console_port);
-    let mut model_server = spawn_model_sentinel(model_listener);
-    let mut onebot_http_server = spawn_onebot_http(onebot_listener, onebot_sent.clone());
-    let mut onebot_ws_server =
+    let dsh_server = spawn_dsh_server(dsh_listener, dsh_authority.clone(), console_port);
+    let model_server = spawn_model_sentinel(model_listener);
+    let onebot_http_server = spawn_onebot_http(onebot_listener, onebot_sent.clone());
+    let onebot_ws_server =
         spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected);
 
     drop(console_reservation); // free the held port on the line before the console spawn

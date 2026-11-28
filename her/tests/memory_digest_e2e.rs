@@ -290,12 +290,6 @@ impl Rig {
         )
         .unwrap()
     }
-    /// Kill the console process the digest runs in, as an abrupt crash or forced restart would.
-    fn kill(&mut self) {
-        let mut child = self.child.take().unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
     fn stop_jobs(&self) {
         let dir = self.root.join("data/lifecycle");
         std::fs::create_dir_all(&dir).unwrap();

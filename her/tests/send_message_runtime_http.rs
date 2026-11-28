@@ -222,7 +222,7 @@ fn http_request(
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     )
     .map_err(|e| format!("write HTTP request: {e}"))?;
     let mut response = Vec::new();
@@ -635,7 +635,7 @@ fn handle_onebot(
         write!(
             stream,
             "HTTP/1.1 {http_status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response.as_bytes().len(),
+            response.len(),
             response
         )
         .ok()?;
@@ -1956,6 +1956,7 @@ fn concurrent_sends_wait_out_a_stalled_state_gate_holder_instead_of_refusing() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(root.join("data/locks/social-v2.lock"))
         .unwrap();
     holder.try_lock().expect("test takes the state gate first");

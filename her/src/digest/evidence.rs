@@ -102,7 +102,7 @@ impl Lines {
     fn push(&mut self, line: &str) -> bool {
         if self.closed { return false; }
         let chars = line.chars().count();
-        if self.chars + chars + 1 <= self.max {
+        if self.chars + chars < self.max {
             self.append(line, chars);
             return true;
         }
@@ -122,7 +122,7 @@ impl Lines {
         if self.lead_closed { return false; }
         let room = self.max.saturating_sub(self.chars + kept);
         let chars = line.chars().count();
-        if chars + 1 <= room {
+        if chars < room {
             self.append(line, chars);
             return true;
         }

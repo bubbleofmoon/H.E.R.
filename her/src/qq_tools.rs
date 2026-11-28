@@ -327,7 +327,7 @@ struct ApiCall {
     long_poll: bool,
 }
 
-impl<'a> ApiCall {
+impl ApiCall {
     fn get(path: String) -> Self {
         Self { method: "GET", path, headers: Vec::new(), body: None, timeout_ms: 15_000, connect_timeout_ms: 10_000, long_poll: false }
     }

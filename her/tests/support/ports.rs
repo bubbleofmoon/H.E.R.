@@ -166,7 +166,7 @@ impl Drop for OwnedChild {
 }
 
 thread_local! {
-    static HELD: std::cell::RefCell<Vec<Reserved>> = std::cell::RefCell::new(Vec::new());
+    static HELD: std::cell::RefCell<Vec<Reserved>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Keeps a reservation bound until `release_held`, for a port that is written into fixture files and

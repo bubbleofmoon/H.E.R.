@@ -5,21 +5,6 @@ use serde_json::{json, Value};
 const REASONING_DEFAULT: &str = "max";
 const REASONING_OPTIONS: [&str; 4] = ["low", "medium", "high", "max"];
 
-#[cfg(test)]
-mod backup_settings_tests {
-    use super::*;
-
-    #[test]
-    fn backup_old_count_migrates_to_seven_days_in_effective_config() {
-        let (config, _) =
-            canonical_config(&json!({"backup":{"keep":42,"includeState":false}})).unwrap();
-        assert_eq!(config["backup"]["keepDays"], 7);
-        assert!(config["backup"].get("keep").is_none());
-        assert_eq!(config["backup"]["time"], "04:00");
-        assert_eq!(config["backup"]["includeState"], false);
-    }
-}
-
 /// Public mode spellings mapped to the internal spelling the runtime compares against.
 /// `simulation` is the canonical public name of `reserved2`, for participation mode selection.
 pub fn normalize_mode(raw: &str) -> Option<&'static str> {
@@ -193,4 +178,19 @@ fn parse_qq(text: &str) -> Result<u64, String> {
         return Err(message.to_string());
     }
     Ok(qq)
+}
+
+#[cfg(test)]
+mod backup_settings_tests {
+    use super::*;
+
+    #[test]
+    fn backup_old_count_migrates_to_seven_days_in_effective_config() {
+        let (config, _) =
+            canonical_config(&json!({"backup":{"keep":42,"includeState":false}})).unwrap();
+        assert_eq!(config["backup"]["keepDays"], 7);
+        assert!(config["backup"].get("keep").is_none());
+        assert_eq!(config["backup"]["time"], "04:00");
+        assert_eq!(config["backup"]["includeState"], false);
+    }
 }

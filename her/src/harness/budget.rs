@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(estimate(&[ChatMessage::user("abcd".to_string())], true), MESSAGE_TOKENS + 1);
         let inbound = ChatMessage::user(vec![ContentPart::Text("abcd".into()), image()]);
         assert_eq!(
-            estimate(&[inbound.clone()], true),
+            estimate(std::slice::from_ref(&inbound), true),
             MESSAGE_TOKENS + 1 + IMAGE_TOKENS,
             "a replayed inbound image counts"
         );

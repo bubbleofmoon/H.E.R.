@@ -28,7 +28,7 @@ fn padded_jpeg(total: usize) -> Vec<u8> {
         }
         let length = size - 2;
         out.extend_from_slice(&[0xFF, 0xFE, (length >> 8) as u8, (length & 0xFF) as u8]);
-        out.extend(std::iter::repeat(b'x').take(length - 2));
+        out.extend(std::iter::repeat_n(b'x', length - 2));
         missing -= size;
     }
     out.extend_from_slice(&jpeg[2..]);
@@ -248,7 +248,7 @@ fn self_avatar_concurrent_callers_fetch_once() {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         Ok(avatar.clone())
                     };
-                    current_with(&context, T0, PIXELS, &mut fetch).is_some()
+                    current_with(context, T0, PIXELS, &mut fetch).is_some()
                 })
             })
             .collect();

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn hidden_command(exe: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(exe);
     #[cfg(windows)]
     {

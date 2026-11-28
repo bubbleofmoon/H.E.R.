@@ -884,6 +884,7 @@ fn social_state_summary_for_request(
     Ok(social_state_summary_for_keys(state, &canonical_key, requested_key))
 }
 
+#[cfg(test)]
 fn handle_social_state(context: &RuntimeContext, key: &str) -> Result<Value, (u16, String)> {
     let doc = ConversationState::for_runtime(context).read_document()?;
     let canonical_key = projection_storage_key(key)?;
@@ -1174,7 +1175,7 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
     // The copied config sections pass the settings redaction: a secret in them reads as the marker.
     let recommended = redact_setting("socialV2", recommended);
 
-    let reply_window = reply_timing::QuietWindow::configured(&cfg,reply_timing::urgent(&cfg,key,&st));
+    let reply_window = reply_timing::QuietWindow::configured(cfg, reply_timing::urgent(cfg, key, &st));
 
     let slang_entries = crate::slang::load_entries_for_runtime(context);
     let slang_max = cfg.get("slang").and_then(|v| v.get("injectMax"));
@@ -1203,7 +1204,7 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         "recentCount": st.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
         "currentWakeConfig": wc,
         "wakeSafety": wake_safety,
-        "memory": crate::prompt::memory_formatted_conversation(&conv, &cfg),
+        "memory": crate::prompt::memory_formatted_conversation(&conv, cfg),
         "participation": crate::prompt::participation_block_conversation(&conv).trim_end(),
         "slang": {
             "enabled": cfg.get("slang").and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true),
@@ -1475,6 +1476,7 @@ fn js_safe_integer(value: &Value) -> Option<i64> {
 /// 分页口径与 JS 一致：
 ///   · 不给 `afterSeq` → 取尾部 `limit` 条（管理台默认视图）
 ///   · 给了 `afterSeq` → 取 seq 大于它的前 `limit` 条（把积压读全）
+#[cfg(test)]
 fn handle_unread(
     context: &RuntimeContext,
     key: &str,
@@ -1486,6 +1488,7 @@ fn handle_unread(
     handle_unread_from_state(context, state, key, limit, after_seq, is_agent)
 }
 
+#[cfg(test)]
 fn handle_unread_from_state(
     context: &RuntimeContext,
     state: Value,
@@ -1676,6 +1679,7 @@ fn is_js_decimal_number(raw: &str) -> bool {
 ///   · **先把旧记录裁剪到当前未读集合** —— 已经读掉/滚出缓冲的 seq 不能再算「看过」，
 ///     否则水位会被越推越远，把还没给模型看过的消息一起跳过；
 ///   · 只记 **seq > 0 且在未读缓冲里** 的，历史消息和自己发的消息不需要回执。
+#[cfg(test)]
 fn note_model_seen(
     context: &RuntimeContext,
     state: &mut Value,
@@ -1719,6 +1723,7 @@ fn note_model_seen_with_auth(
 
 
 /// `/api/socialV2/recent?key=&limit=&offset=`：最近消息（分页方向与 JS 一致）。
+#[cfg(test)]
 fn handle_recent_from_state(
     context: &RuntimeContext,
     state: Value,
@@ -2283,7 +2288,7 @@ fn handle_initial_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Re
     let raw = key.trim_matches(crate::role::js_is_space);
     if raw.is_empty() {
         let mut entries: Vec<(String, crate::initial_prompts::Entry)> = store.entries.clone();
-        entries.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.updated_at));
         let list: Vec<Value> = entries
             .iter()
             .map(|(k, e)| {
@@ -2314,36 +2319,6 @@ fn handle_initial_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Re
         "maxChars": max_chars,
         "writable": store.writable,
     }))
-}
-
-/// Normalize role content: strip BOM and control chars, normalize line endings, and trim outer whitespace while preserving inner newlines.
-fn normalize_initial_prompt_text(raw: &str) -> String {
-    let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
-    let mut out = String::with_capacity(stripped.len());
-    for ch in stripped.chars() {
-        match ch {
-            // \r\n 与 \r 都归一成单个 \n（不能先推 \r 再推 \n，否则会多出空行）
-            '\r' => {
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            // 控制字符整段丢掉，但保留 \t 与 \n
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {}
-            '\u{7F}' => {}
-            c => out.push(c),
-        }
-    }
-    out.trim().to_string()
-}
-
-fn initial_prompt_max_chars(cfg: &Value) -> i64 {
-    cfg.get("socialV2")
-        .and_then(|v| v.get("initialPromptMaxChars"))
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0)
-        .map(|n| n.clamp(100, 8000))
-        .unwrap_or(2000)
 }
 
 fn now_ms_i64() -> i64 {
@@ -3335,16 +3310,6 @@ fn handle_slang_batch_reject(context: &RuntimeContext, body: &str) -> Result<Val
     Ok(json!({ "ok": true, "rejectedCount": rejected }))
 }
 
-/// 错误体直通：handler 如果在 msg 里已经给了完整 JSON（以 `{` 开头），就原样回；
-/// 否则按惯例包成 `{ok:false,error}`。只有需要附带额外字段的端点会走这条路。
-fn passthrough_error(msg: String) -> String {
-    if msg.starts_with('{') {
-        msg
-    } else {
-        json!({ "ok": false, "error": msg }).to_string()
-    }
-}
-
 fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
     social_state::mode_checked(context).map_err(SocialError::into_http)
 }
@@ -3534,7 +3499,7 @@ pub(super) fn handle_wait_post(
     let turn_budget = if is_agent { turn_wait_budget(context, cfg, &key, &epoch, &conv)? } else { None };
     let request_seq = last_unread_seq(&conv);
     // getUnread / getRecent 默认开启；关闭时才退回「请求时水位」。
-    let baseline = if tool_enabled(&cfg, "getUnread") || tool_enabled(&cfg, "getRecent") {
+    let baseline = if tool_enabled(cfg, "getUnread") || tool_enabled(cfg, "getRecent") {
         agent::through_of(context, &key, &conv)
     } else {
         request_seq
@@ -3748,7 +3713,7 @@ pub(super) fn handle_wait_post(
                     let remaining = (batch.window_ms - (now_ms() - last_new_at))
                         .min(batch.max_ms - (now_ms() - batch_started))
                         .min(wait_until.map(|until| until - now_ms()).unwrap_or(i64::MAX));
-                    wait_sleep(remaining.min(80).max(1) as u64);
+                    wait_sleep(remaining.clamp(1, 80) as u64);
                     if !lease.still_current() {
                         return Ok(superseded_result());
                     }
@@ -4027,6 +3992,7 @@ fn wait_leases() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 
 impl WaitLease {
     /// An agent's wait: it always supersedes the current holder.
+    #[cfg(test)]
     fn acquire(key: &str) -> Self {
         Self::try_acquire(key, true).expect("an agent wait always takes the lease")
     }
@@ -4317,6 +4283,7 @@ fn handle_sticker_list(
     Ok(out)
 }
 /// Legacy face projection fixture. Production media resolution is shared in `media.rs`.
+#[cfg(test)]
 fn face_entry(index: usize, face_id: &str, text: &str, img: Option<(&[u8], &str)>) -> Value {
     match img {
         Some((bytes, mime)) => {
@@ -5868,7 +5835,7 @@ fn handle_sticker_list_post(
         .unwrap_or(48)
         .clamp(1, max_count);
     let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let mut force = b.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force = b.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut sync_outcome = StickerSyncOutcome::Skipped;
     // Throttle forced refreshes from model calls to avoid gateway rate limits.
     if force {
@@ -5881,9 +5848,6 @@ fn handle_sticker_list_post(
             Ok(outcome) => sync_outcome = outcome,
             Err(error) => crate::safe_println!("[console] selected sticker refresh failed: {error}"),
         }
-    }
-    if is_agent && force && matches!(sync_outcome, StickerSyncOutcome::Cached | StickerSyncOutcome::Unavailable | StickerSyncOutcome::Skipped) {
-        force = false;
     }
     let entries = load_sticker_entries_for(context)
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
@@ -8165,7 +8129,7 @@ fn onebot_for_runtime(
     let url = context
         .dependency_url("onebot")
         .ok_or_else(|| "selected OneBot dependency is unavailable".to_string())?;
-    crate::onebot::OneBot::try_new_url(&url, token)
+    crate::onebot::OneBot::try_new_url(url, token)
         .map_err(|error| format!("selected OneBot dependency is invalid: {error}"))
 }
 
@@ -14026,7 +13990,7 @@ pub(super) mod tests {
                 let response = response.to_string();
                 let wire = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.as_bytes().len(),
+                    response.len(),
                     response
                 );
                 reader.get_mut().write_all(wire.as_bytes()).expect("fake OneBot response write");
@@ -14399,7 +14363,7 @@ pub(super) mod tests {
             .unwrap();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-console-token: {token}\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.as_bytes().len()
+            body.len()
         );
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
@@ -14608,7 +14572,7 @@ pub(super) mod tests {
             };
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.as_bytes().len()
+                body.len()
             );
             let _ = reader.get_mut().write_all(response.as_bytes());
         });
@@ -18395,7 +18359,6 @@ pub(super) mod tests {
         cfg_a = context_a.load_config().unwrap();
         cfg_b = context_b.load_config().unwrap();
         let config_a_before = std::fs::read(root_a.0.join("config/config.json")).unwrap();
-        let config_b_before = std::fs::read(root_b.0.join("config/config.json")).unwrap();
         let params: HashMap<String, String> =
             [("key".to_string(), key.to_string())].into_iter().collect();
         let headers_a: HashMap<String, String> =
@@ -18474,7 +18437,7 @@ pub(super) mod tests {
             social_agent_policy_denial(&request, &cfg_a, &context_a),
             Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
-        std::fs::write(&root_a.0.join("data/social-v2.json"), &state_a_before).unwrap();
+        std::fs::write(root_a.0.join("data/social-v2.json"), &state_a_before).unwrap();
 
         let mut disabled_cfg = cfg_a.clone();
         disabled_cfg["socialV2"]["enabled"] = json!(false);
@@ -21024,7 +20987,7 @@ pub(super) mod tests {
         )
         .unwrap();
         assert_eq!(final_state["paused"], true, "activity must not be lost to a stale seen snapshot");
-        assert!(final_state["conversations"][key].get("modelSeenSeqs").map_or(true, |v| v == &json!([])), "the receipt is never persisted");
+        assert!(final_state["conversations"][key].get("modelSeenSeqs").is_none_or(|v| v == &json!([])), "the receipt is never persisted");
         assert_eq!(
             agent::receipts_for(&context, key, &final_state["conversations"][key]),
             vec![1, 2],
@@ -21301,13 +21264,11 @@ pub(super) mod tests {
 
     #[test]
     fn isolated_send_message_refuses_before_onebot_when_social_gate_stays_busy() {
-        use std::time::Duration;
-
         let key = "private:7001";
         let agent_token = "fixture-send-busy-agent-abcdefghij";
         let onebot_token = "fixture-send-busy-onebot";
         let (root, _) = fixture_runtime("票据03发送后gate忙", "fixture-send-busy-console");
-        let (onebot_url, request_rx, release_tx, fake_onebot) = start_blocking_fake_onebot();
+        let (onebot_url, request_rx, release_tx, _fake_onebot) = start_blocking_fake_onebot();
         let initial = prepare_send_message_fixture(
             &root,
             &onebot_url,
@@ -21663,7 +21624,7 @@ pub(super) mod tests {
         note_model_seen(&context, &mut retry_snapshot, key, &unread, &seen)
             .expect("same selected write succeeds after the other process releases the gate");
         let final_state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert!(final_state["conversations"][key].get("modelSeenSeqs").map_or(true, |v| v == &json!([])), "the receipt is never persisted");
+        assert!(final_state["conversations"][key].get("modelSeenSeqs").is_none_or(|v| v == &json!([])), "the receipt is never persisted");
         assert_eq!(agent::receipts_for(&context, key, &final_state["conversations"][key]), vec![1]);
         drop(root);
     }
@@ -22661,7 +22622,7 @@ pub(super) mod tests {
         let agent_a = "fixture-selected-agent-a-aaaaaaaaa";
         let agent_b = "fixture-selected-agent-b-aaaaaaaaa";
         let (root_a, context_a) = fixture_runtime("票据 03 projection auth A", token_a);
-        let (root_b, context_b) = fixture_runtime("票据 03 projection auth B", token_b);
+        let (root_b, _context_b) = fixture_runtime("票据 03 projection auth B", token_b);
         let key = "private:7001";
 
         for (root, agent_token, base_seq) in [
@@ -22739,7 +22700,7 @@ pub(super) mod tests {
             &std::fs::read(root_a.0.join("data/social-v2.json")).unwrap(),
         )
         .unwrap();
-        assert!(after_a["conversations"][key].get("modelSeenSeqs").map_or(true, |v| v == &json!([])), "the receipt is never persisted");
+        assert!(after_a["conversations"][key].get("modelSeenSeqs").is_none_or(|v| v == &json!([])), "the receipt is never persisted");
         assert_eq!(agent::receipts_for(&context_a, key, &after_a["conversations"][key]), vec![1, 2]);
         assert_eq!(std::fs::read(root_b.0.join("data/social-v2.json")).unwrap(), original_b);
 

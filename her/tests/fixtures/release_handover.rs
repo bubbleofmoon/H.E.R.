@@ -1180,7 +1180,7 @@ fn private_update_reports_versions_before_install_and_refuses_other_sessions_and
                 .iter()
                 .filter(|send| update_text(send).contains("更新命令仅限管理员私聊"))
                 .count()
-                >= i + 1
+                > i
         });
         assert!(!fixture.image("v1.2.3", "her.exe").exists());
     }

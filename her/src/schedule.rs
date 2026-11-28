@@ -1419,7 +1419,7 @@ mod tests {
             running: false,
             last_result: None,
         };
-        let entries = store.entries(&[job.clone()], NOW).unwrap();
+        let entries = store.entries(std::slice::from_ref(&job), NOW).unwrap();
         let value = serde_json::to_value(&entries[0]).unwrap();
         assert_eq!(value["id"], "system:backup");
         assert_eq!(value["status"], "paused");

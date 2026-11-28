@@ -238,11 +238,10 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
     }
     // Node path.isAbsolute also accepts drive-less Windows roots (/foo, \foo).
     let is_abs = Path::new(raw).has_root() || lower.starts_with("file://") || raw.starts_with('~');
-    let mut resolved: Option<PathBuf> = None;
-    if is_abs {
+    let resolved = if is_abs {
         let found = voice::resolve_audio_source(raw, None, &lib.cwd);
         match found.path.and_then(|p| lib.confine(context, &p)) {
-            Some(path) => resolved = Some(path),
+            Some(path) => Some(path),
             None => {
                 // Only the directory name: this message goes back to a model facing untrusted chat.
                 return Err(format!(
@@ -252,7 +251,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
             }
         }
     } else {
-        resolved = lib.join_existing(context, raw);
+        let mut resolved = lib.join_existing(context, raw);
         if resolved.is_none() && voice::extname(raw).is_empty() {
             resolved = voice::AUDIO_EXTS.iter().find_map(|ext| lib.join_existing(context, &format!("{raw}{ext}")));
         }
@@ -262,7 +261,8 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
                 return Err("已拒绝越界路径：此通道不可传入「..」或根目录路径读取库外文件".to_string());
             }
         }
-    }
+        resolved
+    };
     if let Some(path) = resolved {
         return Ok(path);
     }

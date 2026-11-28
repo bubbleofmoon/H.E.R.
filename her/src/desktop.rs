@@ -52,21 +52,14 @@ impl TrayUpdate {
 }
 
 /// Desktop sign-in proves access to the selected runtime's token file.
+#[cfg(windows)]
 pub(crate) fn console_token(context: &RuntimeContext) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let token = windows::read_private_token(context)?;
-        let token = token.trim();
-        if token.is_empty() || token.contains(['\r', '\n']) {
-            return Err("protected console token file is invalid".into());
-        }
-        Ok(token.to_string())
+    let token = windows::read_private_token(context)?;
+    let token = token.trim();
+    if token.is_empty() || token.contains(['\r', '\n']) {
+        return Err("protected console token file is invalid".into());
     }
-    #[cfg(not(windows))]
-    {
-        let _ = context;
-        Err("desktop token proof requires Windows".into())
-    }
+    Ok(token.to_string())
 }
 
 /// Register startup and return whether the desktop UI should open.
@@ -156,10 +149,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             })? {
                 return Ok(());
             }
-            return windows::run(root, context, cli, hidden).map_err(|error| {
-                windows::show_error(&error);
-                error
-            });
+            windows::run(root, context, cli, hidden).inspect_err(|error| windows::show_error(error))
         }
         #[cfg(not(windows))]
         {
@@ -986,7 +976,7 @@ mod windows {
                     Ok(()) => { update_approval = None; updates.set_enabled(false); updates.set_text("Update approved"); }
                     Err(error) => show_error(&error),
                 },
-                Event::UserEvent(Ui::Login(result)) => { if let Err(error) = result { show_error(&error); } }
+                Event::UserEvent(Ui::Login(Err(error))) => show_error(&error),
                 Event::UserEvent(Ui::Session { url, token, navigate }) => {
                     if let Ok(mut current) = current.lock() { *current = Some(token.clone()); }
                     if navigate || !loaded {

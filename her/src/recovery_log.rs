@@ -101,14 +101,6 @@ pub fn record(context: &RuntimeContext, trigger: Trigger, component: Component, 
     }
 }
 
-/// `record` for the bound default context.
-pub fn record_default(trigger: Trigger, component: Component, event: &str, outcome: Outcome, reason: &str) {
-    let context = default_context().lock().unwrap_or_else(|p| p.into_inner()).clone();
-    if let Some(context) = context {
-        record(&context, trigger, component, event, outcome, reason);
-    }
-}
-
 /// Publish the pending `repeat` summaries (periodic tick, shutdown).
 pub fn flush(context: &RuntimeContext) {
     if let Some(w) = writer(context) {

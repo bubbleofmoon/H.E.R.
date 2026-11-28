@@ -1044,7 +1044,7 @@ fn empty_history_is_unknown_and_not_claimed_as_recovered() {
         ],
     );
     let settled = wait_for(Duration::from_secs(30), || {
-        gaps_of(&admin(harness.console_port)).len() >= 1
+        !gaps_of(&admin(harness.console_port)).is_empty()
     });
     assert!(settled, "expected a gap after the reconnect");
     thread::sleep(Duration::from_secs(2));

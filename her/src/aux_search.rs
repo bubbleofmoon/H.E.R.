@@ -41,6 +41,7 @@ fn text_field(raw: &Value, name: &str) -> Option<String> {
 }
 
 /// The selected `config.json` text as the JS reads it: BOM dropped; unreadable or invalid JSON is `{}`.
+#[cfg(test)]
 pub fn parse_config_text(text: &str) -> Value {
     serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text)).unwrap_or_else(|_| json!({}))
 }

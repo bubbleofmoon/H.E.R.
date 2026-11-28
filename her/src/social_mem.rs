@@ -109,10 +109,10 @@ impl ImpressionPolicy {
 /// The impressions a prompt lists: members speaking in the unread/recent window first (most recent
 /// speaker first, matched by QQ id or display name), then the rest by `lastSeenAt`. The result keeps
 /// storage order so a briefing section changes only when the selected set changes.
-pub(crate) fn select_impressions<'a>(
-    conv: &'a Conversation,
+pub(crate) fn select_impressions(
+    conv: &Conversation,
     limit: usize,
-) -> Vec<(&'a String, &'a MemberImpression)> {
+) -> Vec<(&String, &MemberImpression)> {
     let map = conv.impressions();
     if map.is_empty() {
         return Vec::new();

@@ -1683,6 +1683,12 @@ pub(super) fn finish_status(caller: &front::VerifiedCaller, mut payload: Value) 
     payload
 }
 
+/// Receipts this process holds for a conversation record (token epoch taken from the record itself).
+#[cfg(test)]
+pub(super) fn receipts_for(context: &RuntimeContext, key: &str, conv: &Value) -> Vec<i64> {
+    receipts_of(context, key, conv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1897,10 +1903,4 @@ mod tests {
         assert_eq!(parse_key("friend:1"), None);
         assert_eq!(parse_key("group:"), None);
     }
-}
-
-/// Receipts this process holds for a conversation record (token epoch taken from the record itself).
-#[cfg(test)]
-pub(super) fn receipts_for(context: &RuntimeContext, key: &str, conv: &Value) -> Vec<i64> {
-    receipts_of(context, key, conv)
 }

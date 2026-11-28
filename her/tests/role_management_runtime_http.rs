@@ -346,7 +346,7 @@ fn http_request_raw_body(
         .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{token_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| "connect to selected console port".to_string())?;
@@ -555,12 +555,12 @@ fn create_directory_reparse_point(link: &Path, target: &Path) -> Result<(), Stri
         if output.status.success() {
             return Ok(());
         }
-        return Err(format!(
+        Err(format!(
             "synthetic junction creation failed with {:?}; stdout={:?}; stderr={:?}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
-        ));
+        ))
     }
     #[cfg(unix)]
     {

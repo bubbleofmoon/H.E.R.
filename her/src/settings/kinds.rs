@@ -24,8 +24,6 @@ pub(crate) use bounded_number::BoundedNumber;
 pub(crate) use choice::Choice;
 pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
-#[cfg(test)]
-pub(crate) use id_list::ID_LIST_MAX;
 pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_endpoint::ModelEndpoint;
 pub(crate) use model_id::ModelId;

@@ -266,7 +266,7 @@ fn http_request(
         .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| "connect to selected console port".to_string())?;

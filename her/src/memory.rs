@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 pub use her_memory::{
     index_hint, record_hits, search_error_message, DigestCursor, ForgetError, Hit, MemoryStore,
-    NewMemory, Provenance, VerifiedMessage,
+    NewMemory, VerifiedMessage,
 };
 #[cfg(test)]
 pub use her_memory::{list_acl_json, segment, write_memory, MemoryInput};
@@ -93,6 +93,7 @@ pub fn open_read_only_for_runtime(context: &RuntimeContext) -> Result<Connection
 }
 
 /// Open the selected runtime's memory database without imposing caller-specific PRAGMA policy.
+#[cfg(test)]
 pub fn open_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
     let _restore_gate = crate::restore::writer_gate_shared(context)?;
     open_for_runtime_unlocked(context)

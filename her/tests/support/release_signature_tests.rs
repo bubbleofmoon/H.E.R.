@@ -366,8 +366,7 @@ fn signature_refusal_alerts_only_the_owner_and_clears_discovery_availability() {
     let requests = f.seen.lock().unwrap();
     let notice = requests
         .iter()
-        .filter(|r| r.starts_with("POST /send_private_msg "))
-        .last()
+        .rfind(|r| r.starts_with("POST /send_private_msg "))
         .unwrap();
     let body: Value = serde_json::from_str(notice.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(body["user_id"], 70001);

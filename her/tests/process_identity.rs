@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {

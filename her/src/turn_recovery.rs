@@ -1847,9 +1847,9 @@ mod tests {
             let journal = Journal::open(&context).unwrap();
             let input = "group:1|message:7".to_string();
             journal.record_received(&input, "group:1", "{}", 1).unwrap();
-            journal.mark_processing(&[input.clone()], 2).unwrap();
+            journal.mark_processing(std::slice::from_ref(&input), 2).unwrap();
             journal.recover_interrupted(3).unwrap();
-            let recorder = Recorder::begin(&context, "group:1", "dsh", "atMention", &crate::send_outbox::token_epoch("old-token"), &[input.clone()], None).unwrap();
+            let recorder = Recorder::begin(&context, "group:1", "dsh", "atMention", &crate::send_outbox::token_epoch("old-token"), std::slice::from_ref(&input), None).unwrap();
             recorder.verified("cancel-requested", "turnTimeout").unwrap();
             let pending = turn(crate::turn_ledger::read_records(&context).unwrap());
             let cfg = context.load_config().unwrap();
@@ -4739,9 +4739,9 @@ mod tests {
         let (retried, held) = ("group:1|message:7".to_string(), "group:1|message:8".to_string());
         for event in [&retried, &held] {
             journal.record_received(event, "group:1", "{}", 1).unwrap();
-            journal.mark_handled(&[event.clone()], 2).unwrap();
+            journal.mark_handled(std::slice::from_ref(event), 2).unwrap();
         }
-        let turn = crate::turn_ledger::Recorder::begin(&context, "group:1", "dsh", "atMention", "epoch", &[retried.clone()], None).unwrap();
+        let turn = crate::turn_ledger::Recorder::begin(&context, "group:1", "dsh", "atMention", "epoch", std::slice::from_ref(&retried), None).unwrap();
         turn.unknown("send-unresolved", "synthetic").unwrap();
         crate::turn_ledger::append_record(&context, &json!({"k":"held","t":crate::turn_ledger::now_ms(),"key":"group:1","inbound":[held.clone()],"reason":"atMention","blockedBy":turn.id})).unwrap();
         turn.resolved("retry").unwrap();

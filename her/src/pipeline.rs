@@ -6,6 +6,7 @@
 //!   3. **会话映射落盘**（等价 JS 的 `state.sessions`），重启不丢。
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::PathBuf;
 
 use crate::dsh::Rpc;
@@ -56,8 +57,11 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn load(context: &RuntimeContext) -> Result<Self, String> {
         // The selected runtime shares one mapping with the admin console (`session_map`).
-        let mut store = Self::default();
-        store.workspace_id = crate::session_map::workspace_id(context)?.unwrap_or_default();
+        let workspace_id = crate::session_map::workspace_id(context)?.unwrap_or_default();
+        let mut store = Self {
+            workspace_id,
+            ..Default::default()
+        };
         for (key, session_id) in crate::session_map::all(context)? {
             store.sessions.insert(key, SessionRef { session_id, workspace_id: store.workspace_id.clone() });
         }
@@ -2296,7 +2300,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // 正确的分工：说话 = 模型显式调 `qq_send_message`；不说话 = 什么都没发生。
         // 如果它该说而没说，那是**提示词**的问题（见 prompt::build 的唤醒上下文），
         // 要在提示词里把"谁说了什么、要不要接"说清楚，而不是在这里瞎补。
-        let before = Self::last_ai_reply_at(&self.context, &key);
+        let before = Self::last_ai_reply_at(&self.context, key);
         // JS `withSlangContext`: every prompt handed to DSH starts with the clock line (and the
         // confirmed slang block) at the moment of delivery.
         let delivered = crate::prompt::wrap_for_delivery_with_runtime(
@@ -2312,7 +2316,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             reserved2_turn_timeout(cfg)
         };
         let reply = self.run_admitted_turn(&adapter, key, &delivered, timeout, cfg).await?;
-        let after = Self::last_ai_reply_at(&self.context, &key);
+        let after = Self::last_ai_reply_at(&self.context, key);
         let trimmed = reply.trim();
         let n = trimmed.chars().count();
         // 记录模型到底输出了什么（截断）：既用于判断它有没有说话，也是排障的唯一线索。
@@ -3520,8 +3524,10 @@ mod tests {
 
     #[test]
     fn store_roundtrip_shape() {
-        let mut s = SessionStore::default();
-        s.workspace_id = "ws-1".into();
+        let mut s = SessionStore {
+            workspace_id: "ws-1".into(),
+            ..Default::default()
+        };
         s.sessions.insert(
             "group:1".into(),
             SessionRef { session_id: "s-1".into(), workspace_id: "ws-1".into() },

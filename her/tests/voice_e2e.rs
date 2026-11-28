@@ -47,9 +47,8 @@ fn fake_tool_entry() {
     let last = args.last().cloned().unwrap_or_default();
     let value_after = |flag: &str| {
         args.windows(2)
-            .filter(|w| w[0] == flag)
+            .rfind(|w| w[0] == flag)
             .map(|w| w[1].clone())
-            .last()
             .unwrap_or_default()
     };
     let code = match mode.as_str() {
@@ -1739,7 +1738,7 @@ fn lost_reply_is_unknown_and_never_resent_until_verified() {
     // The unresolved item is visible to operators and carries no resend path through send-message.
     let (s, view) = console.operator(
         "GET",
-        &format!("/api/socialV2/send-outbox?key=group%3A111"),
+        "/api/socialV2/send-outbox?key=group%3A111",
         Value::Null,
     );
     assert_eq!(s, 200, "{view}");

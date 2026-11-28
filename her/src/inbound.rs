@@ -13,6 +13,7 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -293,6 +294,7 @@ impl Journal {
         Self::init(conn)
     }
 
+    #[cfg(test)]
     pub fn open_at(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("打不开入站数据库：{e}"))?;
         Self::init(conn)
@@ -660,8 +662,8 @@ impl Journal {
             .execute(
                 "INSERT INTO inbound_gaps
                    (conversation, from_ms, to_ms, status, reason, detail, recovered, opened_ms, updated_ms)
-                 VALUES (?1, ?2, ?3, 'open', '', '', 0, ?4, ?4)",
-                params![conversation, from_ms, to_ms, now],
+                 VALUES (?1, ?2, ?3, ?4, '', '', 0, ?5, ?5)",
+                params![conversation, from_ms, to_ms, GapStatus::Open.as_str(), now],
             )
             .map_err(db_err)?;
         Ok(self.conn.last_insert_rowid())
@@ -732,6 +734,7 @@ impl Journal {
     }
 
     /// 未解决的缺口：状态不是 `recovered` 的全部。重连成功不会把它们移出。
+    #[cfg(test)]
     pub fn unresolved_gaps(&self) -> Result<Vec<Gap>, String> {
         self.read_gaps("WHERE status <> 'recovered'")
     }
@@ -1333,7 +1336,7 @@ mod tests {
         tx.commit().unwrap();
         let _ = release_tx.send(());
         let result = recovery.join().unwrap();
-        assert_eq!(waited.unwrap(), true, "recovery must wait, not fail immediately: {result:?}");
+        assert!(waited.unwrap(), "recovery must wait, not fail immediately: {result:?}");
         assert_eq!(result.unwrap(), vec!["before", "during"], "read the committed writer state");
         assert_eq!(writer.stage_of("before").unwrap().as_deref(), Some("interrupted"));
         assert_eq!(writer.stage_of("during").unwrap().as_deref(), Some("interrupted"));

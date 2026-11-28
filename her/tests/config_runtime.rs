@@ -88,10 +88,6 @@ fn isolate_env(command: &mut Command, home: &Path) {
     hide_window(command);
 }
 
-fn path_arg(path: &Path) -> &str {
-    path.to_str().expect("utf-8 fixture path")
-}
-
 /// Console home directories of one start. Whatever is still in the list is removed on drop, so a start
 /// that panics after its attempts leaves no home behind.
 struct StaleHomes(Vec<PathBuf>);

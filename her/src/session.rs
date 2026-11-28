@@ -554,11 +554,13 @@ mod tests {
     }
 
     fn drv() -> Driver {
-        let mut cfg = WakeCfg::default();
-        cfg.batch_window_ms = 1500;
         // 限频关掉：这些用例测的是「排队/合并/补发」，不是频率上限。
-        cfg.max_wake_per_minute = 0;
-        cfg.max_wake_per_hour = 0;
+        let cfg = WakeCfg {
+            batch_window_ms: 1500,
+            max_wake_per_minute: 0,
+            max_wake_per_hour: 0,
+            ..Default::default()
+        };
         Driver::new(WakeScheduler::new(cfg, WakeConfig::default()), 42)
     }
 
@@ -570,9 +572,11 @@ mod tests {
     fn adopted_elapsed_sleep_deadline_emits_one_timeout() {
         let mut d = drv();
         let now = wake::parse_iso_ms("2026-10-26T06:00:00.000Z").unwrap();
-        let mut wc = WakeConfig::default();
-        wc.infinite = false;
-        wc.sleep_until = Some("2026-10-26T05:59:59.000Z".into());
+        let wc = WakeConfig {
+            infinite: false,
+            sleep_until: Some("2026-10-26T05:59:59.000Z".into()),
+            ..Default::default()
+        };
         d.adopt_wake_config(wc, now);
         assert_eq!(d.pump(now), vec![WakeEvent { reason: "timeout".into(), at_ms: now }]);
         assert!(d.pump(now + 500).is_empty(), "synchronization must not duplicate the wake");
@@ -582,9 +586,11 @@ mod tests {
     fn config_changed_elapsed_sleep_deadline_emits_timeout() {
         let mut d = drv();
         let now = wake::parse_iso_ms("2026-10-26T06:00:00.000Z").unwrap();
-        let mut wc = WakeConfig::default();
-        wc.infinite = false;
-        wc.sleep_until = Some("2026-10-26T05:59:59.000Z".into());
+        let wc = WakeConfig {
+            infinite: false,
+            sleep_until: Some("2026-10-26T05:59:59.000Z".into()),
+            ..Default::default()
+        };
         assert_eq!(d.apply(Input::ConfigChanged { at_ms: now, wc }), vec![WakeEvent { reason: "timeout".into(), at_ms: now }]);
     }
 
@@ -693,9 +699,11 @@ mod tests {
     #[test]
     fn finite_sleep_fires_timeout() {
         let mut d = drv();
-        let mut wc = WakeConfig::default();
-        wc.infinite = false;
-        wc.sleep_until = Some("2026-10-21T04:01:00.000Z".into());
+        let wc = WakeConfig {
+            infinite: false,
+            sleep_until: Some("2026-10-21T04:01:00.000Z".into()),
+            ..Default::default()
+        };
         let t0 = wake::parse_iso_ms("2026-10-21T04:00:00.000Z").unwrap();
         d.apply(Input::ConfigChanged { at_ms: t0, wc });
         let evs = d.apply(Input::Tick { at_ms: t0 + 61_000 });

@@ -5042,7 +5042,7 @@ fn hotfix81_dsh_quota_alert_is_content_free_and_deduped_per_conversation() {
                 .iter()
                 .filter(|r| r["k"] == "ended" && r["outcome"] == "failed")
                 .count()
-                >= index + 1),
+                > index),
             "failed turn did not end: {:?}",
             rig.ledger()
         );
@@ -5190,7 +5190,7 @@ fn hotfix83_dsh_empty_candidates_records_carried_ids_once_per_turn_without_chat(
             .iter()
             .filter(|r| r["k"] == "ended" && r["outcome"] == "failed")
             .count()
-            >= index + 1));
+            > index));
     }
     let records = rig.data_lines("logs/model-refusals.jsonl");
     assert_eq!(
@@ -5301,11 +5301,7 @@ fn hotfix81_dsh_empty_answer_alerts_owner_without_a_conversation_send() {
         .count()
         == 2));
     assert_eq!(
-        rig.ledger()
-            .iter()
-            .filter(|r| r["k"] == "ended")
-            .last()
-            .unwrap()["outcome"],
+        rig.ledger().iter().rfind(|r| r["k"] == "ended").unwrap()["outcome"],
         "completed",
         "an aborted turn is not a model/backend failure"
     );
@@ -5444,7 +5440,7 @@ exit ([int][IO.File]::ReadAllText([IO.Path]::Combine($dir,'cli-exit.txt')))
             .iter()
             .filter(|r| r["k"] == "ended")
             .count()
-            >= index + 1));
+            > index));
         if !failed {
             rig.wait_texts(GROUP_KEY, 1);
         }

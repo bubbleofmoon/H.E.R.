@@ -7,6 +7,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn hidden(image: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(image);
     #[cfg(windows)]
     {

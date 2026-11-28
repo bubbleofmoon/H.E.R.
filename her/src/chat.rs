@@ -568,6 +568,7 @@ pub enum Reply {
 
 /// The ordered checks of the JS turn-end branch: empty text, silent marker, tool already sent,
 /// sentinel audit.
+#[cfg(test)]
 pub fn reply_plan(end_kind: &str, text: &str, send_tool_ok: bool, secrets: &[String]) -> Reply {
     reply_plan_with_audit(end_kind, text, send_tool_ok, secrets, true)
 }
@@ -803,7 +804,6 @@ pub struct Lookups {
     ob: OneBot,
     names: HashMap<String, (String, Instant)>,
     replies: HashMap<String, (Option<ReplyInfo>, Instant)>,
-    group_names: HashMap<String, String>,
 }
 
 fn data_of(response: Option<Value>) -> Option<Value> {
@@ -816,7 +816,7 @@ fn data_of(response: Option<Value>) -> Option<Value> {
 
 impl Lookups {
     pub fn new(ob: OneBot) -> Self {
-        Self { ob, names: HashMap::new(), replies: HashMap::new(), group_names: HashMap::new() }
+        Self { ob, names: HashMap::new(), replies: HashMap::new() }
     }
 
     fn display(info: &Value) -> Option<String> {
@@ -850,19 +850,6 @@ impl Lookups {
             }
         }
         self.names.get(&key).map(|(n, _)| n.clone())
-    }
-
-    /// `resolveGroupName`: names are cached for the process; failures are not cached.
-    pub fn group_name(&mut self, group: &str) -> String {
-        if let Some(name) = self.group_names.get(group) {
-            return name.clone();
-        }
-        if let Some(list) = data_of(self.ob.request("get_group_list", json!({}))) {
-            for g in list.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                self.group_names.insert(scalar_raw(g.get("group_id")), scalar_raw(g.get("group_name")));
-            }
-        }
-        self.group_names.get(group).cloned().unwrap_or_default()
     }
 
     /// `resolveReplyInfo`: only messages that belong to this conversation are readable.

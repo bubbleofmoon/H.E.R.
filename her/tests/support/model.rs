@@ -154,7 +154,7 @@ impl FakeModel {
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", sse.len());
                     if matches!(reply, ModelReply::TruncatedTools(_)) {
                         let split = sse.match_indices("\n\n").nth(2).unwrap().0 + 2;
-                        let _ = socket.write_all(sse[..split].as_bytes());
+                        let _ = socket.write_all(&sse.as_bytes()[..split]);
                     } else {
                         let _ = socket.write_all(sse.as_bytes());
                     }
@@ -230,7 +230,7 @@ impl FakeModel {
                 // Emit a real content delta before holding or truncating the response.
                 let split = sse.find("\n\n").unwrap() + 2;
                 if matches!(replies.get(n), Some(ModelReply::Truncated(_))) {
-                    let _ = socket.write_all(sse[..split].as_bytes());
+                    let _ = socket.write_all(&sse.as_bytes()[..split]);
                     let _ = socket.flush();
                     continue; // Close before the advertised length, finish reason and [DONE].
                 }
@@ -238,7 +238,7 @@ impl FakeModel {
                     started, release, ..
                 }) = replies.get(n)
                 {
-                    socket.write_all(sse[..split].as_bytes()).unwrap();
+                    socket.write_all(&sse.as_bytes()[..split]).unwrap();
                     socket.flush().unwrap();
                     started.store(true, std::sync::atomic::Ordering::SeqCst);
                     while !release.load(std::sync::atomic::Ordering::SeqCst)
@@ -246,7 +246,7 @@ impl FakeModel {
                     {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    let _ = socket.write_all(sse[split..].as_bytes());
+                    let _ = socket.write_all(&sse.as_bytes()[split..]);
                 } else {
                     let _ = socket.write_all(sse.as_bytes());
                 }

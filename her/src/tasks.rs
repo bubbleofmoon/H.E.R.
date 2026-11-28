@@ -715,8 +715,7 @@ impl Executor for CommandExecutor {
             readers.push(std::thread::spawn(move || {
                 let mut reader = BufReader::new(pipe);
                 let mut line = Vec::with_capacity(8192);
-                loop {
-                    let Ok(chunk) = reader.fill_buf() else { break };
+                while let Ok(chunk) = reader.fill_buf() {
                     if chunk.is_empty() {
                         if !line.is_empty() {
                             let text = String::from_utf8_lossy(&line).trim_end_matches('\r').to_string();
@@ -1071,10 +1070,10 @@ mod tests {
     #[ignore = "synthetic parent launched by the Windows process-tree test"]
     fn windows_task_tree_parent() {
         let mut command = crate::subprocess::command_without_console(std::env::current_exe().unwrap());
-        let child = command.args(["--ignored", "--exact", "tasks::tests::windows_task_tree_grandchild", "--nocapture"])
+        let mut child = command.args(["--ignored", "--exact", "tasks::tests::windows_task_tree_grandchild", "--nocapture"])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         println!("grandchild-pid={}", child.id());
-        std::thread::sleep(Duration::from_secs(30));
+        let _ = child.wait();
     }
 
     #[cfg(windows)]

@@ -293,6 +293,8 @@ fn serve_dsh_connection(
         .map_err(|e| e.to_string())?;
     if first[0] == b'G' {
         let mut path = String::new();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio_tungstenite::tungstenite::accept_hdr(
             stream,
             |request: &Request, response: Response| {
@@ -483,6 +485,8 @@ fn serve_ws(
             .map_err(|error| format!("accept live candidate WS connection: {error}"))?;
         let auth_slot = Arc::new(Mutex::new(None::<String>));
         let callback_auth = auth_slot.clone();
+        #[allow(clippy::result_large_err)]
+        // tokio_tungstenite::accept_hdr requires external ErrorResponse by value.
         let mut socket = tokio::time::timeout(
             Duration::from_secs(5),
             accept_hdr_async(socket, move |request: &Request, response: Response| {
@@ -628,13 +632,12 @@ fn selected_runtime_fixture(root: &Path, dependencies: &Value) {
     fs::write(root.join("dependencies.json"), dependencies.to_string())
         .expect("write selected loopback dependencies");
 
-    let model_script = format!(
-        r#"
+    let model_script = r#"
 $ErrorActionPreference = 'Stop'
 # .NET Framework file APIs need the ordinary form of the canonical Rust path.
 $fixtureRoot = $env:HER_RUNTIME_ROOT
-if ($fixtureRoot.StartsWith('\\?\UNC\')) {{ $fixtureRoot = '\\' + $fixtureRoot.Substring(8) }}
-elseif ($fixtureRoot.StartsWith('\\?\')) {{ $fixtureRoot = $fixtureRoot.Substring(4) }}
+if ($fixtureRoot.StartsWith('\\?\UNC\')) { $fixtureRoot = '\\' + $fixtureRoot.Substring(8) }
+elseif ($fixtureRoot.StartsWith('\\?\')) { $fixtureRoot = $fixtureRoot.Substring(4) }
 $fixtureLog = [IO.Path]::Combine($fixtureRoot, 'data', 'logs', 'model-fixture.log')
 [IO.File]::WriteAllText($fixtureLog, "started`n")
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -648,7 +651,7 @@ $stdin.Dispose()
 $PSModuleAutoLoadingPreference = 'None'
 Import-Module ([IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1'))
 [IO.File]::AppendAllText($fixtureLog, "utility-imported`n")
-$probe = @{{
+$probe = @{
   prompt = $prompt
   modelBase = $env:ANTHROPIC_BASE_URL
   apiKey = $env:OPENCODE_GO_API_KEY
@@ -668,7 +671,7 @@ $probe = @{{
   runtimeRoot = $env:HER_RUNTIME_ROOT
   cwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path
   ambientSentinel = [Environment]::GetEnvironmentVariable('TICKET04_AMBIENT_SENTINEL')
-}}
+}
 $endpoint = ($env:ANTHROPIC_BASE_URL).TrimEnd('/') + '/ticket04/generate'
 $request = [Net.HttpWebRequest]::Create($endpoint)
 $request.Proxy = $null
@@ -691,18 +694,9 @@ $reader.Close()
 $response.Close()
 [Console]::Out.Write([string]$result.text)
 [IO.File]::AppendAllText($fixtureLog, "completed`n")
-"#
-    );
+"#;
     fs::write(root.join("resources/model-fixture.ps1"), model_script)
         .expect("write selected model CLI fixture");
-}
-
-fn spawn_candidate(root: &Path, console_port: u16) -> Child {
-    let ambient = crate::install_root::development_root(std::env::temp_dir().join(format!(
-        "ticket04 ambient profile sentinel {}",
-        std::process::id()
-    )));
-    spawn_candidate_with_ambient(root, console_port, &ambient)
 }
 
 fn spawn_candidate_with_ambient(root: &Path, console_port: u16, ambient: &Path) -> Child {

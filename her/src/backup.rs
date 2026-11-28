@@ -864,6 +864,7 @@ impl Scratch {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         let dir = parent.join(format!(".her-backup-{name}"));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
         builder.create(&dir).map_err(|e| format!("backup staging unavailable: {}", e.kind()))?;
@@ -1602,6 +1603,7 @@ pub(crate) struct VerifiedArchive {
 }
 
 /// Reopen, hash every payload and integrity-check the extracted database. Never extracts archive paths.
+#[cfg(test)]
 pub fn verify_archive(path: &Path, check: Check<'_>) -> Result<Manifest, String> {
     check()?;
     verify_file(File::open(path).map_err(|e| e.to_string())?, check)

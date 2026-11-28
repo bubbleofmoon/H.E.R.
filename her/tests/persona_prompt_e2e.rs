@@ -110,14 +110,6 @@ impl Dsh {
             .collect()
     }
 
-    fn count(&self, method: &str) -> usize {
-        lock(&self.inner)
-            .rpc
-            .iter()
-            .filter(|m| m.as_str() == method)
-            .count()
-    }
-
     fn rpc(self: &Arc<Self>, method: &str, args: &Value) -> Result<Value, (String, String)> {
         let mut inner = lock(&self.inner);
         inner.rpc.push(method.to_string());

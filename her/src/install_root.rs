@@ -252,7 +252,7 @@ fn comparison_path(path: &Path) -> Result<PathBuf, String> {
         } else {
             text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
         };
-        return Ok(PathBuf::from(text.to_lowercase()));
+        Ok(PathBuf::from(text.to_lowercase()))
     }
     #[cfg(not(windows))]
     Ok(PathBuf::from(text))

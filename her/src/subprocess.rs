@@ -29,11 +29,9 @@ pub(crate) fn external_path(path: impl AsRef<std::path::Path>) -> Result<String,
     };
     // Removing the prefix must not change Win32 name resolution or require long-path opt-in
     // from external tools (notably Windows PowerShell 5.1).
-    let tail = if ordinary.starts_with(r"\\") {
-        &ordinary[2..]
-    } else {
-        &ordinary[3..]
-    };
+    let tail = ordinary
+        .strip_prefix(r"\\")
+        .unwrap_or_else(|| &ordinary[3..]);
     if ordinary.encode_utf16().count() >= 260
         || tail.split('\\').any(|part| {
             let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
@@ -106,6 +104,7 @@ pub(crate) fn prevent_stdio_inheritance() {
 /// Keep stdio configuration and lifecycle management at each call site so this
 /// only changes window creation. Other platforms retain Command::new behavior.
 pub(crate) fn command_without_console(program: impl AsRef<OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
@@ -269,6 +268,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     struct WindowSample {
+        #[allow(dead_code)] // Included in Debug failure assertions.
         hwnd: usize,
         process_id: u32,
     }

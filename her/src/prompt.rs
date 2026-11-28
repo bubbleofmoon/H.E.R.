@@ -920,12 +920,6 @@ fn impression_group(conv: &Conversation, cfg: &Value, stable: bool, view: &Value
     ("【对群友的印象】".to_string(), lines)
 }
 
-/// 参与度参考（对应 JS 的 formatParticipationV2）。
-pub fn participation_block(st: &Value) -> String {
-    let conv = Conversation::from_value(st).unwrap_or_default();
-    participation_block_conversation(&conv)
-}
-
 pub(crate) fn participation_block_conversation(conv: &Conversation) -> String {
     participation_block_at(conv, now_ms())
 }
@@ -1094,15 +1088,6 @@ pub fn build_reminder_with_runtime(
     }
     out
 }
-/// 短时记忆的纯文本（供 `/api/socialV2/memory` 用）。
-///
-/// 与 `short_term_block` 的区别：那个是给 prompt 的，末尾带两个换行；
-/// 这个是给管理台展示的，**不带尾随空白** —— 带上去前端就会多出一个空行。
-pub fn memory_formatted(st: &Value, cfg: &Value) -> String {
-    let conv = Conversation::from_value(st).unwrap_or_default();
-    memory_formatted_conversation(&conv, cfg)
-}
-
 pub(crate) fn memory_formatted_conversation(conv: &Conversation, cfg: &Value) -> String {
     short_term_block(conv, cfg).trim_end().to_string()
 }

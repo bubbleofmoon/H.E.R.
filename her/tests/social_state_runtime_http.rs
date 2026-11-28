@@ -500,7 +500,7 @@ fn assert_state_summary(value: &Value, marker: &str) {
     assert_eq!(value["unreadCount"], 4);
     assert_eq!(value["recentCount"], 4);
     assert_eq!(value["lastWakeReason"], format!("{marker}-wake-reason"));
-    assert_eq!(value["wakeSafety"].is_object(), true);
+    assert!(value["wakeSafety"].is_object());
     assert!(value.get("noActionCount").is_none());
     assert!(value.get("recentMessages").is_none());
     assert!(value.get("unread").is_none());

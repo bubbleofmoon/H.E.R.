@@ -55,6 +55,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 struct HttpReq {
     request_line: String,
+    #[allow(dead_code)] // Shared test support; not every integration test reads headers.
     headers: String,
     body: Vec<u8>,
 }

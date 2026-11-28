@@ -5,6 +5,11 @@ edition = "2021"
 license = "GPL-3.0-only"
 autobins = false
 
+# Complex bridge and test-helper signatures/types; tracked by #109.
+[lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+
 [[bin]]
 name = "her"
 path = "src/main.rs"

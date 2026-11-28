@@ -25,6 +25,7 @@ pub fn sign(bytes: &[u8], key: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+#[allow(dead_code)] // Shared across integration tests; not all binaries use every item.
 pub fn keys(primary: &str) -> String {
     let primary = match primary {
         "primary" => include_str!("../fixtures/release-signing/primary.pub"),

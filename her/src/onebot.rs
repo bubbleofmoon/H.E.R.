@@ -371,6 +371,7 @@ mod voice_send_tests {
 }
 
 impl OneBot {
+    #[cfg(test)]
     pub fn new(http_url: &str, token: String) -> Self {
         let base = http_url.trim_end_matches('/');
         let endpoint = crate::loopback_http::LoopbackEndpoint::parse(base).ok();

@@ -2,7 +2,7 @@
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::Path,
 };
 pub(crate) const IMAGES: [&str; 3] = ["her.exe", "her-cli.exe", "herupdate.exe"];
@@ -104,7 +104,7 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     directory(lock.parent().ok_or("release gate has no directory")?)?;
-    if fs::symlink_metadata(&lock)
+    if fs::symlink_metadata(lock)
         .is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta))
     {
         return Err("release install gate is redirected".into());
@@ -122,6 +122,7 @@ pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
 
 /// Every ancestor of `path` exists as a plain directory (no link or reparse point). Unlike
 /// `directory`, never creates anything.
+#[allow(dead_code)] // herupdate compiles release_store without callers of gate_contended
 fn plain_directory(path: &Path) -> bool {
     crate::guarded_file::is_plain_directory(path)
 }
@@ -130,6 +131,7 @@ fn plain_directory(path: &Path) -> bool {
 /// block). Any other outcome is false: a missing or redirected parent directory (checked like
 /// `installation_gate` but without creating folders), a redirected or non-file gate, another lock
 /// error, or the lock acquired, which is released again before returning.
+#[allow(dead_code)] // herupdate compiles release_store without callers of gate_contended
 pub(crate) fn gate_contended(lock: &Path) -> bool {
     if !lock.parent().is_some_and(plain_directory) {
         return false;

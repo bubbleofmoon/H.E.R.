@@ -62,7 +62,7 @@ pub fn webp_animation(count: usize) -> Vec<u8> {
         out.extend(name);
         out.extend((data.len() as u32).to_le_bytes());
         out.extend(data);
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             out.push(0);
         }
     }

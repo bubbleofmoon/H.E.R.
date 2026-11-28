@@ -1379,10 +1379,9 @@ fn commit_isolated_audit_undo(
     let pending = validate_isolated_audit_backups(context, id, entry, &files)?;
     let interaction = crate::closed_agent::lock(context).map_err(|e| CommitError::plain(503, e))?;
     finish_pending_before_change(context, &interaction)?;
-    let mut settings_kept: Vec<&'static str> = Vec::new();
     let mut wake_error = None;
     let mut published_diff: Option<ConfigDiff> = None;
-    let (config_before, restored, planned) = {
+    let (config_before, restored, planned, settings_kept) = {
         let _gate = acquire_gate(context)?;
         let pre_store_before = read_config_before(context)?;
         let snapshots = snapshot_isolated_undo_targets(context, &files, &pending)?;
@@ -1391,7 +1390,6 @@ fn commit_isolated_audit_undo(
             .map_err(|e| CommitError::plain(503, format!("读取当前配置失败，未撤销：{e}")))?;
         let batch =
             prepare_isolated_undo_targets(context, pending, snapshots, confirm, &config_before)?;
-        settings_kept = batch.settings_kept;
         let restored = execute_isolated_undo_writes(
             context,
             batch.targets,
@@ -1403,7 +1401,7 @@ fn commit_isolated_audit_undo(
         if batch.wake_changed {
             wake_error = reconcile_default_wake_configs(context, Some(&config_before)).err();
         }
-        (config_before, restored, batch.planned)
+        (config_before, restored, batch.planned, batch.settings_kept)
     };
     let (after, load_error, change) = match planned {
         Some(planned) => planned,

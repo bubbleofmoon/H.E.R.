@@ -152,6 +152,7 @@ fn restrict_path_inner(
 ) -> Result<(), AclError> {
     #[cfg(unix)]
     {
+        let _ = policy;
         let meta = fs::symlink_metadata(path)
             .map_err(|error| unix::acl_err(path, "private path", "symlink_metadata", &error))?;
         if is_link(&meta)

@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CONSOLE_TOKEN: &str = "isolated-console-token-02";
+#[cfg(windows)]
 const OUTSIDE_SENTINEL: &str = "outside-runtime-fixture-sentinel-02";
 
 // A failed assertion must not leave her.exe running and locked for the next build.
@@ -522,9 +523,9 @@ fn isolated_status_rejects_data_directory_reparse_replacement() {
     .to_string();
     fs::write(&outside_state, &outside_contents).expect("write outside synthetic sentinel");
 
-    let (onebot_listener, onebot_url) = fake_dependency();
-    let (dsh_listener, dsh_url) = fake_dependency();
-    let (model_listener, model_url) = fake_dependency();
+    let (_onebot_listener, onebot_url) = fake_dependency();
+    let (_dsh_listener, dsh_url) = fake_dependency();
+    let (_model_listener, model_url) = fake_dependency();
     write_dependencies(&root, &onebot_url, &dsh_url, &model_url);
 
     let (child, port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {

@@ -361,11 +361,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             .first()
             .map(String::as_str)
             .ok_or("process identify|match needs options")?;
-        if !matches!(operation, "identify" | "match" | "check") || (args.len() - 1) % 2 != 0 {
+        if !matches!(operation, "identify" | "match" | "check")
+            || !(args.len() - 1).is_multiple_of(2)
+        {
             return Err("usage: her-cli process identify|match|check --pid <id> --runtime-root <root> [--program <absolute path> [--script <path>]]".into());
         }
         let mut options = std::collections::BTreeMap::new();
-        for pair in args[1..].chunks_exact(2) {
+        for pair in args[1..].as_chunks::<2>().0 {
             let allowed = matches!(pair[0].as_str(), "--pid" | "--runtime-root")
                 || operation == "match" && matches!(pair[0].as_str(), "--program" | "--script")
                 || operation == "check" && pair[0] == "--start";
@@ -703,17 +705,6 @@ mod os {
         token_user(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
     }
 
-    #[cfg(test)]
-    mod native_tests {
-        #[test]
-        fn token_user_failure_reports_api_and_win32_code() {
-            // A null process handle deterministically fails without opening a token.
-            let error = super::token_user(std::ptr::null_mut()).unwrap_err();
-            assert!(error.contains("OpenProcessToken"), "{error}");
-            assert!(error.contains("Win32 error 6"), "{error}"); // ERROR_INVALID_HANDLE
-        }
-    }
-
     fn tcp_peer_pid(stream: &std::net::TcpStream) -> Result<u32, String> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
@@ -742,7 +733,7 @@ mod os {
             )
         };
         for _ in 0..3 {
-            if size < 4 || size > 16 * 1024 * 1024 {
+            if !(4..=16 * 1024 * 1024).contains(&size) {
                 return Err("TCP owner table is unavailable".into());
             }
             let mut bytes = vec![0u8; size as usize];
@@ -783,10 +774,9 @@ mod os {
                     && row.dwRemoteAddr.to_ne_bytes() == local.ip().octets()
                     && u16::from_be(row.dwLocalPort as u16) == peer.port()
                     && u16::from_be(row.dwRemotePort as u16) == local.port()
+                    && found.replace(row.dwOwningPid).is_some()
                 {
-                    if found.replace(row.dwOwningPid).is_some() {
-                        return Err("TCP peer ownership is ambiguous".into());
-                    }
+                    return Err("TCP peer ownership is ambiguous".into());
                 }
             }
             return found
@@ -871,13 +861,15 @@ mod os {
         let descriptor = read_memory(handle, address, width * 2)?;
         let length = u16::from_le_bytes(descriptor[..2].try_into().unwrap()) as usize;
         let maximum = u16::from_le_bytes(descriptor[2..4].try_into().unwrap()) as usize;
-        if length > maximum || length % 2 != 0 {
+        if length > maximum || !length.is_multiple_of(2) {
             return Err("invalid process Unicode descriptor".into());
         }
         let bytes = read_memory(handle, pointer(&descriptor[width..], width), length)?;
         Ok(bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| u16::from_le_bytes(p))
             .collect())
     }
 
@@ -1195,6 +1187,17 @@ mod os {
                     ))
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod native_tests {
+        #[test]
+        fn token_user_failure_reports_api_and_win32_code() {
+            // A null process handle deterministically fails without opening a token.
+            let error = super::token_user(std::ptr::null_mut()).unwrap_err();
+            assert!(error.contains("OpenProcessToken"), "{error}");
+            assert!(error.contains("Win32 error 6"), "{error}"); // ERROR_INVALID_HANDLE
         }
     }
 }

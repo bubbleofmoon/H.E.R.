@@ -2,9 +2,6 @@
 use serde_json::Value;
 use std::sync::OnceLock;
 
-#[cfg(test)]
-const DEFAULT_WINDOW_MS: i64 = 90_000;
-
 /// Short `forYouReason` hints on messages returned by `qq_wait_for_messages`. A hint never
 /// forces a reply; the model decides.
 pub(crate) const FOR_YOU_QUOTE: &str = "引用回复了你的消息";

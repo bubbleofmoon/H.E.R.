@@ -203,6 +203,7 @@ pub(crate) fn discovered_tools(cfg: &Value, mode: Option<&str>, key: Option<&str
 }
 
 /// Execute a tool using the caller's explicit runtime selection.
+#[cfg(test)]
 pub fn call_tool(
     name: &str,
     args: &Value,
@@ -411,7 +412,7 @@ fn issues_error(issues: &[Issue]) -> String {
 /// `field` of an object `params`, checked against a zod `expected` kind (`record` and `object` both mean a JSON
 /// object; arrays are neither). `required` fields also report `undefined`.
 fn check_field(params: &Value, path: &[&'static str], expected: &'static str, required: bool, issues: &mut Vec<Issue>) {
-    let value = path.iter().skip(1).fold(Some(params), |cur, key| cur.and_then(|v| v.get(*key)));
+    let value = path.iter().skip(1).try_fold(params, |cur, key| cur.get(*key));
     let ok = match (expected, value) {
         (_, None) => !required,
         ("string", Some(v)) => v.is_string(),

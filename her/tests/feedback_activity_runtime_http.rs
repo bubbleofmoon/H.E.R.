@@ -922,7 +922,9 @@ fn activity_text_is_redacted_and_the_log_rotates_at_five_hundred_lines() {
 
 /// Block atomic replacement of a state file, restoring its original permissions on drop.
 struct Unwritable {
+    #[cfg(unix)]
     path: PathBuf,
+    #[cfg(unix)]
     original_permissions: Option<fs::Permissions>,
     active: bool,
     #[cfg(windows)]
@@ -942,8 +944,6 @@ impl Unwritable {
                 .open(path)
                 .unwrap();
             Self {
-                path: path.to_path_buf(),
-                original_permissions: None,
                 active: true,
                 handle: Some(handle),
             }
@@ -992,7 +992,6 @@ impl Unwritable {
         {
             self.handle.take();
             self.active = false;
-            return;
         }
         #[cfg(unix)]
         {
@@ -1020,7 +1019,6 @@ impl Drop for Unwritable {
         #[cfg(windows)]
         {
             self.handle.take();
-            return;
         }
         #[cfg(unix)]
         {

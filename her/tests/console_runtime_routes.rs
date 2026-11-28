@@ -951,6 +951,7 @@ impl ConsoleProcess {
         Self::start_with(root, port, dsh_home, None, None)
     }
 
+    #[cfg(windows)]
     fn start_with_peer_sid(
         root: &Path,
         port: u16,
@@ -1589,7 +1590,7 @@ fn http_request(
     };
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|_| "connect to selected console port".to_string())?;
@@ -4988,12 +4989,12 @@ fn create_directory_reparse_point(link: &Path, target: &Path) -> Result<(), Stri
         if output.status.success() {
             return Ok(());
         }
-        return Err(format!(
+        Err(format!(
             "reparse-point fixture failed with {:?}; stdout={:?}; stderr={:?}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -5331,7 +5332,7 @@ fn serve_fake_sticker_onebot_request(
     .to_string();
     let wire = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response.as_bytes().len(),
+        response.len(),
         response
     );
     reader
@@ -5423,7 +5424,7 @@ fn serve_fake_dsh_request(
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-        response_body.as_bytes().len()
+        response_body.len()
     );
     reader
         .get_mut()

@@ -96,21 +96,15 @@ pub fn read_http_request(
                     headers.push((name, value));
                 }
             }
-            if let Some(total) = end
-                .checked_add(4)
-                .and_then(|n| n.checked_add(content_length))
-            {
-                if request.len() >= total {
-                    return Some(MockRequest {
-                        request_line,
-                        method,
-                        path,
-                        headers,
-                        body: request[end + 4..total].to_vec(),
-                    });
-                }
-            } else {
-                return None;
+            let total = end.checked_add(4)?.checked_add(content_length)?;
+            if request.len() >= total {
+                return Some(MockRequest {
+                    request_line,
+                    method,
+                    path,
+                    headers,
+                    body: request[end + 4..total].to_vec(),
+                });
             }
         }
     }

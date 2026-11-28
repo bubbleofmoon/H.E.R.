@@ -738,13 +738,13 @@ fn webp_frame_count(
                 });
             }
             count += 1;
-        } else if &header[..4] == b"VP8L" || &header[..4] == b"VP8 " {
-            if webp_bitstream_dimensions(&header[..4], &bytes[start..end])? != (w, h) {
-                return Err(NormalizeError::WebpDimensionMismatch {
-                    width: w,
-                    height: h,
-                });
-            }
+        } else if (&header[..4] == b"VP8L" || &header[..4] == b"VP8 ")
+            && webp_bitstream_dimensions(&header[..4], &bytes[start..end])? != (w, h)
+        {
+            return Err(NormalizeError::WebpDimensionMismatch {
+                width: w,
+                height: h,
+            });
         }
         pos = end
             .checked_add(len % 2)

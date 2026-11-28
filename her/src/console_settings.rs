@@ -128,8 +128,8 @@ fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<&'static crate:
     previewed.first().map(|(setting, _)| *setting).ok_or((503, "the settings entry cannot be read".to_string()))
 }
 
-/// Test seam: runs on this thread right after the undo's first look at its entry, so a test can create the entry the
-/// look did not find.
+// Test seam: runs on this thread right after the undo's first look at its entry, so a test can create the entry the
+// look did not find.
 #[cfg(test)]
 thread_local! {
     pub(crate) static AFTER_UNDO_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };

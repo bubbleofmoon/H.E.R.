@@ -138,10 +138,7 @@ fn valid_session(context: &RuntimeContext, key: &str, session: &str, epoch: &str
         .ok()
         .flatten()
         .unwrap_or_default();
-    if token.is_empty() || crate::send_outbox::token_epoch(&token) != epoch {
-        return false;
-    }
-    true
+    !token.is_empty() && crate::send_outbox::token_epoch(&token) == epoch
 }
 
 fn valid_identity(

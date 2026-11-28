@@ -12,13 +12,9 @@ use crate::harness::usage;
 use crate::model_failure::Failure;
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::Arc, time::Duration};
 
 #[cfg(test)]
 mod walk_tests;
@@ -66,6 +62,7 @@ pub(crate) trait OneShot: Send + Sync {
     }
 
     /// One completion taking no longer than `within` and sending nothing once `abandoned` is set.
+    #[cfg(test)]
     fn complete_within(
         &self,
         system: &str,
@@ -632,6 +629,7 @@ impl OneShot for RouteWalk {
             .map_err(|err| err.failure)
     }
 
+    #[cfg(test)]
     fn complete_within(
         &self,
         system: &str,

@@ -556,11 +556,11 @@ fn sep_trim(text: &str) -> &str {
 }
 
 fn sep_trim_start(text: &str) -> &str {
-    text.trim_start_matches(|c: char| c == ' ' || c == '\t')
+    text.trim_start_matches([' ', '\t'])
 }
 
 fn sep_trim_end(text: &str) -> &str {
-    text.trim_end_matches(|c: char| c == ' ' || c == '\t')
+    text.trim_end_matches([' ', '\t'])
 }
 
 /// A line break the YAML loader takes but this reader would not: a carriage return that is not followed by a line

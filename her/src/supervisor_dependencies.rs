@@ -2440,7 +2440,7 @@ mod os {
                 if size > 32 * 1024 * 1024 {
                     break;
                 }
-                table.resize((size as usize + 3) / 4, 0);
+                table.resize((size as usize).div_ceil(4), 0);
                 let status = unsafe {
                     GetExtendedTcpTable(table.as_mut_ptr() as _, &mut size, 0, family, 3, 0)
                 };

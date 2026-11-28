@@ -3504,6 +3504,7 @@ fn admin_reset_with_a_busy_finalization_gate_still_stops_and_archives_the_dsh_se
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&gate_path)
         .unwrap();
     gate.try_lock()
@@ -5174,7 +5175,7 @@ fn admin_retry_of_a_paused_turn_runs_it_once() {
     );
     assert_eq!(status, 200);
     assert!(
-        wait_for(LONG, || rig.dsh.applied().len() >= 1),
+        wait_for(LONG, || !rig.dsh.applied().is_empty()),
         "retry must run the turn: {}",
         rig.view()
     );

@@ -186,17 +186,6 @@ impl UnreadMessage {
         self.fields.get("isSelf").and_then(Value::as_bool) == Some(true)
     }
 
-    pub(crate) fn at_self(&self) -> bool {
-        self.fields.get("atSelf").and_then(Value::as_bool) == Some(true)
-    }
-
-    pub(crate) fn quote_target_is_self(&self) -> bool {
-        self.fields
-            .get("quoteTargetIsSelf")
-            .and_then(Value::as_bool)
-            == Some(true)
-    }
-
     pub(crate) fn message_id(&self) -> Option<&Value> {
         self.fields.get("messageId")
     }
@@ -950,22 +939,6 @@ pub(crate) struct ReservedMessage {
     pub message_id: String,
     pub event_key: String,
     pub time: i64,
-}
-
-impl ReservedMessage {
-    pub(crate) fn line(&self, owner: bool) -> String {
-        format!(
-            "{}{}：{}{}",
-            if owner && self.is_owner {
-                "【管理员】"
-            } else {
-                ""
-            },
-            self.sender,
-            self.text,
-            crate::chat::media_hint(&self.message_id, self.media.len())
-        )
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

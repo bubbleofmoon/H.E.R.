@@ -211,6 +211,1806 @@ impl DshWait {
 /// `claim_reserved2_wake` refusal: the conversation's token changed after the wake was queued.
 const STALE_WAKE: &str = "queued wake token invalidated";
 
+enum MaintenanceResult {
+    Digest(crate::session_rotation::DigestResult),
+    Archived(Result<(),String>),
+}
+struct Maintenance {
+    plan: crate::session_rotation::Plan,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<MaintenanceResult>,
+    digested: bool,
+}
+
+/// None lets idle ingress evaluate its ordinary triggers. Some never rolls probability.
+pub(crate) fn in_turn_decision(in_turn: bool, at_self: bool, is_owner: bool, owner: &str) -> Option<(bool, String)> {
+    if !in_turn { return None; }
+    Some(if at_self { (true, "atMention".into()) }
+        else if is_owner { (true, format!("speaker:{owner}")) }
+        else { (false, "in-turn".into()) })
+}
+
+pub struct Hub {
+    #[cfg(test)]
+    state_read_failure_after: std::cell::Cell<Option<usize>>,
+    #[cfg(test)]
+    tick_snapshot_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    epoch_contended_hook: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    collector_finished_hook: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    cap_clock: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    context: RuntimeContext,
+    journal: inbound::SharedJournal,
+    drivers: HashMap<String, session::Driver>,
+    synced: HashMap<String, session::WakeSync>,
+    awaiting: HashMap<String, Vec<String>>,
+    /// Message wake provenance until dispatch, independent of the bounded recent buffer.
+    queued_messages: HashMap<String, Vec<(i64, String)>>,
+    active: HashMap<String, Active>,
+    /// Recovery owns these DSH tasks outside Hub::active: (turn id, token).
+    recovered: HashMap<String, (String, String)>,
+    maintenance: HashMap<String, Maintenance>,
+    maintenance_scan_at: i64,
+    ready: Vec<(String, String)>,
+    /// Batches whose claim detected suspension after the tick read its settings.
+    suspended_claims: HashSet<String>,
+    groups: Vec<String>,
+    mode_stamp: String,
+    /// `social-v2.json` `resetEpoch`: a console whole reset (`POST /api/socialV2/reset`).
+    reset_stamp: Value,
+    held: HashMap<String, String>,
+    /// Wakes that fell due while DSH was down, or whose turn could not reach it, per conversation. Replayed through the
+    /// normal dispatch (every validity check) once DSH is back.
+    dsh_wait: DshWait,
+    tokens: HashMap<String, String>,
+    timeout_deadlines: HashMap<String, String>,
+    retries: HashMap<String, (i64, String)>,
+    rollback_pending: HashMap<String, (i64, Value, Option<String>)>,
+    rearm_pending: HashMap<String, (i64, String, Value, String)>,
+    failures: HashMap<String, u32>,
+    closing_seen: HashMap<String, Value>,
+    closing_misses: HashMap<String, u32>,
+    slang: crate::slang_learn::SlangLearning,
+    #[cfg(test)]
+    slang_catch_up: Option<std::thread::JoinHandle<()>>,
+    /// Member-name and quoted-message lookups (and their caches) for inbound text; built on first use.
+    lookups: Option<chat::Lookups>,
+    /// Ticket 33: when a Schedule store error was last logged (at most one line a minute; the hub ticks every 500 ms).
+    schedule_log_at: i64,
+}
+
+#[cfg(test)]
+impl Drop for Hub {
+    fn drop(&mut self) {
+        if let Some(handle) = self.slang_catch_up.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Hub {
+    pub fn new(
+        context: &RuntimeContext,
+        journal: inbound::SharedJournal,
+        groups: Vec<String>,
+    ) -> Self {
+        let mode_stamp = context
+            .read_optional_text(RuntimeArea::Data, "mode.json")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let slang = crate::slang_learn::SlangLearning::new(context);
+        #[cfg(test)]
+        let slang_catch_up = slang.start_catch_up();
+        #[cfg(not(test))]
+        let _ = slang.start_catch_up();
+        Self {
+            #[cfg(test)]
+            state_read_failure_after: std::cell::Cell::new(None),
+            #[cfg(test)]
+            tick_snapshot_hook: None,
+            #[cfg(test)]
+            epoch_contended_hook: None,
+            #[cfg(test)]
+            collector_finished_hook: None,
+            #[cfg(test)]
+            cap_clock: None,
+            context: context.clone(),
+            journal,
+            drivers: HashMap::new(),
+            synced: HashMap::new(),
+            awaiting: HashMap::new(),
+            queued_messages: HashMap::new(),
+            active: HashMap::new(),
+            recovered: HashMap::new(),
+            maintenance: HashMap::new(),
+            maintenance_scan_at: 0,
+            ready: Vec::new(),
+            suspended_claims: HashSet::new(),
+            groups,
+            mode_stamp,
+            reset_stamp: crate::conversation_state::ConversationState::for_runtime(context)
+                .read_optional_document()
+                .map(|s| s.reset_epoch())
+                .unwrap_or(Value::Null),
+            held: HashMap::new(),
+            dsh_wait: DshWait::default(),
+            tokens: HashMap::new(),
+            timeout_deadlines: HashMap::new(),
+            retries: HashMap::new(),
+            rollback_pending: HashMap::new(),
+            rearm_pending: HashMap::new(),
+            failures: HashMap::new(),
+            closing_seen: crate::conversation_state::ConversationState::for_runtime(context)
+                .read_optional_document()
+                .map(|s| {
+                    s.conversations()
+                        .map(|(k, c)| {
+                            (
+                                k.to_string(),
+                                c.field("wakeConfig")
+                                    .and_then(|w| w.get("confirmedAt"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            closing_misses: HashMap::new(),
+            slang,
+            #[cfg(test)]
+            slang_catch_up,
+            lookups: None,
+            schedule_log_at: 0,
+        }
+    }
+
+    /// Render an inbound message via `inbound_text::render_inbound` using gateway lookups; a failed
+    /// lookup falls back to `@<qq>` / `[引用消息]` (pinned by `inbound_text` tests).
+    fn render(&mut self, cfg: &Value, key: &str, message: &Value, self_id: i64) -> inbound_text::Rendered {
+        if self.lookups.is_none() {
+            match chat::onebot_of(&self.context, cfg) {
+                Ok(ob) => self.lookups = Some(chat::Lookups::new(ob)),
+                Err(error) => println!("[reserved2] OneBot lookups unavailable: {error}"),
+            }
+        }
+        let (kind, conv) = key.split_once(':').unwrap_or(("", key));
+        match self.lookups.as_mut() {
+            Some(lookups) => {
+                let mut res = chat::GroupResolver {
+                    lookups,
+                    group: (kind == "group").then(|| conv.to_string()),
+                    kind: kind.to_string(),
+                    conv: conv.to_string(),
+                    self_id,
+                };
+                inbound_text::render_inbound(message, self_id, &mut res)
+            }
+            None => inbound_text::render_inbound(message, self_id, &mut inbound_text::NoLookups),
+        }
+    }
+
+    fn state_doc(&self) -> Result<crate::conversation_state::SocialDocument, String> {
+        #[cfg(test)]
+        if let Some(remaining) = self.state_read_failure_after.take() {
+            if remaining == 0 { return Err("synthetic social-state read failure".into()); }
+            self.state_read_failure_after.set(Some(remaining - 1));
+        }
+        crate::conversation_state::ConversationState::for_runtime(&self.context)
+            .read_optional_document()
+            .map_err(|(_, e)| e)
+    }
+
+    fn state(&self) -> Result<Value, String> {
+        self.state_doc().map(crate::conversation_state::SocialDocument::into_value)
+    }
+
+    /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
+    fn rotation_state_doc(&self, cfg: &Value, step: &'static str, now: i64) -> Result<crate::conversation_state::SocialDocument, String> {
+        let keys: std::collections::BTreeSet<_> = self.maintenance.keys().chain(self.drivers.keys()).collect();
+        if keys.iter().any(|key| crate::session_rotation::read_retry_at(&self.context, key, step) > now) {
+            return Err("session rotation read retry deferred".into());
+        }
+        let result = self.state_doc();
+        let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        for key in keys {
+            let _ = crate::session_rotation::rotation_read(&self.context, cfg, key, step, now, status.clone());
+        }
+        result
+    }
+
+    /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
+    fn rotation_state(&self, cfg: &Value, step: &'static str, now: i64) -> Result<Value, String> {
+        self.rotation_state_doc(cfg, step, now)
+            .map(crate::conversation_state::SocialDocument::into_value)
+    }
+
+    /// Forget every queued, held, retried and awaited job (their ingress is settled).
+    async fn drop_everything(&mut self, now: i64) -> Result<(), String> {
+        self.ready.clear();
+        self.suspended_claims.clear();
+        self.recovered.clear();
+        self.queued_messages.clear();
+        self.held.clear();
+        self.dsh_wait.clear();
+        self.drivers.clear();
+        self.synced.clear();
+        self.tokens.clear();
+        self.timeout_deadlines.clear();
+        self.retries.clear();
+        self.rollback_pending.clear();
+        self.rearm_pending.clear();
+        self.failures.clear();
+        self.closing_seen.clear();
+        self.closing_misses.clear();
+        for m in self.maintenance.values() {m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);}
+        let keys = self.awaiting.drain().flat_map(|(_, keys)| keys).collect();
+        self.journal.mark_handled(keys, now).await
+    }
+
+    /// Forget queued work whose epoch ended, settling its awaited ingress.
+    async fn invalidate_key(&mut self, key: &str, now: i64) -> Result<(), String> {
+        if let Some(m)=self.maintenance.remove(key) {
+            m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
+            m.task.abort();
+        }
+        self.queued_messages.remove(key);
+        self.recovered.remove(key);
+        self.closing_seen.remove(key);
+        self.closing_misses.remove(key);
+        self.drivers.remove(key);
+        self.synced.remove(key);
+        self.tokens.remove(key);
+        self.timeout_deadlines.remove(key);
+        self.held.remove(key);
+        self.dsh_wait.remove(key);
+        self.retries.remove(key);
+        self.rollback_pending.remove(key);
+        self.rearm_pending.remove(key);
+        self.failures.remove(key);
+        self.ready.retain(|(k, _)| k != key);
+        self.suspended_claims.remove(key);
+        if let Some(keys) = self.awaiting.remove(key) {
+            self.journal.mark_handled(keys, now).await?;
+        }
+        Ok(())
+    }
+
+    fn drain_rollback_pending(&mut self) {
+        let keys: Vec<String> = self.rollback_pending.keys().cloned().collect();
+        for key in keys {
+            let Some((at, previous, retire_token)) = self.rollback_pending.get(&key).cloned() else {
+                continue;
+            };
+            match run_wake_rollback(&self.context, &key, at, &previous, retire_token.as_deref()) {
+                Ok(()) => {
+                    self.rollback_pending.remove(&key);
+                }
+                Err(error) => {
+                    println!("[reserved2] {key} deferred wake rollback failed: {error}");
+                }
+            }
+        }
+    }
+
+    fn drain_rearm_pending(&mut self, cfg: &Value) {
+        let keys: Vec<String> = self.rearm_pending.keys().cloned().collect();
+        for key in keys {
+            let Some((at, reason, previous, expected_token)) = self.rearm_pending.get(&key).cloned() else {
+                continue;
+            };
+            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &reason, &previous, &expected_token) {
+                Ok(()) => {
+                    self.rearm_pending.remove(&key);
+                }
+                Err(error) => {
+                    println!("[reserved2] {key} provisional sleep rearm failed: {error}");
+                }
+            }
+        }
+    }
+
+    /// Driver control events never become prompts. Our cancellation's minted epoch keeps
+    /// ordinary queued ingress; an external rotation still invalidates ordinary work.
+    /// A cancellation that fails is logged and never aborts the ingress or tick that routed it:
+    /// a failed DSH stop still revoked the old epoch, so its minted token is adopted all the same.
+    fn remember_timeout_deadline(&mut self, key: &str, reason: &str, previous: &Value) {
+        if reason == "timeout" {
+            if let Some(deadline) = previous["wakeConfig"]["sleepUntil"].as_str() {
+                self.timeout_deadlines
+                    .insert(key.to_string(), deadline.to_string());
+            }
+        }
+    }
+
+    fn route_driver_event(&mut self, cfg: &Value, key: &str, event: session::WakeEvent) {
+        if event.reason != "turnTimeout" {
+            if event.reason == "timeout" {
+                if let Some(deadline) = self
+                    .drivers
+                    .get(key)
+                    .filter(|d| !d.sched.wc.infinite)
+                    .and_then(|d| d.sched.wc.sleep_until.clone())
+                {
+                    self.timeout_deadlines.insert(key.to_string(), deadline);
+                }
+            }
+            self.ready.push((key.to_string(), event.reason));
+            return;
+        }
+        if self.active.get(key).is_some_and(Active::preserve_harness_cap) {
+            // The worker refuses an expired admission or settles the running harness's cap.
+            return;
+        }
+        let dispatch = self.active.get(key).map(|active| (active.token.as_str(), &active.minted));
+        let cancelled = pipeline::Pipeline::cancel_reserved2_cap(&self.context, cfg, key, dispatch);
+        match cancelled {
+            Ok(cancelled) => {
+                if let Some(token) = cancelled.token {
+                    self.tokens.insert(key.to_string(), token);
+                }
+                if let Some(error) = cancelled.stop_error {
+                    // DSH may never end this turn: the collector is aborted after a fixed headroom.
+                    let abort_at = (crate::now_ms() as i64).saturating_add(crate::wake::COLLECTOR_HEADROOM_MS);
+                    if let Some(active) = self.active.get_mut(key) {
+                        active.cap_abort_at.get_or_insert(abort_at);
+                    }
+                    println!("[reserved2] {key} turn cap: stopping the DSH turn failed: {error}");
+                }
+            }
+            Err(error) => println!("[reserved2] {key} turn cap cancellation failed: {error}"),
+        }
+    }
+
+    /// Read state and the turn's publication together. Both token adoption and
+    /// invalidation/admission must use this observation, even across repeated rotations.
+    fn observe_turn_epoch(&mut self, key: &str) -> Result<(Value, bool), String> {
+        let active = self.active.get(key).filter(|a| a.mode_stamp == self.mode_stamp);
+        #[cfg(test)]
+        if active.is_some_and(|a| a.minted.try_lock().is_err()) {
+            if let Some(hook) = self.epoch_contended_hook.take() { let _ = hook.send(()); }
+        }
+        let minted = active.map(|a| a.minted.lock().unwrap_or_else(|p| p.into_inner()));
+        let doc = self.state_doc()?;
+        let current = doc
+            .conversation(key)
+            .and_then(|c| c.token().map(str::to_string))
+            .unwrap_or_default();
+        let valid = doc.reset_epoch() == self.reset_stamp && !current.is_empty();
+        let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current.as_str()));
+        if valid && published {
+            self.tokens.insert(key.to_string(), current.clone());
+        }
+        let in_turn = valid && (active.is_some_and(|a| a.token == current || published)
+            || self.recovered.get(key).is_some_and(|(_, owned)| owned == &current));
+        Ok((doc.into_value(), in_turn))
+    }
+
+    /// Queue a wake that cannot be dispatched while DSH is down. A full conversation drops its oldest wake
+    /// (`dsh_health::QUEUE_MAX` cap); the messages themselves stay in the conversation state and are served by the wakes that remain.
+    fn park_for_dsh(&mut self, key: &str, now: i64, reason: String) {
+        if let Some((_, dropped)) = self.dsh_wait.push(key, now, reason) {
+            println!("[reserved2] {key} 等待 DSH 的唤醒已满（{}），丢弃最早的一条（{dropped}）", crate::dsh_health::QUEUE_MAX);
+            crate::recovery_log::record(
+                &self.context,
+                crate::run_record::Trigger::Turn,
+                crate::run_record::Component::Queue,
+                "dropped-oldest",
+                crate::run_record::Outcome::Failed,
+                &format!("{key}: queue of {} waiting wakes is full", crate::dsh_health::QUEUE_MAX),
+            );
+        }
+    }
+
+    fn taken(&self, key: &str) -> bool {
+        self.groups.iter().any(|k| k == key)
+    }
+
+    /// Ticket 33: a Schedule store error is logged at most once a minute (the hub ticks every 500 ms).
+    fn log_schedule_error(&mut self, what: &str, error: &crate::schedule::StoreError, now: i64) {
+        if now.saturating_sub(self.schedule_log_at) >= 60_000 {
+            self.schedule_log_at = now;
+            println!("[reserved2] schedule {what}: {}", error.message());
+        }
+    }
+
+    /// Ticket 33: apply the console's timer cancels. Runs before the timers are pumped, so a timer cancelled before it
+    /// fell due never fires in the tick that takes its cancel. A cancel applies only to the timer the owner saw (same
+    /// `timer_at`); one that fired or was re-armed meanwhile is left alone. A reach-out cancel skips that chance.
+    fn apply_timer_cancels(&mut self, now: i64) -> bool {
+        let cancels = match crate::schedule::ScheduleStore::new(&self.context).take_timer_cancels(now) {
+            Ok(cancels) => cancels,
+            Err(error) => {
+                self.log_schedule_error("cancels", &error, now);
+                return false;
+            }
+        };
+        for cancel in cancels {
+            let Some(d) = self.drivers.get_mut(&cancel.conversation) else { continue };
+            match cancel.kind {
+                crate::schedule::TimerKind::ReplyCheck => {
+                    if d.sched.reply_check_at == Some(cancel.timer_at) {
+                        d.sched.reply_check_at = None;
+                    }
+                }
+                crate::schedule::TimerKind::ReachOut => d.skip_proactive(cancel.timer_at),
+                crate::schedule::TimerKind::Sleep => {}
+            }
+        }
+        true
+    }
+
+    /// Fire due timers, after applying the console's cancels (in that order). When the cancels cannot be read, the due
+    /// reply checks and reach-outs wait for a tick whose cancels can be read, so a cancelled one never fires.
+    fn pump_timers(&mut self, cfg: &Value, now: i64) {
+        let cancels_ok = self.apply_timer_cancels(now);
+        let deferred: Vec<(String, Option<i64>, Option<i64>)> = if cancels_ok {
+            Vec::new()
+        } else {
+            self.drivers
+                .iter_mut()
+                .filter_map(|(key, d)| {
+                    let reply = d.sched.reply_check_at.filter(|at| *at <= now);
+                    let proactive = d.sched.proactive_at.filter(|at| *at <= now);
+                    if reply.is_none() && proactive.is_none() {
+                        return None;
+                    }
+                    if reply.is_some() {
+                        d.sched.reply_check_at = None;
+                    }
+                    if proactive.is_some() {
+                        d.sched.proactive_at = None;
+                    }
+                    Some((key.clone(), reply, proactive))
+                })
+                .collect()
+        };
+        for (key, e) in session::pump_all(&mut self.drivers, now) {
+            self.route_driver_event(cfg, &key, e);
+        }
+        for (key, reply, proactive) in deferred {
+            let Some(d) = self.drivers.get_mut(&key) else { continue };
+            if reply.is_some() && d.sched.reply_check_at.is_none() {
+                d.sched.reply_check_at = reply;
+            }
+            if proactive.is_some() && d.sched.proactive_at.is_none() {
+                d.sched.proactive_at = proactive;
+            }
+        }
+    }
+
+    /// Ticket 33: publish this hub's in-memory timers for the Schedule page, then claim due reminders for idle
+    /// conversations. A conversation is not idle while DSH is down (unless a CLI is pinned for it) or while a wake of it
+    /// is queued, parked for DSH, held or waiting for a retry: its reminder stays due and runs once, late, when the
+    /// conversation is free, so an outage never piles up a burst of missed repeats.
+    fn sync_schedule(&mut self, cfg: &Value, suspended: bool, now: i64) {
+        let store = crate::schedule::ScheduleStore::new(&self.context);
+        let mut timers = Vec::new();
+        for (key, d) in &self.drivers {
+            if !d.sched.wc.infinite {
+                if let Some(at) = d.sched.wc.sleep_until.as_deref().and_then(crate::wake::parse_iso_ms) {
+                    timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::Sleep, at });
+                }
+            }
+            if let Some(at) = d.sched.reply_check_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReplyCheck, at });
+            }
+            if let Some(at) = d.sched.proactive_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReachOut, at });
+            }
+        }
+        if let Err(error) = store.publish_timers(timers, now) {
+            self.log_schedule_error("timers", &error, now);
+        }
+        if suspended {
+            return;
+        }
+        let dsh_down = crate::dsh_health::is_down(&self.context);
+        let idle: std::collections::HashSet<String> = self
+            .drivers
+            .iter()
+            .filter(|(key, d)| {
+                let key = key.as_str();
+                self.taken(key)
+                    && social_state::inbound_admitted(cfg, key)
+                    && (!dsh_down || !wake_needs_dsh(&self.context, cfg, key))
+                    && !self.active.contains_key(key)
+                    && !self.recovered.contains_key(key)
+                    && !self.maintenance.contains_key(key)
+                    && !d.sched.is_busy(now)
+                    && !self.ready.iter().any(|(queued, _)| queued.as_str() == key)
+                    && self.dsh_wait.len(key) == 0
+                    && !self.held.contains_key(key)
+                    && !self.retries.contains_key(key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let zone = crate::local_time::configured_zone(cfg);
+        match store.claim_due(now, &zone, |key| idle.contains(key)) {
+            Ok(items) => {
+                for item in items {
+                    println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);
+                    let reason = format!("{}{}", crate::schedule::REMINDER_REASON, item.id);
+                    self.ready.push((item.conversation, reason));
+                }
+            }
+            Err(error) => self.log_schedule_error("claim", &error, now),
+        }
+    }
+
+    fn record(&self, name: &str, value: &Value) -> Result<(), String> {
+        crate::append_runtime_json_line(&self.context, name, value).map_err(|e| e.to_string())
+    }
+
+    /// Cancel each running turn's own DSH session (captured when the turn learned it). A session
+    /// that replaced it meanwhile (a new turn after a switch) is never touched; a turn that has no
+    /// session yet cannot bind one across the change (`Pipeline::ensure_session`).
+    fn cancel_running(&self, cfg: &Value, when: &str) {
+        for (key, active) in &self.active {
+            let Some(session) = active.session() else { continue };
+            if let Err(error) = pipeline::Pipeline::new_with_runtime(&self.context, cfg, true).and_then(|mut p| p.cancel_session(key, &session)) {
+                println!("[reserved2] {key} {when}取消在途回合失败：{error}");
+            }
+        }
+    }
+
+    async fn adopt_mode(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
+        let raw = self
+            .context
+            .read_optional_text(RuntimeArea::Data, "mode.json")
+            .map_err(|e| e.to_string())?;
+        social_state::validate_mode_text(raw.as_deref()).map_err(|e| e.to_string())?;
+        let stamp = raw.unwrap_or_default();
+        let reset = self.rotation_state(cfg, "guard-read", now)?["resetEpoch"].clone();
+        if reset != self.reset_stamp {
+            // The console already stopped DSH work, cancelled the ledger turns and removed every
+            // token; nothing queued or held here survives. A running turn stays attached, as on a
+            // mode change: it is cancelled, ends through the normal path (its token is gone, so
+            // it is not retried and its ingress is settled then), and no second turn of its
+            // conversation starts while it runs.
+            self.reset_stamp = reset;
+            self.drop_everything(now).await?;
+            self.cancel_running(cfg, "重置后");
+
+            self.record(
+                "logs/rbridge-live.jsonl",
+                &json!({"ts":now,"reason":"socialV2-reset","action":"invalidated"}),
+            )?;
+        }
+        if stamp != self.mode_stamp {
+            self.mode_stamp = stamp;
+            self.drop_everything(now).await?;
+            self.cancel_running(cfg, "模式切换后");
+            self.record(
+                "logs/rbridge-live.jsonl",
+                &json!({"ts":now,"reason":"mode-changed","action":"invalidated"}),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub async fn handle(
+        &mut self,
+        ev: &crate::Event,
+        raw: &str,
+        replayed: bool,
+        self_id: i64,
+        nick: &str,
+        cards: &HashMap<i64, String>,
+    ) -> Result<(), String> {
+        let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+        self.handle_with_config(cfg, ev, raw, replayed, self_id, nick, cards).await
+    }
+
+    /// #192 (F3): `handle` with the configuration the caller read for this event: the main loop reads it once, holds
+    /// the event while it cannot, and hands the same read here, so the gate and the handling never see two reads.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_with_config(
+        &mut self,
+        cfg: Value,
+        ev: &crate::Event,
+        raw: &str,
+        replayed: bool,
+        self_id: i64,
+        nick: &str,
+        cards: &HashMap<i64, String>,
+    ) -> Result<(), String> {
+        self.adopt_mode(&cfg, crate::now_ms() as i64).await?;
+        self.refresh_recovered(&cfg, crate::now_ms() as i64).await?;
+        let key = match (ev.post_type.as_str(), ev.message_type.as_str()) {
+            ("message", "group") => ev.group_id.map(|id| format!("group:{id}")),
+            ("message", "private") => ev.user_id.map(|id| format!("private:{id}")),
+            ("notice", _) if ev.sub_type == "poke" => {
+                ev.group_id.map(|id| format!("group:{id}")).or_else(|| {
+                    ev.user_id
+                        .or(ev.sender_id)
+                        .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id))
+                        .map(|id| format!("private:{id}"))
+                })
+            }
+            _ => None,
+        };
+        // #186: this event's configuration decides (allow and deny); `taken` is the `--live-groups` list of this process.
+        let Some(key) = key.filter(|k| self.taken(k) && social_state::inbound_admitted(&cfg, k)) else {
+            return Ok(());
+        };
+        let is_poke = ev.sub_type == "poke";
+        let inbound_text::Rendered { text: rendered_text, plain, quote_self, at_self } = if is_poke {
+            inbound_text::Rendered { text: String::new(), plain: String::new(), quote_self: false, at_self: false }
+        } else {
+            self.render(&cfg, &key, &ev.message, self_id)
+        };
+        let body = if is_poke && plain.is_empty() {
+            ev.raw_message.clone()
+        } else {
+            plain.clone()
+        };
+        if let Some(m)=self.maintenance.get(&key) {m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);}
+        let now = crate::now_ms() as i64;
+        let inbound_key = inbound::event_key(
+            &key,
+            &ev.post_type,
+            crate::event_message_id(ev).as_deref(),
+            raw,
+        );
+        if !replayed
+            && self
+                .journal
+                .record_received(inbound_key.clone(), key.clone(), raw.to_string(), now)
+                .await?
+                == inbound::Receipt::Duplicate
+        {
+            return Ok(());
+        }
+        // Messages with no words of their own that do not quote the bot (e.g. quoting someone else or whitespace)
+        // are settled without storage.
+        if !is_poke && plain.is_empty() && !quote_self {
+            self.journal.mark_handled(vec![inbound_key], now).await?;
+            return Ok(());
+        }
+        // #170: the voice record of an opted-in conversation is read as its local transcript in place of the `[语音]`
+        // label (`voice_stt`); without one the label stays. The transcript goes to the stored message and the model
+        // only: the activity log (`preview`) keeps the label.
+        let activity_text = rendered_text.clone();
+        let (rendered_text, plain, body) = match crate::voice_stt::for_message(&self.context, &cfg, &key, &inbound_key, &ev.message).await {
+            Some(label) => {
+                let plain = crate::voice_stt::apply(&plain, &label);
+                (crate::voice_stt::apply(&rendered_text, &label), plain.clone(), plain)
+            }
+            None => (rendered_text, plain, body),
+        };
+        let sender = ev
+            .sender
+            .as_ref()
+            .map(|s| {
+                if s.card.is_empty() {
+                    &s.nickname
+                } else {
+                    &s.card
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                ev.user_id
+                    .or(ev.sender_id)
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+            });
+        let text = if ev.sub_type == "poke" {
+            format!(
+                "[拍一拍] {sender} 拍了拍 {}",
+                if ev.target_id == Some(self_id) {
+                    "你".into()
+                } else {
+                    ev.target_id.map(|id| id.to_string()).unwrap_or_default()
+                }
+            )
+        } else {
+            rendered_text
+        };
+        let (stored_text, stored_plain, stored_tail) = if is_poke {
+            let text = crate::social_mem::truncate_text(&text, 200);
+            (text.clone(), text.clone(), text)
+        } else {
+            inbound_text::stored_texts(&text, &plain)
+        };
+        // The previews above are all most reads show; a longer message keeps its readable full text
+        // for `qq_get_message_detail` (model views never carry it).
+        let full = if is_poke { None } else { inbound_text::stored_full_text(&text, inbound_text::full_text_cap(&cfg)) };
+        let (media, forward_ids) = crate::forward_fmt::collect_segment_meta(ev.message.as_array().map(Vec::as_slice).unwrap_or(&[]));
+        // Private messages store sender as `'私聊'` (display names apply only to groups);
+        // `record_reserved2_incoming` adds `ownerLabel` for the owner (`String(cfg.ownerQQ ?? '')`).
+        let stored_sender = if !is_poke && key.starts_with("private:") { "私聊".to_string() } else { sender.clone() };
+        let owner_qq = cfg.get("ownerQQ").filter(|v| !v.is_null()).map(crate::aux_text::js_string).unwrap_or_default();
+        let is_owner = ev.user_id.map(|id| id.to_string()).is_some_and(|id| id == owner_qq);
+        let owner_label = if is_owner { format!("管理员（ownerQQ {owner_qq}）") } else { String::new() };
+        let neutral = !is_poke && inbound_text::quiet_neutral(&ev.message);
+        // Bridge hint for the model, classified against the conversation before this message.
+        // An unreadable state only loses the exchange evidence; the message is still recorded.
+        let before = self.state().unwrap_or_else(|error| {
+            println!("[reserved2] {key} 来信归类读取会话失败（按无交流记录处理）：{error}");
+            Value::Null
+        });
+        let poke = is_poke.then(|| ev.target_id == Some(self_id));
+        let for_you = crate::question::ingress_for_you(ev, &key, poke, quote_self, at_self,
+            !is_poke && crate::names_self(ev, &body.to_lowercase(), nick, cards),
+            &before["conversations"][&key], &cfg, now);
+        let mut message = json!({"messageId":crate::event_message_id(ev), "sender":stored_sender, "userId":ev.user_id.or(ev.sender_id).map(|id| id.to_string()), "text":stored_text, "plain":stored_plain, "tail":stored_tail, "quoteTargetIsSelf":quote_self, "atSelf":at_self, "quietNeutral":neutral, "isSelf":false, "isOwner":is_owner, "ownerLabel":owner_label, "time":now, "hasMedia":!media.is_empty(), "media":media, "hasForward":!forward_ids.is_empty(), "forwardIds":forward_ids,
+            "forYou":for_you.is_some(), "forYouReason":for_you.unwrap_or(crate::question::NOT_FOR_YOU)});
+        if let Some((full_text, chars)) = full {
+            message["fullText"] = json!(full_text);
+            message["textChars"] = json!(chars);
+            message["textTruncated"] = json!(true);
+        }
+        let seq =
+            social_state::record_reserved2_incoming(&self.context, &cfg, &key, &inbound_key, message)?;
+        if ev.post_type == "message" && ev.message_type == "group" && cfg.pointer("/slang/enabled") != Some(&json!(false)) {
+            crate::feed_slang(&self.slang, true, &cfg, &key, &sender, &body);
+        }
+        let (state, in_turn) = self.observe_turn_epoch(&key)?;
+        let conv = &state["conversations"][&key];
+        let preview = crate::activity::slice(if is_poke { &text } else { &activity_text }, 80);
+        // The activity line belongs to the event's first arrival: a journal replay after a restart
+        // must not log it a second time.
+        if is_poke && !replayed {
+            crate::activity::append(&self.context, &format!("{key} 拍一拍事件：{preview}"));
+        }
+        let muted = crate::group_mute::active(&self.context, &key).is_some();
+        if muted || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) {
+            if !is_poke && !replayed {
+                crate::activity::append(
+                    &self.context,
+                    &if muted {
+                        format!("{key} [reserved2] 当前所在群聊正处于禁言阶段，消息已记入待阅档案而暂不唤起：{preview}")
+                    } else if state["paused"] == true {
+                        format!("{key} [reserved2] 当前会话的自动处理处于暂停状态，来信仅作留存记档而暂不唤起：{preview}")
+                    } else {
+                        format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}")
+                    },
+                );
+            }
+            self.journal.mark_handled(vec![inbound_key], now).await?;
+            return Ok(());
+        }
+        let token = crate::conversation_state::Conversation::from_value(conv)
+            .and_then(|c| c.token().map(str::to_string))
+            .unwrap_or_default();
+        if self.tokens.get(&key).is_some_and(|old| old != &token) {
+            self.invalidate_key(&key, now).await?;
+        }
+        self.tokens.insert(key.clone(), token);
+        self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
+        self.synced
+            .entry(key.clone())
+            .or_insert_with(|| session::WakeSync::of(&conv["wakeConfig"]));
+        let mut tr: crate::Triggers = serde_json::from_value(conv["wakeConfig"]["triggers"].clone()).unwrap_or_default();
+        // The persona's names wake her like keywords, except the ones she dropped (`wake_words.rs`).
+        tr.keywords = crate::wake_words::effective(&self.context, &key, &tr.keywords, &tr.drop_names);
+        // Do not even evaluate probability or question triggers for an active conversation.
+        // Urgent candidates survive only if no later read covers them before completion.
+        let (mut wake, mut reason) = in_turn_decision(in_turn, at_self, is_owner && ev.post_type == "message", &owner_qq)
+            .unwrap_or_else(|| crate::decide(ev, &body, at_self || quote_self, nick, cards, &tr,
+                crate::question::directed(ev, &body, quote_self, conv, &cfg, now)));
+        if !in_turn && social_state::claim_first_wake(&self.context, &cfg, &key)? {
+            wake = true;
+            reason = "bootstrap".into();
+        }
+        if !in_turn && (is_owner || at_self) && !wake {
+            wake = true;
+            reason = if at_self {"atMention".into()} else {format!("speaker:{owner_qq}")};
+        }
+        let driver = self.drivers.entry(key.clone()).or_insert_with(|| {
+            session::Driver::new(
+                session::scheduler_from_state(crate::wake_cfg_of(&cfg), conv),
+                crate::text_seed(&key, None),
+            )
+        });
+        if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
+            driver.adopt_wake_config(session::wake_config_from_json(Some(&conv["wakeConfig"])), now);
+            self.synced.insert(key.clone(), next);
+        }
+        driver.sched.last_incoming_at = now;
+        driver.sched.prompt_running = self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key);
+        self.record(
+            "logs/rbridge-live.jsonl",
+            &json!({"ts":now,"key":key,"shouldWake":wake,"reason":reason,"shadow":false}),
+        )?;
+        if wake {
+            self.retries.remove(&key);
+            self.failures.remove(&key);
+            self.queued_messages.entry(key.clone()).or_default().push((seq, inbound_key.clone()));
+            self.awaiting
+                .entry(key.clone())
+                .or_default()
+                .push(inbound_key);
+        } else {
+            self.journal.mark_handled(vec![inbound_key], now).await?;
+        }
+        let (events, preempted) = {
+            let driver = self.drivers.get_mut(&key).unwrap();
+            let events = driver.apply(session::Input::Incoming { reason: wake.then_some(reason), seq, at_ms: now, neutral, urgent: is_owner || at_self });
+            (events, driver.preempted.take().is_some())
+        };
+        for event in events { self.route_driver_event(&cfg, &key, event); }
+        let harness = self.active.get(&key).filter(|active| active.uses_harness());
+        if let Some(active) = harness.filter(|_| preempted) {
+            // Invalidate only this turn. Its runner observes the change and remains
+            // attached until any started handler has durably settled.
+            if let Err(error) = pipeline::revoke_reserved2_epoch(
+                &self.context, &key, &active.admitted_token(), Some(&active.minted),
+            ) {
+                println!("[reserved2] {key} preemption revocation failed: {error}");
+            }
+        } else if preempted {
+            let cancelled = pipeline::Pipeline::new_with_runtime(&self.context, &cfg, true)
+                .and_then(|mut control| control.cancel_with_reason(&key, "superseded"));
+            match cancelled {
+                Ok(cancelled) => {
+                    if let Some(token) = cancelled.token {
+                        self.tokens.insert(key.clone(), token);
+                    }
+                    if let Some(error) = cancelled.stop_error {
+                        println!("[reserved2] {key} preemption: stopping the DSH turn failed: {error}");
+                    }
+                }
+                Err(error) => println!("[reserved2] {key} preemption cancellation failed: {error}"),
+            }
+        }
+
+        if !is_poke && !replayed {
+            crate::activity::append(&self.context, &format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}"));
+        }
+        Ok(())
+    }
+
+    async fn refresh_recovered(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
+        let doc = self.rotation_state_doc(cfg, "guard-read", now)?;
+        // An unreadable ledger cannot prove that an attached turn ended.
+        let Ok(records) = crate::turn_ledger::read_records(&self.context) else { return Ok(()) };
+        let (turns, _) = crate::turn_ledger::fold(&records);
+        let mut running = HashMap::new();
+        if social_state::mode(&self.context) == "reserved2" && !doc.paused() {
+            for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
+                let conv = doc.conversation(&turn.key);
+                let token = conv.as_ref().and_then(|c| c.token()).unwrap_or("");
+                if !token.is_empty() && social_state::inbound_admitted(cfg, &turn.key)
+                    && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
+                    && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
+                    running.insert(turn.key.clone(), (turn.id.clone(), token.to_string()));
+                }
+            }
+        }
+        let ended: Vec<_> = self.recovered.iter().filter(|(key, owned)| running.get(*key) != Some(*owned))
+            .map(|(key, owned)| (key.clone(), owned.clone())).collect();
+        self.recovered = running;
+        for (key, (turn_id, token)) in ended {
+            if doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).as_deref() == Some(token.as_str())
+                && turns.iter().any(|t| t.id == turn_id && t.state == crate::turn_ledger::State::Completed) {
+                self.settle_turn_coverage(cfg, &key, &token, &turn_id, now).await?;
+            }
+            if let Some(driver) = self.drivers.get_mut(&key) {
+                driver.sched.prompt_running = false;
+                let events = driver.apply(session::Input::TurnEnd { at_ms: now });
+                for event in events.into_iter().filter(|e|e.reason != "turnTimeout") {
+                    self.route_driver_event(cfg, &key, event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Coverage can only remove work already owned by the base queue, after success.
+    async fn settle_turn_coverage(&mut self, cfg: &Value, key: &str, token: &str, turn: &str, now: i64) -> Result<(), String> {
+        if self.queued_messages.get(key).is_none_or(Vec::is_empty) { return Ok(()); }
+        let (context, cfg, query_key, token, turn) =
+            (self.context.clone(), cfg.clone(), key.to_string(), token.to_string(), turn.to_string());
+        // Missing evidence (including console restart) preserves the base follow-up.
+        let delivered = tokio::task::spawn_blocking(move ||
+            crate::qq_tools::wake_delivered_urgent(&context, &cfg, &query_key, &token, &turn)
+        ).await.map_err(|e|e.to_string())?.unwrap_or_default();
+        let covered: Vec<_> = self.queued_messages.get(key).into_iter().flatten()
+            .filter(|(seq, _)| delivered.contains(seq)).cloned().collect();
+        if covered.is_empty() { return Ok(()); }
+        let covered_keys: std::collections::HashSet<_> = covered.iter().map(|(_, k)| k.clone()).collect();
+        self.journal.mark_handled(covered_keys.iter().cloned().collect(), now).await?;
+        if let Some(items) = self.awaiting.get_mut(key) { items.retain(|k| !covered_keys.contains(k)); }
+        if let Some(items) = self.queued_messages.get_mut(key) { items.retain(|(seq, _)| !delivered.contains(seq)); }
+        if let Some(d) = self.drivers.get_mut(key) {
+            d.sched.pending.retain(|item| crate::wake::is_timer_reason(&item.reason) || !delivered.contains(&item.seq));
+        }
+        if self.queued_messages.get(key).is_none_or(|items|items.is_empty()) {
+            self.ready.retain(|(k,reason)| k != key || crate::wake::is_timer_reason(reason) || reason == "wakeReminder");
+            if let Some(d) = self.drivers.get_mut(key) {
+                if d.sched.pending_wake_reason.as_ref().is_some_and(|reason| !crate::wake::is_timer_reason(reason) && reason != "wakeReminder") {
+                    d.sched.pending_wake_at = None;
+                    d.sched.pending_wake_reason = None;
+                }
+            }
+        }
+        for (seq, _) in covered {
+            self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"seq":seq,"shouldWake":false,"reason":"covered","shadow":false}))?;
+        }
+        Ok(())
+    }
+
+    async fn maintain_sessions(&mut self, cfg: &Value, suspended: bool, now: i64) -> Result<(),String> {
+        use std::sync::atomic::Ordering;
+        for (key,m) in &self.maintenance {
+            let current=self.rotation_state(cfg,"guard-read",now)?["conversations"][key].clone();
+            if suspended || !self.taken(key) || !social_state::inbound_admitted(cfg,key)
+                || m.plan.policy != json!({"rotation":cfg.pointer("/dsh/rotation"),"cacheTtlMinutes":cfg.pointer("/dsh/cacheTtlMinutes")})
+                || ["lastIncomingAt","lastUnreadSeq","adminWakes"].iter().any(|field|current[*field]!=m.plan.guard[*field])
+                || self.ready.iter().any(|(k,_)|k==key) {
+                m.cancel.store(true,Ordering::SeqCst);
+            }
+        }
+        let done:Vec<_>=self.maintenance.iter().filter(|(_,m)|m.task.is_finished()).map(|(k,_)|k.clone()).collect();
+        for key in done {
+            // Keep the completed task owned and unconsumed if its retirement guard
+            // cannot be read. The next tick retries it even while scans are throttled.
+            let current=self.rotation_state(cfg,"retirement-read",now)?["conversations"][&key].clone();
+            let mut m=self.maintenance.remove(&key).unwrap();
+            let outcome=match m.task.await {Ok(o)=>o,Err(_)=>MaintenanceResult::Digest(crate::session_rotation::DigestResult::Pending)};
+            match outcome {
+                MaintenanceResult::Archived(result)=>{
+                    crate::session_rotation::recovery_complete(&self.context,&key);
+                    if result.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"archive");}
+                    else {crate::activity::append(&self.context,&format!("{} session rotation tokens={} digest={}",key,m.plan.input,if m.digested {"yes"} else {"no"}));}
+                }
+                MaintenanceResult::Digest(crate::session_rotation::DigestResult::Pending)=>{
+                    let (context,cfg,plan,cancel)=(self.context.clone(),cfg.clone(),m.plan.clone(),m.cancel.clone());
+                    let retry_ms=crate::session_rotation::read_retry_ms(&context,&key);
+                    m.task=tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                        MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg,plan,cancel).await)
+                    });
+                    self.maintenance.insert(key,m);
+                }
+                MaintenanceResult::Digest(crate::session_rotation::DigestResult::Done{ran,retire_unknown})=>{
+                    let current_typed = crate::conversation_state::Conversation::from_value(&current);
+                    if current_typed.as_ref().and_then(|c| c.token()).is_some_and(|token| token != m.plan.epoch) {
+                        crate::session_rotation::recovery_complete(&self.context,&key);
+                        continue;
+                    }
+                    if !retire_unknown && (m.cancel.load(Ordering::SeqCst) || suspended) {continue;}
+                    // Unverifiable work must lose its old token before queued ingress can
+                    // use a fresh session, even when the old DSH cancel route is broken.
+                    let guard=if retire_unknown {current} else {m.plan.guard.clone()};
+                    let guard_token = crate::conversation_state::Conversation::from_value(&guard)
+                        .and_then(|c| c.token().map(str::to_string));
+                    if retire_unknown && guard_token.as_deref().unwrap_or("") != m.plan.epoch.as_str() {continue;}
+                    let retired=social_state::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
+                    if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
+                        if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
+                        // A changed message guard or storage refusal is not permission to
+                        // reuse an unverified session. Re-plan under its retained slot.
+                        let (context,cfg,plan,cancel)=(self.context.clone(),cfg.clone(),m.plan.clone(),m.cancel.clone());
+                        m.task=tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg,plan,cancel).await)
+                        });
+                        self.maintenance.insert(key,m);
+                        continue;
+                    }
+                    match retired {
+                        Ok(Some(token))=>{
+                            self.tokens.insert(key.clone(),token);
+                            let (context,cfg,key2,sid)=(self.context.clone(),cfg.clone(),key.clone(),m.plan.sid.clone());
+                            m.digested=ran;
+                            m.task=tokio::spawn(async move {
+                                let result=tokio::task::spawn_blocking(move ||social_state::stop_and_archive_session(&context,&cfg,&key2,&sid)).await.unwrap_or_else(|e|Err(e.to_string()));
+                                MaintenanceResult::Archived(result)
+                            });
+                            self.maintenance.insert(key,m);
+                        }
+                        Ok(None)=>{},
+                        Err(_)=>{
+                            let _=crate::session_map::update_context(&self.context,&key,&m.plan.sid,&m.plan.epoch,|r| {
+                                r["rotation"]["phase"]=json!("done");
+                                r["rotation"]["attemptedTurn"]=json!(m.plan.turn_seq);
+                            });
+                            crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");
+                        }
+                    }
+                }
+            }
+        }
+        if suspended {return Ok(());}
+        let dsh_down=crate::dsh_health::is_down(&self.context);
+        if now < self.maintenance_scan_at {return Ok(());}
+        let state=self.rotation_state(cfg,"scan-state",now)?;
+        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && social_state::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
+        for key in keys {
+            if self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key) {continue;}
+            if crate::session_rotation::read_retry_at(&self.context,&key,"recovery-scan") > now {
+                return Err("session rotation read retry deferred".into());
+            }
+            let candidate=crate::session_rotation::candidate(&self.context,cfg,&key,now);
+            let Some(plan)=crate::session_rotation::rotation_read(&self.context,cfg,&key,"recovery-scan",now,candidate)? else {continue;};
+            if !plan.recovering && (dsh_down
+                || crate::turn_engine::Engine::read_choice(&self.context, cfg, &key, "reserved2").is_ok_and(|engine| !engine.uses_dsh())
+                || self.awaiting.get(&key).is_some_and(|v|!v.is_empty())
+                || self.ready.iter().any(|(k,_)|k==&key)
+                || self.retries.contains_key(&key) || self.held.contains_key(&key)
+                || pipeline::pinned_cli_backend(cfg,&key).is_some()) {continue;}
+            let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (context,cfg2,plan2,cancel2)=(self.context.clone(),cfg.clone(),plan.clone(),cancel.clone());
+            let task=tokio::spawn(async move {MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg2,plan2,cancel2).await)});
+            self.maintenance.insert(key,Maintenance{plan,cancel,task,digested:false});
+        }
+        // A failed recovery read must be retried before the next tick can dispatch.
+        self.maintenance_scan_at=now+5000;
+        Ok(())
+    }
+
+    pub async fn tick(&mut self, nick: &str, self_id: i64) -> Result<(), String> {
+        let now = crate::now_ms() as i64;
+        let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+        // No scheduler error spam or dispatch while a failed recovery read is cooling down.
+        if self.maintenance.keys().chain(self.drivers.keys()).any(|key|
+            ["guard-read", "retirement-read", "scan-state", "recovery-scan"].iter()
+                .any(|step| crate::session_rotation::read_retry_at(&self.context,key,step) > now)) {
+            return Ok(());
+        }
+        self.adopt_mode(&cfg, now).await?;
+        self.refresh_recovered(&cfg, now).await?;
+        let state = self.rotation_state(&cfg,"guard-read",now)?;
+        let suspended = social_state::mode(&self.context) != "reserved2"
+            || state["paused"] == true
+            || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
+        self.maintain_sessions(&cfg,suspended,now).await?;
+        self.drain_rollback_pending();
+        self.drain_rearm_pending(&cfg);
+        let mut state=self.state()?;
+        let suspended = suspended || state["paused"] == true;
+        #[cfg(test)]
+        if let Some(hook) = self.tick_snapshot_hook.take() {
+            let (done, finished) = tokio::sync::oneshot::channel();
+            let _ = hook.send(done);
+            let _ = finished.await;
+        }
+        let keys: Vec<String> = self.drivers.keys().cloned().collect();
+        let mut invalid = Vec::new();
+        for key in keys {
+            // Never compare a newly published token against tick's earlier snapshot.
+            // A second owned rotation can finish before this lock is acquired.
+            (state, _) = self.observe_turn_epoch(&key)?;
+            let doc = crate::conversation_state::SocialDocument::from_value(state.clone())
+                .map_err(|(_, e)| e)?;
+            let predicate = if !self.taken(&key) { "notTaken" }
+                else if !social_state::inbound_admitted(&cfg, &key) { "notAllowed" }
+                else if !doc.has_conversation(key.as_str()) { "missing" }
+                else if self.tokens.get(&key).is_some_and(|old| {
+                    old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
+                }) { "tokenChanged" }
+                // Only a batch already refused by the claim can survive a suspended tick.
+                else if suspended && !self.suspended_claims.contains(&key) { "suspended" }
+                else { continue; };
+            invalid.push((key, predicate));
+        }
+        for (key, predicate) in invalid {
+            self.invalidate_key(&key, now).await?;
+            self.record(
+                "logs/rbridge-live.jsonl",
+                &json!({"ts":now,"key":key,"reason":"settings-invalidated","predicate":predicate}),
+            )?;
+        }
+        if social_state::mode(&self.context) == "reserved2"
+            && state["paused"] != true
+            && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
+        {
+            if let Some(conversations) = state["conversations"].as_object() {
+                for (key, conv) in conversations {
+                    if self.taken(key) && social_state::inbound_admitted(&cfg, key) {
+                        self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
+                        self.drivers.entry(key.clone()).or_insert_with(|| {
+                            session::Driver::new(
+                                session::scheduler_from_state(crate::wake_cfg_of(&cfg), conv),
+                                crate::text_seed(key, None),
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        crate::sync_wake_configs(
+            &self.context,
+            &cfg,
+            &state,
+            &mut self.drivers,
+            &mut self.synced,
+            now,
+        );
+        for (key, d) in self.drivers.iter_mut() {
+            let conv = &state["conversations"][key];
+            let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
+            // Recovery may restore a consumed lease after this driver was initialized. This is
+            // not a tool configuration change, so confirmedAt alone cannot detect it. Local
+            // retries/holds already own their deadline and must retain their bounded backoff.
+            if !self.active.contains_key(key) && !self.held.contains_key(key)
+                && !self.retries.contains_key(key) && !self.dsh_wait.per_key.contains_key(key)
+            {
+                sync_persisted_driver_deadline(d, conv, persisted_wake, now);
+            }
+            let mut next_cfg = crate::wake_cfg_of(&cfg);
+            if self.active.contains_key(key) {
+                next_cfg.turn_hard_cap_ms = d.sched.cfg.turn_hard_cap_ms;
+                next_cfg.turn_ceiling_ms = d.sched.cfg.turn_ceiling_ms;
+            }
+            if d.last_rate_limited.is_some()
+                && (d.sched.cfg.max_wake_per_minute != next_cfg.max_wake_per_minute
+                    || d.sched.cfg.max_wake_per_hour != next_cfg.max_wake_per_hour)
+            {
+                d.sched.pending_wake_at = Some(now);
+            }
+            if d.sched.cfg.proactive_enabled != next_cfg.proactive_enabled
+                || d.sched.cfg.proactive_min_ms != next_cfg.proactive_min_ms
+                || d.sched.cfg.proactive_max_ms != next_cfg.proactive_max_ms
+            {
+                d.sched.proactive_at = None;
+            }
+            d.sched.cfg = next_cfg;
+            d.refresh_observed_state(conv, now);
+            self.tokens
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    crate::conversation_state::Conversation::from_value(conv)
+                        .and_then(|c| c.token().map(str::to_string))
+                        .unwrap_or_default()
+                });
+            d.arm_proactive_now(now);
+            d.sched.prompt_running = self.active.contains_key(key) || self.recovered.contains_key(key) || self.maintenance.contains_key(key);
+        }
+        #[cfg(test)]
+        if let Some(finished) = self.collector_finished_hook.take() { let _ = finished.await; }
+        for (key, active) in self.active.iter().filter(|(_, a)| a.cap_abort_at.is_some_and(|at| now >= at)) {
+            if !active.task.is_finished() {
+                println!("[reserved2] {key} turn cap: DSH did not confirm the stop; aborting the collector");
+                active.task.abort();
+            }
+        }
+        let ended: Vec<String> = self
+            .active
+            .iter()
+            .filter(|(_, a)| a.task.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in ended {
+            // Observe publication again before releasing the wake or replaying queued work.
+            let (state, owned) = self.observe_turn_epoch(&key)?;
+            let active = &self.active[&key];
+            if owned && active.route() == pipeline::Reserved2Route::ExpiredBeforeAdmission
+                && active.reason == "timeout" && active.previous["wakeConfig"]["sleepUntil"].is_string()
+            {
+                // A wake refused at the gate never got to consume its durable timer claim.
+                let token = crate::conversation_state::SocialDocument::from_value(state.clone())
+                    .ok()
+                    .and_then(|doc| doc.conversation(&key))
+                    .and_then(|c| c.token().map(str::to_string))
+                    .unwrap_or_default();
+                social_state::retire_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
+            }
+            let active = self.active.remove(&key).unwrap();
+            let admitted_token = active.admitted_token();
+            let route = active.route();
+            let uses_cli = route == pipeline::Reserved2Route::Cli;
+            let DispatchResult { result, unsubmitted, failure_parks } = match active.task.await {
+                Ok(ended) => ended,
+                // Our own abort after a failed cap stop: the cap cancellation already settled the turn.
+                Err(error) if error.is_cancelled() && active.cap_abort_at.is_some() =>
+                    DispatchResult::new(Err("回合已取消：turnTimeout（DSH 未确认停止，已中止收集）".to_string()), false),
+                Err(error) => return Err(error.to_string()),
+            };
+            println!("[reserved2] {key} turn ended: {result:?}");
+            // The pipeline already wrote the turn-error line and told the administrator when the turn ended in a model error.
+            let model_error = pipeline::take_model_error(&self.context, &key);
+            let token_res = social_state::token(&self.context, &key);
+            let mode_res = social_state::mode_checked(&self.context);
+            let current_token = token_res
+                .as_ref()
+                .ok()
+                .and_then(|t| t.as_deref())
+                .unwrap_or("")
+                .to_string();
+            let in_scope = mode_res.as_ref().is_ok_and(|m| m == "reserved2")
+                && social_state::inbound_admitted(&cfg, &key)
+                && self.mode_stamp == active.mode_stamp;
+            let still_valid = in_scope && current_token == admitted_token;
+            let owned_token = current_token == admitted_token
+                || active.minted.lock().unwrap_or_else(|p|p.into_inner()).as_deref() == Some(current_token.as_str());
+            let owned_in_scope = in_scope && owned_token;
+            let completed_in_scope = result.is_ok() && owned_in_scope;
+            let clean_sleep = result.is_ok() && crate::turn_ledger::read_records(&self.context).ok().is_some_and(|records| {
+                let epoch = crate::send_outbox::token_epoch(&admitted_token);
+                crate::turn_ledger::fold(&records).0.iter().any(|t|t.key == key && t.begun_at >= active.at
+                    && t.epochs.contains(&epoch) && t.state == crate::turn_ledger::State::Completed && t.outcome_reason == "observationSleep")
+            });
+            if clean_sleep {
+                if completed_in_scope {
+                    social_state::rearm_observation_sleep(&self.context, &cfg, &key, &current_token, now)?;
+                }
+                println!("[reserved2] observation budget ended; keeping wake config");
+            }
+            if completed_in_scope && !uses_cli {
+                if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
+                    let (turns, _) = crate::turn_ledger::fold(&records);
+                    let epoch = crate::send_outbox::token_epoch(&admitted_token);
+                    if let Some(turn) = turns.iter().rev().find(|t| t.key == key && t.begun_at >= active.at
+                        && t.epochs.contains(&epoch) && t.state == crate::turn_ledger::State::Completed) {
+                        self.settle_turn_coverage(&cfg, &key, &current_token, &turn.id, now).await?;
+                    }
+                }
+            }
+            let held = still_valid
+                && result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.starts_with(pipeline::HELD_ERROR_PREFIX));
+            let access_refused = result.as_ref().is_err_and(|error| pipeline::is_dsh_access_refusal(error));
+            if still_valid && !held && !access_refused {
+                if let (Err(message), None) = (&result, &model_error) {
+                    let shown = if crate::pipeline::configured_outbound_violation(&cfg, message, &[]).is_some() {
+                        "（涉及敏感内容，已遮蔽）".to_string()
+                    } else {
+                        crate::activity::slice(message, 500)
+                    };
+                    crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&shown, 80)));
+                }
+            }
+            let retry = still_valid && result.is_err() && unsubmitted && !held && !access_refused
+                && route != pipeline::Reserved2Route::ExpiredBeforeAdmission;
+            // The prompt never reached DSH and DSH is down: wait for it (bounded) instead of burning the retries.
+            let wait_for_dsh = retry && !uses_cli && failure_parks.unwrap_or_else(|| {
+                crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key)
+            });
+            let is_reminder = active.reason == "wakeReminder";
+            let had_inbound = !active.inbound.is_empty();
+            let retry_exhausted = retry
+                && !wait_for_dsh
+                && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
+            let retire_expired_timeout = active.reason == "timeout"
+                && active.previous["wakeConfig"]["sleepUntil"].is_string()
+                && (route == pipeline::Reserved2Route::ExpiredBeforeAdmission || retry_exhausted);
+            let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
+                || retry_exhausted
+                || (held && had_inbound);
+            let transient_read_drop = (token_res.is_err() || mode_res.is_err())
+                && self.mode_stamp == active.mode_stamp
+                && social_state::inbound_admitted(&cfg, &key)
+                && result.is_err()
+                && unsubmitted;
+            let needs_provisional_rearm = !access_refused
+                && !is_reminder
+                && !retire_expired_timeout
+                && active.previous["wakeConfig"]["sleepRetired"] != true
+                && active.previous["wakeConfig"]["infinite"] == false
+                && (((still_valid
+                    || (owned_in_scope && route == pipeline::Reserved2Route::ExpiredBeforeAdmission))
+                    && dropped_unadmitted)
+                    || transient_read_drop);
+            if needs_provisional_rearm {
+                let rearm_token = if owned_in_scope {
+                    current_token.clone()
+                } else {
+                    active
+                        .minted
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                        .unwrap_or_else(|| admitted_token.clone())
+                };
+                self.rearm_pending.insert(
+                    key.clone(),
+                    (active.at, active.reason.clone(), active.previous.clone(), rearm_token),
+                );
+            }
+            if held || retry {
+                let retire_token = (retry_exhausted
+                    && active.reason == "timeout"
+                    && active.previous["wakeConfig"]["sleepUntil"].is_string())
+                .then(|| current_token.clone());
+                if let Err(error) = run_wake_rollback(
+                    &self.context,
+                    &key,
+                    active.at,
+                    &active.previous,
+                    retire_token.as_deref(),
+                ) {
+                    println!("[reserved2] {key} turn rollback failed: {error}");
+                    self.rollback_pending.insert(
+                        key.clone(),
+                        (active.at, active.previous.clone(), retire_token),
+                    );
+                }
+                if held && !had_inbound {
+                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
+                    self.held.insert(key.clone(), active.reason.clone());
+                }
+            }
+            self.journal
+                .mark_handled(active.inbound.clone(), now)
+                .await?;
+            if wait_for_dsh {
+                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
+                let keys = active.inbound;
+                self.awaiting.entry(key.clone()).or_default().extend(keys.clone());
+                self.journal.run(move |j| j.settle_events(&keys, "received", now)).await?;
+                self.remember_timeout_deadline(&key, &active.reason, &active.previous);
+                self.park_for_dsh(&key, now, active.reason);
+            } else if retry {
+                let attempt = {
+                    let failures = self.failures.entry(key.clone()).or_default();
+                    *failures += 1;
+                    *failures
+                };
+                if attempt <= MAX_WAKE_RETRIES {
+                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
+                    self.retries.insert(
+                        key.clone(),
+                        (now + 5_000 * (1_i64 << (attempt - 1)), active.reason),
+                    );
+                    let keys = active.inbound;
+                    self.awaiting
+                        .entry(key.clone())
+                        .or_default()
+                        .extend(keys.clone());
+                    self.journal
+                        .run(move |j| j.settle_events(&keys, "received", now))
+                        .await?;
+                }
+            } else if result.is_ok() || (model_error.is_some() && !held) {
+                // Run the wake-reminder check at every turn end, a model error included.
+                if result.is_ok() {
+                    self.failures.remove(&key);
+                }
+                if (still_valid || completed_in_scope) && !clean_sleep {
+                    let records = crate::turn_ledger::read_records(&self.context)?;
+                    let started = crate::turn_ledger::fold(&records).0.into_iter().rev()
+                        .find(|turn| turn.key == key && turn.begun_at >= active.at
+                            && turn.epochs.contains(&crate::send_outbox::token_epoch(&admitted_token)))
+                        .and_then(|turn| records.iter().rev().find(|r| r["turn"] == turn.id && r["k"] == "started"))
+                        .and_then(|r| r["t"].as_i64());
+                    let miss = self.closing_misses.get(&key).copied().unwrap_or(0) + 1;
+                    let seen = self.closing_seen.get(&key).cloned().unwrap_or(Value::Null);
+                    let (remind, stamp) = social_state::complete_reserved2_turn(&self.context, &cfg, &key, &current_token, started, &seen, miss)?;
+                    self.closing_seen.insert(key.clone(), stamp);
+                    // A failed text-only CLI cannot configure its wake through MCP. Its failed
+                    // ledger/input is settled: a closing reminder must not replay that prompt.
+                    if remind && !(result.is_err() && uses_cli) {
+                        self.closing_misses.insert(key.clone(), miss);
+                        self.ready.push((key.clone(), "wakeReminder".into()));
+                    } else {
+                        self.closing_misses.remove(&key);
+                    }
+                }
+            }
+            self.drain_rollback_pending();
+            self.drain_rearm_pending(&cfg);
+            let completed_state = self.state()?;
+            if clean_sleep {
+                self.closing_seen.insert(key.clone(), completed_state["conversations"][&key]["wakeConfig"]["confirmedAt"].clone());
+                self.closing_misses.remove(&key);
+            }
+            if let Some(d) = self.drivers.get_mut(&key) {
+                let conv = &completed_state["conversations"][&key];
+                let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
+                if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
+                    d.adopt_wake_config(persisted_wake, now);
+                    self.synced.insert(key.clone(), next);
+                } else if !self.held.contains_key(&key)
+                    && !self.retries.contains_key(&key)
+                    && !self.dsh_wait.per_key.contains_key(&key)
+                {
+                    sync_persisted_driver_deadline(d, conv, persisted_wake, now);
+                }
+                d.refresh_observed_state(conv, now);
+                d.sched.prompt_running = false;
+                if held || retry {
+                    d.sched.turn_started_at = None;
+                    d.sched.pending_wake_key_at = None;
+                    d.sched.wake_times.retain(|at| *at != active.at);
+                    continue;
+                }
+                // The turn already ended: a cap that passed since the last tick must not cancel it.
+                let events: Vec<_> = d.apply(session::Input::TurnEnd { at_ms: now })
+                    .into_iter().filter(|e| e.reason != "turnTimeout").collect();
+                for e in events {
+                    self.route_driver_event(&cfg, &key, e);
+                }
+            }
+        }
+        if !self.dsh_wait.is_empty() {
+            let dsh_down = crate::dsh_health::is_down(&self.context);
+            // A new explicit CLI choice also releases that conversation while DSH stays down.
+            // Every released wake still passes the normal mode, access, pause and epoch checks.
+            let runnable: std::collections::HashSet<_> = self.dsh_wait.per_key.keys()
+                .filter(|key| !dsh_down || !wake_needs_dsh(&self.context, &cfg, key)).cloned().collect();
+            for (key, reason) in self.dsh_wait.drain_ready(|key| runnable.contains(key)) {
+                println!("[reserved2] {key} 重新投递等待中的唤醒（先核对权限与会话状态）");
+                self.ready.push((key, reason));
+            }
+        }
+        if !self.held.is_empty() {
+            let (turns, _) =
+                crate::turn_ledger::fold(&crate::turn_ledger::read_records(&self.context)?);
+            let released: Vec<String> = self
+                .held
+                .keys()
+                .filter(|k| crate::turn_ledger::blocking_turn(&turns, k).is_none())
+                .cloned()
+                .collect();
+            for key in released {
+                self.ready
+                    .push((key.clone(), self.held.remove(&key).unwrap()));
+            }
+        }
+        let retry_due: Vec<String> = self
+            .retries
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in retry_due {
+            self.ready
+                .push((key.clone(), self.retries.remove(&key).unwrap().1));
+        }
+        // Manual wakes from the console (`POST /api/socialV2/wake`): the pending batch wake is
+        // replaced, a busy conversation buffers the reason, and a free one wakes now (rate limits still apply).
+        // One request per conversation per tick.
+        let requested: Vec<String> = state["conversations"]
+            .as_object()
+            .map(|c| c.iter().filter(|(_, v)| v["adminWakes"].as_array().is_some_and(|a| !a.is_empty())).map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default();
+        for key in requested {
+            if !self.taken(&key) {
+                continue;
+            }
+            let Some(reason) = social_state::take_admin_wake(&self.context, &key)? else {
+                println!("[reserved2] {key} 手动唤醒已失效（令牌代际已变），丢弃");
+                continue;
+            };
+            if suspended || !social_state::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
+                println!("[reserved2] {key} 手动唤醒未执行：当前不允许唤醒（{reason}）");
+                continue;
+            }
+            let running = self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key);
+            let d = self.drivers.get_mut(&key).expect("checked above");
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_reason = None;
+            d.sched.prompt_running = running;
+            if let crate::wake::Outcome::Armed = d.sched.schedule_wake(&reason, now) {
+                d.sched.pending_wake_at = Some(now);
+            }
+            println!("[reserved2] 收到后台操作指令，主动唤醒会话 {key}，原因说明：{reason}");
+        }
+        if !suspended {
+            self.pump_timers(&cfg, now);
+        }
+        self.sync_schedule(&cfg, suspended, now);
+        if suspended {
+            self.ready.retain(|(key, _)| self.suspended_claims.contains(key));
+            return Ok(());
+        }
+        for (key, reason) in std::mem::take(&mut self.ready) {
+            if let Some(m)=self.maintenance.get(&key) {
+                m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
+                self.ready.push((key,reason));
+                continue;
+            }
+            if self.active.contains_key(&key) || self.recovered.contains_key(&key) {
+                if reason == "wakeReminder" {
+                    self.ready.push((key, reason));
+                } else if let Some(d) = self.drivers.get_mut(&key) {
+                    if reason == "timeout" {
+                        self.timeout_deadlines.remove(&key);
+                    }
+                    d.sched.prompt_running = true;
+                    d.sched.schedule_wake(&reason, now);
+                }
+                continue;
+            }
+            self.suspended_claims.remove(&key);
+            if !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
+                self.timeout_deadlines.remove(&key);
+                continue;
+            }
+            if crate::group_mute::active(&self.context, &key).is_some() {
+                // #46: no wake while muted; its messages stay unread for the first wake after the mute.
+                println!("{key} [reserved2] 该群当前依然处在管理员禁言期间之内，所以这次唤醒调度已自动跳过（触发原因为 {reason}）");
+                self.timeout_deadlines.remove(&key);
+                continue;
+            }
+            if crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key) {
+                // DSH-dependent work waits without a call. A pinned CLI is an independent backend
+                // and must not be prevented from handling its conversation by a DSH outage.
+                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
+                self.park_for_dsh(&key, now, reason);
+                continue;
+            }
+            let expected_sleep = (reason == "timeout")
+                .then(|| {
+                    self.timeout_deadlines.get(&key).cloned().or_else(|| {
+                        self.drivers
+                            .get(&key)
+                            .filter(|d| !d.sched.wc.infinite)
+                            .and_then(|d| d.sched.wc.sleep_until.clone())
+                    })
+                })
+                .flatten();
+            let mut keys = Vec::new();
+            let mut claimed = None;
+            // Keep each drained job until a task or a bounded retry owns it.
+            let prepared = async {
+                if let Some((at, previous, retire_token)) = self.rollback_pending.get(&key) {
+                    run_wake_rollback(&self.context, &key, *at, previous, retire_token.as_deref())?;
+                    self.rollback_pending.remove(&key);
+                }
+                // Imported conversations can predate agent tokens. Mint their first epoch
+                // before claiming a wake; a previously nonempty epoch still invalidates normally.
+                if self.tokens.get(&key).is_some_and(String::is_empty) {
+                    let token = social_state::ensure_or_rotate(&self.context, &key, false)?;
+                    self.tokens.insert(key.clone(), token);
+                }
+                if reason != "wakeReminder" {
+                    keys = self.awaiting.get(&key).cloned().unwrap_or_default();
+                    self.journal.mark_processing(keys.clone(), now).await?;
+                    self.awaiting.remove(&key);
+                }
+                // The token the queued work was seen under: a wake never takes a token minted after it
+                // was queued (revoke and re-grant while it waited).
+                let expected = self.tokens.get(&key).filter(|t| !t.is_empty()).cloned();
+                let (previous, dispatch_token) = if reason == "wakeReminder" {
+                    let conv_typed = self.state_doc()?.conversation(&key);
+                    let token = conv_typed
+                        .as_ref()
+                        .and_then(|c| c.token())
+                        .unwrap_or("")
+                        .to_string();
+                    let conv = conv_typed
+                        .map(|c| c.to_value())
+                        .unwrap_or(Value::Null);
+                    if expected.as_ref().is_some_and(|t| *t != token) {
+                        return Err(STALE_WAKE.to_string());
+                    }
+                    (conv, token)
+                } else {
+                    crate::turn_recovery::retire_pending_startup_timeout(&self.context, &key)?;
+                    let claim = if reason == "timeout" {
+                        social_state::claim_reserved2_wake_for_deadline(
+                            &self.context,
+                            &key,
+                            &reason,
+                            now,
+                            expected.as_deref(),
+                            expected_sleep.as_deref(),
+                        )?
+                    } else {
+                        social_state::claim_reserved2_wake(
+                            &self.context,
+                            &key,
+                            &reason,
+                            now,
+                            expected.as_deref(),
+                        )?
+                    };
+                    claimed = Some(claim.clone());
+                    claim
+                };
+                let prompt = if reason == "wakeReminder" {
+                    prompt::build_reminder_with_runtime(&self.context, &key, nick, &self_id.to_string())
+                } else {
+                    prompt::build_with_runtime(&self.context, &key, &reason, nick, &self_id.to_string())
+                };
+                let cli_prompt = prompt::build_text_only_for_wake(&self.context, &key, &reason, nick, &self_id.to_string());
+                let target = crate::parse_target(&key, &cfg).map_err(|e| e.to_string())?;
+                self.record("logs/rbridge-live-wakes.jsonl", &json!({"ts":now,"key":key,"reason":reason,"shadow":false}))?;
+                Ok::<_, String>((previous, dispatch_token, prompt, cli_prompt, target))
+            }.await;
+            let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
+                Ok(prepared) => {
+                    self.timeout_deadlines.remove(&key);
+                    prepared
+                }
+                Err(error) if error == STALE_WAKE || error == social_state::WAKE_ACCESS_REFUSED => {
+                    // Authority changed while the wake was queued. Settle its ingress without a retry.
+                    self.invalidate_key(&key, now).await?;
+                    self.journal.mark_handled(keys, now).await?;
+                    let reason = if error == STALE_WAKE { "token-invalidated" } else { "settings-invalidated" };
+                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":reason}))?;
+                    continue;
+                }
+                Err(error) if error == social_state::WAKE_TIMEOUT_STALE => {
+                    self.timeout_deadlines.remove(&key);
+                    self.suspended_claims.remove(&key);
+                    if !keys.is_empty() {
+                        self.awaiting.insert(key.clone(), keys.clone());
+                        if let Err(error) = self.journal.run(move |j| j.requeue_unsubmitted(&keys, now)).await {
+                            println!("[reserved2] {key} stale timeout journal rollback failed: {error}");
+                        }
+                    }
+                    if let Some(d) = self.drivers.get_mut(&key) {
+                        d.sched.prompt_running = false;
+                        d.sched.turn_started_at = None;
+                        d.sched.pending_wake_key_at = None;
+                        d.sched.wake_times.retain(|at| *at != now);
+                        d.sched.wc.sleep_until = None;
+                        d.sched.sleep_at = None;
+                        if d.sched.pending_wake_reason.as_deref() == Some("timeout") {
+                            d.sched.pending_wake_at = None;
+                            d.sched.pending_wake_reason = None;
+                        }
+                    }
+                    if let Ok(fresh_state) = self.state() {
+                        let conv = &fresh_state["conversations"][&key];
+                        let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
+                        if let Some(d) = self.drivers.get_mut(&key) {
+                            if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
+                                d.adopt_wake_config(persisted_wake, now);
+                                self.synced.insert(key.clone(), next);
+                            } else {
+                                sync_persisted_driver_deadline(d, conv, persisted_wake, now);
+                            }
+                            d.refresh_observed_state(conv, now);
+                        }
+                    } else {
+                        self.synced.remove(&key);
+                    }
+                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":"timeout-stale"}))?;
+                    continue;
+                }
+                Err(error) => {
+                    println!("[reserved2] {key} dispatch preparation failed: {error}");
+                    let prep_retry_exhausted = error != social_state::WAKE_SUSPENDED
+                        && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
+                    if let Some((previous, dispatch_token)) = claimed.as_ref() {
+                        let retire_token = (prep_retry_exhausted
+                            && reason == "timeout"
+                            && previous["wakeConfig"]["sleepUntil"].is_string())
+                        .then(|| dispatch_token.clone());
+                        if let Err(error) = run_wake_rollback(
+                            &self.context,
+                            &key,
+                            now,
+                            previous,
+                            retire_token.as_deref(),
+                        ) {
+                            println!("[reserved2] {key} dispatch rollback failed: {error}");
+                            self.rollback_pending.insert(
+                                key.clone(),
+                                (now, previous.clone(), retire_token),
+                            );
+                        }
+                    }
+                    // A failed journal transition may have left the original entry in place.
+                    if !keys.is_empty() { self.awaiting.insert(key.clone(), keys.clone()); }
+                    if let Err(error) = self.journal.run(move |j| j.requeue_unsubmitted(&keys, now)).await {
+                        println!("[reserved2] {key} dispatch journal rollback failed: {error}");
+                    }
+                    if let Some(d) = self.drivers.get_mut(&key) {
+                        d.sched.prompt_running = false;
+                        d.sched.turn_started_at = None;
+                        d.sched.pending_wake_key_at = None;
+                        d.sched.wake_times.retain(|at| *at != now);
+                    }
+                    if error == social_state::WAKE_SUSPENDED {
+                        self.suspended_claims.insert(key.clone());
+                        self.ready.push((key, reason));
+                        continue;
+                    }
+                    let count = {
+                        let failures = self.failures.entry(key.clone()).or_default();
+                        *failures += 1;
+                        *failures
+                    };
+                    if count <= MAX_WAKE_RETRIES {
+                        self.retries.insert(key, (now + 5_000 * (1_i64 << (count - 1)), reason));
+                    } else {
+                        self.timeout_deadlines.remove(&key);
+                        if let Some((previous, dispatch_token)) = claimed.as_ref() {
+                            let retire_timeout = (reason == "timeout"
+                                && previous["wakeConfig"]["sleepUntil"].is_string())
+                                || previous["wakeConfig"]["sleepRetired"] == true;
+                            if !retire_timeout && previous["wakeConfig"]["infinite"] == false {
+                                self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
+                                self.drain_rearm_pending(&cfg);
+                            }
+                        } else if reason == "timeout" {
+                            // Preflight never claimed the deadline: clear retry count and cached
+                            // sleep state so the next Hub::tick re-adopts any persisted sleepUntil.
+                            self.failures.remove(&key);
+                            if let Some(d) = self.drivers.get_mut(&key) {
+                                d.sched.wc.sleep_until = None;
+                                d.sched.sleep_at = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            // Reminders do not consume awaiting messages or grant a wake snapshot.
+            if reason != "wakeReminder" { self.queued_messages.remove(&key); }
+            let (context, cfg2, reason2, keys2) = (self.context.clone(), cfg.clone(), reason.clone(), keys.clone());
+            println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
+            let hard_cap_ms = crate::wake::turn_budget(&cfg).hard_cap_ms;
+            let d = self.drivers.get_mut(&key).unwrap();
+            d.sched.prompt_running = true;
+            d.sched.cfg.turn_hard_cap_ms = hard_cap_ms;
+            d.sched.cfg.turn_ceiling_ms = crate::wake::turn_ceiling_ms(&cfg);
+            d.sched.turn_started_at = Some(now);
+            d.sched.pending_wake_key_at = None;
+            if reason != "wakeReminder" {
+                d.sched.wc.sleep_until = None;
+                d.sched.sleep_at = None;
+            }
+            let token = dispatch_token.clone();
+            let wake_claim = json!({"wakeConfig":previous["wakeConfig"],"lastWakeReason":previous["lastWakeReason"]});
+            let session = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let shared = session.clone();
+            let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let minted_shared = minted.clone();
+            let queued_route = match crate::turn_engine::Engine::selected(&context, &cfg2, &key, "reserved2") {
+                Ok(crate::turn_engine::Engine::Harness) => pipeline::Reserved2Route::PendingHarness,
+                _ if pipeline::pinned_cli_backend(&cfg2, &key).is_some() => pipeline::Reserved2Route::Cli,
+                _ => pipeline::Reserved2Route::Dsh,
+            };
+            let route = std::sync::Arc::new(std::sync::Mutex::new(queued_route));
+            let route_shared = route.clone();
+            let admitted = pipeline::MintedEpoch::default();
+            let admitted_shared = admitted.clone();
+            let retries_remaining = self.failures.get(&key).copied().unwrap_or_default() < MAX_WAKE_RETRIES;
+            #[cfg(test)]
+            let cap_clock = self.cap_clock.clone();
+            let task = tokio::spawn(async move {
+                match pipeline::Pipeline::new_without_dsh(&context, &cfg2, true) {
+                    Err(error) => DispatchResult::new(Err(error), true),
+                    Ok(mut pipe) => {
+                        #[cfg(test)]
+                        {
+                            pipe.cap_clock = cap_clock;
+                        }
+                        pipe.share_session(shared);
+                        pipe.share_minted_epoch(minted_shared);
+                        pipe.share_reserved2_route(route_shared, admitted_shared);
+                        pipe.set_reserved2_retry_budget(retries_remaining);
+                        pipe.note_turn(&reason2, &keys2);
+                        pipe.expect_dispatch_token(dispatch_token);
+                        pipe.expect_dispatch_deadline(now.saturating_add(hard_cap_ms));
+                        if reason2 != "wakeReminder" { pipe.expect_dispatch_wake(now, wake_claim); }
+                        let result = pipe.run_turn(&target, &prompt, &cli_prompt, &cfg2).await;
+                        DispatchResult {
+                            result,
+                            unsubmitted: pipe.dispatch_definitely_unsubmitted(),
+                            failure_parks: pipe.reserved2_failure_parks(),
+                        }
+                    }
+                }
+            });
+            self.active.insert(
+                key,
+                Active {
+                    task,
+                    inbound: keys,
+                    reason,
+                    previous,
+                    at: now,
+                    token,
+                    mode_stamp: self.mode_stamp.clone(),
+                    session,
+                    minted,
+                    cap_abort_at: None,
+                    route,
+                    admitted,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +2274,7 @@ mod tests {
 
     #[tokio::test]
     async fn hf135_partial_reset_keeps_maintenance_and_queued_ingress_until_revoked() {
-        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+        use std::sync::{Arc, atomic::AtomicBool};
         let (root,mut hub) = queued_hub("hf135-partial-reset").await;
         let key="group:420042";
         let (stop,server)=fake_dsh(&root,&mut hub,key,false);
@@ -5270,1805 +7070,5 @@ mod tests {
         wait.remove("group:1");
         assert_eq!(wait.len("group:1"), 0);
         assert_eq!(wait.len("group:2"), 1);
-    }
-}
-
-enum MaintenanceResult {
-    Digest(crate::session_rotation::DigestResult),
-    Archived(Result<(),String>),
-}
-struct Maintenance {
-    plan: crate::session_rotation::Plan,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    task: tokio::task::JoinHandle<MaintenanceResult>,
-    digested: bool,
-}
-
-/// None lets idle ingress evaluate its ordinary triggers. Some never rolls probability.
-pub(crate) fn in_turn_decision(in_turn: bool, at_self: bool, is_owner: bool, owner: &str) -> Option<(bool, String)> {
-    if !in_turn { return None; }
-    Some(if at_self { (true, "atMention".into()) }
-        else if is_owner { (true, format!("speaker:{owner}")) }
-        else { (false, "in-turn".into()) })
-}
-
-pub struct Hub {
-    #[cfg(test)]
-    state_read_failure_after: std::cell::Cell<Option<usize>>,
-    #[cfg(test)]
-    tick_snapshot_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
-    #[cfg(test)]
-    epoch_contended_hook: Option<std::sync::mpsc::Sender<()>>,
-    #[cfg(test)]
-    collector_finished_hook: Option<tokio::sync::oneshot::Receiver<()>>,
-    #[cfg(test)]
-    cap_clock: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
-    context: RuntimeContext,
-    journal: inbound::SharedJournal,
-    drivers: HashMap<String, session::Driver>,
-    synced: HashMap<String, session::WakeSync>,
-    awaiting: HashMap<String, Vec<String>>,
-    /// Message wake provenance until dispatch, independent of the bounded recent buffer.
-    queued_messages: HashMap<String, Vec<(i64, String)>>,
-    active: HashMap<String, Active>,
-    /// Recovery owns these DSH tasks outside Hub::active: (turn id, token).
-    recovered: HashMap<String, (String, String)>,
-    maintenance: HashMap<String, Maintenance>,
-    maintenance_scan_at: i64,
-    ready: Vec<(String, String)>,
-    /// Batches whose claim detected suspension after the tick read its settings.
-    suspended_claims: HashSet<String>,
-    groups: Vec<String>,
-    mode_stamp: String,
-    /// `social-v2.json` `resetEpoch`: a console whole reset (`POST /api/socialV2/reset`).
-    reset_stamp: Value,
-    held: HashMap<String, String>,
-    /// Wakes that fell due while DSH was down, or whose turn could not reach it, per conversation. Replayed through the
-    /// normal dispatch (every validity check) once DSH is back.
-    dsh_wait: DshWait,
-    tokens: HashMap<String, String>,
-    timeout_deadlines: HashMap<String, String>,
-    retries: HashMap<String, (i64, String)>,
-    rollback_pending: HashMap<String, (i64, Value, Option<String>)>,
-    rearm_pending: HashMap<String, (i64, String, Value, String)>,
-    failures: HashMap<String, u32>,
-    closing_seen: HashMap<String, Value>,
-    closing_misses: HashMap<String, u32>,
-    slang: crate::slang_learn::SlangLearning,
-    #[cfg(test)]
-    slang_catch_up: Option<std::thread::JoinHandle<()>>,
-    /// Member-name and quoted-message lookups (and their caches) for inbound text; built on first use.
-    lookups: Option<chat::Lookups>,
-    /// Ticket 33: when a Schedule store error was last logged (at most one line a minute; the hub ticks every 500 ms).
-    schedule_log_at: i64,
-}
-
-#[cfg(test)]
-impl Drop for Hub {
-    fn drop(&mut self) {
-        if let Some(handle) = self.slang_catch_up.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Hub {
-    pub fn new(
-        context: &RuntimeContext,
-        journal: inbound::SharedJournal,
-        groups: Vec<String>,
-    ) -> Self {
-        let mode_stamp = context
-            .read_optional_text(RuntimeArea::Data, "mode.json")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let slang = crate::slang_learn::SlangLearning::new(context);
-        #[cfg(test)]
-        let slang_catch_up = slang.start_catch_up();
-        #[cfg(not(test))]
-        let _ = slang.start_catch_up();
-        Self {
-            #[cfg(test)]
-            state_read_failure_after: std::cell::Cell::new(None),
-            #[cfg(test)]
-            tick_snapshot_hook: None,
-            #[cfg(test)]
-            epoch_contended_hook: None,
-            #[cfg(test)]
-            collector_finished_hook: None,
-            #[cfg(test)]
-            cap_clock: None,
-            context: context.clone(),
-            journal,
-            drivers: HashMap::new(),
-            synced: HashMap::new(),
-            awaiting: HashMap::new(),
-            queued_messages: HashMap::new(),
-            active: HashMap::new(),
-            recovered: HashMap::new(),
-            maintenance: HashMap::new(),
-            maintenance_scan_at: 0,
-            ready: Vec::new(),
-            suspended_claims: HashSet::new(),
-            groups,
-            mode_stamp,
-            reset_stamp: crate::conversation_state::ConversationState::for_runtime(context)
-                .read_optional_document()
-                .map(|s| s.reset_epoch())
-                .unwrap_or(Value::Null),
-            held: HashMap::new(),
-            dsh_wait: DshWait::default(),
-            tokens: HashMap::new(),
-            timeout_deadlines: HashMap::new(),
-            retries: HashMap::new(),
-            rollback_pending: HashMap::new(),
-            rearm_pending: HashMap::new(),
-            failures: HashMap::new(),
-            closing_seen: crate::conversation_state::ConversationState::for_runtime(context)
-                .read_optional_document()
-                .map(|s| {
-                    s.conversations()
-                        .map(|(k, c)| {
-                            (
-                                k.to_string(),
-                                c.field("wakeConfig")
-                                    .and_then(|w| w.get("confirmedAt"))
-                                    .cloned()
-                                    .unwrap_or(Value::Null),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            closing_misses: HashMap::new(),
-            slang,
-            #[cfg(test)]
-            slang_catch_up,
-            lookups: None,
-            schedule_log_at: 0,
-        }
-    }
-
-    /// Render an inbound message via `inbound_text::render_inbound` using gateway lookups; a failed
-    /// lookup falls back to `@<qq>` / `[引用消息]` (pinned by `inbound_text` tests).
-    fn render(&mut self, cfg: &Value, key: &str, message: &Value, self_id: i64) -> inbound_text::Rendered {
-        if self.lookups.is_none() {
-            match chat::onebot_of(&self.context, cfg) {
-                Ok(ob) => self.lookups = Some(chat::Lookups::new(ob)),
-                Err(error) => println!("[reserved2] OneBot lookups unavailable: {error}"),
-            }
-        }
-        let (kind, conv) = key.split_once(':').unwrap_or(("", key));
-        match self.lookups.as_mut() {
-            Some(lookups) => {
-                let mut res = chat::GroupResolver {
-                    lookups,
-                    group: (kind == "group").then(|| conv.to_string()),
-                    kind: kind.to_string(),
-                    conv: conv.to_string(),
-                    self_id,
-                };
-                inbound_text::render_inbound(message, self_id, &mut res)
-            }
-            None => inbound_text::render_inbound(message, self_id, &mut inbound_text::NoLookups),
-        }
-    }
-
-    fn state_doc(&self) -> Result<crate::conversation_state::SocialDocument, String> {
-        #[cfg(test)]
-        if let Some(remaining) = self.state_read_failure_after.take() {
-            if remaining == 0 { return Err("synthetic social-state read failure".into()); }
-            self.state_read_failure_after.set(Some(remaining - 1));
-        }
-        crate::conversation_state::ConversationState::for_runtime(&self.context)
-            .read_optional_document()
-            .map_err(|(_, e)| e)
-    }
-
-    fn state(&self) -> Result<Value, String> {
-        self.state_doc().map(crate::conversation_state::SocialDocument::into_value)
-    }
-
-    /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
-    fn rotation_state_doc(&self, cfg: &Value, step: &'static str, now: i64) -> Result<crate::conversation_state::SocialDocument, String> {
-        let keys: std::collections::BTreeSet<_> = self.maintenance.keys().chain(self.drivers.keys()).collect();
-        if keys.iter().any(|key| crate::session_rotation::read_retry_at(&self.context, key, step) > now) {
-            return Err("session rotation read retry deferred".into());
-        }
-        let result = self.state_doc();
-        let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
-        for key in keys {
-            let _ = crate::session_rotation::rotation_read(&self.context, cfg, key, step, now, status.clone());
-        }
-        result
-    }
-
-    /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
-    fn rotation_state(&self, cfg: &Value, step: &'static str, now: i64) -> Result<Value, String> {
-        self.rotation_state_doc(cfg, step, now)
-            .map(crate::conversation_state::SocialDocument::into_value)
-    }
-
-    /// Forget every queued, held, retried and awaited job (their ingress is settled).
-    async fn drop_everything(&mut self, now: i64) -> Result<(), String> {
-        self.ready.clear();
-        self.suspended_claims.clear();
-        self.recovered.clear();
-        self.queued_messages.clear();
-        self.held.clear();
-        self.dsh_wait.clear();
-        self.drivers.clear();
-        self.synced.clear();
-        self.tokens.clear();
-        self.timeout_deadlines.clear();
-        self.retries.clear();
-        self.rollback_pending.clear();
-        self.rearm_pending.clear();
-        self.failures.clear();
-        self.closing_seen.clear();
-        self.closing_misses.clear();
-        for m in self.maintenance.values() {m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);}
-        let keys = self.awaiting.drain().flat_map(|(_, keys)| keys).collect();
-        self.journal.mark_handled(keys, now).await
-    }
-
-    /// Forget queued work whose epoch ended, settling its awaited ingress.
-    async fn invalidate_key(&mut self, key: &str, now: i64) -> Result<(), String> {
-        if let Some(m)=self.maintenance.remove(key) {
-            m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
-            m.task.abort();
-        }
-        self.queued_messages.remove(key);
-        self.recovered.remove(key);
-        self.closing_seen.remove(key);
-        self.closing_misses.remove(key);
-        self.drivers.remove(key);
-        self.synced.remove(key);
-        self.tokens.remove(key);
-        self.timeout_deadlines.remove(key);
-        self.held.remove(key);
-        self.dsh_wait.remove(key);
-        self.retries.remove(key);
-        self.rollback_pending.remove(key);
-        self.rearm_pending.remove(key);
-        self.failures.remove(key);
-        self.ready.retain(|(k, _)| k != key);
-        self.suspended_claims.remove(key);
-        if let Some(keys) = self.awaiting.remove(key) {
-            self.journal.mark_handled(keys, now).await?;
-        }
-        Ok(())
-    }
-
-    fn drain_rollback_pending(&mut self) {
-        let keys: Vec<String> = self.rollback_pending.keys().cloned().collect();
-        for key in keys {
-            let Some((at, previous, retire_token)) = self.rollback_pending.get(&key).cloned() else {
-                continue;
-            };
-            match run_wake_rollback(&self.context, &key, at, &previous, retire_token.as_deref()) {
-                Ok(()) => {
-                    self.rollback_pending.remove(&key);
-                }
-                Err(error) => {
-                    println!("[reserved2] {key} deferred wake rollback failed: {error}");
-                }
-            }
-        }
-    }
-
-    fn drain_rearm_pending(&mut self, cfg: &Value) {
-        let keys: Vec<String> = self.rearm_pending.keys().cloned().collect();
-        for key in keys {
-            let Some((at, reason, previous, expected_token)) = self.rearm_pending.get(&key).cloned() else {
-                continue;
-            };
-            match rearm_dropped_provisional_sleep(&self.context, cfg, &key, at, &reason, &previous, &expected_token) {
-                Ok(()) => {
-                    self.rearm_pending.remove(&key);
-                }
-                Err(error) => {
-                    println!("[reserved2] {key} provisional sleep rearm failed: {error}");
-                }
-            }
-        }
-    }
-
-    /// Driver control events never become prompts. Our cancellation's minted epoch keeps
-    /// ordinary queued ingress; an external rotation still invalidates ordinary work.
-    /// A cancellation that fails is logged and never aborts the ingress or tick that routed it:
-    /// a failed DSH stop still revoked the old epoch, so its minted token is adopted all the same.
-    fn remember_timeout_deadline(&mut self, key: &str, reason: &str, previous: &Value) {
-        if reason == "timeout" {
-            if let Some(deadline) = previous["wakeConfig"]["sleepUntil"].as_str() {
-                self.timeout_deadlines
-                    .insert(key.to_string(), deadline.to_string());
-            }
-        }
-    }
-
-    fn route_driver_event(&mut self, cfg: &Value, key: &str, event: session::WakeEvent) {
-        if event.reason != "turnTimeout" {
-            if event.reason == "timeout" {
-                if let Some(deadline) = self
-                    .drivers
-                    .get(key)
-                    .filter(|d| !d.sched.wc.infinite)
-                    .and_then(|d| d.sched.wc.sleep_until.clone())
-                {
-                    self.timeout_deadlines.insert(key.to_string(), deadline);
-                }
-            }
-            self.ready.push((key.to_string(), event.reason));
-            return;
-        }
-        if self.active.get(key).is_some_and(Active::preserve_harness_cap) {
-            // The worker refuses an expired admission or settles the running harness's cap.
-            return;
-        }
-        let dispatch = self.active.get(key).map(|active| (active.token.as_str(), &active.minted));
-        let cancelled = pipeline::Pipeline::cancel_reserved2_cap(&self.context, cfg, key, dispatch);
-        match cancelled {
-            Ok(cancelled) => {
-                if let Some(token) = cancelled.token {
-                    self.tokens.insert(key.to_string(), token);
-                }
-                if let Some(error) = cancelled.stop_error {
-                    // DSH may never end this turn: the collector is aborted after a fixed headroom.
-                    let abort_at = (crate::now_ms() as i64).saturating_add(crate::wake::COLLECTOR_HEADROOM_MS);
-                    if let Some(active) = self.active.get_mut(key) {
-                        active.cap_abort_at.get_or_insert(abort_at);
-                    }
-                    println!("[reserved2] {key} turn cap: stopping the DSH turn failed: {error}");
-                }
-            }
-            Err(error) => println!("[reserved2] {key} turn cap cancellation failed: {error}"),
-        }
-    }
-
-    /// Read state and the turn's publication together. Both token adoption and
-    /// invalidation/admission must use this observation, even across repeated rotations.
-    fn observe_turn_epoch(&mut self, key: &str) -> Result<(Value, bool), String> {
-        let active = self.active.get(key).filter(|a| a.mode_stamp == self.mode_stamp);
-        #[cfg(test)]
-        if active.is_some_and(|a| a.minted.try_lock().is_err()) {
-            if let Some(hook) = self.epoch_contended_hook.take() { let _ = hook.send(()); }
-        }
-        let minted = active.map(|a| a.minted.lock().unwrap_or_else(|p| p.into_inner()));
-        let doc = self.state_doc()?;
-        let current = doc
-            .conversation(key)
-            .and_then(|c| c.token().map(str::to_string))
-            .unwrap_or_default();
-        let valid = doc.reset_epoch() == self.reset_stamp && !current.is_empty();
-        let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current.as_str()));
-        if valid && published {
-            self.tokens.insert(key.to_string(), current.clone());
-        }
-        let in_turn = valid && (active.is_some_and(|a| a.token == current || published)
-            || self.recovered.get(key).is_some_and(|(_, owned)| owned == &current));
-        Ok((doc.into_value(), in_turn))
-    }
-
-    /// Queue a wake that cannot be dispatched while DSH is down. A full conversation drops its oldest wake
-    /// (`dsh_health::QUEUE_MAX` cap); the messages themselves stay in the conversation state and are served by the wakes that remain.
-    fn park_for_dsh(&mut self, key: &str, now: i64, reason: String) {
-        if let Some((_, dropped)) = self.dsh_wait.push(key, now, reason) {
-            println!("[reserved2] {key} 等待 DSH 的唤醒已满（{}），丢弃最早的一条（{dropped}）", crate::dsh_health::QUEUE_MAX);
-            crate::recovery_log::record(
-                &self.context,
-                crate::run_record::Trigger::Turn,
-                crate::run_record::Component::Queue,
-                "dropped-oldest",
-                crate::run_record::Outcome::Failed,
-                &format!("{key}: queue of {} waiting wakes is full", crate::dsh_health::QUEUE_MAX),
-            );
-        }
-    }
-
-    fn taken(&self, key: &str) -> bool {
-        self.groups.iter().any(|k| k == key)
-    }
-
-    /// Ticket 33: a Schedule store error is logged at most once a minute (the hub ticks every 500 ms).
-    fn log_schedule_error(&mut self, what: &str, error: &crate::schedule::StoreError, now: i64) {
-        if now.saturating_sub(self.schedule_log_at) >= 60_000 {
-            self.schedule_log_at = now;
-            println!("[reserved2] schedule {what}: {}", error.message());
-        }
-    }
-
-    /// Ticket 33: apply the console's timer cancels. Runs before the timers are pumped, so a timer cancelled before it
-    /// fell due never fires in the tick that takes its cancel. A cancel applies only to the timer the owner saw (same
-    /// `timer_at`); one that fired or was re-armed meanwhile is left alone. A reach-out cancel skips that chance.
-    fn apply_timer_cancels(&mut self, now: i64) -> bool {
-        let cancels = match crate::schedule::ScheduleStore::new(&self.context).take_timer_cancels(now) {
-            Ok(cancels) => cancels,
-            Err(error) => {
-                self.log_schedule_error("cancels", &error, now);
-                return false;
-            }
-        };
-        for cancel in cancels {
-            let Some(d) = self.drivers.get_mut(&cancel.conversation) else { continue };
-            match cancel.kind {
-                crate::schedule::TimerKind::ReplyCheck => {
-                    if d.sched.reply_check_at == Some(cancel.timer_at) {
-                        d.sched.reply_check_at = None;
-                    }
-                }
-                crate::schedule::TimerKind::ReachOut => d.skip_proactive(cancel.timer_at),
-                crate::schedule::TimerKind::Sleep => {}
-            }
-        }
-        true
-    }
-
-    /// Fire due timers, after applying the console's cancels (in that order). When the cancels cannot be read, the due
-    /// reply checks and reach-outs wait for a tick whose cancels can be read, so a cancelled one never fires.
-    fn pump_timers(&mut self, cfg: &Value, now: i64) {
-        let cancels_ok = self.apply_timer_cancels(now);
-        let deferred: Vec<(String, Option<i64>, Option<i64>)> = if cancels_ok {
-            Vec::new()
-        } else {
-            self.drivers
-                .iter_mut()
-                .filter_map(|(key, d)| {
-                    let reply = d.sched.reply_check_at.filter(|at| *at <= now);
-                    let proactive = d.sched.proactive_at.filter(|at| *at <= now);
-                    if reply.is_none() && proactive.is_none() {
-                        return None;
-                    }
-                    if reply.is_some() {
-                        d.sched.reply_check_at = None;
-                    }
-                    if proactive.is_some() {
-                        d.sched.proactive_at = None;
-                    }
-                    Some((key.clone(), reply, proactive))
-                })
-                .collect()
-        };
-        for (key, e) in session::pump_all(&mut self.drivers, now) {
-            self.route_driver_event(cfg, &key, e);
-        }
-        for (key, reply, proactive) in deferred {
-            let Some(d) = self.drivers.get_mut(&key) else { continue };
-            if reply.is_some() && d.sched.reply_check_at.is_none() {
-                d.sched.reply_check_at = reply;
-            }
-            if proactive.is_some() && d.sched.proactive_at.is_none() {
-                d.sched.proactive_at = proactive;
-            }
-        }
-    }
-
-    /// Ticket 33: publish this hub's in-memory timers for the Schedule page, then claim due reminders for idle
-    /// conversations. A conversation is not idle while DSH is down (unless a CLI is pinned for it) or while a wake of it
-    /// is queued, parked for DSH, held or waiting for a retry: its reminder stays due and runs once, late, when the
-    /// conversation is free, so an outage never piles up a burst of missed repeats.
-    fn sync_schedule(&mut self, cfg: &Value, suspended: bool, now: i64) {
-        let store = crate::schedule::ScheduleStore::new(&self.context);
-        let mut timers = Vec::new();
-        for (key, d) in &self.drivers {
-            if !d.sched.wc.infinite {
-                if let Some(at) = d.sched.wc.sleep_until.as_deref().and_then(crate::wake::parse_iso_ms) {
-                    timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::Sleep, at });
-                }
-            }
-            if let Some(at) = d.sched.reply_check_at {
-                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReplyCheck, at });
-            }
-            if let Some(at) = d.sched.proactive_at {
-                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReachOut, at });
-            }
-        }
-        if let Err(error) = store.publish_timers(timers, now) {
-            self.log_schedule_error("timers", &error, now);
-        }
-        if suspended {
-            return;
-        }
-        let dsh_down = crate::dsh_health::is_down(&self.context);
-        let idle: std::collections::HashSet<String> = self
-            .drivers
-            .iter()
-            .filter(|(key, d)| {
-                let key = key.as_str();
-                self.taken(key)
-                    && social_state::inbound_admitted(cfg, key)
-                    && (!dsh_down || !wake_needs_dsh(&self.context, cfg, key))
-                    && !self.active.contains_key(key)
-                    && !self.recovered.contains_key(key)
-                    && !self.maintenance.contains_key(key)
-                    && !d.sched.is_busy(now)
-                    && !self.ready.iter().any(|(queued, _)| queued.as_str() == key)
-                    && self.dsh_wait.len(key) == 0
-                    && !self.held.contains_key(key)
-                    && !self.retries.contains_key(key)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let zone = crate::local_time::configured_zone(cfg);
-        match store.claim_due(now, &zone, |key| idle.contains(key)) {
-            Ok(items) => {
-                for item in items {
-                    println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);
-                    let reason = format!("{}{}", crate::schedule::REMINDER_REASON, item.id);
-                    self.ready.push((item.conversation, reason));
-                }
-            }
-            Err(error) => self.log_schedule_error("claim", &error, now),
-        }
-    }
-
-    fn record(&self, name: &str, value: &Value) -> Result<(), String> {
-        crate::append_runtime_json_line(&self.context, name, value).map_err(|e| e.to_string())
-    }
-
-    /// Cancel each running turn's own DSH session (captured when the turn learned it). A session
-    /// that replaced it meanwhile (a new turn after a switch) is never touched; a turn that has no
-    /// session yet cannot bind one across the change (`Pipeline::ensure_session`).
-    fn cancel_running(&self, cfg: &Value, when: &str) {
-        for (key, active) in &self.active {
-            let Some(session) = active.session() else { continue };
-            if let Err(error) = pipeline::Pipeline::new_with_runtime(&self.context, cfg, true).and_then(|mut p| p.cancel_session(key, &session)) {
-                println!("[reserved2] {key} {when}取消在途回合失败：{error}");
-            }
-        }
-    }
-
-    async fn adopt_mode(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
-        let raw = self
-            .context
-            .read_optional_text(RuntimeArea::Data, "mode.json")
-            .map_err(|e| e.to_string())?;
-        social_state::validate_mode_text(raw.as_deref()).map_err(|e| e.to_string())?;
-        let stamp = raw.unwrap_or_default();
-        let reset = self.rotation_state(cfg, "guard-read", now)?["resetEpoch"].clone();
-        if reset != self.reset_stamp {
-            // The console already stopped DSH work, cancelled the ledger turns and removed every
-            // token; nothing queued or held here survives. A running turn stays attached, as on a
-            // mode change: it is cancelled, ends through the normal path (its token is gone, so
-            // it is not retried and its ingress is settled then), and no second turn of its
-            // conversation starts while it runs.
-            self.reset_stamp = reset;
-            self.drop_everything(now).await?;
-            self.cancel_running(cfg, "重置后");
-
-            self.record(
-                "logs/rbridge-live.jsonl",
-                &json!({"ts":now,"reason":"socialV2-reset","action":"invalidated"}),
-            )?;
-        }
-        if stamp != self.mode_stamp {
-            self.mode_stamp = stamp;
-            self.drop_everything(now).await?;
-            self.cancel_running(cfg, "模式切换后");
-            self.record(
-                "logs/rbridge-live.jsonl",
-                &json!({"ts":now,"reason":"mode-changed","action":"invalidated"}),
-            )?;
-        }
-        Ok(())
-    }
-
-    pub async fn handle(
-        &mut self,
-        ev: &crate::Event,
-        raw: &str,
-        replayed: bool,
-        self_id: i64,
-        nick: &str,
-        cards: &HashMap<i64, String>,
-    ) -> Result<(), String> {
-        let cfg = self.context.load_config().map_err(|e| e.to_string())?;
-        self.handle_with_config(cfg, ev, raw, replayed, self_id, nick, cards).await
-    }
-
-    /// #192 (F3): `handle` with the configuration the caller read for this event: the main loop reads it once, holds
-    /// the event while it cannot, and hands the same read here, so the gate and the handling never see two reads.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn handle_with_config(
-        &mut self,
-        cfg: Value,
-        ev: &crate::Event,
-        raw: &str,
-        replayed: bool,
-        self_id: i64,
-        nick: &str,
-        cards: &HashMap<i64, String>,
-    ) -> Result<(), String> {
-        self.adopt_mode(&cfg, crate::now_ms() as i64).await?;
-        self.refresh_recovered(&cfg, crate::now_ms() as i64).await?;
-        let key = match (ev.post_type.as_str(), ev.message_type.as_str()) {
-            ("message", "group") => ev.group_id.map(|id| format!("group:{id}")),
-            ("message", "private") => ev.user_id.map(|id| format!("private:{id}")),
-            ("notice", _) if ev.sub_type == "poke" => {
-                ev.group_id.map(|id| format!("group:{id}")).or_else(|| {
-                    ev.user_id
-                        .or(ev.sender_id)
-                        .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id))
-                        .map(|id| format!("private:{id}"))
-                })
-            }
-            _ => None,
-        };
-        // #186: this event's configuration decides (allow and deny); `taken` is the `--live-groups` list of this process.
-        let Some(key) = key.filter(|k| self.taken(k) && social_state::inbound_admitted(&cfg, k)) else {
-            return Ok(());
-        };
-        let is_poke = ev.sub_type == "poke";
-        let inbound_text::Rendered { text: rendered_text, plain, quote_self, at_self } = if is_poke {
-            inbound_text::Rendered { text: String::new(), plain: String::new(), quote_self: false, at_self: false }
-        } else {
-            self.render(&cfg, &key, &ev.message, self_id)
-        };
-        let body = if is_poke && plain.is_empty() {
-            ev.raw_message.clone()
-        } else {
-            plain.clone()
-        };
-        if let Some(m)=self.maintenance.get(&key) {m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);}
-        let now = crate::now_ms() as i64;
-        let inbound_key = inbound::event_key(
-            &key,
-            &ev.post_type,
-            crate::event_message_id(ev).as_deref(),
-            raw,
-        );
-        if !replayed
-            && self
-                .journal
-                .record_received(inbound_key.clone(), key.clone(), raw.to_string(), now)
-                .await?
-                == inbound::Receipt::Duplicate
-        {
-            return Ok(());
-        }
-        // Messages with no words of their own that do not quote the bot (e.g. quoting someone else or whitespace)
-        // are settled without storage.
-        if !is_poke && plain.is_empty() && !quote_self {
-            self.journal.mark_handled(vec![inbound_key], now).await?;
-            return Ok(());
-        }
-        // #170: the voice record of an opted-in conversation is read as its local transcript in place of the `[语音]`
-        // label (`voice_stt`); without one the label stays. The transcript goes to the stored message and the model
-        // only: the activity log (`preview`) keeps the label.
-        let activity_text = rendered_text.clone();
-        let (rendered_text, plain, body) = match crate::voice_stt::for_message(&self.context, &cfg, &key, &inbound_key, &ev.message).await {
-            Some(label) => {
-                let plain = crate::voice_stt::apply(&plain, &label);
-                (crate::voice_stt::apply(&rendered_text, &label), plain.clone(), plain)
-            }
-            None => (rendered_text, plain, body),
-        };
-        let sender = ev
-            .sender
-            .as_ref()
-            .map(|s| {
-                if s.card.is_empty() {
-                    &s.nickname
-                } else {
-                    &s.card
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_else(|| {
-                ev.user_id
-                    .or(ev.sender_id)
-                    .map(|id| id.to_string())
-                    .unwrap_or_default()
-            });
-        let text = if ev.sub_type == "poke" {
-            format!(
-                "[拍一拍] {sender} 拍了拍 {}",
-                if ev.target_id == Some(self_id) {
-                    "你".into()
-                } else {
-                    ev.target_id.map(|id| id.to_string()).unwrap_or_default()
-                }
-            )
-        } else {
-            rendered_text
-        };
-        let (stored_text, stored_plain, stored_tail) = if is_poke {
-            let text = crate::social_mem::truncate_text(&text, 200);
-            (text.clone(), text.clone(), text)
-        } else {
-            inbound_text::stored_texts(&text, &plain)
-        };
-        // The previews above are all most reads show; a longer message keeps its readable full text
-        // for `qq_get_message_detail` (model views never carry it).
-        let full = if is_poke { None } else { inbound_text::stored_full_text(&text, inbound_text::full_text_cap(&cfg)) };
-        let (media, forward_ids) = crate::forward_fmt::collect_segment_meta(ev.message.as_array().map(Vec::as_slice).unwrap_or(&[]));
-        // Private messages store sender as `'私聊'` (display names apply only to groups);
-        // `record_reserved2_incoming` adds `ownerLabel` for the owner (`String(cfg.ownerQQ ?? '')`).
-        let stored_sender = if !is_poke && key.starts_with("private:") { "私聊".to_string() } else { sender.clone() };
-        let owner_qq = cfg.get("ownerQQ").filter(|v| !v.is_null()).map(crate::aux_text::js_string).unwrap_or_default();
-        let is_owner = ev.user_id.map(|id| id.to_string()).is_some_and(|id| id == owner_qq);
-        let owner_label = if is_owner { format!("管理员（ownerQQ {owner_qq}）") } else { String::new() };
-        let neutral = !is_poke && inbound_text::quiet_neutral(&ev.message);
-        // Bridge hint for the model, classified against the conversation before this message.
-        // An unreadable state only loses the exchange evidence; the message is still recorded.
-        let before = self.state().unwrap_or_else(|error| {
-            println!("[reserved2] {key} 来信归类读取会话失败（按无交流记录处理）：{error}");
-            Value::Null
-        });
-        let poke = is_poke.then(|| ev.target_id == Some(self_id));
-        let for_you = crate::question::ingress_for_you(ev, &key, poke, quote_self, at_self,
-            !is_poke && crate::names_self(ev, &body.to_lowercase(), nick, cards),
-            &before["conversations"][&key], &cfg, now);
-        let mut message = json!({"messageId":crate::event_message_id(ev), "sender":stored_sender, "userId":ev.user_id.or(ev.sender_id).map(|id| id.to_string()), "text":stored_text, "plain":stored_plain, "tail":stored_tail, "quoteTargetIsSelf":quote_self, "atSelf":at_self, "quietNeutral":neutral, "isSelf":false, "isOwner":is_owner, "ownerLabel":owner_label, "time":now, "hasMedia":!media.is_empty(), "media":media, "hasForward":!forward_ids.is_empty(), "forwardIds":forward_ids,
-            "forYou":for_you.is_some(), "forYouReason":for_you.unwrap_or(crate::question::NOT_FOR_YOU)});
-        if let Some((full_text, chars)) = full {
-            message["fullText"] = json!(full_text);
-            message["textChars"] = json!(chars);
-            message["textTruncated"] = json!(true);
-        }
-        let seq =
-            social_state::record_reserved2_incoming(&self.context, &cfg, &key, &inbound_key, message)?;
-        if ev.post_type == "message" && ev.message_type == "group" && cfg.pointer("/slang/enabled") != Some(&json!(false)) {
-            crate::feed_slang(&self.slang, true, &cfg, &key, &sender, &body);
-        }
-        let (state, in_turn) = self.observe_turn_epoch(&key)?;
-        let conv = &state["conversations"][&key];
-        let preview = crate::activity::slice(if is_poke { &text } else { &activity_text }, 80);
-        // The activity line belongs to the event's first arrival: a journal replay after a restart
-        // must not log it a second time.
-        if is_poke && !replayed {
-            crate::activity::append(&self.context, &format!("{key} 拍一拍事件：{preview}"));
-        }
-        let muted = crate::group_mute::active(&self.context, &key).is_some();
-        if muted || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) {
-            if !is_poke && !replayed {
-                crate::activity::append(
-                    &self.context,
-                    &if muted {
-                        format!("{key} [reserved2] 当前所在群聊正处于禁言阶段，消息已记入待阅档案而暂不唤起：{preview}")
-                    } else if state["paused"] == true {
-                        format!("{key} [reserved2] 当前会话的自动处理处于暂停状态，来信仅作留存记档而暂不唤起：{preview}")
-                    } else {
-                        format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}")
-                    },
-                );
-            }
-            self.journal.mark_handled(vec![inbound_key], now).await?;
-            return Ok(());
-        }
-        let token = crate::conversation_state::Conversation::from_value(conv)
-            .and_then(|c| c.token().map(str::to_string))
-            .unwrap_or_default();
-        if self.tokens.get(&key).is_some_and(|old| old != &token) {
-            self.invalidate_key(&key, now).await?;
-        }
-        self.tokens.insert(key.clone(), token);
-        self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
-        self.synced
-            .entry(key.clone())
-            .or_insert_with(|| session::WakeSync::of(&conv["wakeConfig"]));
-        let mut tr: crate::Triggers = serde_json::from_value(conv["wakeConfig"]["triggers"].clone()).unwrap_or_default();
-        // The persona's names wake her like keywords, except the ones she dropped (`wake_words.rs`).
-        tr.keywords = crate::wake_words::effective(&self.context, &key, &tr.keywords, &tr.drop_names);
-        // Do not even evaluate probability or question triggers for an active conversation.
-        // Urgent candidates survive only if no later read covers them before completion.
-        let (mut wake, mut reason) = in_turn_decision(in_turn, at_self, is_owner && ev.post_type == "message", &owner_qq)
-            .unwrap_or_else(|| crate::decide(ev, &body, at_self || quote_self, nick, cards, &tr,
-                crate::question::directed(ev, &body, quote_self, conv, &cfg, now)));
-        if !in_turn && social_state::claim_first_wake(&self.context, &cfg, &key)? {
-            wake = true;
-            reason = "bootstrap".into();
-        }
-        if !in_turn && (is_owner || at_self) && !wake {
-            wake = true;
-            reason = if at_self {"atMention".into()} else {format!("speaker:{owner_qq}")};
-        }
-        let driver = self.drivers.entry(key.clone()).or_insert_with(|| {
-            session::Driver::new(
-                session::scheduler_from_state(crate::wake_cfg_of(&cfg), conv),
-                crate::text_seed(&key, None),
-            )
-        });
-        if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
-            driver.adopt_wake_config(session::wake_config_from_json(Some(&conv["wakeConfig"])), now);
-            self.synced.insert(key.clone(), next);
-        }
-        driver.sched.last_incoming_at = now;
-        driver.sched.prompt_running = self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key);
-        self.record(
-            "logs/rbridge-live.jsonl",
-            &json!({"ts":now,"key":key,"shouldWake":wake,"reason":reason,"shadow":false}),
-        )?;
-        if wake {
-            self.retries.remove(&key);
-            self.failures.remove(&key);
-            self.queued_messages.entry(key.clone()).or_default().push((seq, inbound_key.clone()));
-            self.awaiting
-                .entry(key.clone())
-                .or_default()
-                .push(inbound_key);
-        } else {
-            self.journal.mark_handled(vec![inbound_key], now).await?;
-        }
-        let (events, preempted) = {
-            let driver = self.drivers.get_mut(&key).unwrap();
-            let events = driver.apply(session::Input::Incoming { reason: wake.then_some(reason), seq, at_ms: now, neutral, urgent: is_owner || at_self });
-            (events, driver.preempted.take().is_some())
-        };
-        for event in events { self.route_driver_event(&cfg, &key, event); }
-        let harness = self.active.get(&key).filter(|active| active.uses_harness());
-        if let Some(active) = harness.filter(|_| preempted) {
-            // Invalidate only this turn. Its runner observes the change and remains
-            // attached until any started handler has durably settled.
-            if let Err(error) = pipeline::revoke_reserved2_epoch(
-                &self.context, &key, &active.admitted_token(), Some(&active.minted),
-            ) {
-                println!("[reserved2] {key} preemption revocation failed: {error}");
-            }
-        } else if preempted {
-            let cancelled = pipeline::Pipeline::new_with_runtime(&self.context, &cfg, true)
-                .and_then(|mut control| control.cancel_with_reason(&key, "superseded"));
-            match cancelled {
-                Ok(cancelled) => {
-                    if let Some(token) = cancelled.token {
-                        self.tokens.insert(key.clone(), token);
-                    }
-                    if let Some(error) = cancelled.stop_error {
-                        println!("[reserved2] {key} preemption: stopping the DSH turn failed: {error}");
-                    }
-                }
-                Err(error) => println!("[reserved2] {key} preemption cancellation failed: {error}"),
-            }
-        }
-
-        if !is_poke && !replayed {
-            crate::activity::append(&self.context, &format!("{key} [reserved2] 收到一则新的会话来信，已经顺手记入未读待办列表以便稍后处理：{preview}"));
-        }
-        Ok(())
-    }
-
-    async fn refresh_recovered(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
-        let doc = self.rotation_state_doc(cfg, "guard-read", now)?;
-        // An unreadable ledger cannot prove that an attached turn ended.
-        let Ok(records) = crate::turn_ledger::read_records(&self.context) else { return Ok(()) };
-        let (turns, _) = crate::turn_ledger::fold(&records);
-        let mut running = HashMap::new();
-        if social_state::mode(&self.context) == "reserved2" && !doc.paused() {
-            for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
-                let conv = doc.conversation(&turn.key);
-                let token = conv.as_ref().and_then(|c| c.token()).unwrap_or("");
-                if !token.is_empty() && social_state::inbound_admitted(cfg, &turn.key)
-                    && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
-                    && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
-                    running.insert(turn.key.clone(), (turn.id.clone(), token.to_string()));
-                }
-            }
-        }
-        let ended: Vec<_> = self.recovered.iter().filter(|(key, owned)| running.get(*key) != Some(*owned))
-            .map(|(key, owned)| (key.clone(), owned.clone())).collect();
-        self.recovered = running;
-        for (key, (turn_id, token)) in ended {
-            if doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).as_deref() == Some(token.as_str())
-                && turns.iter().any(|t| t.id == turn_id && t.state == crate::turn_ledger::State::Completed) {
-                self.settle_turn_coverage(cfg, &key, &token, &turn_id, now).await?;
-            }
-            if let Some(driver) = self.drivers.get_mut(&key) {
-                driver.sched.prompt_running = false;
-                let events = driver.apply(session::Input::TurnEnd { at_ms: now });
-                for event in events.into_iter().filter(|e|e.reason != "turnTimeout") {
-                    self.route_driver_event(cfg, &key, event);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Coverage can only remove work already owned by the base queue, after success.
-    async fn settle_turn_coverage(&mut self, cfg: &Value, key: &str, token: &str, turn: &str, now: i64) -> Result<(), String> {
-        if self.queued_messages.get(key).is_none_or(Vec::is_empty) { return Ok(()); }
-        let (context, cfg, query_key, token, turn) =
-            (self.context.clone(), cfg.clone(), key.to_string(), token.to_string(), turn.to_string());
-        // Missing evidence (including console restart) preserves the base follow-up.
-        let delivered = tokio::task::spawn_blocking(move ||
-            crate::qq_tools::wake_delivered_urgent(&context, &cfg, &query_key, &token, &turn)
-        ).await.map_err(|e|e.to_string())?.unwrap_or_default();
-        let covered: Vec<_> = self.queued_messages.get(key).into_iter().flatten()
-            .filter(|(seq, _)| delivered.contains(seq)).cloned().collect();
-        if covered.is_empty() { return Ok(()); }
-        let covered_keys: std::collections::HashSet<_> = covered.iter().map(|(_, k)| k.clone()).collect();
-        self.journal.mark_handled(covered_keys.iter().cloned().collect(), now).await?;
-        if let Some(items) = self.awaiting.get_mut(key) { items.retain(|k| !covered_keys.contains(k)); }
-        if let Some(items) = self.queued_messages.get_mut(key) { items.retain(|(seq, _)| !delivered.contains(seq)); }
-        if let Some(d) = self.drivers.get_mut(key) {
-            d.sched.pending.retain(|item| crate::wake::is_timer_reason(&item.reason) || !delivered.contains(&item.seq));
-        }
-        if self.queued_messages.get(key).is_none_or(|items|items.is_empty()) {
-            self.ready.retain(|(k,reason)| k != key || crate::wake::is_timer_reason(reason) || reason == "wakeReminder");
-            if let Some(d) = self.drivers.get_mut(key) {
-                if d.sched.pending_wake_reason.as_ref().is_some_and(|reason| !crate::wake::is_timer_reason(reason) && reason != "wakeReminder") {
-                    d.sched.pending_wake_at = None;
-                    d.sched.pending_wake_reason = None;
-                }
-            }
-        }
-        for (seq, _) in covered {
-            self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"seq":seq,"shouldWake":false,"reason":"covered","shadow":false}))?;
-        }
-        Ok(())
-    }
-
-    async fn maintain_sessions(&mut self, cfg: &Value, suspended: bool, now: i64) -> Result<(),String> {
-        use std::sync::atomic::Ordering;
-        for (key,m) in &self.maintenance {
-            let current=self.rotation_state(cfg,"guard-read",now)?["conversations"][key].clone();
-            if suspended || !self.taken(key) || !social_state::inbound_admitted(cfg,key)
-                || m.plan.policy != json!({"rotation":cfg.pointer("/dsh/rotation"),"cacheTtlMinutes":cfg.pointer("/dsh/cacheTtlMinutes")})
-                || ["lastIncomingAt","lastUnreadSeq","adminWakes"].iter().any(|field|current[*field]!=m.plan.guard[*field])
-                || self.ready.iter().any(|(k,_)|k==key) {
-                m.cancel.store(true,Ordering::SeqCst);
-            }
-        }
-        let done:Vec<_>=self.maintenance.iter().filter(|(_,m)|m.task.is_finished()).map(|(k,_)|k.clone()).collect();
-        for key in done {
-            // Keep the completed task owned and unconsumed if its retirement guard
-            // cannot be read. The next tick retries it even while scans are throttled.
-            let current=self.rotation_state(cfg,"retirement-read",now)?["conversations"][&key].clone();
-            let mut m=self.maintenance.remove(&key).unwrap();
-            let outcome=match m.task.await {Ok(o)=>o,Err(_)=>MaintenanceResult::Digest(crate::session_rotation::DigestResult::Pending)};
-            match outcome {
-                MaintenanceResult::Archived(result)=>{
-                    crate::session_rotation::recovery_complete(&self.context,&key);
-                    if result.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"archive");}
-                    else {crate::activity::append(&self.context,&format!("{} session rotation tokens={} digest={}",key,m.plan.input,if m.digested {"yes"} else {"no"}));}
-                }
-                MaintenanceResult::Digest(crate::session_rotation::DigestResult::Pending)=>{
-                    let (context,cfg,plan,cancel)=(self.context.clone(),cfg.clone(),m.plan.clone(),m.cancel.clone());
-                    let retry_ms=crate::session_rotation::read_retry_ms(&context,&key);
-                    m.task=tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
-                        MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg,plan,cancel).await)
-                    });
-                    self.maintenance.insert(key,m);
-                }
-                MaintenanceResult::Digest(crate::session_rotation::DigestResult::Done{ran,retire_unknown})=>{
-                    let current_typed = crate::conversation_state::Conversation::from_value(&current);
-                    if current_typed.as_ref().and_then(|c| c.token()).is_some_and(|token| token != m.plan.epoch) {
-                        crate::session_rotation::recovery_complete(&self.context,&key);
-                        continue;
-                    }
-                    if !retire_unknown && (m.cancel.load(Ordering::SeqCst) || suspended) {continue;}
-                    // Unverifiable work must lose its old token before queued ingress can
-                    // use a fresh session, even when the old DSH cancel route is broken.
-                    let guard=if retire_unknown {current} else {m.plan.guard.clone()};
-                    let guard_token = crate::conversation_state::Conversation::from_value(&guard)
-                        .and_then(|c| c.token().map(str::to_string));
-                    if retire_unknown && guard_token.as_deref().unwrap_or("") != m.plan.epoch.as_str() {continue;}
-                    let retired=social_state::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
-                    if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
-                        if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
-                        // A changed message guard or storage refusal is not permission to
-                        // reuse an unverified session. Re-plan under its retained slot.
-                        let (context,cfg,plan,cancel)=(self.context.clone(),cfg.clone(),m.plan.clone(),m.cancel.clone());
-                        m.task=tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg,plan,cancel).await)
-                        });
-                        self.maintenance.insert(key,m);
-                        continue;
-                    }
-                    match retired {
-                        Ok(Some(token))=>{
-                            self.tokens.insert(key.clone(),token);
-                            let (context,cfg,key2,sid)=(self.context.clone(),cfg.clone(),key.clone(),m.plan.sid.clone());
-                            m.digested=ran;
-                            m.task=tokio::spawn(async move {
-                                let result=tokio::task::spawn_blocking(move ||social_state::stop_and_archive_session(&context,&cfg,&key2,&sid)).await.unwrap_or_else(|e|Err(e.to_string()));
-                                MaintenanceResult::Archived(result)
-                            });
-                            self.maintenance.insert(key,m);
-                        }
-                        Ok(None)=>{},
-                        Err(_)=>{
-                            let _=crate::session_map::update_context(&self.context,&key,&m.plan.sid,&m.plan.epoch,|r| {
-                                r["rotation"]["phase"]=json!("done");
-                                r["rotation"]["attemptedTurn"]=json!(m.plan.turn_seq);
-                            });
-                            crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");
-                        }
-                    }
-                }
-            }
-        }
-        if suspended {return Ok(());}
-        let dsh_down=crate::dsh_health::is_down(&self.context);
-        if now < self.maintenance_scan_at {return Ok(());}
-        let state=self.rotation_state(cfg,"scan-state",now)?;
-        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && social_state::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
-        for key in keys {
-            if self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key) {continue;}
-            if crate::session_rotation::read_retry_at(&self.context,&key,"recovery-scan") > now {
-                return Err("session rotation read retry deferred".into());
-            }
-            let candidate=crate::session_rotation::candidate(&self.context,cfg,&key,now);
-            let Some(plan)=crate::session_rotation::rotation_read(&self.context,cfg,&key,"recovery-scan",now,candidate)? else {continue;};
-            if !plan.recovering && (dsh_down
-                || crate::turn_engine::Engine::read_choice(&self.context, cfg, &key, "reserved2").is_ok_and(|engine| !engine.uses_dsh())
-                || self.awaiting.get(&key).is_some_and(|v|!v.is_empty())
-                || self.ready.iter().any(|(k,_)|k==&key)
-                || self.retries.contains_key(&key) || self.held.contains_key(&key)
-                || pipeline::pinned_cli_backend(cfg,&key).is_some()) {continue;}
-            let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (context,cfg2,plan2,cancel2)=(self.context.clone(),cfg.clone(),plan.clone(),cancel.clone());
-            let task=tokio::spawn(async move {MaintenanceResult::Digest(crate::session_rotation::digest(context,cfg2,plan2,cancel2).await)});
-            self.maintenance.insert(key,Maintenance{plan,cancel,task,digested:false});
-        }
-        // A failed recovery read must be retried before the next tick can dispatch.
-        self.maintenance_scan_at=now+5000;
-        Ok(())
-    }
-
-    pub async fn tick(&mut self, nick: &str, self_id: i64) -> Result<(), String> {
-        let now = crate::now_ms() as i64;
-        let cfg = self.context.load_config().map_err(|e| e.to_string())?;
-        // No scheduler error spam or dispatch while a failed recovery read is cooling down.
-        if self.maintenance.keys().chain(self.drivers.keys()).any(|key|
-            ["guard-read", "retirement-read", "scan-state", "recovery-scan"].iter()
-                .any(|step| crate::session_rotation::read_retry_at(&self.context,key,step) > now)) {
-            return Ok(());
-        }
-        self.adopt_mode(&cfg, now).await?;
-        self.refresh_recovered(&cfg, now).await?;
-        let state = self.rotation_state(&cfg,"guard-read",now)?;
-        let suspended = social_state::mode(&self.context) != "reserved2"
-            || state["paused"] == true
-            || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
-        self.maintain_sessions(&cfg,suspended,now).await?;
-        self.drain_rollback_pending();
-        self.drain_rearm_pending(&cfg);
-        let mut state=self.state()?;
-        let suspended = suspended || state["paused"] == true;
-        #[cfg(test)]
-        if let Some(hook) = self.tick_snapshot_hook.take() {
-            let (done, finished) = tokio::sync::oneshot::channel();
-            let _ = hook.send(done);
-            let _ = finished.await;
-        }
-        let keys: Vec<String> = self.drivers.keys().cloned().collect();
-        let mut invalid = Vec::new();
-        for key in keys {
-            // Never compare a newly published token against tick's earlier snapshot.
-            // A second owned rotation can finish before this lock is acquired.
-            (state, _) = self.observe_turn_epoch(&key)?;
-            let doc = crate::conversation_state::SocialDocument::from_value(state.clone())
-                .map_err(|(_, e)| e)?;
-            let predicate = if !self.taken(&key) { "notTaken" }
-                else if !social_state::inbound_admitted(&cfg, &key) { "notAllowed" }
-                else if !doc.has_conversation(key.as_str()) { "missing" }
-                else if self.tokens.get(&key).is_some_and(|old| {
-                    old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
-                }) { "tokenChanged" }
-                // Only a batch already refused by the claim can survive a suspended tick.
-                else if suspended && !self.suspended_claims.contains(&key) { "suspended" }
-                else { continue; };
-            invalid.push((key, predicate));
-        }
-        for (key, predicate) in invalid {
-            self.invalidate_key(&key, now).await?;
-            self.record(
-                "logs/rbridge-live.jsonl",
-                &json!({"ts":now,"key":key,"reason":"settings-invalidated","predicate":predicate}),
-            )?;
-        }
-        if social_state::mode(&self.context) == "reserved2"
-            && state["paused"] != true
-            && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
-        {
-            if let Some(conversations) = state["conversations"].as_object() {
-                for (key, conv) in conversations {
-                    if self.taken(key) && social_state::inbound_admitted(&cfg, key) {
-                        self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
-                        self.drivers.entry(key.clone()).or_insert_with(|| {
-                            session::Driver::new(
-                                session::scheduler_from_state(crate::wake_cfg_of(&cfg), conv),
-                                crate::text_seed(key, None),
-                            )
-                        });
-                    }
-                }
-            }
-        }
-        crate::sync_wake_configs(
-            &self.context,
-            &cfg,
-            &state,
-            &mut self.drivers,
-            &mut self.synced,
-            now,
-        );
-        for (key, d) in self.drivers.iter_mut() {
-            let conv = &state["conversations"][key];
-            let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
-            // Recovery may restore a consumed lease after this driver was initialized. This is
-            // not a tool configuration change, so confirmedAt alone cannot detect it. Local
-            // retries/holds already own their deadline and must retain their bounded backoff.
-            if !self.active.contains_key(key) && !self.held.contains_key(key)
-                && !self.retries.contains_key(key) && !self.dsh_wait.per_key.contains_key(key)
-            {
-                sync_persisted_driver_deadline(d, conv, persisted_wake, now);
-            }
-            let mut next_cfg = crate::wake_cfg_of(&cfg);
-            if self.active.contains_key(key) {
-                next_cfg.turn_hard_cap_ms = d.sched.cfg.turn_hard_cap_ms;
-                next_cfg.turn_ceiling_ms = d.sched.cfg.turn_ceiling_ms;
-            }
-            if d.last_rate_limited.is_some()
-                && (d.sched.cfg.max_wake_per_minute != next_cfg.max_wake_per_minute
-                    || d.sched.cfg.max_wake_per_hour != next_cfg.max_wake_per_hour)
-            {
-                d.sched.pending_wake_at = Some(now);
-            }
-            if d.sched.cfg.proactive_enabled != next_cfg.proactive_enabled
-                || d.sched.cfg.proactive_min_ms != next_cfg.proactive_min_ms
-                || d.sched.cfg.proactive_max_ms != next_cfg.proactive_max_ms
-            {
-                d.sched.proactive_at = None;
-            }
-            d.sched.cfg = next_cfg;
-            d.refresh_observed_state(conv, now);
-            self.tokens
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    crate::conversation_state::Conversation::from_value(conv)
-                        .and_then(|c| c.token().map(str::to_string))
-                        .unwrap_or_default()
-                });
-            d.arm_proactive_now(now);
-            d.sched.prompt_running = self.active.contains_key(key) || self.recovered.contains_key(key) || self.maintenance.contains_key(key);
-        }
-        #[cfg(test)]
-        if let Some(finished) = self.collector_finished_hook.take() { let _ = finished.await; }
-        for (key, active) in self.active.iter().filter(|(_, a)| a.cap_abort_at.is_some_and(|at| now >= at)) {
-            if !active.task.is_finished() {
-                println!("[reserved2] {key} turn cap: DSH did not confirm the stop; aborting the collector");
-                active.task.abort();
-            }
-        }
-        let ended: Vec<String> = self
-            .active
-            .iter()
-            .filter(|(_, a)| a.task.is_finished())
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in ended {
-            // Observe publication again before releasing the wake or replaying queued work.
-            let (state, owned) = self.observe_turn_epoch(&key)?;
-            let active = &self.active[&key];
-            if owned && active.route() == pipeline::Reserved2Route::ExpiredBeforeAdmission
-                && active.reason == "timeout" && active.previous["wakeConfig"]["sleepUntil"].is_string()
-            {
-                // A wake refused at the gate never got to consume its durable timer claim.
-                let token = crate::conversation_state::SocialDocument::from_value(state.clone())
-                    .ok()
-                    .and_then(|doc| doc.conversation(&key))
-                    .and_then(|c| c.token().map(str::to_string))
-                    .unwrap_or_default();
-                social_state::retire_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
-            }
-            let active = self.active.remove(&key).unwrap();
-            let admitted_token = active.admitted_token();
-            let route = active.route();
-            let uses_cli = route == pipeline::Reserved2Route::Cli;
-            let DispatchResult { result, unsubmitted, failure_parks } = match active.task.await {
-                Ok(ended) => ended,
-                // Our own abort after a failed cap stop: the cap cancellation already settled the turn.
-                Err(error) if error.is_cancelled() && active.cap_abort_at.is_some() =>
-                    DispatchResult::new(Err("回合已取消：turnTimeout（DSH 未确认停止，已中止收集）".to_string()), false),
-                Err(error) => return Err(error.to_string()),
-            };
-            println!("[reserved2] {key} turn ended: {result:?}");
-            // The pipeline already wrote the turn-error line and told the administrator when the turn ended in a model error.
-            let model_error = pipeline::take_model_error(&self.context, &key);
-            let token_res = social_state::token(&self.context, &key);
-            let mode_res = social_state::mode_checked(&self.context);
-            let current_token = token_res
-                .as_ref()
-                .ok()
-                .and_then(|t| t.as_deref())
-                .unwrap_or("")
-                .to_string();
-            let in_scope = mode_res.as_ref().is_ok_and(|m| m == "reserved2")
-                && social_state::inbound_admitted(&cfg, &key)
-                && self.mode_stamp == active.mode_stamp;
-            let still_valid = in_scope && current_token == admitted_token;
-            let owned_token = current_token == admitted_token
-                || active.minted.lock().unwrap_or_else(|p|p.into_inner()).as_deref() == Some(current_token.as_str());
-            let owned_in_scope = in_scope && owned_token;
-            let completed_in_scope = result.is_ok() && owned_in_scope;
-            let clean_sleep = result.is_ok() && crate::turn_ledger::read_records(&self.context).ok().is_some_and(|records| {
-                let epoch = crate::send_outbox::token_epoch(&admitted_token);
-                crate::turn_ledger::fold(&records).0.iter().any(|t|t.key == key && t.begun_at >= active.at
-                    && t.epochs.contains(&epoch) && t.state == crate::turn_ledger::State::Completed && t.outcome_reason == "observationSleep")
-            });
-            if clean_sleep {
-                if completed_in_scope {
-                    social_state::rearm_observation_sleep(&self.context, &cfg, &key, &current_token, now)?;
-                }
-                println!("[reserved2] observation budget ended; keeping wake config");
-            }
-            if completed_in_scope && !uses_cli {
-                if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
-                    let (turns, _) = crate::turn_ledger::fold(&records);
-                    let epoch = crate::send_outbox::token_epoch(&admitted_token);
-                    if let Some(turn) = turns.iter().rev().find(|t| t.key == key && t.begun_at >= active.at
-                        && t.epochs.contains(&epoch) && t.state == crate::turn_ledger::State::Completed) {
-                        self.settle_turn_coverage(&cfg, &key, &current_token, &turn.id, now).await?;
-                    }
-                }
-            }
-            let held = still_valid
-                && result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|e| e.starts_with(pipeline::HELD_ERROR_PREFIX));
-            let access_refused = result.as_ref().is_err_and(|error| pipeline::is_dsh_access_refusal(error));
-            if still_valid && !held && !access_refused {
-                if let (Err(message), None) = (&result, &model_error) {
-                    let shown = if crate::pipeline::configured_outbound_violation(&cfg, message, &[]).is_some() {
-                        "（涉及敏感内容，已遮蔽）".to_string()
-                    } else {
-                        crate::activity::slice(message, 500)
-                    };
-                    crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&shown, 80)));
-                }
-            }
-            let retry = still_valid && result.is_err() && unsubmitted && !held && !access_refused
-                && route != pipeline::Reserved2Route::ExpiredBeforeAdmission;
-            // The prompt never reached DSH and DSH is down: wait for it (bounded) instead of burning the retries.
-            let wait_for_dsh = retry && !uses_cli && failure_parks.unwrap_or_else(|| {
-                crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key)
-            });
-            let is_reminder = active.reason == "wakeReminder";
-            let had_inbound = !active.inbound.is_empty();
-            let retry_exhausted = retry
-                && !wait_for_dsh
-                && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
-            let retire_expired_timeout = active.reason == "timeout"
-                && active.previous["wakeConfig"]["sleepUntil"].is_string()
-                && (route == pipeline::Reserved2Route::ExpiredBeforeAdmission || retry_exhausted);
-            let dropped_unadmitted = (route == pipeline::Reserved2Route::ExpiredBeforeAdmission && !held)
-                || retry_exhausted
-                || (held && had_inbound);
-            let transient_read_drop = (token_res.is_err() || mode_res.is_err())
-                && self.mode_stamp == active.mode_stamp
-                && social_state::inbound_admitted(&cfg, &key)
-                && result.is_err()
-                && unsubmitted;
-            let needs_provisional_rearm = !access_refused
-                && !is_reminder
-                && !retire_expired_timeout
-                && active.previous["wakeConfig"]["sleepRetired"] != true
-                && active.previous["wakeConfig"]["infinite"] == false
-                && (((still_valid
-                    || (owned_in_scope && route == pipeline::Reserved2Route::ExpiredBeforeAdmission))
-                    && dropped_unadmitted)
-                    || transient_read_drop);
-            if needs_provisional_rearm {
-                let rearm_token = if owned_in_scope {
-                    current_token.clone()
-                } else {
-                    active
-                        .minted
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone()
-                        .unwrap_or_else(|| admitted_token.clone())
-                };
-                self.rearm_pending.insert(
-                    key.clone(),
-                    (active.at, active.reason.clone(), active.previous.clone(), rearm_token),
-                );
-            }
-            if held || retry {
-                let retire_token = (retry_exhausted
-                    && active.reason == "timeout"
-                    && active.previous["wakeConfig"]["sleepUntil"].is_string())
-                .then(|| current_token.clone());
-                if let Err(error) = run_wake_rollback(
-                    &self.context,
-                    &key,
-                    active.at,
-                    &active.previous,
-                    retire_token.as_deref(),
-                ) {
-                    println!("[reserved2] {key} turn rollback failed: {error}");
-                    self.rollback_pending.insert(
-                        key.clone(),
-                        (active.at, active.previous.clone(), retire_token),
-                    );
-                }
-                if held && !had_inbound {
-                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
-                    self.held.insert(key.clone(), active.reason.clone());
-                }
-            }
-            self.journal
-                .mark_handled(active.inbound.clone(), now)
-                .await?;
-            if wait_for_dsh {
-                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
-                let keys = active.inbound;
-                self.awaiting.entry(key.clone()).or_default().extend(keys.clone());
-                self.journal.run(move |j| j.settle_events(&keys, "received", now)).await?;
-                self.remember_timeout_deadline(&key, &active.reason, &active.previous);
-                self.park_for_dsh(&key, now, active.reason);
-            } else if retry {
-                let attempt = {
-                    let failures = self.failures.entry(key.clone()).or_default();
-                    *failures += 1;
-                    *failures
-                };
-                if attempt <= MAX_WAKE_RETRIES {
-                    self.remember_timeout_deadline(&key, &active.reason, &active.previous);
-                    self.retries.insert(
-                        key.clone(),
-                        (now + 5_000 * (1_i64 << (attempt - 1)), active.reason),
-                    );
-                    let keys = active.inbound;
-                    self.awaiting
-                        .entry(key.clone())
-                        .or_default()
-                        .extend(keys.clone());
-                    self.journal
-                        .run(move |j| j.settle_events(&keys, "received", now))
-                        .await?;
-                }
-            } else if result.is_ok() || (model_error.is_some() && !held) {
-                // Run the wake-reminder check at every turn end, a model error included.
-                if result.is_ok() {
-                    self.failures.remove(&key);
-                }
-                if (still_valid || completed_in_scope) && !clean_sleep {
-                    let records = crate::turn_ledger::read_records(&self.context)?;
-                    let started = crate::turn_ledger::fold(&records).0.into_iter().rev()
-                        .find(|turn| turn.key == key && turn.begun_at >= active.at
-                            && turn.epochs.contains(&crate::send_outbox::token_epoch(&admitted_token)))
-                        .and_then(|turn| records.iter().rev().find(|r| r["turn"] == turn.id && r["k"] == "started"))
-                        .and_then(|r| r["t"].as_i64());
-                    let miss = self.closing_misses.get(&key).copied().unwrap_or(0) + 1;
-                    let seen = self.closing_seen.get(&key).cloned().unwrap_or(Value::Null);
-                    let (remind, stamp) = social_state::complete_reserved2_turn(&self.context, &cfg, &key, &current_token, started, &seen, miss)?;
-                    self.closing_seen.insert(key.clone(), stamp);
-                    // A failed text-only CLI cannot configure its wake through MCP. Its failed
-                    // ledger/input is settled: a closing reminder must not replay that prompt.
-                    if remind && !(result.is_err() && uses_cli) {
-                        self.closing_misses.insert(key.clone(), miss);
-                        self.ready.push((key.clone(), "wakeReminder".into()));
-                    } else {
-                        self.closing_misses.remove(&key);
-                    }
-                }
-            }
-            self.drain_rollback_pending();
-            self.drain_rearm_pending(&cfg);
-            let completed_state = self.state()?;
-            if clean_sleep {
-                self.closing_seen.insert(key.clone(), completed_state["conversations"][&key]["wakeConfig"]["confirmedAt"].clone());
-                self.closing_misses.remove(&key);
-            }
-            if let Some(d) = self.drivers.get_mut(&key) {
-                let conv = &completed_state["conversations"][&key];
-                let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
-                if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
-                    d.adopt_wake_config(persisted_wake, now);
-                    self.synced.insert(key.clone(), next);
-                } else if !self.held.contains_key(&key)
-                    && !self.retries.contains_key(&key)
-                    && !self.dsh_wait.per_key.contains_key(&key)
-                {
-                    sync_persisted_driver_deadline(d, conv, persisted_wake, now);
-                }
-                d.refresh_observed_state(conv, now);
-                d.sched.prompt_running = false;
-                if held || retry {
-                    d.sched.turn_started_at = None;
-                    d.sched.pending_wake_key_at = None;
-                    d.sched.wake_times.retain(|at| *at != active.at);
-                    continue;
-                }
-                // The turn already ended: a cap that passed since the last tick must not cancel it.
-                let events: Vec<_> = d.apply(session::Input::TurnEnd { at_ms: now })
-                    .into_iter().filter(|e| e.reason != "turnTimeout").collect();
-                for e in events {
-                    self.route_driver_event(&cfg, &key, e);
-                }
-            }
-        }
-        if !self.dsh_wait.is_empty() {
-            let dsh_down = crate::dsh_health::is_down(&self.context);
-            // A new explicit CLI choice also releases that conversation while DSH stays down.
-            // Every released wake still passes the normal mode, access, pause and epoch checks.
-            let runnable: std::collections::HashSet<_> = self.dsh_wait.per_key.keys()
-                .filter(|key| !dsh_down || !wake_needs_dsh(&self.context, &cfg, key)).cloned().collect();
-            for (key, reason) in self.dsh_wait.drain_ready(|key| runnable.contains(key)) {
-                println!("[reserved2] {key} 重新投递等待中的唤醒（先核对权限与会话状态）");
-                self.ready.push((key, reason));
-            }
-        }
-        if !self.held.is_empty() {
-            let (turns, _) =
-                crate::turn_ledger::fold(&crate::turn_ledger::read_records(&self.context)?);
-            let released: Vec<String> = self
-                .held
-                .keys()
-                .filter(|k| crate::turn_ledger::blocking_turn(&turns, k).is_none())
-                .cloned()
-                .collect();
-            for key in released {
-                self.ready
-                    .push((key.clone(), self.held.remove(&key).unwrap()));
-            }
-        }
-        let retry_due: Vec<String> = self
-            .retries
-            .iter()
-            .filter(|(_, (at, _))| *at <= now)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in retry_due {
-            self.ready
-                .push((key.clone(), self.retries.remove(&key).unwrap().1));
-        }
-        // Manual wakes from the console (`POST /api/socialV2/wake`): the pending batch wake is
-        // replaced, a busy conversation buffers the reason, and a free one wakes now (rate limits still apply).
-        // One request per conversation per tick.
-        let requested: Vec<String> = state["conversations"]
-            .as_object()
-            .map(|c| c.iter().filter(|(_, v)| v["adminWakes"].as_array().is_some_and(|a| !a.is_empty())).map(|(k, _)| k.clone()).collect())
-            .unwrap_or_default();
-        for key in requested {
-            if !self.taken(&key) {
-                continue;
-            }
-            let Some(reason) = social_state::take_admin_wake(&self.context, &key)? else {
-                println!("[reserved2] {key} 手动唤醒已失效（令牌代际已变），丢弃");
-                continue;
-            };
-            if suspended || !social_state::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
-                println!("[reserved2] {key} 手动唤醒未执行：当前不允许唤醒（{reason}）");
-                continue;
-            }
-            let running = self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key);
-            let d = self.drivers.get_mut(&key).expect("checked above");
-            d.sched.pending_wake_at = None;
-            d.sched.pending_wake_reason = None;
-            d.sched.prompt_running = running;
-            if let crate::wake::Outcome::Armed = d.sched.schedule_wake(&reason, now) {
-                d.sched.pending_wake_at = Some(now);
-            }
-            println!("[reserved2] 收到后台操作指令，主动唤醒会话 {key}，原因说明：{reason}");
-        }
-        if !suspended {
-            self.pump_timers(&cfg, now);
-        }
-        self.sync_schedule(&cfg, suspended, now);
-        if suspended {
-            self.ready.retain(|(key, _)| self.suspended_claims.contains(key));
-            return Ok(());
-        }
-        for (key, reason) in std::mem::take(&mut self.ready) {
-            if let Some(m)=self.maintenance.get(&key) {
-                m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
-                self.ready.push((key,reason));
-                continue;
-            }
-            if self.active.contains_key(&key) || self.recovered.contains_key(&key) {
-                if reason == "wakeReminder" {
-                    self.ready.push((key, reason));
-                } else if let Some(d) = self.drivers.get_mut(&key) {
-                    if reason == "timeout" {
-                        self.timeout_deadlines.remove(&key);
-                    }
-                    d.sched.prompt_running = true;
-                    d.sched.schedule_wake(&reason, now);
-                }
-                continue;
-            }
-            self.suspended_claims.remove(&key);
-            if !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
-                self.timeout_deadlines.remove(&key);
-                continue;
-            }
-            if crate::group_mute::active(&self.context, &key).is_some() {
-                // #46: no wake while muted; its messages stay unread for the first wake after the mute.
-                println!("{key} [reserved2] 该群当前依然处在管理员禁言期间之内，所以这次唤醒调度已自动跳过（触发原因为 {reason}）");
-                self.timeout_deadlines.remove(&key);
-                continue;
-            }
-            if crate::dsh_health::is_down(&self.context) && wake_needs_dsh(&self.context, &cfg, &key) {
-                // DSH-dependent work waits without a call. A pinned CLI is an independent backend
-                // and must not be prevented from handling its conversation by a DSH outage.
-                println!("[reserved2] {key} 引擎眼下离线，本轮唤起暂列队等候");
-                self.park_for_dsh(&key, now, reason);
-                continue;
-            }
-            let expected_sleep = (reason == "timeout")
-                .then(|| {
-                    self.timeout_deadlines.get(&key).cloned().or_else(|| {
-                        self.drivers
-                            .get(&key)
-                            .filter(|d| !d.sched.wc.infinite)
-                            .and_then(|d| d.sched.wc.sleep_until.clone())
-                    })
-                })
-                .flatten();
-            let mut keys = Vec::new();
-            let mut claimed = None;
-            // Keep each drained job until a task or a bounded retry owns it.
-            let prepared = async {
-                if let Some((at, previous, retire_token)) = self.rollback_pending.get(&key) {
-                    run_wake_rollback(&self.context, &key, *at, previous, retire_token.as_deref())?;
-                    self.rollback_pending.remove(&key);
-                }
-                // Imported conversations can predate agent tokens. Mint their first epoch
-                // before claiming a wake; a previously nonempty epoch still invalidates normally.
-                if self.tokens.get(&key).is_some_and(String::is_empty) {
-                    let token = social_state::ensure_or_rotate(&self.context, &key, false)?;
-                    self.tokens.insert(key.clone(), token);
-                }
-                if reason != "wakeReminder" {
-                    keys = self.awaiting.get(&key).cloned().unwrap_or_default();
-                    self.journal.mark_processing(keys.clone(), now).await?;
-                    self.awaiting.remove(&key);
-                }
-                // The token the queued work was seen under: a wake never takes a token minted after it
-                // was queued (revoke and re-grant while it waited).
-                let expected = self.tokens.get(&key).filter(|t| !t.is_empty()).cloned();
-                let (previous, dispatch_token) = if reason == "wakeReminder" {
-                    let conv_typed = self.state_doc()?.conversation(&key);
-                    let token = conv_typed
-                        .as_ref()
-                        .and_then(|c| c.token())
-                        .unwrap_or("")
-                        .to_string();
-                    let conv = conv_typed
-                        .map(|c| c.to_value())
-                        .unwrap_or(Value::Null);
-                    if expected.as_ref().is_some_and(|t| *t != token) {
-                        return Err(STALE_WAKE.to_string());
-                    }
-                    (conv, token)
-                } else {
-                    crate::turn_recovery::retire_pending_startup_timeout(&self.context, &key)?;
-                    let claim = if reason == "timeout" {
-                        social_state::claim_reserved2_wake_for_deadline(
-                            &self.context,
-                            &key,
-                            &reason,
-                            now,
-                            expected.as_deref(),
-                            expected_sleep.as_deref(),
-                        )?
-                    } else {
-                        social_state::claim_reserved2_wake(
-                            &self.context,
-                            &key,
-                            &reason,
-                            now,
-                            expected.as_deref(),
-                        )?
-                    };
-                    claimed = Some(claim.clone());
-                    claim
-                };
-                let prompt = if reason == "wakeReminder" {
-                    prompt::build_reminder_with_runtime(&self.context, &key, nick, &self_id.to_string())
-                } else {
-                    prompt::build_with_runtime(&self.context, &key, &reason, nick, &self_id.to_string())
-                };
-                let cli_prompt = prompt::build_text_only_for_wake(&self.context, &key, &reason, nick, &self_id.to_string());
-                let target = crate::parse_target(&key, &cfg).map_err(|e| e.to_string())?;
-                self.record("logs/rbridge-live-wakes.jsonl", &json!({"ts":now,"key":key,"reason":reason,"shadow":false}))?;
-                Ok::<_, String>((previous, dispatch_token, prompt, cli_prompt, target))
-            }.await;
-            let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
-                Ok(prepared) => {
-                    self.timeout_deadlines.remove(&key);
-                    prepared
-                }
-                Err(error) if error == STALE_WAKE || error == social_state::WAKE_ACCESS_REFUSED => {
-                    // Authority changed while the wake was queued. Settle its ingress without a retry.
-                    self.invalidate_key(&key, now).await?;
-                    self.journal.mark_handled(keys, now).await?;
-                    let reason = if error == STALE_WAKE { "token-invalidated" } else { "settings-invalidated" };
-                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":reason}))?;
-                    continue;
-                }
-                Err(error) if error == social_state::WAKE_TIMEOUT_STALE => {
-                    self.timeout_deadlines.remove(&key);
-                    self.suspended_claims.remove(&key);
-                    if !keys.is_empty() {
-                        self.awaiting.insert(key.clone(), keys.clone());
-                        if let Err(error) = self.journal.run(move |j| j.requeue_unsubmitted(&keys, now)).await {
-                            println!("[reserved2] {key} stale timeout journal rollback failed: {error}");
-                        }
-                    }
-                    if let Some(d) = self.drivers.get_mut(&key) {
-                        d.sched.prompt_running = false;
-                        d.sched.turn_started_at = None;
-                        d.sched.pending_wake_key_at = None;
-                        d.sched.wake_times.retain(|at| *at != now);
-                        d.sched.wc.sleep_until = None;
-                        d.sched.sleep_at = None;
-                        if d.sched.pending_wake_reason.as_deref() == Some("timeout") {
-                            d.sched.pending_wake_at = None;
-                            d.sched.pending_wake_reason = None;
-                        }
-                    }
-                    if let Ok(fresh_state) = self.state() {
-                        let conv = &fresh_state["conversations"][&key];
-                        let persisted_wake = session::wake_config_from_json(Some(&conv["wakeConfig"]));
-                        if let Some(d) = self.drivers.get_mut(&key) {
-                            if let Some(next) = session::WakeSync::changed(self.synced.get(&key), &conv["wakeConfig"]) {
-                                d.adopt_wake_config(persisted_wake, now);
-                                self.synced.insert(key.clone(), next);
-                            } else {
-                                sync_persisted_driver_deadline(d, conv, persisted_wake, now);
-                            }
-                            d.refresh_observed_state(conv, now);
-                        }
-                    } else {
-                        self.synced.remove(&key);
-                    }
-                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":"timeout-stale"}))?;
-                    continue;
-                }
-                Err(error) => {
-                    println!("[reserved2] {key} dispatch preparation failed: {error}");
-                    let prep_retry_exhausted = error != social_state::WAKE_SUSPENDED
-                        && self.failures.get(&key).copied().unwrap_or(0) + 1 > MAX_WAKE_RETRIES;
-                    if let Some((previous, dispatch_token)) = claimed.as_ref() {
-                        let retire_token = (prep_retry_exhausted
-                            && reason == "timeout"
-                            && previous["wakeConfig"]["sleepUntil"].is_string())
-                        .then(|| dispatch_token.clone());
-                        if let Err(error) = run_wake_rollback(
-                            &self.context,
-                            &key,
-                            now,
-                            previous,
-                            retire_token.as_deref(),
-                        ) {
-                            println!("[reserved2] {key} dispatch rollback failed: {error}");
-                            self.rollback_pending.insert(
-                                key.clone(),
-                                (now, previous.clone(), retire_token),
-                            );
-                        }
-                    }
-                    // A failed journal transition may have left the original entry in place.
-                    if !keys.is_empty() { self.awaiting.insert(key.clone(), keys.clone()); }
-                    if let Err(error) = self.journal.run(move |j| j.requeue_unsubmitted(&keys, now)).await {
-                        println!("[reserved2] {key} dispatch journal rollback failed: {error}");
-                    }
-                    if let Some(d) = self.drivers.get_mut(&key) {
-                        d.sched.prompt_running = false;
-                        d.sched.turn_started_at = None;
-                        d.sched.pending_wake_key_at = None;
-                        d.sched.wake_times.retain(|at| *at != now);
-                    }
-                    if error == social_state::WAKE_SUSPENDED {
-                        self.suspended_claims.insert(key.clone());
-                        self.ready.push((key, reason));
-                        continue;
-                    }
-                    let count = {
-                        let failures = self.failures.entry(key.clone()).or_default();
-                        *failures += 1;
-                        *failures
-                    };
-                    if count <= MAX_WAKE_RETRIES {
-                        self.retries.insert(key, (now + 5_000 * (1_i64 << (count - 1)), reason));
-                    } else {
-                        self.timeout_deadlines.remove(&key);
-                        if let Some((previous, dispatch_token)) = claimed.as_ref() {
-                            let retire_timeout = (reason == "timeout"
-                                && previous["wakeConfig"]["sleepUntil"].is_string())
-                                || previous["wakeConfig"]["sleepRetired"] == true;
-                            if !retire_timeout && previous["wakeConfig"]["infinite"] == false {
-                                self.rearm_pending.insert(key, (now, reason, previous.clone(), dispatch_token.clone()));
-                                self.drain_rearm_pending(&cfg);
-                            }
-                        } else if reason == "timeout" {
-                            // Preflight never claimed the deadline: clear retry count and cached
-                            // sleep state so the next Hub::tick re-adopts any persisted sleepUntil.
-                            self.failures.remove(&key);
-                            if let Some(d) = self.drivers.get_mut(&key) {
-                                d.sched.wc.sleep_until = None;
-                                d.sched.sleep_at = None;
-                            }
-                        }
-                    }
-                    continue;
-                }
-            };
-            // Reminders do not consume awaiting messages or grant a wake snapshot.
-            if reason != "wakeReminder" { self.queued_messages.remove(&key); }
-            let (context, cfg2, reason2, keys2) = (self.context.clone(), cfg.clone(), reason.clone(), keys.clone());
-            println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
-            let hard_cap_ms = crate::wake::turn_budget(&cfg).hard_cap_ms;
-            let d = self.drivers.get_mut(&key).unwrap();
-            d.sched.prompt_running = true;
-            d.sched.cfg.turn_hard_cap_ms = hard_cap_ms;
-            d.sched.cfg.turn_ceiling_ms = crate::wake::turn_ceiling_ms(&cfg);
-            d.sched.turn_started_at = Some(now);
-            d.sched.pending_wake_key_at = None;
-            if reason != "wakeReminder" {
-                d.sched.wc.sleep_until = None;
-                d.sched.sleep_at = None;
-            }
-            let token = dispatch_token.clone();
-            let wake_claim = json!({"wakeConfig":previous["wakeConfig"],"lastWakeReason":previous["lastWakeReason"]});
-            let session = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let shared = session.clone();
-            let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let minted_shared = minted.clone();
-            let queued_route = match crate::turn_engine::Engine::selected(&context, &cfg2, &key, "reserved2") {
-                Ok(crate::turn_engine::Engine::Harness) => pipeline::Reserved2Route::PendingHarness,
-                _ if pipeline::pinned_cli_backend(&cfg2, &key).is_some() => pipeline::Reserved2Route::Cli,
-                _ => pipeline::Reserved2Route::Dsh,
-            };
-            let route = std::sync::Arc::new(std::sync::Mutex::new(queued_route));
-            let route_shared = route.clone();
-            let admitted = pipeline::MintedEpoch::default();
-            let admitted_shared = admitted.clone();
-            let retries_remaining = self.failures.get(&key).copied().unwrap_or_default() < MAX_WAKE_RETRIES;
-            #[cfg(test)]
-            let cap_clock = self.cap_clock.clone();
-            let task = tokio::spawn(async move {
-                match pipeline::Pipeline::new_without_dsh(&context, &cfg2, true) {
-                    Err(error) => DispatchResult::new(Err(error), true),
-                    Ok(mut pipe) => {
-                        #[cfg(test)]
-                        {
-                            pipe.cap_clock = cap_clock;
-                        }
-                        pipe.share_session(shared);
-                        pipe.share_minted_epoch(minted_shared);
-                        pipe.share_reserved2_route(route_shared, admitted_shared);
-                        pipe.set_reserved2_retry_budget(retries_remaining);
-                        pipe.note_turn(&reason2, &keys2);
-                        pipe.expect_dispatch_token(dispatch_token);
-                        pipe.expect_dispatch_deadline(now.saturating_add(hard_cap_ms));
-                        if reason2 != "wakeReminder" { pipe.expect_dispatch_wake(now, wake_claim); }
-                        let result = pipe.run_turn(&target, &prompt, &cli_prompt, &cfg2).await;
-                        DispatchResult {
-                            result,
-                            unsubmitted: pipe.dispatch_definitely_unsubmitted(),
-                            failure_parks: pipe.reserved2_failure_parks(),
-                        }
-                    }
-                }
-            });
-            self.active.insert(
-                key,
-                Active {
-                    task,
-                    inbound: keys,
-                    reason,
-                    previous,
-                    at: now,
-                    token,
-                    mode_stamp: self.mode_stamp.clone(),
-                    session,
-                    minted,
-                    cap_abort_at: None,
-                    route,
-                    admitted,
-                },
-            );
-        }
-        Ok(())
     }
 }

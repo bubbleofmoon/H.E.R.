@@ -31,9 +31,6 @@ fn step(name: &'static str) -> io::Result<()> {
 
 /// A symlink, or any Windows reparse point (junction, mount point, symlink).
 pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -41,7 +38,7 @@ pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
             return true;
         }
     }
-    false
+    metadata.file_type().is_symlink()
 }
 
 /// Open the final component itself, never a link's target:

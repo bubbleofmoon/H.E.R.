@@ -455,6 +455,7 @@ fixture = runpy.run_path(sys.argv[1])
 with fixture['TemporaryDirectory'](prefix='her-guard-fixture-'):
     pass
 "#;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut runners = vec![(
         python_program(),
         vec![
@@ -705,6 +706,7 @@ fn installed_and_development_supervisors_can_own_their_selected_runtime() {
 fn script_helpers_allow_disposable_roots_and_existing_checks() {
     let fixture = Fixture::new();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut runners = vec![(
         "node",
         vec![
@@ -895,7 +897,7 @@ fn has_layout_marker(line: &str) -> bool {
     const MARKER: &str = "// layout-literal:";
     line.match_indices(MARKER).any(|(at, _)| {
         let quotes = line[..at].replace("\\\"", "").matches('"').count();
-        quotes % 2 == 0 && !line[at + MARKER.len()..].trim().is_empty()
+        quotes.is_multiple_of(2) && !line[at + MARKER.len()..].trim().is_empty()
     })
 }
 

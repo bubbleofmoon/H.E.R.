@@ -25,6 +25,7 @@ impl Staging {
         let path =
             std::env::temp_dir().join(format!("her-restore-{:032x}", u128::from_ne_bytes(id)));
         crate::install_root::check_development_path(&path)?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -755,6 +756,7 @@ fn hash_file(mut file: &File) -> Result<[u8; 32], String> {
 
 fn protected_stash_dir(context: &RuntimeContext) -> Result<(), String> {
     let path = context.resolve_path(RuntimeArea::Data, RECOVERY_DIR, PathIntent::CreateDirectory)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
