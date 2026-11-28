@@ -27,6 +27,7 @@ Read the source before making any claim about it.
 - **Real solutions:** implement the full behavior for all valid inputs. Never skip/weaken tests, hardcode test cases or replace missing behavior with stubs.
 - **Safety:** never contact real QQ, DSH, model or TTS services, and never write production roots (`C:/qqbot`, `C:/qqbot-rust`, `C:/her-orch/relay`, `~/.dsh`, `memory.db`).
 - **Known pitfalls check:** confirm resource/process/temp cleanup on failure paths, boundary conditions on both sides of thresholds, resolved paths, no stale artifacts, `#[cfg(test)]` vs non-test visibility, all callers (including `#[cfg(windows)]`) updated, line endings/file modes preserved, and clean plain commits.
+- **Pre-review self-check:** before reporting ready: (1) grep every sibling caller of any changed admission, token or mode guard; (2) re-capture a failing red receipt (`cargo-slot.ps1 -ExpectFail` or equivalent) whenever test fixtures or assertions changed; (3) run `npm --prefix her-ui run build` and persist `ui-build.log` under `C:/her-orch/<ticket>/evidence/` whenever `her-ui/` changed.
 
 ## Report
 

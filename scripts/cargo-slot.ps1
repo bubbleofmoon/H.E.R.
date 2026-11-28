@@ -4,7 +4,8 @@ param(
   [Parameter(Mandatory)][string]$WorkTree,
   [Parameter(Mandatory)][string]$EvidenceDir,
   [Parameter(Mandatory)][string]$RunName,
-  [Parameter(Mandatory)][string]$Cargo
+  [Parameter(Mandatory)][string]$Cargo,
+  [switch]$ExpectFail
 )
 
 # Windows counterpart of scripts/cargo-slot.sh. Runs one cargo command in <WorkTree>\her, offline, hidden, with MSVC set
@@ -311,5 +312,9 @@ try {
 } finally {
   Set-Content -LiteralPath $exitFile -Value $code -Encoding ASCII
   $targetMaintenance.Dispose()
+}
+if ($ExpectFail -and $code -eq '0') {
+  [Console]::Error.WriteLine("cargo-slot: -ExpectFail was set but command exited 0 (non-red receipt)")
+  exit 1
 }
 if ($code -match '^\d+$') { exit [int]$code } else { exit 1 }

@@ -85,5 +85,47 @@ class FileModeCheck(unittest.TestCase):
         self.assertNotIn('mode:', result.stdout)
 
 
+class EolParityCheck(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix='check-repo-eol-'))
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        self.env.update(GIT_ENV)
+        self.git('init', '-q')
+        self.git('config', 'core.autocrlf', 'false')
+        (self.repo / 'scripts').mkdir()
+        shutil.copyfile(CHECK, self.repo / 'scripts' / 'check-repo.py')
+        (self.repo / 'a.md').write_bytes(b'# A\nline\n')
+        (self.repo / 'b.rs').write_bytes(b'fn b() {}\r\n')
+        self.git('add', 'scripts/check-repo.py', 'a.md', 'b.rs')
+        self.git('commit', '-qm', 'base')
+
+    def git(self, *args):
+        subprocess.run(['git', *args], cwd=self.repo, env=self.env, check=True, capture_output=True)
+
+    def run_eol(self, base='HEAD'):
+        return subprocess.run(
+            [sys.executable, '-I', str(self.repo / 'scripts' / 'check-repo.py'), '--eol-base', base],
+            cwd=self.repo, capture_output=True, text=True, env=self.env,
+        )
+
+    def test_eol_parity_catches_drift_and_allows_matching_edits(self):
+        ok = self.run_eol()
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn('EOL-parity scan: 0 findings', ok.stdout)
+
+        (self.repo / 'a.md').write_bytes(b'# A\r\nchanged\r\n')
+        bad = self.run_eol()
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn('eol: a.md changed from LF to CRLF', bad.stdout)
+        self.assertIn('EOL-parity scan: 1 findings', bad.stdout)
+
+        (self.repo / 'a.md').write_bytes(b'# A\nfixed\n')
+        (self.repo / 'b.rs').write_bytes(b'fn b() { let _ = 1; }\r\n')
+        clean = self.run_eol()
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertIn('EOL-parity scan: 0 findings', clean.stdout)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

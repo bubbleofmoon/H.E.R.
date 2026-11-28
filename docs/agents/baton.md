@@ -12,5 +12,5 @@ Development runs on a single Windows Antigravity coordinator against `bubbleofmo
 ## Shared ground rules
 
 - Merge only through a pull request with green `checks` CI on a head containing current `origin/main` (`docs/agents/issue-tracker.md` "Pull requests and merging").
-- Production is read-only from development: never write `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay`, `~/.dsh`) or `memory.db`, and never contact real QQ, DSH, model or TTS services (`docs/agents/production-ops.md`).
+- Production is read-only from development: never write `C:/qqbot` (plus archived pre-move folders until #127) or `memory.db`, and never contact real QQ, DSH, model or TTS services (`docs/agents/production-ops.md`).
 - Never `@`-mention usernames in GitHub comments.

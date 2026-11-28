@@ -10,7 +10,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - `bubbleofmoon/H.E.R.-vault`, checked out at `C:/her-vault` (Linux `/root/her-vault`), is the vault: specs, raw validation evidence, `.scratch/`, bot memory, chat and session samples, the patched copy of SnowLuma's non-commercial code and production incident detail stay there. No vault material moves into this repository or its history, except the owner-approved default persona text (ADR 0002). Coordinators commit to the vault with the repository-level git identity set in the vault checkout by the owner, on both hosts: user name `bubbleofmoon` and the owner's GitHub noreply address.
 - A public ticket, comment or commit names vault files by path only. Post every issue, comment or pull-request body through `scripts/gh-public.sh` / `.ps1`, never a bare `gh` write (`docs/agents/issue-tracker.md`); `.githooks/pre-push` scans everything a push publishes.
 - The scan refuses secrets, digit runs of 7 or more without a reviewed exception, account-home paths and lines that look like quoted chat or session records. It prints a finding's kind and position, never the matched text. Fix the text; do not widen a rule.
-- Production is never a development target: never write the production root `C:/qqbot` (until the owner's move, #67, also `C:/qqbot-rust`, `C:/her-orch/relay` and `~/.dsh`), and never contact real QQ, DSH, model or TTS services from development. The one exception is the #67 move, which the Windows coordinator runs on the owner's relayed go (`docs/agents/production-ops.md`).
+- Production is never a development target: never write `C:/qqbot` (plus archived pre-move folders until #127), and never contact real QQ, DSH, model or TTS services from development (`docs/agents/production-ops.md`).
 
 ## DOX
 
@@ -23,13 +23,12 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Agent workflow
 
-- Coordinator rules (model routing, two-axis review, merge flow and GitHub API budget) are in `docs/agents/coordinator.md`.
-- Ticket work runs on `her/<n>-<slug>` branches cut from `origin/main` in `C:/her-wt/<ticket>` (never push directly to `main`, never force-push). Merge only through pull requests gated by hosted `checks.yml`.
-- Never poll GitHub. Wait for CI only through `scripts/ci-wait.py` (`docs/agents/coordinator.md` "GitHub API budget").
-- No host needs a local Rust build. Hosted CI compiles, lints, formats and tests Rust. Native checks a gate names follow `docs/agents/rust-validation.md`. Apply only ticket-authorized `fmt-patch` hunks for owned files and follow that doc for partial Clippy patches and CI proof. Local rustfmt and editor tooling are optional.
+- Coordinator workflow, model routing, two-axis review, merge flow and GitHub API budget (`scripts/ci-wait.py`; never poll GitHub): `docs/agents/coordinator.md`.
+- Ticket work runs on `her/<n>-<slug>` branches cut from `origin/main` in `C:/her-wt/<ticket>` (never push directly to `main`, never force-push) and merges through CI-gated PRs (`checks.yml`).
+- Hosted CI compiles, lints, formats and tests Rust; native build/test rules, `fmt-patch`/`clippy` handling and Windows shell notes live in `docs/agents/rust-validation.md`.
 - A case called "bounded" or "unlikely" is a finding: fix it or name a follow-up.
-- Stop only processes you started, by recorded PID and creation time, never by name or pattern. Never edit a script a run may be using: write a temporary file beside it and move it into place.
-- Ticket run material (prompts, plans, reports, receipts, evidence, `PROGRESS.md`) lives under `C:/her-orch/<ticket>/`, never in the checkout.
+- Stop only processes you started, by recorded PID and creation time, never by name or pattern. Replace scripts atomically via a temporary sibling move.
+- Keep ticket run artifacts under `C:/her-orch/<ticket>/`, never in the checkout.
 
 ## Agent skills
 

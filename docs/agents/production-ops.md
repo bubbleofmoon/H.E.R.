@@ -4,9 +4,9 @@ Public rules only. Live layout, log/report formats, console/exe-swap procedures,
 
 ## Public rules
 
-- **Read-only boundary:** production root is `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay`, `~/.dsh`). Never write them or `memory.db`, change scheduled tasks/services/tokens/releases/configs there, or stop/start/replace production processes from development.
+- **Read-only boundary:** production root is `C:/qqbot` (plus archived pre-move folders until #127). Never write them or `memory.db`, change scheduled tasks/services/tokens/releases/configs there, or stop/start/replace production processes from development.
 - **Database safety:** read production DBs from file metadata or an owner-approved copy only — never open live DBs in place (`mode=ro` creates/leaves `-wal`/`-shm`; `immutable=1` reuses existing ones).
-- **Owner authority:** every production action requires the owner's go at execution time (`docs/agents/baton.md`); agents prepare commands/checks only (exception: `#67` move below).
+- **Owner authority:** every production action requires the owner's go at execution time (`docs/agents/baton.md`); agents prepare commands/checks only (`C:/her-orch/ops/stage-release.ps1` stages local `main-<sha>` bundles and cutover scripts per vault `docs/agents/production-ops.md`).
 - **Test isolation:** tests use throwaway runtimes (`HER_INSTALL_ROOT`) and fake gateways/agent hosts/model servers; never contact real QQ, DSH, model or TTS services.
 - **Evidence hygiene:** diagnosis notes, `her-cli report` output, log excerpts and receipts go to `C:/her-vault/.scratch/<feature>/evidence/<NN>/` or `C:/her-orch/<ticket>/evidence/`. Public text uses `group:<n>` / `private:<n>` placeholders and never quotes logs, chats, session IDs, tokens or account numbers (`scripts/gh-public` enforces).
 - **Production move (`#67`, `scripts/production-move.ps1 -Production`):** admin PowerShell under owner account: `-Mode Inventory` (non-interactive read-only; blocked checks report `skipped: needs <check>`), `-Mode Move` (`-DigestModel <id>` sets digest model), `-Mode Rollback -Production -StateFile <evidence>\state.json`, `-Mode OperatorFolders` (copies ops scripts to `C:\qqbot\ops`).
