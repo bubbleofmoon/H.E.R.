@@ -18,7 +18,12 @@ Binding for the single Windows Antigravity coordinator (`C:/her`, 32 GB, 4 cores
   - **Tier 2 (cross-cutting/multi-module):** Neon gathers read-only grep inventory and drafts plan; adversarial red-team pass with a fresh `research` (`Model: "pro"`) reviewer and `codex-task.ps1` (`gpt-6.2-sol`, CI/UI/rollback/scope), returning `file:line` deltas only.
   - **Tier 3 (greenfield/architecture forks):** blind planners (`gemini-4-neon-high`, independent subagent planners, and `codex-task.ps1` `gpt-6.2-sol` when quota allows) in parallel on identical prompt + inventory, writing separate files (`@coordinator DONE: <path>`), merged by Neon.
 - **Deep single-model:** `Gemini 4 Neon (High/XHigh)` for deep backend bugs, UI architecture, or Rust concurrency/lifecycle.
-- **Review cap:** verify findings in code before requiring fixes; file non-blocking medium/low items as follow-up issues (`#362` or new tickets).
+- **Review cap:** verify findings in code before requiring fixes; file non-blocking medium/low items as follow-up issues (new tickets).
+
+## Staged tracks (`implement-spec`)
+
+- Staged multi-ticket track specs and the index live at `C:/her-vault/.scratch/tracks/INDEX.md` (`<NN>-<slug>/spec.md`).
+- When picking up a track with `implement-spec`: cut integration branch `her/<track-slug>` from `origin/main` in `C:/her-wt/<track-slug>`, run per-ticket implementer subagents in sibling worktrees (`tdd`), merge into the integration branch, gate with two-axis `code-review`, open PR via `scripts/gh-public.ps1` (`Refs #...`), wait via `scripts/ci-wait.py`, merge on green `checks.yml`, clean worktrees, and close each resolved issue via `scripts/gh-public.ps1` + `gh issue close`.
 
 ## Native checks
 
