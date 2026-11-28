@@ -475,7 +475,8 @@ pub(crate) fn probe_held_owner_identity(
     lock_path: &Path,
     expected_role: &str,
 ) -> Option<ProcessIdentity> {
-    let lock = crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
+    let lock =
+        crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
     match lock.try_lock() {
         Err(fs::TryLockError::WouldBlock) => {}
         _ => return None,
@@ -484,7 +485,8 @@ pub(crate) fn probe_held_owner_identity(
     let mut marker_os = lock_path.as_os_str().to_os_string();
     marker_os.push(".owner.json");
     let marker_path = PathBuf::from(marker_os);
-    let bytes = crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
+    let bytes =
+        crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
     let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     if marker["v"].as_u64() != Some(1) || marker["role"].as_str() != Some(expected_role) {
         return None;

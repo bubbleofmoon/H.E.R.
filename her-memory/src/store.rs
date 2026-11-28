@@ -121,7 +121,12 @@ impl Reader<'_> {
     }
 
     /// Explicit search; counts a hit on every returned memory.
-    pub fn search(&self, query: &str, kinds: &[String], limit: usize) -> rusqlite::Result<Vec<Hit>> {
+    pub fn search(
+        &self,
+        query: &str,
+        kinds: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Hit>> {
         let mut hits = super::search(self.conn, &self.key, self.is_owner, query, kinds, limit)?;
         self.attach_provenance(&mut hits)?;
         Ok(hits)
@@ -152,14 +157,20 @@ impl Reader<'_> {
     /// A correction and its predecessor update commit together. Only the original speaker
     /// can correct a linked message. The owner can also correct an unlinked private note.
     pub fn write_message(
-        &self, message: VerifiedMessage<'_>, supersedes: Option<i64>,
+        &self,
+        message: VerifiedMessage<'_>,
+        supersedes: Option<i64>,
     ) -> rusqlite::Result<Option<UpsertOutcome>> {
         let attribution = (!self.is_owner).then_some(message.author_id);
         let content = match attribution {
             Some(speaker) => format!("{speaker}说：{}", message.text),
             None => message.text.to_string(),
         };
-        let scope = if self.key.starts_with("private:") { "private" } else { "group" };
+        let scope = if self.key.starts_with("private:") {
+            "private"
+        } else {
+            "group"
+        };
         super::atomic(self.conn, |conn| {
             let existing = conn.query_row(
                 "SELECT m.id, m.archived FROM memory m JOIN memory_provenance p ON p.memory_id=m.id
@@ -189,7 +200,10 @@ impl Reader<'_> {
                 }
                 let same_author = author.as_deref() == Some(message.author_id)
                     || (author.is_none() && self.is_owner);
-                if archived || replacement.is_some() || !same_author || existing_id == Some(previous)
+                if archived
+                    || replacement.is_some()
+                    || !same_author
+                    || existing_id == Some(previous)
                     || existing.is_some_and(|(_, archived)| archived)
                     || at.is_some_and(|old| message.position <= old)
                 {
@@ -198,14 +212,30 @@ impl Reader<'_> {
             }
 
             let written = if let Some((id, archived)) = existing {
-                UpsertOutcome { id, deduped: true, archived }
+                UpsertOutcome {
+                    id,
+                    deduped: true,
+                    archived,
+                }
             } else {
-                let id = super::write_memory(conn, &MemoryInput {
-                    owner_type: "session", owner_id: &self.key, scope,
-                    kind: if attribution.is_some() { "inference" } else { "fact" },
-                    subject: None, content: &content, tags: None, source: "verified-message",
-                    importance: 0.5,
-                })?;
+                let id = super::write_memory(
+                    conn,
+                    &MemoryInput {
+                        owner_type: "session",
+                        owner_id: &self.key,
+                        scope,
+                        kind: if attribution.is_some() {
+                            "inference"
+                        } else {
+                            "fact"
+                        },
+                        subject: None,
+                        content: &content,
+                        tags: None,
+                        source: "verified-message",
+                        importance: 0.5,
+                    },
+                )?;
                 conn.execute(
                     "INSERT INTO memory_provenance(memory_id,message_id,attributed_to,author_id,message_at,message_seq)
                      VALUES(?1,?2,?3,?4,?5,?6)",
@@ -213,7 +243,11 @@ impl Reader<'_> {
                         message.position.0, message.position.1],
                 )?;
                 super::audit(conn, &self.key, "write-message", Some(id), None)?;
-                UpsertOutcome { id, deduped: false, archived: false }
+                UpsertOutcome {
+                    id,
+                    deduped: false,
+                    archived: false,
+                }
             };
             if let Some(previous) = supersedes {
                 conn.execute(
@@ -248,18 +282,29 @@ impl Reader<'_> {
     }
 
     pub fn write(&self, m: &NewMemory<'_>) -> rusqlite::Result<UpsertOutcome> {
-        let default_scope = if self.key.starts_with("private:") { "private" } else { "group" };
-        super::upsert_memory(self.conn, &MemoryInput {
-            owner_type: m.owner_type,
-            owner_id: &self.key,
-            scope: m.scope.unwrap_or(default_scope),
-            kind: m.kind,
-            subject: m.subject,
-            content: m.content,
-            tags: m.tags,
-            source: if m.source == "verified-message" { "agent" } else { m.source },
-            importance: m.importance,
-        })
+        let default_scope = if self.key.starts_with("private:") {
+            "private"
+        } else {
+            "group"
+        };
+        super::upsert_memory(
+            self.conn,
+            &MemoryInput {
+                owner_type: m.owner_type,
+                owner_id: &self.key,
+                scope: m.scope.unwrap_or(default_scope),
+                kind: m.kind,
+                subject: m.subject,
+                content: m.content,
+                tags: m.tags,
+                source: if m.source == "verified-message" {
+                    "agent"
+                } else {
+                    m.source
+                },
+                importance: m.importance,
+            },
+        )
     }
 
     /// Digest progress in one sequence space (`msg`, `inbound`); `None` before any digest or failure.
@@ -273,12 +318,23 @@ impl Reader<'_> {
     /// Write a digest's memories and move its cursor to `through` (HER's replies to `replies_ms`) in one
     /// transaction; a success clears the failure time. `Ok(None)`: the stored sequence (0 when there is none)
     /// is no longer `expected` because another run digested first; nothing is written.
-    pub fn write_digest(&self, space: &str, expected: i64, through: i64, replies: (i64, i64), memories: &[NewMemory<'_>])
-        -> rusqlite::Result<Option<Vec<UpsertOutcome>>> {
+    pub fn write_digest(
+        &self,
+        space: &str,
+        expected: i64,
+        through: i64,
+        replies: (i64, i64),
+        memories: &[NewMemory<'_>],
+    ) -> rusqlite::Result<Option<Vec<UpsertOutcome>>> {
         super::atomic(self.conn, |conn| {
             use rusqlite::OptionalExtension;
-            let current: Option<i64> = conn.query_row("SELECT through_seq FROM digest_cursor WHERE conversation=?1 AND space=?2",
-                rusqlite::params![self.key, space], |r| r.get(0)).optional()?;
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT through_seq FROM digest_cursor WHERE conversation=?1 AND space=?2",
+                    rusqlite::params![self.key, space],
+                    |r| r.get(0),
+                )
+                .optional()?;
             if current.unwrap_or(0) != expected {
                 return Ok(None);
             }
@@ -312,20 +368,52 @@ impl Reader<'_> {
             deleting = true;
             let deleted = super::forget_memory(conn, id, &self.key)?;
             if deleted && self.has_provenance {
-                conn.execute("UPDATE memory_provenance SET superseded_by=NULL WHERE superseded_by=?1", [id])?;
+                conn.execute(
+                    "UPDATE memory_provenance SET superseded_by=NULL WHERE superseded_by=?1",
+                    [id],
+                )?;
             }
             Ok(Some(deleted))
         })
-        .map_err(|error| if deleting { ForgetError::Delete(error) } else { ForgetError::Check(error) })
+        .map_err(|error| {
+            if deleting {
+                ForgetError::Delete(error)
+            } else {
+                ForgetError::Check(error)
+            }
+        })
     }
 }
 
 impl Admin<'_> {
-    pub fn grant(&self, reader_type: &str, reader_id: &str, read_type: &str, read_id: &str, level: &str, actor: &str) -> rusqlite::Result<i64> {
-        super::grant_acl(self.conn, reader_type, reader_id, read_type, read_id, level, actor)
+    pub fn grant(
+        &self,
+        reader_type: &str,
+        reader_id: &str,
+        read_type: &str,
+        read_id: &str,
+        level: &str,
+        actor: &str,
+    ) -> rusqlite::Result<i64> {
+        super::grant_acl(
+            self.conn,
+            reader_type,
+            reader_id,
+            read_type,
+            read_id,
+            level,
+            actor,
+        )
     }
 
-    pub fn revoke(&self, reader_type: &str, reader_id: &str, read_type: &str, read_id: &str, actor: &str) -> rusqlite::Result<bool> {
+    pub fn revoke(
+        &self,
+        reader_type: &str,
+        reader_id: &str,
+        read_type: &str,
+        read_id: &str,
+        actor: &str,
+    ) -> rusqlite::Result<bool> {
         super::revoke_acl(self.conn, reader_type, reader_id, read_type, read_id, actor)
     }
 
@@ -357,12 +445,29 @@ mod tests {
     /// ACL: group:1 reads group:3; group:7 holds a wildcard grant.
     fn store(owner: Option<&str>) -> MemoryStore {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
-        for (owner_id, scope) in [("group:1", "group"), ("private:2", "private"), ("group:3", "group"), (OWNER, "private")] {
-            crate::write_memory(&conn, &MemoryInput {
-                owner_type: "session", owner_id, scope, kind: "fact", subject: None,
-                content: &format!("needle {owner_id}"), tags: None, source: "fixture", importance: 0.5,
-            }).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql"))
+            .unwrap();
+        for (owner_id, scope) in [
+            ("group:1", "group"),
+            ("private:2", "private"),
+            ("group:3", "group"),
+            (OWNER, "private"),
+        ] {
+            crate::write_memory(
+                &conn,
+                &MemoryInput {
+                    owner_type: "session",
+                    owner_id,
+                    scope,
+                    kind: "fact",
+                    subject: None,
+                    content: &format!("needle {owner_id}"),
+                    tags: None,
+                    source: "fixture",
+                    importance: 0.5,
+                },
+            )
+            .unwrap();
         }
         conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES
             ('session','group:1','session','group:3','read',1),
@@ -371,14 +476,26 @@ mod tests {
     }
 
     fn visible(store: &MemoryStore, reader: &str) -> Vec<i64> {
-        let mut ids: Vec<i64> = store.for_reader(reader).search("needle", &[], 50).unwrap()
-            .into_iter().map(|h| h.id).collect();
+        let mut ids: Vec<i64> = store
+            .for_reader(reader)
+            .search("needle", &[], 50)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
         ids.sort();
         ids
     }
 
     fn exists(store: &MemoryStore, id: i64) -> bool {
-        store.conn.query_row("SELECT EXISTS(SELECT 1 FROM memory WHERE id=?1)", [id], |r| r.get(0)).unwrap()
+        store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -390,7 +507,11 @@ mod tests {
         assert_eq!(reader.forget(2).unwrap(), None);
         assert_eq!(reader.forget(4).unwrap(), None);
         assert!(exists(&store, 2) && exists(&store, 4));
-        assert_eq!(visible(&store, "private:2"), vec![2], "a private conversation reads only its own private rows");
+        assert_eq!(
+            visible(&store, "private:2"),
+            vec![2],
+            "a private conversation reads only its own private rows"
+        );
     }
 
     #[test]
@@ -413,7 +534,11 @@ mod tests {
         assert_eq!(owned.for_reader(OWNER).index(12).unwrap().0, 4);
         assert_eq!(owned.for_reader(OWNER).forget(2).unwrap(), Some(true));
         let unowned = store(None);
-        assert_eq!(visible(&unowned, OWNER), vec![4], "without a configured owner it is an ordinary private reader");
+        assert_eq!(
+            visible(&unowned, OWNER),
+            vec![4],
+            "without a configured owner it is an ordinary private reader"
+        );
         assert_eq!(unowned.for_reader(OWNER).forget(2).unwrap(), None);
     }
 
@@ -421,60 +546,163 @@ mod tests {
     fn writes_belong_to_the_reader_conversation() {
         let store = store(Some(OWNER));
         let new = |scope: Option<&'static str>| NewMemory {
-            owner_type: "session", scope, kind: "fact", subject: None, content: "written",
-            tags: None, source: "fixture", importance: 0.5,
+            owner_type: "session",
+            scope,
+            kind: "fact",
+            subject: None,
+            content: "written",
+            tags: None,
+            source: "fixture",
+            importance: 0.5,
         };
         let group = store.for_reader("group:3").write(&new(None)).unwrap();
         let private = store.for_reader("private:2").write(&new(None)).unwrap();
         let row = |id: i64| -> (String, String) {
-            store.conn.query_row("SELECT owner_id, scope FROM memory WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+            store
+                .conn
+                .query_row(
+                    "SELECT owner_id, scope FROM memory WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
         };
         assert_eq!(row(group.id), ("group:3".to_string(), "group".to_string()));
-        assert_eq!(row(private.id), ("private:2".to_string(), "private".to_string()));
+        assert_eq!(
+            row(private.id),
+            ("private:2".to_string(), "private".to_string())
+        );
     }
 
     #[test]
     fn digest_write_commits_memories_with_its_cursor_and_refuses_a_moved_cursor() {
         let store = store(Some(OWNER));
         store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
-        let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
-            subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
+        let new = |content: &'static str| NewMemory {
+            owner_type: "session",
+            scope: None,
+            kind: "inference",
+            subject: Some("s"),
+            content,
+            tags: None,
+            source: "digest:group:3:msg:1-4",
+            importance: 0.5,
+        };
         let reader = store.for_reader("group:3");
         assert_eq!(reader.digest_cursor("msg").unwrap(), None);
-        assert_eq!(reader.write_digest("msg", 0, 4, (7, 3), &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
+        assert_eq!(
+            reader
+                .write_digest("msg", 0, 4, (7, 3), &[new("digested")])
+                .unwrap()
+                .map(|w| w.len()),
+            Some(1)
+        );
         let stored = reader.digest_cursor("msg").unwrap().unwrap();
-        assert_eq!((stored.through, stored.replies_ms, stored.replies_seq, stored.failed_at), (4, 7, 3, 0));
-        assert!(reader.write_digest("msg", 0, 9, (7, 3), &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
-        let rows: i64 = store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            (
+                stored.through,
+                stored.replies_ms,
+                stored.replies_seq,
+                stored.failed_at
+            ),
+            (4, 7, 3, 0)
+        );
+        assert!(
+            reader
+                .write_digest("msg", 0, 9, (7, 3), &[new("stale")])
+                .unwrap()
+                .is_none(),
+            "a stale expected cursor writes nothing"
+        );
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memory WHERE source LIKE 'digest:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(rows, 1);
         reader.digest_failed("msg").unwrap();
         let failed = reader.digest_cursor("msg").unwrap().unwrap();
-        assert!(failed.through == 4 && failed.failed_at > 0, "a failure keeps the progress: {failed:?}");
-        assert_eq!(reader.write_digest("msg", 4, 6, (8, 1), &[]).unwrap().map(|w| w.len()), Some(0));
-        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| (c.through, c.failed_at)), Some((6, 0)), "a success clears the failure");
-        assert_eq!(store.for_reader("group:1").digest_cursor("msg").unwrap(), None, "cursors are per conversation");
-        assert_eq!(reader.digest_cursor("inbound").unwrap(), None, "cursors are per sequence space");
+        assert!(
+            failed.through == 4 && failed.failed_at > 0,
+            "a failure keeps the progress: {failed:?}"
+        );
+        assert_eq!(
+            reader
+                .write_digest("msg", 4, 6, (8, 1), &[])
+                .unwrap()
+                .map(|w| w.len()),
+            Some(0)
+        );
+        assert_eq!(
+            reader
+                .digest_cursor("msg")
+                .unwrap()
+                .map(|c| (c.through, c.failed_at)),
+            Some((6, 0)),
+            "a success clears the failure"
+        );
+        assert_eq!(
+            store.for_reader("group:1").digest_cursor("msg").unwrap(),
+            None,
+            "cursors are per conversation"
+        );
+        assert_eq!(
+            reader.digest_cursor("inbound").unwrap(),
+            None,
+            "cursors are per sequence space"
+        );
     }
 
     #[test]
     fn a_fault_after_the_memory_insert_rolls_back_the_memories_and_the_cursor() {
         let store = store(Some(OWNER));
         store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
-        let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
-            subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
+        let new = |content: &'static str| NewMemory {
+            owner_type: "session",
+            scope: None,
+            kind: "inference",
+            subject: Some("s"),
+            content,
+            tags: None,
+            source: "digest:group:3:msg:1-4",
+            importance: 0.5,
+        };
         let reader = store.for_reader("group:3");
-        reader.write_digest("msg", 0, 4, (0, 0), &[new("kept")]).unwrap();
+        reader
+            .write_digest("msg", 0, 4, (0, 0), &[new("kept")])
+            .unwrap();
         let counts = || -> (i64, i64) {
-            (store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap(),
-             store.conn.query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0)).unwrap())
+            (
+                store
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM memory WHERE source LIKE 'digest:%'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap(),
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
+                    .unwrap(),
+            )
         };
         let before = counts();
         // The cursor statement fails after this digest's memory rows were inserted.
         store.conn.execute_batch("CREATE TEMP TRIGGER digest_fault_insert BEFORE INSERT ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;
             CREATE TEMP TRIGGER digest_fault_update BEFORE UPDATE ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-        assert!(reader.write_digest("msg", 4, 9, (0, 0), &[new("lost one"), new("lost two")]).is_err());
+        assert!(reader
+            .write_digest("msg", 4, 9, (0, 0), &[new("lost one"), new("lost two")])
+            .is_err());
         assert_eq!(counts(), before, "a failed cursor commit kept memory rows");
-        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.through), Some(4), "a failed commit moved the cursor");
+        assert_eq!(
+            reader.digest_cursor("msg").unwrap().map(|c| c.through),
+            Some(4),
+            "a failed commit moved the cursor"
+        );
     }
 
     #[test]
@@ -498,13 +726,24 @@ mod tests {
             position: (10, 0),
         };
         let first = reader.write_message(msg(), None).unwrap().unwrap();
-        assert_eq!(first, UpsertOutcome { id: 1, deduped: false, archived: false });
+        assert_eq!(
+            first,
+            UpsertOutcome {
+                id: 1,
+                deduped: false,
+                archived: false
+            }
+        );
 
         assert!(store.admin().archive(first.id, true, "console").unwrap());
         let while_archived = reader.write_message(msg(), None).unwrap().unwrap();
         assert_eq!(
             while_archived,
-            UpsertOutcome { id: first.id, deduped: true, archived: true }
+            UpsertOutcome {
+                id: first.id,
+                deduped: true,
+                archived: true
+            }
         );
         assert!(reader.search("热茶", &[], 10).unwrap().is_empty());
 
@@ -512,7 +751,11 @@ mod tests {
         let after_unarchive = reader.write_message(msg(), None).unwrap().unwrap();
         assert_eq!(
             after_unarchive,
-            UpsertOutcome { id: first.id, deduped: true, archived: false }
+            UpsertOutcome {
+                id: first.id,
+                deduped: true,
+                archived: false
+            }
         );
         assert_eq!(reader.search("热茶", &[], 10).unwrap().len(), 1);
     }
@@ -525,7 +768,12 @@ mod tests {
         let reader = store.for_reader(OWNER);
         let first = reader
             .write_message(
-                VerifiedMessage { id: "m1", text: "热茶", author_id: "9", position: (10, 0) },
+                VerifiedMessage {
+                    id: "m1",
+                    text: "热茶",
+                    author_id: "9",
+                    position: (10, 0),
+                },
                 None,
             )
             .unwrap()
@@ -536,19 +784,41 @@ mod tests {
             author_id: "9",
             position: (11, 0),
         };
-        let second = reader.write_message(second_msg(), Some(first.id)).unwrap().unwrap();
-        assert_eq!(second, UpsertOutcome { id: 2, deduped: false, archived: false });
+        let second = reader
+            .write_message(second_msg(), Some(first.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second,
+            UpsertOutcome {
+                id: 2,
+                deduped: false,
+                archived: false
+            }
+        );
 
         assert!(store.admin().archive(second.id, true, "console").unwrap());
-        let retried = reader.write_message(second_msg(), Some(first.id)).unwrap().unwrap();
+        let retried = reader
+            .write_message(second_msg(), Some(first.id))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             retried,
-            UpsertOutcome { id: second.id, deduped: true, archived: true }
+            UpsertOutcome {
+                id: second.id,
+                deduped: true,
+                archived: true
+            }
         );
 
         let third = reader
             .write_message(
-                VerifiedMessage { id: "m3", text: "乌龙茶", author_id: "9", position: (12, 0) },
+                VerifiedMessage {
+                    id: "m3",
+                    text: "乌龙茶",
+                    author_id: "9",
+                    position: (12, 0),
+                },
                 None,
             )
             .unwrap()

@@ -20,9 +20,9 @@ fn pending_approval(rig: &Rig) -> String {
     assert_eq!(item["target"], GROUP_KEY);
     assert_eq!(item["message"], "approved group text");
     let id = item["requestId"].as_str().unwrap();
-    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| {
-        text.contains(id) && text.contains("approved group text")
-    })));
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(
+        |text| { text.contains(id) && text.contains("approved group text") }
+    )));
     id.into()
 }
 
@@ -33,11 +33,22 @@ fn unrecognised_approval_reply_reprompts_with_both_exact_commands() {
     let id = request_approval(&mut rig);
     let expected = format!("回复 /approve {id} 或 /deny {id}");
     for reply in ["/approve", "/approve wrong extra", "/approval-help"] {
-        let before = rig.texts_to(OWNER_KEY).iter().filter(|text| *text == &expected).count();
+        let before = rig
+            .texts_to(OWNER_KEY)
+            .iter()
+            .filter(|text| *text == &expected)
+            .count();
         says(&rig, OWNER_KEY, OWNER, "owner", reply);
-        assert!(wait_for(LONG, || {
-            rig.texts_to(OWNER_KEY).iter().filter(|text| *text == &expected).count() > before
-        }), "an unrecognised approval reply did not display both exact commands");
+        assert!(
+            wait_for(LONG, || {
+                rig.texts_to(OWNER_KEY)
+                    .iter()
+                    .filter(|text| *text == &expected)
+                    .count()
+                    > before
+            }),
+            "an unrecognised approval reply did not display both exact commands"
+        );
     }
     assert_eq!(lock(&model.requests).len(), 1);
     assert!(rig.texts_to(GROUP_KEY).is_empty());
@@ -55,13 +66,28 @@ fn ordinary_chat_during_approval_reaches_a_normal_turn() {
     let ordinary = "an unrelated chat message";
     says(&rig, OWNER_KEY, OWNER, "owner", ordinary);
     let expected = format!("回复 /approve {id} 或 /deny {id}");
-    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).contains(&expected)));
+    assert!(wait_for(LONG, || rig
+        .texts_to(OWNER_KEY)
+        .contains(&expected)));
     says(&rig, OWNER_KEY, OWNER, "owner", &format!("/approve {id}"));
-    assert!(wait_for(LONG, || lock(&model.requests).len() == 3), "ordinary chat did not start its own turn");
-    assert!(lock(&model.requests)[2]["messages"].as_array().unwrap().iter().any(|message| {
-        message["role"] == "user" && message["content"].as_str().is_some_and(|text| text.contains(ordinary))
-    }));
-    assert_eq!(conversation_facts(&rig)["turns"].as_array().unwrap().len(), 2);
+    assert!(
+        wait_for(LONG, || lock(&model.requests).len() == 3),
+        "ordinary chat did not start its own turn"
+    );
+    assert!(lock(&model.requests)[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(ordinary))
+        }));
+    assert_eq!(
+        conversation_facts(&rig)["turns"].as_array().unwrap().len(),
+        2
+    );
     assert_eq!(rig.texts_to(GROUP_KEY), ["approved group text"]);
 }
 
@@ -70,11 +96,21 @@ fn stray_approval_commands_report_nothing_pending() {
     let model = FakeModel::script(vec![]);
     let mut rig = owner_harness_rig("owner-approval-stray", &model);
     rig.start();
-    for (index, command) in ["/approve missing", "/deny missing"].into_iter().enumerate() {
+    for (index, command) in ["/approve missing", "/deny missing"]
+        .into_iter()
+        .enumerate()
+    {
         says(&rig, OWNER_KEY, OWNER, "owner", command);
-        assert!(wait_for(LONG, || {
-            rig.texts_to(OWNER_KEY).iter().filter(|text| text.as_str() == "没有待处理的请求。").count() > index
-        }), "a stray approval command did not report that nothing was pending");
+        assert!(
+            wait_for(LONG, || {
+                rig.texts_to(OWNER_KEY)
+                    .iter()
+                    .filter(|text| text.as_str() == "没有待处理的请求。")
+                    .count()
+                    > index
+            }),
+            "a stray approval command did not report that nothing was pending"
+        );
     }
     assert!(lock(&model.requests).is_empty());
 }
@@ -96,7 +132,10 @@ fn matching_approval_commands_from_group_members_and_the_owner_in_a_group_are_ig
     // through ingress and the same approval is still live.
     says(&rig, OWNER_KEY, OWNER, "owner", "/approval-help");
     let expected = format!("回复 /approve {id} 或 /deny {id}");
-    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).contains(&expected)), "a group command consumed the private approval");
+    assert!(
+        wait_for(LONG, || rig.texts_to(OWNER_KEY).contains(&expected)),
+        "a group command consumed the private approval"
+    );
     assert_eq!(lock(&model.requests).len(), 1);
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "running");
     assert_eq!(pending_approval(&rig), id);
@@ -116,8 +155,14 @@ fn refusing_an_approval_creates_no_target_send_intent() {
     let id = request_approval(&mut rig);
     says(&rig, OWNER_KEY, OWNER, "owner", &format!("/deny {id}"));
     assert!(wait_for(LONG, || lock(&model.requests).len() == 2));
-    assert!(rig.texts_to(GROUP_KEY).is_empty(), "a refused approval sent to the group");
-    assert!(rig.data_lines("send-outbox.jsonl").iter().all(|entry| entry["key"] != GROUP_KEY));
+    assert!(
+        rig.texts_to(GROUP_KEY).is_empty(),
+        "a refused approval sent to the group"
+    );
+    assert!(rig
+        .data_lines("send-outbox.jsonl")
+        .iter()
+        .all(|entry| entry["key"] != GROUP_KEY));
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "refused");
 }
 
@@ -130,14 +175,20 @@ fn only_the_current_approval_id_can_send_and_it_sends_once() {
     let mut rig = owner_harness_rig("owner-approval-once", &model);
     let id = request_approval(&mut rig);
     says(&rig, OWNER_KEY, OWNER, "owner", "/approve obsolete-request");
-    assert!(!wait_for(Duration::from_secs(3), || lock(&model.requests).len() > 1), "a mismatched request ID resumed the approval");
+    assert!(
+        !wait_for(Duration::from_secs(3), || lock(&model.requests).len() > 1),
+        "a mismatched request ID resumed the approval"
+    );
     let approval = format!("/approve {id}");
     says(&rig, OWNER_KEY, OWNER, "owner", &approval);
     says(&rig, OWNER_KEY, OWNER, "owner", &approval);
     assert!(wait_for(LONG, || lock(&model.requests).len() == 2));
     assert_eq!(rig.texts_to(GROUP_KEY), ["approved group text"]);
     assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "completed");
-    assert_eq!(rig.console("GET", "/api/pending", None), (200, json!({"pending":[]})));
+    assert_eq!(
+        rig.console("GET", "/api/pending", None),
+        (200, json!({"pending":[]}))
+    );
 }
 
 #[test]
@@ -152,12 +203,20 @@ fn ambiguous_approved_delivery_pauses_and_does_not_continue_or_resend() {
     says(&rig, OWNER_KEY, OWNER, "owner", &format!("/approve {id}"));
     assert!(wait_for(LONG, || lock(&model.requests).len() > 1
         || rig.console("GET", "/api/turns", None).1["pausedCount"] == 1));
-    assert_eq!(lock(&model.requests).len(), 1, "ambiguous approved delivery was returned to the model");
+    assert_eq!(
+        lock(&model.requests).len(),
+        1,
+        "ambiguous approved delivery was returned to the model"
+    );
     let facts = conversation_facts(&rig);
     assert_eq!(facts["tools"][0]["state"], "uncertain");
     assert_eq!(rig.texts_to(GROUP_KEY), ["approved group text"]);
     let turn = facts["turns"][0]["id"].as_str().unwrap();
-    let (status, _) = rig.console("POST", "/api/turns/resolve", Some(&json!({"turnId":turn,"action":"retry"})));
+    let (status, _) = rig.console(
+        "POST",
+        "/api/turns/resolve",
+        Some(&json!({"turnId":turn,"action":"retry"})),
+    );
     assert_eq!(status, 409);
 }
 
@@ -175,13 +234,33 @@ fn the_group_send_cap_counts_each_approving_turn() {
     cfg["socialV2"]["send"]["maxPerTurn"] = json!(1);
     fs::write(path, cfg.to_string()).unwrap();
     let first = request_approval(&mut rig);
-    says(&rig, OWNER_KEY, OWNER, "owner", &format!("/approve {first}"));
-    assert!(wait_for(LONG, || rig.ledger().iter().any(|row| row["k"] == "ended" && row["outcome"] == "completed")));
+    says(
+        &rig,
+        OWNER_KEY,
+        OWNER,
+        "owner",
+        &format!("/approve {first}"),
+    );
+    assert!(wait_for(LONG, || {
+        rig.ledger()
+            .iter()
+            .any(|row| row["k"] == "ended" && row["outcome"] == "completed")
+    }));
     assert_eq!(rig.texts_to(GROUP_KEY), ["approved group text"]);
     says(&rig, OWNER_KEY, OWNER, "owner", "ask to post again");
     let second = pending_approval(&rig);
     assert_ne!(second, first);
-    says(&rig, OWNER_KEY, OWNER, "owner", &format!("/approve {second}"));
+    says(
+        &rig,
+        OWNER_KEY,
+        OWNER,
+        "owner",
+        &format!("/approve {second}"),
+    );
     assert!(wait_for(LONG, || lock(&model.requests).len() == 4));
-    assert_eq!(rig.texts_to(GROUP_KEY).len(), 2, "a previous approving turn spent the current turn's group send cap");
+    assert_eq!(
+        rig.texts_to(GROUP_KEY).len(),
+        2,
+        "a previous approving turn spent the current turn's group send cap"
+    );
 }

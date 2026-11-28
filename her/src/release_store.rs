@@ -104,13 +104,17 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     directory(lock.parent().ok_or("release gate has no directory")?)?;
-    if fs::symlink_metadata(&lock).is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta)) {
+    if fs::symlink_metadata(&lock)
+        .is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta))
+    {
         return Err("release install gate is redirected".into());
     }
-    let gate = crate::guarded_file::open_gate(lock, crate::guarded_file::Gate::Create).map_err(|error| match error {
-        crate::guarded_file::GateError::Open(_) => "release install gate unavailable",
-        _ => "release install gate is redirected",
-    })?;
+    let gate = crate::guarded_file::open_gate(lock, crate::guarded_file::Gate::Create).map_err(
+        |error| match error {
+            crate::guarded_file::GateError::Open(_) => "release install gate unavailable",
+            _ => "release install gate is redirected",
+        },
+    )?;
     gate.try_lock()
         .map_err(|_| "another release installation or restore is running")?;
     Ok(gate)
@@ -144,7 +148,11 @@ pub(crate) fn gate_contended(lock: &Path) -> bool {
 /// Fsynced root-level state/helper publication under the caller's installation gate.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     directory(path.parent().ok_or("release state has no parent")?)?;
-    let mode = if path.extension().is_some_and(|ext| ext == "exe") { 0o700 } else { 0o600 };
+    let mode = if path.extension().is_some_and(|ext| ext == "exe") {
+        0o700
+    } else {
+        0o600
+    };
     crate::guarded_file::publish_atomic_with(
         path,
         &mut &contents[..],

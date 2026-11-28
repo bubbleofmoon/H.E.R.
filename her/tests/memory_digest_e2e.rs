@@ -80,25 +80,38 @@ impl Model {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (requests, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+        let (requests, stop) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
         let (log, done) = (requests.clone(), stop.clone());
         let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(replies)));
-        let thread = thread::spawn(move || while !done.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let Some((path, header, body)) = request(&mut stream) else { continue };
-                    log.lock().unwrap().push((path, header, body));
-                    let (status, body, delay) = replies.lock().unwrap().pop_front().unwrap_or_else(|| {
-                        let (s, b) = completion("[]");
-                        (s, b, 0)
-                    });
-                    thread::sleep(Duration::from_millis(delay));
-                    let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let thread = thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some((path, header, body)) = request(&mut stream) else {
+                            continue;
+                        };
+                        log.lock().unwrap().push((path, header, body));
+                        let (status, body, delay) =
+                            replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+                                let (s, b) = completion("[]");
+                                (s, b, 0)
+                            });
+                        thread::sleep(Duration::from_millis(delay));
+                        let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
                 }
-                Err(_) => thread::sleep(Duration::from_millis(5)),
             }
         });
-        Self { port, requests, stop, thread: Some(thread) }
+        Self {
+            port,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
     }
     fn count(&self) -> usize {
         self.requests.lock().unwrap().len()
@@ -130,9 +143,14 @@ impl Rig {
         let root = crate::support::RuntimeRoot::new("digest");
         let reservation = crate::support::ports::reserve();
         let port = reservation.port();
-        std::fs::write(root.join("config/config.json"), json!({"consoleToken":"fixture-digest-token","consolePort":port,
+        std::fs::write(
+            root.join("config/config.json"),
+            json!({"consoleToken":"fixture-digest-token","consolePort":port,
             "ownerQQ":9001,"memory":{"autoFlush":auto},"harness":{"model":"digest-fixture-model"},
-            "tasks":{"nodePath":root.join("nonexistent-node.exe"),"installRoot":root.path()}}).to_string()).unwrap();
+            "tasks":{"nodePath":root.join("nonexistent-node.exe"),"installRoot":root.path()}})
+            .to_string(),
+        )
+        .unwrap();
         std::fs::write(root.join("config/harness-api-key"), "fixture-digest-key").unwrap();
         std::fs::write(root.join("data/social-v2.json"), social.to_string()).unwrap();
         std::fs::write(
@@ -249,7 +267,8 @@ impl Rig {
     }
     fn cursor_rows(&self) -> i64 {
         let db = rusqlite::Connection::open(self.root.join("data/memory.db")).unwrap();
-        db.query_row("SELECT count(*) FROM digest_cursor", [], |r| r.get(0)).unwrap()
+        db.query_row("SELECT count(*) FROM digest_cursor", [], |r| r.get(0))
+            .unwrap()
     }
     /// Digest memory rows, in write order.
     fn digest_rows(&self) -> Vec<(String, String, String, String)> {
@@ -264,8 +283,12 @@ impl Rig {
     }
     fn count_rows(&self, source: &str) -> i64 {
         let db = rusqlite::Connection::open(self.root.join("data/memory.db")).unwrap();
-        db.query_row("SELECT count(*) FROM memory WHERE source = ?1", [source], |r| r.get(0))
-            .unwrap()
+        db.query_row(
+            "SELECT count(*) FROM memory WHERE source = ?1",
+            [source],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
     /// Kill the console process the digest runs in, as an abrupt crash or forced restart would.
     fn kill(&mut self) {
@@ -339,7 +362,9 @@ fn three() -> Value {
 
 #[test]
 fn nightly_digest_writes_new_messages_with_bridge_provenance_and_never_logs_chat() {
-    let model = Model::start(vec![completion(r#"[{"subject":"爬山","content":"甲周六去爬山","source":"model-claimed"}]"#)]);
+    let model = Model::start(vec![completion(
+        r#"[{"subject":"爬山","content":"甲周六去爬山","source":"model-claimed"}]"#,
+    )]);
     let mut rig = Rig::new(&model, json!({}), social(three()));
     rig.start();
     let run = rig.run("memory-digest", "digest-provenance");
@@ -368,7 +393,9 @@ fn nightly_digest_writes_new_messages_with_bridge_provenance_and_never_logs_chat
     assert!(!leaks(&rig, &run, CHAT));
     let lines = meta_lines(&rig, &run);
     assert!(
-        lines.iter().any(|l| l.contains("digest written=1 memories=1 quiet=1 failures=0")),
+        lines
+            .iter()
+            .any(|l| l.contains("digest written=1 memories=1 quiet=1 failures=0")),
         "{lines:?}"
     );
     let repeat = rig.run("memory-digest", "digest-provenance-repeat");
@@ -378,7 +405,10 @@ fn nightly_digest_writes_new_messages_with_bridge_provenance_and_never_logs_chat
 
 #[test]
 fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
-    let quota = (429, r#"{"error":{"message":"private-quota-text"}}"#.to_string());
+    let quota = (
+        429,
+        r#"{"error":{"message":"private-quota-text"}}"#.to_string(),
+    );
     let model = Model::start(vec![
         quota.clone(),
         quota,
@@ -413,7 +443,10 @@ fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
         assert_eq!(model.count(), count);
         let lines = meta_lines(&rig, &run);
         let expected = format!("digest failed step=model kind={kind}");
-        assert!(lines.iter().any(|line| line.contains(&expected)), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "{lines:?}"
+        );
     }
     let fifth = rig.run("memory-digest", "digest-fail-5");
     assert_eq!(fifth["state"], "succeeded", "{fifth}");
@@ -421,13 +454,20 @@ fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
     assert_eq!(model.count(), 9);
     let sixth = rig.run("memory-digest", "digest-fail-6");
     assert_eq!(sixth["state"], "succeeded", "{sixth}");
-    assert_eq!(model.count(), 9, "the cursor moved, so the new run is quiet");
+    assert_eq!(
+        model.count(),
+        9,
+        "the cursor moved, so the new run is quiet"
+    );
     {
         let requests = model.requests.lock().unwrap();
         let messages = &requests[0].2["messages"];
         assert!(messages.to_string().contains("下周搬家"));
         for (index, (_, _, body)) in requests.iter().enumerate().skip(1) {
-            assert_eq!(&body["messages"], messages, "request {index} changed the messages");
+            assert_eq!(
+                &body["messages"], messages,
+                "request {index} changed the messages"
+            );
         }
     }
 }
@@ -447,7 +487,9 @@ fn disabled_digest_contacts_no_model() {
 
 #[test]
 fn check_digest_waits_for_a_backlog() {
-    let model = Model::start(vec![completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#)]);
+    let model = Model::start(vec![completion(
+        r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#,
+    )]);
     let mut rig = Rig::new(
         &model,
         json!({}),
@@ -470,7 +512,11 @@ fn a_stopped_runtime_refuses_digest_admission_with_409() {
     rig.start();
     rig.stop_jobs();
     let (code, body) = rig
-        .http("POST", "/api/tasks/memory-digest/run", Some(json!({"requestId":"digest-stopped"})))
+        .http(
+            "POST",
+            "/api/tasks/memory-digest/run",
+            Some(json!({"requestId":"digest-stopped"})),
+        )
         .unwrap();
     assert_eq!(code, 409, "{body}");
     assert_eq!(model.count(), 0);
@@ -478,7 +524,11 @@ fn a_stopped_runtime_refuses_digest_admission_with_409() {
 
 #[test]
 fn stop_during_a_model_call_ends_the_run_cancelled_without_a_write_or_a_second_request() {
-    let model = Model::start_delayed(vec![(200, completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#).1, 1500)]);
+    let model = Model::start_delayed(vec![(
+        200,
+        completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#).1,
+        1500,
+    )]);
     let mut rig = Rig::new(&model, json!({}), two());
     rig.start();
     let id = rig.trigger("memory-digest", "digest-stop-mid-run");
@@ -486,11 +536,25 @@ fn stop_during_a_model_call_ends_the_run_cancelled_without_a_write_or_a_second_r
     rig.stop_jobs();
     let run = rig.wait_run(&id, Duration::from_secs(15));
     assert_eq!(run["state"], "cancelled", "{run}");
-    assert!(rig.digest_rows().is_empty(), "a held digest wrote memories: {:?}", rig.digest_rows());
+    assert!(
+        rig.digest_rows().is_empty(),
+        "a held digest wrote memories: {:?}",
+        rig.digest_rows()
+    );
     assert_eq!(rig.cursor_rows(), 0, "a held digest moved a cursor");
     thread::sleep(Duration::from_millis(300));
-    assert_eq!(model.count(), 1, "the second conversation reached the model");
-    assert!(!model.requests.lock().unwrap()[0].2.to_string().contains("下周开会"), "another conversation's message reached the input");
+    assert_eq!(
+        model.count(),
+        1,
+        "the second conversation reached the model"
+    );
+    assert!(
+        !model.requests.lock().unwrap()[0]
+            .2
+            .to_string()
+            .contains("下周开会"),
+        "another conversation's message reached the input"
+    );
 }
 
 #[test]
@@ -502,27 +566,53 @@ fn a_check_during_a_running_digest_skips_on_the_lock() {
     wait_for_request(&model, 1);
     let check = rig.run("memory-digest-check", "digest-gate-check");
     assert_eq!(check["state"], "succeeded", "{check}");
-    assert!(meta_lines(&rig, &check).iter().any(|l| l.contains("digest skipped: already running")), "check did not skip on the lock");
-    assert_eq!(rig.wait_run(&daily, Duration::from_secs(15))["state"], "succeeded");
+    assert!(
+        meta_lines(&rig, &check)
+            .iter()
+            .any(|l| l.contains("digest skipped: already running")),
+        "check did not skip on the lock"
+    );
+    assert_eq!(
+        rig.wait_run(&daily, Duration::from_secs(15))["state"],
+        "succeeded"
+    );
     assert_eq!(model.count(), 1);
 }
 
 #[test]
 fn each_job_reloads_the_selected_config_and_model_endpoint() {
     let old = Model::start(vec![]);
-    let current = Model::start(vec![completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#)]);
+    let current = Model::start(vec![completion(
+        r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#,
+    )]);
     let mut rig = Rig::new(&old, json!({"enabled":false}), social(three()));
     rig.start();
-    assert_eq!(rig.run("memory-digest", "digest-reload-disabled")["state"], "succeeded");
+    assert_eq!(
+        rig.run("memory-digest", "digest-reload-disabled")["state"],
+        "succeeded"
+    );
     let path = rig.root.join("config/config.json");
     let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     cfg["memory"]["autoFlush"]["enabled"] = json!(true);
     std::fs::write(&path, cfg.to_string()).unwrap();
-    std::fs::write(rig.root.join("dependencies.json"), json!({"dsh":"http://127.0.0.1:1",
-        "model":format!("http://127.0.0.1:{}", current.port),"onebot":"http://127.0.0.1:1"}).to_string()).unwrap();
+    std::fs::write(
+        rig.root.join("dependencies.json"),
+        json!({"dsh":"http://127.0.0.1:1",
+        "model":format!("http://127.0.0.1:{}", current.port),"onebot":"http://127.0.0.1:1"})
+        .to_string(),
+    )
+    .unwrap();
     let run = rig.run("memory-digest", "digest-reload-enabled");
     assert_eq!(run["state"], "succeeded", "{run}");
-    assert_eq!(current.count(), 1, "the job must use the current dependencies.json");
-    assert_eq!(old.count(), 0, "the job contacted the endpoint cached at console start");
+    assert_eq!(
+        current.count(),
+        1,
+        "the job must use the current dependencies.json"
+    );
+    assert_eq!(
+        old.count(),
+        0,
+        "the job contacted the endpoint cached at console start"
+    );
     assert_eq!(rig.digest_rows().len(), 1);
 }

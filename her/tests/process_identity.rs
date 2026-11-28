@@ -30,7 +30,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     fn node(name: &str, entry: &str, extra: &[&str]) -> Self {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-process-{name}-{}", std::process::id())));
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("her-process-{name}-{}", std::process::id())),
+        );
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::write(
             root.join(entry),

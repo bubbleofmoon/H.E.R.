@@ -36,9 +36,10 @@ fn start_notices_with(root: &Path, groups: &[i64], initial: FakeGateway) -> Harn
             while socket.read().is_ok() {}
         }
     });
-    let (console, console_port) = crate::support::ports::start_console(std::time::Duration::from_secs(20), |port| {
-        spawn_console(root, port)
-    });
+    let (console, console_port) =
+        crate::support::ports::start_console(std::time::Duration::from_secs(20), |port| {
+            spawn_console(root, port)
+        });
     let console = crate::support::ports::OwnedChild(console);
     Harness {
         child: spawn_candidate(root, console_port),
@@ -372,10 +373,7 @@ fn private_gap_windows_are_grouped_and_only_new_windows_are_announced_after_rest
                 text.contains("private:8808：6 个") && text.contains("private:8810：3 个"),
                 "{text}"
             );
-            assert!(
-                text.contains("2026/10/30 18:30:12"),
-                "local time: {text}"
-            );
+            assert!(text.contains("2026/10/30 18:30:12"), "local time: {text}");
             assert!(
                 text.contains("group:42：2 个")
                     && text.contains("已补收 1")

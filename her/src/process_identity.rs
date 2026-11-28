@@ -715,46 +715,91 @@ mod os {
     }
 
     fn tcp_peer_pid(stream: &std::net::TcpStream) -> Result<u32, String> {
-        use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL};
-        let (std::net::SocketAddr::V4(peer), std::net::SocketAddr::V4(local)) =
-            (stream.peer_addr().map_err(|_| "TCP peer is unavailable")?, stream.local_addr().map_err(|_| "TCP listener is unavailable")?) else {
-                return Err("desktop sign-in requires IPv4 loopback".into());
-            };
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        };
+        let (std::net::SocketAddr::V4(peer), std::net::SocketAddr::V4(local)) = (
+            stream.peer_addr().map_err(|_| "TCP peer is unavailable")?,
+            stream
+                .local_addr()
+                .map_err(|_| "TCP listener is unavailable")?,
+        ) else {
+            return Err("desktop sign-in requires IPv4 loopback".into());
+        };
         if !peer.ip().is_loopback() || !local.ip().is_loopback() {
             return Err("desktop sign-in requires loopback".into());
         }
         let mut size = 0;
         // SAFETY: query required IPv4 owner table size; AF_INET is 2.
-        unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, 2, TCP_TABLE_OWNER_PID_ALL, 0) };
+        unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                2,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
+        };
         for _ in 0..3 {
-            if size < 4 || size > 16 * 1024 * 1024 { return Err("TCP owner table is unavailable".into()); }
+            if size < 4 || size > 16 * 1024 * 1024 {
+                return Err("TCP owner table is unavailable".into());
+            }
             let mut bytes = vec![0u8; size as usize];
-            let status = unsafe { GetExtendedTcpTable(bytes.as_mut_ptr().cast(), &mut size, 0, 2, TCP_TABLE_OWNER_PID_ALL, 0) };
-            if status == 122 { continue; } // ERROR_INSUFFICIENT_BUFFER: table grew.
-            if status != 0 { return Err("TCP owner table is unavailable".into()); }
+            let status = unsafe {
+                GetExtendedTcpTable(
+                    bytes.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    2,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
+            };
+            if status == 122 {
+                continue;
+            } // ERROR_INSUFFICIENT_BUFFER: table grew.
+            if status != 0 {
+                return Err("TCP owner table is unavailable".into());
+            }
             let count = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as usize;
             let width = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
-            if count > (bytes.len() - 4) / width { return Err("TCP owner table is invalid".into()); }
+            if count > (bytes.len() - 4) / width {
+                return Err("TCP owner table is invalid".into());
+            }
             let mut found = None;
             for index in 0..count {
                 // SAFETY: bounds checked above; read_unaligned avoids assumptions about Vec<u8> alignment.
-                let row = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(4 + index * width).cast::<MIB_TCPROW_OWNER_PID>()) };
+                let row = unsafe {
+                    std::ptr::read_unaligned(
+                        bytes
+                            .as_ptr()
+                            .add(4 + index * width)
+                            .cast::<MIB_TCPROW_OWNER_PID>(),
+                    )
+                };
                 if row.dwState == 5 // MIB_TCP_STATE_ESTAB
                     && row.dwLocalAddr.to_ne_bytes() == peer.ip().octets()
                     && row.dwRemoteAddr.to_ne_bytes() == local.ip().octets()
                     && u16::from_be(row.dwLocalPort as u16) == peer.port()
-                    && u16::from_be(row.dwRemotePort as u16) == local.port() {
-                    if found.replace(row.dwOwningPid).is_some() { return Err("TCP peer ownership is ambiguous".into()); }
+                    && u16::from_be(row.dwRemotePort as u16) == local.port()
+                {
+                    if found.replace(row.dwOwningPid).is_some() {
+                        return Err("TCP peer ownership is ambiguous".into());
+                    }
                 }
             }
-            return found.filter(|pid| *pid != 0).ok_or_else(|| "TCP peer process is unavailable".into());
+            return found
+                .filter(|pid| *pid != 0)
+                .ok_or_else(|| "TCP peer process is unavailable".into());
         }
         Err("TCP owner table changed during inspection".into())
     }
 
     pub(super) fn tcp_peer_user(stream: &std::net::TcpStream) -> Result<Vec<u8>, String> {
         let pid = tcp_peer_pid(stream)?;
-        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.ok_or("TCP peer process exited")?;
+        let handle =
+            open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.ok_or("TCP peer process exited")?;
         let before = identity(&handle, pid)?.ok_or("TCP peer process exited")?;
         let user = token_user(handle.0)?;
         let after = identity(&handle, pid)?.ok_or("TCP peer process exited")?;
@@ -1042,7 +1087,10 @@ mod os {
         type Window = *mut std::ffi::c_void;
         #[link(name = "user32")]
         extern "system" {
-            fn EnumWindows(callback: Option<unsafe extern "system" fn(Window, isize) -> i32>, data: isize) -> i32;
+            fn EnumWindows(
+                callback: Option<unsafe extern "system" fn(Window, isize) -> i32>,
+                data: isize,
+            ) -> i32;
             fn GetWindowThreadProcessId(window: Window, pid: *mut u32) -> u32;
             fn IsWindowVisible(window: Window) -> i32;
             fn IsIconic(window: Window) -> i32;
@@ -1050,7 +1098,10 @@ mod os {
             fn SetForegroundWindow(window: Window) -> i32;
             fn GetForegroundWindow() -> Window;
         }
-        struct Search { pid: u32, window: Window }
+        struct Search {
+            pid: u32,
+            window: Window,
+        }
         unsafe extern "system" fn visit(window: Window, data: isize) -> i32 {
             // SAFETY: EnumWindows is synchronous; data points to its live Search.
             let search = unsafe { &mut *(data as *mut Search) };
@@ -1066,28 +1117,46 @@ mod os {
             1
         }
         let missing = "No verified QQ login window was found";
-        if !std::path::Path::new(&expected.exe).file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("QQ.exe")) {
+        if !std::path::Path::new(&expected.exe)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("QQ.exe"))
+        {
             return Err(missing.into());
         }
         let handle = open(expected.pid, PROCESS_QUERY_LIMITED_INFORMATION)?.ok_or(missing)?;
         let matches = || -> Result<bool, String> {
-            Ok(identity(&handle, expected.pid)?.is_some_and(|found| same_identity(&found, expected)))
+            Ok(identity(&handle, expected.pid)?
+                .is_some_and(|found| same_identity(&found, expected)))
         };
-        if !matches()? { return Err(missing.into()); }
-        let mut search = Search { pid: expected.pid, window: std::ptr::null_mut() };
+        if !matches()? {
+            return Err(missing.into());
+        }
+        let mut search = Search {
+            pid: expected.pid,
+            window: std::ptr::null_mut(),
+        };
         // SAFETY: synchronous enumeration, callback state remains live through the call.
-        unsafe { EnumWindows(Some(visit), (&mut search as *mut Search) as isize); }
-        if search.window.is_null() || !matches()? { return Err(missing.into()); }
+        unsafe {
+            EnumWindows(Some(visit), (&mut search as *mut Search) as isize);
+        }
+        if search.window.is_null() || !matches()? {
+            return Err(missing.into());
+        }
         let mut pid = 0;
         // SAFETY: recheck the window owner immediately before activation; the process handle
         // remains pinned and no process creation, termination or injection is performed.
         unsafe {
             GetWindowThreadProcessId(search.window, &mut pid);
-            if pid != expected.pid { return Err(missing.into()); }
-            if IsIconic(search.window) != 0 { ShowWindowAsync(search.window, 9); }
+            if pid != expected.pid {
+                return Err(missing.into());
+            }
+            if IsIconic(search.window) != 0 {
+                ShowWindowAsync(search.window, 9);
+            }
             if SetForegroundWindow(search.window) == 0 || GetForegroundWindow() != search.window {
-                return Err("Windows could not bring the verified QQ login window to the front".into());
+                return Err(
+                    "Windows could not bring the verified QQ login window to the front".into(),
+                );
             }
         }
         Ok(())

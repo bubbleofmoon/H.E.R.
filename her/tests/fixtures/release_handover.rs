@@ -73,10 +73,15 @@ struct Portable {
     controls: PathBuf,
 }
 impl Portable {
-    fn new() -> Self { Self::configured(|_| {}) }
+    fn new() -> Self {
+        Self::configured(|_| {})
+    }
     fn configured(configure: impl FnOnce(&Self)) -> Self {
         let f = Fixture::new();
-        let mut sums = format!("# HER-RELEASE v1.2.3 1\n{}", release_signing::keys("primary"));
+        let mut sums = format!(
+            "# HER-RELEASE v1.2.3 1\n{}",
+            release_signing::keys("primary")
+        );
         for (name, source) in [
             ("her.exe", env!("CARGO_BIN_EXE_her")),
             ("her-cli.exe", env!("CARGO_BIN_EXE_her-cli")),
@@ -491,9 +496,29 @@ impl Drop for Portable {
                 "current at failure: {:?}",
                 fs::canonicalize(self.f.root.join("install/current"))
             ));
-            for name in ["handover-control.helper.stderr","install/runtime/data/releases.json","handover-control.json","old-supervisor.err","install/runtime/data/logs/rbridge-live.err.log","install/runtime/data/logs/rbridge-live.out.log","install/runtime/data/logs/rbridge-live.stderr.log","install/runtime/data/logs/rbridge-live.stdout.log","install/runtime/dsh/packets.jsonl"] {
+            for name in [
+                "handover-control.helper.stderr",
+                "install/runtime/data/releases.json",
+                "handover-control.json",
+                "old-supervisor.err",
+                "install/runtime/data/logs/rbridge-live.err.log",
+                "install/runtime/data/logs/rbridge-live.out.log",
+                "install/runtime/data/logs/rbridge-live.stderr.log",
+                "install/runtime/data/logs/rbridge-live.stdout.log",
+                "install/runtime/dsh/packets.jsonl",
+            ] {
                 if let Ok(text) = fs::read_to_string(self.f.root.join(name)) {
-                    cleanup_warning(format_args!("{name}: {}",text.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")));
+                    cleanup_warning(format_args!(
+                        "{name}: {}",
+                        text.lines()
+                            .rev()
+                            .take(25)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
                 }
             }
         }
@@ -506,7 +531,8 @@ impl Drop for Portable {
         for identity in owners.iter() {
             if process_identity::check_identity(identity) == process_identity::Liveness::Matches {
                 match process_identity::kill_verified(identity) {
-                    process_identity::KillOutcome::Killed | process_identity::KillOutcome::Gone => {}
+                    process_identity::KillOutcome::Killed | process_identity::KillOutcome::Gone => {
+                    }
                     outcome => cleanup_warning(format_args!("terminate {identity:?}: {outcome:?}")),
                 }
             }
@@ -1388,10 +1414,16 @@ fn auto_update_rechecks_a_turn_paused_during_trial_before_retirement() {
     // Wait for the aborted auto-handover helper child to finish exiting and release
     // update-restore.lock before sending manual approval on slow CI runners.
     let lock_path = fixture.runtime().join("data/locks/update-restore.lock");
-    fixture.wait(|| match fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Ok(file) => file.try_lock().is_ok(),
-        Err(_) => false,
+    fixture.wait(|| {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(file) => file.try_lock().is_ok(),
+            Err(_) => false,
+        }
     });
     // Manual approval retains its existing drain semantics: a durable pause
     // with no active pipeline does not veto the owner's explicit decision.
@@ -1473,7 +1505,6 @@ fn update_command_casing_and_alias_policies_never_bypass_the_interceptor() {
     fixture.assert_link("current", "v0.0.0");
 }
 
-
 #[test]
 fn fix3_native_recovery_uses_last_good_cli_when_current_images_are_missing() {
     let fixture = Portable::new();
@@ -1546,7 +1577,10 @@ fn fix5_helper_publication_uses_the_verified_bytes() {
         scope.spawn(|| {
             let end = Instant::now() + Duration::from_secs(60);
             while !waiting.is_file() {
-                assert!(Instant::now() < end, "helper publication barrier not reached");
+                assert!(
+                    Instant::now() < end,
+                    "helper publication barrier not reached"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
             // A writer replaces the candidate helper after verification.

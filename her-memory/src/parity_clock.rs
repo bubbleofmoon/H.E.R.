@@ -47,7 +47,10 @@ mod fixed {
     /// Fixed epoch plus elapsed monotonic time, or None when the env var is absent.
     pub fn now_ms() -> Option<i64> {
         let origin = ORIGIN.get_or_init(|| {
-            let epoch_ms = std::env::var("HER_PARITY_EPOCH_MS").ok()?.parse::<i64>().ok()?;
+            let epoch_ms = std::env::var("HER_PARITY_EPOCH_MS")
+                .ok()?
+                .parse::<i64>()
+                .ok()?;
             eprintln!("[parity-clock] fixed epoch_ms={epoch_ms}");
             Some(Origin {
                 epoch_ms,

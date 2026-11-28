@@ -1,5 +1,5 @@
-use support::install_root;
 use support::hide_window as hide_process_window;
+use support::install_root;
 mod support;
 use serde_json::{json, Value};
 use std::fs;
@@ -8,8 +8,8 @@ use std::net::{TcpListener, TcpStream};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,7 +113,13 @@ fn fixture_root(
     )
     .expect("write selected state");
     fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("write selected mode");
-    crate::support::write_dependencies(&root, crate::support::CLOSED, "http://127.0.0.1:2", onebot_url, None);
+    crate::support::write_dependencies(
+        &root,
+        crate::support::CLOSED,
+        "http://127.0.0.1:2",
+        onebot_url,
+        None,
+    );
     FixtureRoot(root)
 }
 
@@ -406,7 +412,8 @@ impl FakeOneBot {
                             let private = request.path == "/send_private_msg";
                             requests.push(request);
                             if private {
-                                observed_private_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                observed_private_count
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
                     }
@@ -472,7 +479,11 @@ enum Step {
     OkDelayed(u64),
     /// Accept, then rewrite the conversation's agent token in the selected state file, whose path
     /// the test fills in after the fixture exists.
-    OkRotateToken { target: RotateTarget, key: String, token: String },
+    OkRotateToken {
+        target: RotateTarget,
+        key: String,
+        token: String,
+    },
 }
 
 type RotateTarget = Arc<Mutex<Option<PathBuf>>>;
@@ -495,7 +506,10 @@ struct Behavior {
 
 impl Behavior {
     fn plain(reject_send: bool) -> Self {
-        Self { reject_send, ..Self::default() }
+        Self {
+            reject_send,
+            ..Self::default()
+        }
     }
 }
 
@@ -505,7 +519,9 @@ fn handle_onebot(
     behavior: &mut Behavior,
     request_count: &std::sync::atomic::AtomicUsize,
 ) -> Option<OneBotRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).ok()?;
@@ -563,21 +579,27 @@ fn handle_onebot(
         Some(json!({ "status": "ok", "retcode": 0, "data": { "user_id": 9001 } }).to_string())
     } else if path == "/get_group_msg_history" || path == "/get_friend_msg_history" {
         {
-        let messages = if behavior.history_hidden_calls > 0 {
-            behavior.history_hidden_calls -= 1;
-            Vec::new()
-        } else {
-            behavior.history.clone()
-        };
-        Some(json!({ "status": "ok", "retcode": 0, "data": { "messages": messages } }).to_string())
-    }
+            let messages = if behavior.history_hidden_calls > 0 {
+                behavior.history_hidden_calls -= 1;
+                Vec::new()
+            } else {
+                behavior.history.clone()
+            };
+            Some(
+                json!({ "status": "ok", "retcode": 0, "data": { "messages": messages } })
+                    .to_string(),
+            )
+        }
     } else {
         behavior.sends += 1;
-        let step = behavior.steps.pop_front().unwrap_or(if behavior.reject_send {
-            Step::Reject
-        } else {
-            Step::Ok
-        });
+        let step = behavior
+            .steps
+            .pop_front()
+            .unwrap_or(if behavior.reject_send {
+                Step::Reject
+            } else {
+                Step::Ok
+            });
         let accepted =
             json!({ "status": "ok", "retcode": 0, "data": { "message_id": 91000 + behavior.sends } }).to_string();
         match step {
@@ -709,7 +731,10 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
         response_a.body["quoted"],
         json!({ "sender": "fixture-card", "text": "引用文本", "userId": "711" })
     );
-    assert!(response_a.body.get("hint").is_none(), "split sends follow the selected policy");
+    assert!(
+        response_a.body.get("hint").is_none(),
+        "split sends follow the selected policy"
+    );
     assert!(response_a.body["warn"]
         .as_str()
         .unwrap()
@@ -743,7 +768,9 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
     assert_eq!(response_b.body["delays"], json!([9]));
     assert!(response_b.body.get("hint").is_none());
 
-    let b_calls_before_limit = onebot_b.request_count.load(std::sync::atomic::Ordering::SeqCst);
+    let b_calls_before_limit = onebot_b
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         b_calls_before_limit, 6,
         "two private sends and their typing pairs"
@@ -762,7 +789,9 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
     );
 
     assert_eq!(
-        onebot_b.request_count.load(std::sync::atomic::Ordering::SeqCst),
+        onebot_b
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         b_calls_before_limit,
         "the rate-limited request must make no OneBot call, including typing"
     );
@@ -865,11 +894,14 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
         "根A继续工作"
     );
     assert!(
-        requests_a.iter().all(|request| request.path != "/set_input_status"),
+        requests_a
+            .iter()
+            .all(|request| request.path != "/set_input_status"),
         "groups must never publish typing status"
     );
     assert_eq!(
-        requests_b.len(), 6,
+        requests_b.len(),
+        6,
         "two B sends and four private typing calls only"
     );
     let b_sends: Vec<_> = requests_b
@@ -892,10 +924,17 @@ fn send_message_keeps_two_selected_roots_and_complete_success_contract() {
         ]
     );
     assert_eq!(
-        requests_b.iter().map(|request| request.path.as_str()).collect::<Vec<_>>(),
+        requests_b
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
         vec![
-            "/set_input_status", "/set_input_status", "/send_private_msg",
-            "/set_input_status", "/set_input_status", "/send_private_msg",
+            "/set_input_status",
+            "/set_input_status",
+            "/send_private_msg",
+            "/set_input_status",
+            "/set_input_status",
+            "/send_private_msg",
         ]
     );
     assert!(requests_b
@@ -1233,7 +1272,10 @@ fn send_message_rejects_oversized_declared_body_after_auth_without_side_effects(
         MAX_BODY_BYTES + 1,
     )
     .expect("read the auth response for an oversized request");
-    assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
+    assert_eq!(
+        unauthorized.status, 401,
+        "console auth must precede body limits"
+    );
     assert_eq!(
         unauthorized.body["error"],
         "未通过鉴权：缺少有效控制台访问令牌"
@@ -1243,11 +1285,18 @@ fn send_message_rejects_oversized_declared_body_after_auth_without_side_effects(
         let response = http_request_with_declared_length(
             console.port,
             Some(console_token),
-            Some(if console.port == console_a.port { AGENT_A } else { AGENT_B }),
+            Some(if console.port == console_a.port {
+                AGENT_A
+            } else {
+                AGENT_B
+            }),
             MAX_BODY_BYTES + 1,
         )
         .expect("read the selected send-message body-limit response");
-        assert_eq!(response.status, 413, "oversized selected send must be rejected");
+        assert_eq!(
+            response.status, 413,
+            "oversized selected send must be rejected"
+        );
         assert_eq!(response.body["error"], "请求体过大（超过 1MB）");
     }
 
@@ -1300,8 +1349,10 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     let config_b_before = fs::read(&config_b).expect("snapshot selected B config");
     let mode_a_before = fs::read(&mode_a).expect("snapshot selected A mode");
     let mode_b_before = fs::read(&mode_b).expect("snapshot selected B mode");
-    let dependencies_a_before = fs::read(&dependencies_a).expect("snapshot selected A dependencies");
-    let dependencies_b_before = fs::read(&dependencies_b).expect("snapshot selected B dependencies");
+    let dependencies_a_before =
+        fs::read(&dependencies_a).expect("snapshot selected A dependencies");
+    let dependencies_b_before =
+        fs::read(&dependencies_b).expect("snapshot selected B dependencies");
     let console_a = ConsoleProcess::start(&root_a);
     let console_b = ConsoleProcess::start(&root_b);
 
@@ -1313,7 +1364,10 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
         MAX_BODY_BYTES,
     )
     .expect("read the auth response for an oversized chunked request");
-    assert_eq!(unauthorized.status, 401, "console auth must precede body limits");
+    assert_eq!(
+        unauthorized.status, 401,
+        "console auth must precede body limits"
+    );
     assert_eq!(
         unauthorized.body["error"],
         "未通过鉴权：缺少有效控制台访问令牌"
@@ -1327,7 +1381,10 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
         MAX_BODY_BYTES,
     )
     .expect("read the global agent-gate response before the body limit");
-    assert_eq!(empty_agent.status, 403, "agent gate must precede body limits");
+    assert_eq!(
+        empty_agent.status, 403,
+        "agent gate must precede body limits"
+    );
     assert_eq!(empty_agent.body["error"], "agent token 不能为空");
 
     let paused_state = json!({
@@ -1361,8 +1418,14 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
         MAX_BODY_BYTES,
     )
     .expect("read the disabled-v2 gate response before the body limit");
-    assert_eq!(disabled.status, 403, "v2 enabled gate must precede body limits");
-    assert_eq!(disabled.body["error"], "二代社交功能已停用，禁止调用 v2 工具");
+    assert_eq!(
+        disabled.status, 403,
+        "v2 enabled gate must precede body limits"
+    );
+    assert_eq!(
+        disabled.body["error"],
+        "二代社交功能已停用，禁止调用 v2 工具"
+    );
     assert_eq!(fs::read(&config_a).unwrap(), disabled_before);
     fs::write(&config_a, &config_a_before).unwrap();
 
@@ -1393,7 +1456,10 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
             MAX_BODY_BYTES,
         )
         .expect("read the selected send-message chunked body-limit response");
-        assert_eq!(response.status, 413, "oversized selected send must be rejected");
+        assert_eq!(
+            response.status, 413,
+            "oversized selected send must be rejected"
+        );
         assert_eq!(response.body["error"], "请求体过大（超过 1MB）");
     }
 
@@ -1526,16 +1592,31 @@ fn send_resume_refuses_interaction_batches_even_in_reserved2() {
     let group = "group:70001";
     let owner = "private:9001";
     let root = fixture_root(
-        "interaction-resume-purpose", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        group, &[70001], &["9001"], 100, json!([]),
+        "interaction-resume-purpose",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        group,
+        &[70001],
+        &["9001"],
+        100,
+        json!([]),
     );
     hf123_config(&root, |_| {});
     let state_path = root.join("data/social-v2.json");
     let mut state = read_selected_state(&root);
     state["conversations"][owner] = state["conversations"][group].clone();
     fs::write(state_path, state.to_string()).unwrap();
-    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let protected = [(group, "approved-group"), (owner, "owner-interaction"), (owner, "owner-interaction-timeout")];
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let protected = [
+        (group, "approved-group"),
+        (owner, "owner-interaction"),
+        (owner, "owner-interaction-timeout"),
+    ];
     let controls = [(group, "legacy-group"), (owner, "legacy-private")];
     let mut records = String::new();
     for (key, batch) in protected.into_iter().chain(controls) {
@@ -1554,16 +1635,30 @@ fn send_resume_refuses_interaction_batches_even_in_reserved2() {
     let console = ConsoleProcess::start(&root);
     for (key, batch) in protected {
         let response = post_send(&console, AGENT_A, json!({"key":key,"resumeBatchId":batch}));
-        assert_eq!(response.status, 409, "resume accepted a protected {batch} batch: {}", response.body);
+        assert_eq!(
+            response.status, 409,
+            "resume accepted a protected {batch} batch: {}",
+            response.body
+        );
         assert_eq!(response.body["error"], "该批次不能恢复发送");
     }
     assert_eq!(fs::read_to_string(&outbox).unwrap(), records);
     for (key, batch) in controls {
         let control = post_send(&console, AGENT_A, json!({"key":key,"resumeBatchId":batch}));
-        assert_eq!(control.status, 200, "legacy control was not resumable: {}", control.body);
+        assert_eq!(
+            control.status, 200,
+            "legacy control was not resumable: {}",
+            control.body
+        );
     }
     let requests = onebot.finish();
-    assert_eq!(send_texts(&requests), ["resume fixture legacy-group", "resume fixture legacy-private"]);
+    assert_eq!(
+        send_texts(&requests),
+        [
+            "resume fixture legacy-group",
+            "resume fixture legacy-private"
+        ]
+    );
 }
 
 #[test]
@@ -1575,10 +1670,25 @@ fn durable_partial_success_resumes_without_resending_confirmed_items() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-partial", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-partial",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
 
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["一", "二", "三"], "gapMode": "fixed", "gaps": [0, 0] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["一", "二", "三"], "gapMode": "fixed", "gaps": [0, 0] }),
+    );
     assert_eq!(first.status, 500, "partial batch body: {}", first.body);
     assert_eq!(first.body["ok"], false);
     assert_eq!(first.body["sent"], 2);
@@ -1590,29 +1700,71 @@ fn durable_partial_success_resumes_without_resending_confirmed_items() {
 
     let state = read_selected_state(&root);
     let conv = &state["conversations"]["group:70001"];
-    assert_eq!(conv["sendTimes"].as_array().unwrap().len(), 2, "refused item gives its reservation back");
-    let recent: Vec<&str> = conv["recentMessages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap()).collect();
-    assert_eq!(recent, vec!["一", "三"], "only delivered texts become the bot's recent messages");
-    assert!(conv.get("lastAiReplyAt").is_none(), "a partial batch is not a completed reply");
+    assert_eq!(
+        conv["sendTimes"].as_array().unwrap().len(),
+        2,
+        "refused item gives its reservation back"
+    );
+    let recent: Vec<&str> = conv["recentMessages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        recent,
+        vec!["一", "三"],
+        "only delivered texts become the bot's recent messages"
+    );
+    assert!(
+        conv.get("lastAiReplyAt").is_none(),
+        "a partial batch is not a completed reply"
+    );
 
-    let resumed = post_send(&console, AGENT_A, json!({ "key": "group:70001", "resumeBatchId": batch_id }));
+    let resumed = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "resumeBatchId": batch_id }),
+    );
     assert_eq!(resumed.status, 200, "resume body: {}", resumed.body);
     assert_eq!(resumed.body["ok"], true);
     assert_eq!(resumed.body["sent"], 3);
     assert_eq!(resumed.body["pending"], json!([]));
 
     let requests = onebot.finish();
-    let texts: Vec<String> = send_paths(&requests).into_iter().map(segment_text).collect();
-    assert_eq!(texts, vec!["一", "二", "三", "二"], "resume sends only the refused item again");
+    let texts: Vec<String> = send_paths(&requests)
+        .into_iter()
+        .map(segment_text)
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["一", "二", "三", "二"],
+        "resume sends only the refused item again"
+    );
 
-    let view = http_request(console.port, "GET", "/api/socialV2/send-outbox?key=group:70001", Some(CONSOLE_A), None, &Value::Null).unwrap();
+    let view = http_request(
+        console.port,
+        "GET",
+        "/api/socialV2/send-outbox?key=group:70001",
+        Some(CONSOLE_A),
+        None,
+        &Value::Null,
+    )
+    .unwrap();
     assert_eq!(view.status, 200);
     let batch = &view.body["batches"][0];
     assert_eq!(batch["batchId"], json!(batch_id));
-    let states: Vec<&str> = batch["items"].as_array().unwrap().iter().map(|i| i["state"].as_str().unwrap()).collect();
+    let states: Vec<&str> = batch["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["state"].as_str().unwrap())
+        .collect();
     assert_eq!(states, vec!["confirmed", "confirmed", "confirmed"]);
 
-    assert!(read_outbox(&root).iter().any(|r| r["k"] == "not_committed" && r["idx"] == 1));
+    assert!(read_outbox(&root)
+        .iter()
+        .any(|r| r["k"] == "not_committed" && r["idx"] == 1));
 }
 
 #[test]
@@ -1624,29 +1776,60 @@ fn unknown_result_is_recorded_and_never_resent_without_evidence() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-unknown", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-unknown",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
 
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["未知结果"] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["未知结果"] }),
+    );
     assert_eq!(first.status, 500, "unknown body: {}", first.body);
     assert_eq!(first.body["sent"], 0);
     assert_eq!(first.body["unknown"], json!([0]));
     let batch_id = first.body["batchId"].as_str().unwrap().to_string();
-    let reserved = read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len();
+    let reserved = read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+        .as_array()
+        .unwrap()
+        .len();
     assert_eq!(reserved, 1, "an unknown item keeps its reservation");
 
-    let resumed = post_send(&console, AGENT_A, json!({ "key": "group:70001", "resumeBatchId": batch_id }));
+    let resumed = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "resumeBatchId": batch_id }),
+    );
     assert_eq!(resumed.status, 409, "resume must refuse: {}", resumed.body);
     assert_eq!(resumed.body["unknown"], json!([0]));
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 1, "no automatic resend of an unverified item");
-    assert!(read_outbox(&root).iter().any(|r| r["k"] == "unknown" && r["idx"] == 0));
+    assert_eq!(
+        send_paths(&requests).len(),
+        1,
+        "no automatic resend of an unverified item"
+    );
+    assert!(read_outbox(&root)
+        .iter()
+        .any(|r| r["k"] == "unknown" && r["idx"] == 0));
 }
 
 #[test]
 fn unknown_result_is_confirmed_when_history_shows_our_own_message() {
-    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let onebot = FakeOneBot::start_with(
         70001,
         Behavior {
@@ -1661,10 +1844,25 @@ fn unknown_result_is_confirmed_when_history_shows_our_own_message() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-verified", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-verified",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
 
-    let response = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["已核实"] }));
+    let response = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["已核实"] }),
+    );
     assert_eq!(response.status, 200, "verified body: {}", response.body);
     assert_eq!(response.body["sent"], 1);
     assert_eq!(response.body["failed"], 0);
@@ -1682,7 +1880,18 @@ fn unknown_result_is_confirmed_when_history_shows_our_own_message() {
 #[test]
 fn concurrent_sends_share_one_persisted_quota_reservation() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("durable-quota", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 2, json!([]));
+    let root = fixture_root(
+        "durable-quota",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        2,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
     let port = console.port;
 
@@ -1708,10 +1917,18 @@ fn concurrent_sends_share_one_persisted_quota_reservation() {
     });
     let mut sorted = statuses.clone();
     sorted.sort_unstable();
-    assert_eq!(sorted, vec![200, 200, 429], "two sends fit the per-minute quota, the third is refused");
+    assert_eq!(
+        sorted,
+        vec![200, 200, 429],
+        "two sends fit the per-minute quota, the third is refused"
+    );
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 2, "the refused send never reaches OneBot");
+    assert_eq!(
+        send_paths(&requests).len(),
+        2,
+        "the refused send never reaches OneBot"
+    );
 }
 
 #[test]
@@ -1719,7 +1936,18 @@ fn concurrent_sends_wait_out_a_stalled_state_gate_holder_instead_of_refusing() {
     // A holder that keeps `locks/social-v2.lock` for far longer than the old 300 ms wait (a slow
     // fsync or a descheduled writer) must delay the sends, not turn one of them into a 503.
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("durable-quota-stall", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 2, json!([]));
+    let root = fixture_root(
+        "durable-quota-stall",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        2,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
     let port = console.port;
 
@@ -1756,10 +1984,18 @@ fn concurrent_sends_wait_out_a_stalled_state_gate_holder_instead_of_refusing() {
     });
     let mut sorted = statuses.clone();
     sorted.sort_unstable();
-    assert_eq!(sorted, vec![200, 200, 429], "a stalled gate holder delays the sends; it must not refuse them");
+    assert_eq!(
+        sorted,
+        vec![200, 200, 429],
+        "a stalled gate holder delays the sends; it must not refuse them"
+    );
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 2, "the refused send never reaches OneBot");
+    assert_eq!(
+        send_paths(&requests).len(),
+        2,
+        "the refused send never reaches OneBot"
+    );
 }
 
 /// Gap batch small-parity item 2: the quote preview is the quoted message's own words rendered by
@@ -1782,9 +2018,24 @@ fn quote_preview_renders_the_quoted_message_like_segments_to_text() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("quote-preview", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "quote-preview",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let response = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["引用"], "replyToMessageId": "90042" }));
+    let response = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["引用"], "replyToMessageId": "90042" }),
+    );
     assert_eq!(response.status, 200, "send body: {}", response.body);
     assert_eq!(
         response.body["quoted"]["text"],
@@ -1795,14 +2046,38 @@ fn quote_preview_renders_the_quoted_message_like_segments_to_text() {
 
 #[test]
 fn quote_failure_gives_back_the_reservation_without_any_request() {
-    let onebot = FakeOneBot::start_with(70001, Behavior { quote_missing: true, ..Behavior::default() });
-    let root = fixture_root("durable-quote-miss", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let onebot = FakeOneBot::start_with(
+        70001,
+        Behavior {
+            quote_missing: true,
+            ..Behavior::default()
+        },
+    );
+    let root = fixture_root(
+        "durable-quote-miss",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
 
-    let response = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["引用"], "replyToMessageId": "90042" }));
+    let response = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["引用"], "replyToMessageId": "90042" }),
+    );
     assert_eq!(response.status, 400, "quote body: {}", response.body);
     let state = read_selected_state(&root);
-    assert!(state["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().is_empty());
+    assert!(state["conversations"]["group:70001"]["sendTimes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let requests = onebot.finish();
     assert!(send_paths(&requests).is_empty());
@@ -1817,9 +2092,24 @@ fn stale_turn_batch_is_refused_after_the_agent_token_changes() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-stale", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-stale",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲", "乙"], "gapMode": "fixed", "gaps": [0] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲", "乙"], "gapMode": "fixed", "gaps": [0] }),
+    );
     assert_eq!(first.status, 500);
     let batch_id = first.body["batchId"].as_str().unwrap().to_string();
 
@@ -1827,11 +2117,23 @@ fn stale_turn_batch_is_refused_after_the_agent_token_changes() {
     state["conversations"]["group:70001"]["agentToken"] = json!("fixture-agent-token-rotated");
     fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
 
-    let resumed = post_send(&console, "fixture-agent-token-rotated", json!({ "key": "group:70001", "resumeBatchId": batch_id }));
-    assert_eq!(resumed.status, 409, "old-turn batch must be refused: {}", resumed.body);
+    let resumed = post_send(
+        &console,
+        "fixture-agent-token-rotated",
+        json!({ "key": "group:70001", "resumeBatchId": batch_id }),
+    );
+    assert_eq!(
+        resumed.status, 409,
+        "old-turn batch must be refused: {}",
+        resumed.body
+    );
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 2, "refused resume sends nothing");
+    assert_eq!(
+        send_paths(&requests).len(),
+        2,
+        "refused resume sends nothing"
+    );
 }
 
 #[test]
@@ -1850,29 +2152,76 @@ fn token_rotation_during_a_batch_cancels_the_remaining_items() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-cancel", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-cancel",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     *rotate_target.lock().unwrap() = Some(root.join("data/social-v2.json"));
     let console = ConsoleProcess::start(&root);
 
-    let response = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲", "乙", "丙"], "gapMode": "fixed", "gaps": [0, 0] }));
+    let response = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲", "乙", "丙"], "gapMode": "fixed", "gaps": [0, 0] }),
+    );
     assert_eq!(response.status, 500, "cancel body: {}", response.body);
     assert_eq!(response.body["sent"], 1);
     assert_eq!(response.body["cancelled"], json!([1, 2]));
-    assert!(response.body["error"].as_str().unwrap().contains("发送中止"));
+    assert!(response.body["error"]
+        .as_str()
+        .unwrap()
+        .contains("发送中止"));
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 1, "cancelled items never reach OneBot");
-    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        send_paths(&requests).len(),
+        1,
+        "cancelled items never reach OneBot"
+    );
+    assert_eq!(
+        read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn silent_mode_blocks_non_owner_sends_before_any_request() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("durable-silent", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
-    fs::write(root.join("data/current-role.json"), r#"{"role":null,"mode":"silent"}"#).unwrap();
+    let root = fixture_root(
+        "durable-silent",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
+    fs::write(
+        root.join("data/current-role.json"),
+        r#"{"role":null,"mode":"silent"}"#,
+    )
+    .unwrap();
     let console = ConsoleProcess::start(&root);
 
-    let response = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["静默"] }));
+    let response = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["静默"] }),
+    );
     assert_eq!(response.status, 403, "silent body: {}", response.body);
     let requests = onebot.finish();
     assert!(send_paths(&requests).is_empty());
@@ -1881,7 +2230,18 @@ fn silent_mode_blocks_non_owner_sends_before_any_request() {
 #[test]
 fn quote_and_at_stay_on_the_first_segment_in_order() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("durable-segments", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-segments",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
 
     let response = post_send(
@@ -1894,16 +2254,29 @@ fn quote_and_at_stay_on_the_first_segment_in_order() {
     let requests = onebot.finish();
     let sends = send_paths(&requests);
     assert_eq!(sends.len(), 2);
-    let first_types: Vec<&str> = sends[0].body["message"].as_array().unwrap().iter().map(|s| s["type"].as_str().unwrap()).collect();
+    let first_types: Vec<&str> = sends[0].body["message"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["type"].as_str().unwrap())
+        .collect();
     assert_eq!(first_types, vec!["reply", "at", "text"]);
     assert_eq!(sends[0].body["message"][0]["data"]["id"], "90042");
-    let second_types: Vec<&str> = sends[1].body["message"].as_array().unwrap().iter().map(|s| s["type"].as_str().unwrap()).collect();
+    let second_types: Vec<&str> = sends[1].body["message"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["type"].as_str().unwrap())
+        .collect();
     assert_eq!(second_types, vec!["text"]);
 }
 
 #[test]
 fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_before_any_resend() {
-    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let onebot = FakeOneBot::start_with(
         70001,
         Behavior {
@@ -1919,9 +2292,24 @@ fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_bef
             ..Behavior::default()
         },
     );
-    let root = fixture_root("durable-restart", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-restart",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["重启前发出"] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["重启前发出"] }),
+    );
     assert_eq!(first.status, 500, "unknown body: {}", first.body);
     let batch_id = first.body["batchId"].as_str().unwrap().to_string();
     drop(console);
@@ -1935,22 +2323,51 @@ fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_bef
         .map(str::to_string)
         .collect();
     assert_eq!(kept.len(), 2, "intent + attempt remain: {kept:?}");
-    fs::write(&path, kept.join("
-") + "
-").unwrap();
+    fs::write(
+        &path,
+        kept.join(
+            "
+",
+        ) + "
+",
+    )
+    .unwrap();
 
     let console = ConsoleProcess::start(&root);
-    let view = http_request(console.port, "GET", "/api/socialV2/send-outbox?key=group:70001", Some(CONSOLE_A), None, &Value::Null).unwrap();
-    assert_eq!(view.body["batches"][0]["items"][0]["state"], "unknown", "attempt without outcome is unknown after restart");
+    let view = http_request(
+        console.port,
+        "GET",
+        "/api/socialV2/send-outbox?key=group:70001",
+        Some(CONSOLE_A),
+        None,
+        &Value::Null,
+    )
+    .unwrap();
+    assert_eq!(
+        view.body["batches"][0]["items"][0]["state"], "unknown",
+        "attempt without outcome is unknown after restart"
+    );
     assert_eq!(view.body["batches"][0]["sent"], 0);
 
-    let resumed = post_send(&console, AGENT_A, json!({ "key": "group:70001", "resumeBatchId": batch_id }));
+    let resumed = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "resumeBatchId": batch_id }),
+    );
     assert_eq!(resumed.status, 200, "resume body: {}", resumed.body);
     assert_eq!(resumed.body["sent"], 1);
 
     let requests = onebot.finish();
-    assert_eq!(send_paths(&requests).len(), 1, "history evidence confirms the item; nothing is resent");
-    let confirmed = read_outbox(&root).into_iter().rev().find(|r| r["k"] == "confirmed").unwrap();
+    assert_eq!(
+        send_paths(&requests).len(),
+        1,
+        "history evidence confirms the item; nothing is resent"
+    );
+    let confirmed = read_outbox(&root)
+        .into_iter()
+        .rev()
+        .find(|r| r["k"] == "confirmed")
+        .unwrap();
     assert_eq!(confirmed["messageId"], 77002);
     assert_eq!(confirmed["verified"], true);
 }
@@ -1959,16 +2376,35 @@ fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_bef
 fn unreachable_gateway_is_recorded_as_not_committed_and_resumable() {
     let onebot = FakeOneBot::start(70001, false);
     let dead_url = crate::support::CLOSED.to_string();
-    let root = fixture_root("durable-dead", CONSOLE_A, AGENT_A, ONEBOT_A, &dead_url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "durable-dead",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &dead_url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["连不上"] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["连不上"] }),
+    );
     assert_eq!(first.status, 500, "dead gateway body: {}", first.body);
     assert_eq!(first.body["notCommitted"], json!([0]));
     assert_eq!(first.body["unknown"], json!([]));
-    assert!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().is_empty());
+    assert!(
+        read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     drop(onebot);
 }
-
 
 fn history_message(message_id: i64, time: i64, text: &str) -> Value {
     json!({
@@ -1981,7 +2417,10 @@ fn history_message(message_id: i64, time: i64, text: &str) -> Value {
 }
 
 fn now_seconds() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn send_texts(requests: &[OneBotRequest]) -> Vec<String> {
@@ -1989,7 +2428,11 @@ fn send_texts(requests: &[OneBotRequest]) -> Vec<String> {
 }
 
 fn resume(console: &ConsoleProcess, batch_id: &str) -> HttpResponse {
-    post_send(console, AGENT_A, json!({ "key": "group:70001", "resumeBatchId": batch_id }))
+    post_send(
+        console,
+        AGENT_A,
+        json!({ "key": "group:70001", "resumeBatchId": batch_id }),
+    )
 }
 
 // ---- Ticket 08 hardening -------------------------------------------------------------------
@@ -2006,9 +2449,24 @@ fn concurrent_resumes_of_one_batch_never_send_an_item_twice() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("harden-resume-race", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "harden-resume-race",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["一", "二", "三"], "gapMode": "fixed", "gaps": [0, 0] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["一", "二", "三"], "gapMode": "fixed", "gaps": [0, 0] }),
+    );
     assert_eq!(first.status, 500, "setup body: {}", first.body);
     assert_eq!(first.body["unknown"], json!([0]));
     assert_eq!(first.body["notCommitted"], json!([1]));
@@ -2017,18 +2475,41 @@ fn concurrent_resumes_of_one_batch_never_send_an_item_twice() {
     let port = console.port;
     let id_a = batch_id.clone();
     let worker = thread::spawn(move || {
-        http_request(port, "POST", "/api/socialV2/send-message", Some(CONSOLE_A), Some(AGENT_A),
-            &json!({ "key": "group:70001", "resumeBatchId": id_a })).unwrap()
+        http_request(
+            port,
+            "POST",
+            "/api/socialV2/send-message",
+            Some(CONSOLE_A),
+            Some(AGENT_A),
+            &json!({ "key": "group:70001", "resumeBatchId": id_a }),
+        )
+        .unwrap()
     });
     thread::sleep(Duration::from_millis(250));
     let second = resume(&console, &batch_id);
     let first_resume = worker.join().unwrap();
 
-    assert_eq!(second.status, 409, "overlapping resume must be refused: {}", second.body);
-    assert!(second.body.to_string().contains("进行中"), "refusal explains why: {}", second.body);
-    assert_eq!(first_resume.status, 500, "first resume still has the unknown item: {}", first_resume.body);
+    assert_eq!(
+        second.status, 409,
+        "overlapping resume must be refused: {}",
+        second.body
+    );
+    assert!(
+        second.body.to_string().contains("进行中"),
+        "refusal explains why: {}",
+        second.body
+    );
+    assert_eq!(
+        first_resume.status, 500,
+        "first resume still has the unknown item: {}",
+        first_resume.body
+    );
     let requests = onebot.finish();
-    assert_eq!(send_texts(&requests), vec!["一", "二", "三", "二"], "item 二 is resent exactly once");
+    assert_eq!(
+        send_texts(&requests),
+        vec!["一", "二", "三", "二"],
+        "item 二 is resent exactly once"
+    );
 }
 
 #[test]
@@ -2040,7 +2521,18 @@ fn resume_racing_the_original_send_is_refused_and_never_duplicates() {
             ..Behavior::default()
         },
     );
-    let root = fixture_root("harden-original-race", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "harden-original-race",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
     let port = console.port;
     let original = thread::spawn(move || {
@@ -2050,21 +2542,44 @@ fn resume_racing_the_original_send_is_refused_and_never_duplicates() {
     // Find the running batch through the durable view once its attempt is recorded.
     let deadline = Instant::now() + Duration::from_secs(5);
     let batch_id = loop {
-        let view = http_request(console.port, "GET", "/api/socialV2/send-outbox?key=group:70001", Some(CONSOLE_A), None, &Value::Null).unwrap();
+        let view = http_request(
+            console.port,
+            "GET",
+            "/api/socialV2/send-outbox?key=group:70001",
+            Some(CONSOLE_A),
+            None,
+            &Value::Null,
+        )
+        .unwrap();
         if let Some(id) = view.body["batches"][0]["batchId"].as_str() {
             if read_outbox(&root).iter().any(|r| r["k"] == "attempt") {
                 break id.to_string();
             }
         }
-        assert!(Instant::now() < deadline, "batch never appeared in the outbox");
+        assert!(
+            Instant::now() < deadline,
+            "batch never appeared in the outbox"
+        );
         thread::sleep(Duration::from_millis(40));
     };
     let racing = resume(&console, &batch_id);
     let original = original.join().unwrap();
-    assert_eq!(racing.status, 409, "resume of a running batch must be refused: {}", racing.body);
-    assert_eq!(original.status, 200, "original send completes: {}", original.body);
+    assert_eq!(
+        racing.status, 409,
+        "resume of a running batch must be refused: {}",
+        racing.body
+    );
+    assert_eq!(
+        original.status, 200,
+        "original send completes: {}",
+        original.body
+    );
     let requests = onebot.finish();
-    assert_eq!(send_texts(&requests), vec!["一", "二"], "no item is sent twice");
+    assert_eq!(
+        send_texts(&requests),
+        vec!["一", "二"],
+        "no item is sent twice"
+    );
 }
 
 // Retcode 100 without result=120 may have delivered (#46 keeps it unknown); result=120 is covered by a_result_120_refusal_is_not_committed.
@@ -2073,45 +2588,134 @@ fn failure_retcodes_that_may_have_delivered_are_unknown_and_clear_refusals_stay_
     let onebot = FakeOneBot::start_with(
         70001,
         Behavior {
-            steps: [Step::Failed(1403), Step::HttpStatus(401), Step::Failed(200), Step::Failed(100)].into_iter().collect(),
+            steps: [
+                Step::Failed(1403),
+                Step::HttpStatus(401),
+                Step::Failed(200),
+                Step::Failed(100),
+            ]
+            .into_iter()
+            .collect(),
             ..Behavior::default()
         },
     );
-    let root = fixture_root("harden-retcode", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "harden-retcode",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲", "乙", "丙", "丁"], "gapMode": "fixed", "gaps": [0, 0, 0] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲", "乙", "丙", "丁"], "gapMode": "fixed", "gaps": [0, 0, 0] }),
+    );
     assert_eq!(first.status, 500, "body: {}", first.body);
-    assert_eq!(first.body["notCommitted"], json!([0, 1]), "1403 and HTTP 401 are refusals before processing: {}", first.body);
-    assert_eq!(first.body["unknown"], json!([2, 3]), "other failure retcodes may have delivered: {}", first.body);
+    assert_eq!(
+        first.body["notCommitted"],
+        json!([0, 1]),
+        "1403 and HTTP 401 are refusals before processing: {}",
+        first.body
+    );
+    assert_eq!(
+        first.body["unknown"],
+        json!([2, 3]),
+        "other failure retcodes may have delivered: {}",
+        first.body
+    );
     let batch_id = first.body["batchId"].as_str().unwrap().to_string();
-    let reserved = read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len();
-    assert_eq!(reserved, 2, "unknown items keep their reservation, refusals give theirs back");
+    let reserved = read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        reserved, 2,
+        "unknown items keep their reservation, refusals give theirs back"
+    );
 
     let resumed = resume(&console, &batch_id);
-    assert_eq!(resumed.status, 500, "unknown items remain after resume: {}", resumed.body);
+    assert_eq!(
+        resumed.status, 500,
+        "unknown items remain after resume: {}",
+        resumed.body
+    );
     assert_eq!(resumed.body["unknown"], json!([2, 3]));
     let requests = onebot.finish();
-    assert_eq!(send_texts(&requests), vec!["甲", "乙", "丙", "丁", "甲", "乙"], "unknown items are never resent");
+    assert_eq!(
+        send_texts(&requests),
+        vec!["甲", "乙", "丙", "丁", "甲", "乙"],
+        "unknown items are never resent"
+    );
 }
 
 #[test]
 fn a_result_120_refusal_is_not_committed() {
-    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
-    let root = fixture_root("mute-120", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let onebot = FakeOneBot::start_with(
+        70001,
+        Behavior {
+            steps: [Step::Muted].into_iter().collect(),
+            ..Behavior::default()
+        },
+    );
+    let root = fixture_root(
+        "mute-120",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
-    assert_eq!(first.status, 500, "a partial or failed batch keeps its status: {}", first.body);
-    assert_eq!(first.body["notCommitted"], json!([0]), "a muted refusal is definite: {}", first.body);
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲"] }),
+    );
+    assert_eq!(
+        first.status, 500,
+        "a partial or failed batch keeps its status: {}",
+        first.body
+    );
+    assert_eq!(
+        first.body["notCommitted"],
+        json!([0]),
+        "a muted refusal is definite: {}",
+        first.body
+    );
     assert_eq!(first.body["unknown"], json!([]), "{}", first.body);
-    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
-    let refused: Vec<String> = read_outbox(&root).iter().filter(|r| r["k"] == "not_committed")
-        .filter_map(|r| r["error"].as_str().map(str::to_string)).collect();
+    assert_eq!(
+        read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "the refusal gives its reservation back"
+    );
+    let refused: Vec<String> = read_outbox(&root)
+        .iter()
+        .filter(|r| r["k"] == "not_committed")
+        .filter_map(|r| r["error"].as_str().map(str::to_string))
+        .collect();
     assert_eq!(refused, vec!["OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
     drop(onebot);
 }
 
 fn now_millis() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// Seed `data/group-mutes.json` with one personal mute ending at `personal_until` (ms; -1 = unknown end).
@@ -2121,95 +2725,295 @@ fn seed_mute(root: &Path, key: &str, personal_until: i64) {
         key.to_string(),
         json!({"personalUntil": personal_until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}),
     );
-    fs::write(root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    fs::write(
+        root.join("data/group-mutes.json"),
+        json!({"v": 1, "groups": groups}).to_string(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn a_muted_group_is_refused_locally_without_a_onebot_call() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("muted-local", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "muted-local",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     seed_mute(&root, "group:70001", now_millis() + 600_000);
     let console = ConsoleProcess::start(&root);
-    let refused = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    let refused = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲"] }),
+    );
     assert_eq!(refused.status, 403, "{}", refused.body);
     let error = refused.body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("禁言") && error.contains("muted until"), "{}", refused.body);
-    assert!(refused.body.get("unknown").is_none(), "a local refusal is never unknown delivery: {}", refused.body);
-    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0);
-    assert!(read_outbox(&root).iter().all(|r| r["k"] != "intent"), "no intent for a refused send");
+    assert!(
+        error.contains("禁言") && error.contains("muted until"),
+        "{}",
+        refused.body
+    );
+    assert!(
+        refused.body.get("unknown").is_none(),
+        "a local refusal is never unknown delivery: {}",
+        refused.body
+    );
+    assert_eq!(
+        read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        read_outbox(&root).iter().all(|r| r["k"] != "intent"),
+        "no intent for a refused send"
+    );
 
     // The other side of the threshold: a mute that ended one millisecond ago no longer refuses.
     seed_mute(&root, "group:70001", now_millis() - 1);
-    let sent = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    let sent = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲"] }),
+    );
     assert_eq!(sent.status, 200, "{}", sent.body);
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r| r.path == "/send_group_msg").count(), 1, "only the post-mute send reached OneBot");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        1,
+        "only the post-mute send reached OneBot"
+    );
 }
 
 #[test]
 fn a_result_120_refusal_teaches_the_mute_and_the_next_send_stays_local() {
-    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
-    let root = fixture_root("muted-learn", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let onebot = FakeOneBot::start_with(
+        70001,
+        Behavior {
+            steps: [Step::Muted].into_iter().collect(),
+            ..Behavior::default()
+        },
+    );
+    let root = fixture_root(
+        "muted-learn",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["甲"] }),
+    );
     assert_eq!(first.body["notCommitted"], json!([0]), "{}", first.body);
-    let second = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["乙"] }));
-    assert_eq!(second.status, 403, "the learned mute refuses the next send locally: {}", second.body);
-    let store: Value = serde_json::from_slice(&fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    let second = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["乙"] }),
+    );
+    assert_eq!(
+        second.status, 403,
+        "the learned mute refuses the next send locally: {}",
+        second.body
+    );
+    let store: Value = serde_json::from_slice(
+        &fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state"),
+    )
+    .unwrap();
     assert_eq!(store["groups"]["group:70001"]["personalUntil"], json!(-1));
     // One content-free owner notice for the new episode.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while onebot.private_request_count.load(std::sync::atomic::Ordering::SeqCst) < 1 && Instant::now() < deadline {
+    while onebot
+        .private_request_count
+        .load(std::sync::atomic::Ordering::SeqCst)
+        < 1
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(20));
     }
     let requests = onebot.finish();
-    let groups: Vec<String> = requests.iter().filter(|r| r.path == "/send_group_msg").map(segment_text).collect();
-    assert_eq!(groups, vec!["甲".to_string()], "the second send never reached OneBot");
-    let notices: Vec<String> = requests.iter().filter(|r| r.path == "/send_private_msg").map(segment_text).collect();
+    let groups: Vec<String> = requests
+        .iter()
+        .filter(|r| r.path == "/send_group_msg")
+        .map(segment_text)
+        .collect();
+    assert_eq!(
+        groups,
+        vec!["甲".to_string()],
+        "the second send never reached OneBot"
+    );
+    let notices: Vec<String> = requests
+        .iter()
+        .filter(|r| r.path == "/send_private_msg")
+        .map(segment_text)
+        .collect();
     assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].contains("70001") && notices[0].contains("禁言"), "{notices:?}");
-    assert!(!notices[0].contains('甲') && !notices[0].contains('乙'), "the notice carries no message content");
+    assert!(
+        notices[0].contains("70001") && notices[0].contains("禁言"),
+        "{notices:?}"
+    );
+    assert!(
+        !notices[0].contains('甲') && !notices[0].contains('乙'),
+        "the notice carries no message content"
+    );
 }
 
 #[test]
 fn a_result_120_poke_refusal_is_a_definite_403_and_teaches_the_mute() {
-    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
-    let root = fixture_root("muted-poke", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
-    hf123_config(&root, |cfg| cfg["socialV2"]["tools"]["sendPoke"] = json!(true));
+    let onebot = FakeOneBot::start_with(
+        70001,
+        Behavior {
+            steps: [Step::Muted].into_iter().collect(),
+            ..Behavior::default()
+        },
+    );
+    let root = fixture_root(
+        "muted-poke",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["tools"]["sendPoke"] = json!(true)
+    });
     let console = ConsoleProcess::start(&root);
     let body = json!({"key": "group:70001", "targetUserId": "822"});
-    let first = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    let first = http_request(
+        console.port,
+        "POST",
+        "/api/socialV2/send-poke",
+        Some(CONSOLE_A),
+        Some(AGENT_A),
+        &body,
+    )
+    .unwrap();
     assert_eq!(first.status, 403, "{}", first.body);
-    assert!(first.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", first.body);
-    let store: Value = serde_json::from_slice(&fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    assert!(
+        first.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("禁言"),
+        "{}",
+        first.body
+    );
+    let store: Value = serde_json::from_slice(
+        &fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state"),
+    )
+    .unwrap();
     assert_eq!(store["groups"]["group:70001"]["personalUntil"], json!(-1));
-    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refused poke gave its reservation back");
-    let second = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    assert_eq!(
+        read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "the refused poke gave its reservation back"
+    );
+    let second = http_request(
+        console.port,
+        "POST",
+        "/api/socialV2/send-poke",
+        Some(CONSOLE_A),
+        Some(AGENT_A),
+        &body,
+    )
+    .unwrap();
     assert_eq!(second.status, 403, "{}", second.body);
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r| r.path == "/group_poke").count(), 1, "the second poke stayed local");
+    assert_eq!(
+        requests.iter().filter(|r| r.path == "/group_poke").count(),
+        1,
+        "the second poke stayed local"
+    );
 }
 
 #[test]
 fn a_muted_group_refuses_direct_and_poke_without_any_gateway_request() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("muted-direct", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "muted-direct",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     hf123_config(&root, |cfg| {
         cfg["socialV2"]["tools"]["sendGroup"] = json!(true);
         cfg["socialV2"]["tools"]["sendPoke"] = json!(true);
     });
     seed_mute(&root, "group:70001", now_millis() + 600_000);
     let console = ConsoleProcess::start(&root);
-    let direct = http_request(console.port, "POST", "/api/send/group", Some(CONSOLE_A), Some(AGENT_A),
-        &json!({"groupId": 70001, "token": AGENT_A, "message": "甲"})).unwrap();
+    let direct = http_request(
+        console.port,
+        "POST",
+        "/api/send/group",
+        Some(CONSOLE_A),
+        Some(AGENT_A),
+        &json!({"groupId": 70001, "token": AGENT_A, "message": "甲"}),
+    )
+    .unwrap();
     assert_eq!(direct.status, 403, "{}", direct.body);
-    assert!(direct.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", direct.body);
-    let poke = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A),
-        &json!({"key": "group:70001", "targetUserId": "711"})).unwrap();
+    assert!(
+        direct.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("禁言"),
+        "{}",
+        direct.body
+    );
+    let poke = http_request(
+        console.port,
+        "POST",
+        "/api/socialV2/send-poke",
+        Some(CONSOLE_A),
+        Some(AGENT_A),
+        &json!({"key": "group:70001", "targetUserId": "711"}),
+    )
+    .unwrap();
     assert_eq!(poke.status, 403, "{}", poke.body);
-    assert!(poke.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", poke.body);
+    assert!(
+        poke.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("禁言"),
+        "{}",
+        poke.body
+    );
     let requests = onebot.finish();
-    assert!(requests.is_empty(), "no gateway request of any path: {requests:?}");
+    assert!(
+        requests.is_empty(),
+        "no gateway request of any path: {requests:?}"
+    );
 }
 
 #[test]
@@ -2224,10 +3028,29 @@ fn identical_message_from_before_the_attempt_does_not_confirm_an_unknown_item() 
             ..Behavior::default()
         },
     );
-    let root = fixture_root("harden-verify-old", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "harden-verify-old",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["重复文本"] }));
-    assert_eq!(first.status, 500, "an old identical message is not evidence: {}", first.body);
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["重复文本"] }),
+    );
+    assert_eq!(
+        first.status, 500,
+        "an old identical message is not evidence: {}",
+        first.body
+    );
     assert_eq!(first.body["sent"], 0);
     assert_eq!(first.body["unknown"], json!([0]));
     assert!(!read_outbox(&root).iter().any(|r| r["k"] == "confirmed"));
@@ -2246,21 +3069,49 @@ fn one_history_message_confirms_only_one_of_two_identical_unknown_items_on_resum
             ..Behavior::default()
         },
     );
-    let root = fixture_root("harden-verify-twice", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let root = fixture_root(
+        "harden-verify-twice",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        20,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["同文", "同文"], "gapMode": "fixed", "gaps": [0] }));
-    assert_eq!(first.body["unknown"], json!([0, 1]), "setup body: {}", first.body);
+    let first = post_send(
+        &console,
+        AGENT_A,
+        json!({ "key": "group:70001", "messages": ["同文", "同文"], "gapMode": "fixed", "gaps": [0] }),
+    );
+    assert_eq!(
+        first.body["unknown"],
+        json!([0, 1]),
+        "setup body: {}",
+        first.body
+    );
     let batch_id = first.body["batchId"].as_str().unwrap().to_string();
     drop(console);
     let path = root.join("data/send-outbox.jsonl");
-    let kept: Vec<String> = fs::read_to_string(&path).unwrap().lines()
-        .filter(|line| !line.contains("\"k\":\"unknown\"")).map(str::to_string).collect();
+    let kept: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains("\"k\":\"unknown\""))
+        .map(str::to_string)
+        .collect();
     assert_eq!(kept.len(), 3, "intent + two attempts remain: {kept:?}");
     fs::write(&path, kept.join("\n") + "\n").unwrap();
 
     let console = ConsoleProcess::start(&root);
     let resumed = resume(&console, &batch_id);
-    assert_eq!(resumed.body["sent"], 1, "one message cannot confirm two items: {}", resumed.body);
+    assert_eq!(
+        resumed.body["sent"], 1,
+        "one message cannot confirm two items: {}",
+        resumed.body
+    );
     assert_eq!(resumed.body["unknown"], json!([1]));
     assert_eq!(resumed.status, 409);
     let requests = onebot.finish();
@@ -2270,21 +3121,44 @@ fn one_history_message_confirms_only_one_of_two_identical_unknown_items_on_resum
 #[test]
 fn hf124_text_face_and_face_only_reach_onebot_as_segments() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf124", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf124",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
     for text in ["前[表情28]后", "[表情14]"] {
-        let response = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":[text]}));
+        let response = post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":[text]}),
+        );
         assert_eq!(response.status, 200, "{}", response.body);
         assert_eq!(response.body["sent"], 1);
     }
     let requests = onebot.finish();
-    let sends: Vec<_> = requests.iter().filter(|r| r.path == "/send_group_msg").collect();
+    let sends: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == "/send_group_msg")
+        .collect();
     assert_eq!(sends.len(), 2);
-    assert_eq!(sends[0].body["message"], json!([
+    assert_eq!(
+        sends[0].body["message"],
+        json!([
         {"type":"text","data":{"text":"前"}}, {"type":"face","data":{"id":"28"}},
-        {"type":"text","data":{"text":"后"}}]));
-    assert_eq!(sends[1].body["message"], json!([{"type":"face","data":{"id":"14"}}]));
+        {"type":"text","data":{"text":"后"}}])
+    );
+    assert_eq!(
+        sends[1].body["message"],
+        json!([{"type":"face","data":{"id":"14"}}])
+    );
 }
 
 fn hf123_config(root: &Path, update: impl FnOnce(&mut Value)) {
@@ -2544,69 +3418,173 @@ fn hf123_fix1_resumed_legacy_text_is_audited_before_submission() {
 #[test]
 fn hf123_third_identical_send_is_refused_before_hold_and_notifies_owner_once() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-repeat", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-repeat",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     let console = ConsoleProcess::start(&root);
     for (index, expected) in [200, 200, 429, 429].into_iter().enumerate() {
         if index == 2 {
             // A wrongly admitted third batch would enter a 25-second hold (HTTP budget: 4 s).
-            hf123_config(&root, |cfg| cfg["socialV2"]["reply"] = json!({"quietMedianMs":25000,"quietMinMs":25000,"quietMaxMs":25000}));
+            hf123_config(&root, |cfg| {
+                cfg["socialV2"]["reply"] =
+                    json!({"quietMedianMs":25000,"quietMinMs":25000,"quietMaxMs":25000})
+            });
             let path = root.join("data/social-v2.json");
             let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             state["conversations"]["group:70001"]["lastIncomingAt"] = json!(now);
             state["conversations"]["group:70001"]["lastReplyIncomingAt"] = json!(now);
             fs::write(path, state.to_string()).unwrap();
         }
-        let response = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["REPEAT_SECRET_123"]}));
+        let response = post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["REPEAT_SECRET_123"]}),
+        );
         assert_eq!(response.status, expected, "{}", response.body);
-        if expected == 429 { assert!(!response.body.to_string().contains("REPEAT_SECRET_123")); }
+        if expected == 429 {
+            assert!(!response.body.to_string().contains("REPEAT_SECRET_123"));
+        }
     }
     // Notifications are asynchronous; wait for the one private request without shutting down its fake.
     let deadline = Instant::now() + Duration::from_secs(3);
-    while onebot.request_count.load(std::sync::atomic::Ordering::Relaxed) < 3 && Instant::now() < deadline {
+    while onebot
+        .request_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 3
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(10));
     }
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_group_msg").count(), 2);
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_private_msg").count(), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_private_msg")
+            .count(),
+        1
+    );
     let ledger = fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap();
-    assert_eq!(ledger.lines().filter(|l|serde_json::from_str::<Value>(l).unwrap()["k"] == "intent").count(), 2);
+    assert_eq!(
+        ledger
+            .lines()
+            .filter(|l| serde_json::from_str::<Value>(l).unwrap()["k"] == "intent")
+            .count(),
+        2
+    );
     let log = fs::read_to_string(root.join("console.stdout.log")).unwrap();
     let refusals: Vec<_> = log.lines().filter(|l| l.contains("[send-guard]")).collect();
     assert_eq!(refusals.len(), 2, "{log}");
-    assert!(refusals.iter().all(|l| l.contains("key=group:70001") && l.contains("turn=") && l.contains("reason=repeat") && l.contains("count=") && !l.contains("REPEAT_SECRET_123")));
-    let state: Value = serde_json::from_slice(&fs::read(root.join("data/social-v2.json")).unwrap()).unwrap();
+    assert!(refusals.iter().all(|l| l.contains("key=group:70001")
+        && l.contains("turn=")
+        && l.contains("reason=repeat")
+        && l.contains("count=")
+        && !l.contains("REPEAT_SECRET_123")));
+    let state: Value =
+        serde_json::from_slice(&fs::read(root.join("data/social-v2.json")).unwrap()).unwrap();
     assert!(state["conversations"]["group:70001"]["replyRevisionBudget"].is_null());
 }
 
 #[test]
 fn hf124_unknown_tokens_stay_text_summaries_are_stripped_and_inbound_face_roundtrips() {
-    let onebot = FakeOneBot::start_with(70001, Behavior {
-        quote_message: Some(json!([{"type":"face","data":{"id":28}}])), ..Behavior::default()
-    });
-    let root = fixture_root("hf124-normalize", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let onebot = FakeOneBot::start_with(
+        70001,
+        Behavior {
+            quote_message: Some(json!([{"type":"face","data":{"id":28}}])),
+            ..Behavior::default()
+        },
+    );
+    let root = fixture_root(
+        "hf124-normalize",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     let console = ConsoleProcess::start(&root);
-    let quoted = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["引用"],"replyToMessageId":"90042"}));
+    let quoted = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["引用"],"replyToMessageId":"90042"}),
+    );
     assert_eq!(quoted.status, 200);
     assert_eq!(quoted.body["quoted"]["text"], "[表情28]");
-    for text in [quoted.body["quoted"]["text"].as_str().unwrap(), "[表情999999][表情x][表情-1]", "前[表情:给糖][表情]后", "[表情028]"] {
-        let response = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":[text]}));
+    for text in [
+        quoted.body["quoted"]["text"].as_str().unwrap(),
+        "[表情999999][表情x][表情-1]",
+        "前[表情:给糖][表情]后",
+        "[表情028]",
+    ] {
+        let response = post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":[text]}),
+        );
         assert_eq!(response.status, 200, "{}", response.body);
     }
-    let empty = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情:摘要][表情]"]}));
-    assert_eq!(empty.status, 400, "stripped-only messages must never create empty sends: {}", empty.body);
+    let empty = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["[表情:摘要][表情]"]}),
+    );
+    assert_eq!(
+        empty.status, 400,
+        "stripped-only messages must never create empty sends: {}",
+        empty.body
+    );
     let requests = onebot.finish();
-    let sends: Vec<_> = requests.iter().filter(|r|r.path == "/send_group_msg").collect();
+    let sends: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == "/send_group_msg")
+        .collect();
     assert_eq!(sends.len(), 5);
-    assert_eq!(sends[1].body["message"], json!([{"type":"face","data":{"id":"28"}}]));
-    assert_eq!(sends[2].body["message"], json!([{"type":"text","data":{"text":"[表情999999][表情x][表情-1]"}}]));
-    assert_eq!(sends[3].body["message"], json!([{"type":"text","data":{"text":"前后"}}]));
-    assert_eq!(sends[4].body["message"], json!([{"type":"face","data":{"id":"28"}}]));
-    let intents: Vec<Value> = fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap().lines()
-        .map(|l|serde_json::from_str::<Value>(l).unwrap()).filter(|r|r["k"] == "intent").collect();
+    assert_eq!(
+        sends[1].body["message"],
+        json!([{"type":"face","data":{"id":"28"}}])
+    );
+    assert_eq!(
+        sends[2].body["message"],
+        json!([{"type":"text","data":{"text":"[表情999999][表情x][表情-1]"}}])
+    );
+    assert_eq!(
+        sends[3].body["message"],
+        json!([{"type":"text","data":{"text":"前后"}}])
+    );
+    assert_eq!(
+        sends[4].body["message"],
+        json!([{"type":"face","data":{"id":"28"}}])
+    );
+    let intents: Vec<Value> = fs::read_to_string(root.join("data/send-outbox.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r["k"] == "intent")
+        .collect();
     assert_eq!(intents[3]["messages"], json!(["前后"]));
     assert_eq!(intents[4]["messages"], json!(["[表情28]"]));
 }
@@ -2614,65 +3592,208 @@ fn hf124_unknown_tokens_stay_text_summaries_are_stripped_and_inbound_face_roundt
 #[test]
 fn hf123_turn_cap_counts_bubbles_atomically_and_varied_sends_are_allowed() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-cap", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-cap",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     // This case pins its own cap; the default is covered by the engagement-window case below.
-    hf123_config(&root, |cfg| cfg["socialV2"]["send"]["maxPerTurn"] = json!(8));
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["send"]["maxPerTurn"] = json!(8)
+    });
     let console = ConsoleProcess::start(&root);
     for n in 0..7 {
-        assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":[format!("varied-{n}")]})).status, 200);
+        assert_eq!(
+            post_send(
+                &console,
+                AGENT_A,
+                json!({"key":"group:70001","messages":[format!("varied-{n}")]})
+            )
+            .status,
+            200
+        );
     }
     let before = fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap();
-    let refused = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["overflow-a","overflow-b"]}));
-    assert_eq!(refused.status, 429, "whole batch must be refused: {}", refused.body);
+    let refused = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["overflow-a","overflow-b"]}),
+    );
+    assert_eq!(
+        refused.status, 429,
+        "whole batch must be refused: {}",
+        refused.body
+    );
     // A refusal record may be appended, but no new intent, attempt or hold is admitted.
-    let intents = |s: &str|s.lines().filter(|l| serde_json::from_str::<Value>(l).unwrap()["k"] == "intent").count();
-    assert_eq!(intents(&fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap()), intents(&before));
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["eighth"]})).status, 200);
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["ninth"]})).status, 429);
+    let intents = |s: &str| {
+        s.lines()
+            .filter(|l| serde_json::from_str::<Value>(l).unwrap()["k"] == "intent")
+            .count()
+    };
+    assert_eq!(
+        intents(&fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap()),
+        intents(&before)
+    );
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["eighth"]})
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["ninth"]})
+        )
+        .status,
+        429
+    );
     // Settings are read on the next request; increasing the cap requires no restart.
-    hf123_config(&root, |cfg|cfg["socialV2"]["send"]["maxPerTurn"] = json!(9));
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["new-cap"]})).status, 200);
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["send"]["maxPerTurn"] = json!(9)
+    });
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["new-cap"]})
+        )
+        .status,
+        200
+    );
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_group_msg").count(), 9);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        9
+    );
 }
 
 #[test]
 fn engage_default_turn_send_cap_is_twenty_and_repeats_are_still_refused() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("engage-cap", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
-    hf123_config(&root, |cfg| cfg["socialV2"]["send"]["maxSendPerMinute"] = json!(100));
+    let root = fixture_root(
+        "engage-cap",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["send"]["maxSendPerMinute"] = json!(100)
+    });
     let console = ConsoleProcess::start(&root);
     for n in 0..20 {
-        let sent = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":[format!("long chat {n}")]}));
-        assert_eq!(sent.status, 200, "send {n} is within the default cap of 20: {}", sent.body);
+        let sent = post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":[format!("long chat {n}")]}),
+        );
+        assert_eq!(
+            sent.status, 200,
+            "send {n} is within the default cap of 20: {}",
+            sent.body
+        );
     }
-    let over = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["twenty-first"]}));
-    assert_eq!(over.status, 429, "the 21st bubble exceeds the default cap: {}", over.body);
+    let over = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["twenty-first"]}),
+    );
+    assert_eq!(
+        over.status, 429,
+        "the 21st bubble exceeds the default cap: {}",
+        over.body
+    );
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_group_msg").count(), 20);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        20
+    );
 
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("engage-repeat", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "engage-repeat",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     let console = ConsoleProcess::start(&root);
     for expected in [200, 200, 429] {
-        let response = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["same words"]}));
-        assert_eq!(response.status, expected, "the repeat guard is unchanged: {}", response.body);
+        let response = post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["same words"]}),
+        );
+        assert_eq!(
+            response.status, expected,
+            "the repeat guard is unchanged: {}",
+            response.body
+        );
     }
-    assert_eq!(onebot.finish().iter().filter(|r|r.path == "/send_group_msg").count(), 2);
+    assert_eq!(
+        onebot
+            .finish()
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        2
+    );
 }
 
 fn hf123_turn(root: &Path, id: &str, previous: Option<&str>) {
     use sha2::{Digest, Sha256};
-    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
-    let mut log = fs::OpenOptions::new().create(true).append(true).open(root.join("data/turn-ledger.jsonl")).unwrap();
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("data/turn-ledger.jsonl"))
+        .unwrap();
     if let Some(prev) = previous {
-        writeln!(log,"{}",json!({"k":"ended","turn":prev,"outcome":"failed","reason":"turnTimeout","t":1000})).unwrap();
+        writeln!(
+            log,
+            "{}",
+            json!({"k":"ended","turn":prev,"outcome":"failed","reason":"turnTimeout","t":1000})
+        )
+        .unwrap();
     }
-    writeln!(log,"{}",json!({"k":"begun","turn":id,"key":"group:70001","backend":"dsh","epoch":epoch,"t":1001})).unwrap();
+    writeln!(
+        log,
+        "{}",
+        json!({"k":"begun","turn":id,"key":"group:70001","backend":"dsh","epoch":epoch,"t":1001})
+    )
+    .unwrap();
 }
 
 #[test]
@@ -2680,36 +3801,74 @@ fn hf136_fix3_sends_without_a_known_start_and_after_console_restart() {
     use sha2::{Digest, Sha256};
     for evidence in ["no-turn", "unknown-start", "stale-start", "expired-budget"] {
         let onebot = FakeOneBot::start(70001, false);
-        let root = fixture_root("hf136-fix3-send", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-            "group:70001", &[70001], &[], 100, json!([]));
+        let root = fixture_root(
+            "hf136-fix3-send",
+            CONSOLE_A,
+            AGENT_A,
+            ONEBOT_A,
+            &onebot.url,
+            "group:70001",
+            &[70001],
+            &[],
+            100,
+            json!([]),
+        );
         hf123_config(&root, |_| {});
-        let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
+        let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if evidence != "no-turn" {
             let mut begun = json!({"k":"begun","turn":"restart-turn","key":"group:70001","backend":"dsh","epoch":epoch});
-            if evidence != "unknown-start" { begun["t"] = json!(1001); }
-            let mut ledger = fs::OpenOptions::new().create(true).append(true)
-                .open(root.join("data/turn-ledger.jsonl")).unwrap();
+            if evidence != "unknown-start" {
+                begun["t"] = json!(1001);
+            }
+            let mut ledger = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join("data/turn-ledger.jsonl"))
+                .unwrap();
             writeln!(ledger, "{begun}").unwrap();
             if evidence == "expired-budget" {
-                writeln!(ledger, "{}", json!({"k":"budget","turn":"restart-turn","deadline":2000})).unwrap();
+                writeln!(
+                    ledger,
+                    "{}",
+                    json!({"k":"budget","turn":"restart-turn","deadline":2000})
+                )
+                .unwrap();
             }
         }
         let ledger_before = fs::read(root.join("data/turn-ledger.jsonl")).ok();
         for phase in ["before-restart", "after-restart"] {
             // Drop reaps the first console before the same durable turn/epoch is reused.
             let console = ConsoleProcess::start(&root);
-            let sent = post_send(&console, AGENT_A,
-                json!({"key":"group:70001","messages":[phase]}));
+            let sent = post_send(
+                &console,
+                AGENT_A,
+                json!({"key":"group:70001","messages":[phase]}),
+            );
             assert_eq!(sent.status, 200, "{evidence}/{phase}: {}", sent.body);
             assert_eq!(sent.body["sent"], 1, "{evidence}/{phase}: {}", sent.body);
             assert_ne!(sent.body["held"], true, "{}", sent.body);
             assert_ne!(sent.body["turnBudgetExhausted"], true, "{}", sent.body);
             drop(console);
         }
-        assert_eq!(fs::read(root.join("data/turn-ledger.jsonl")).ok(), ledger_before);
-        assert_eq!(onebot.finish().iter().filter(|r|r.path == "/send_group_msg").count(), 2);
+        assert_eq!(
+            fs::read(root.join("data/turn-ledger.jsonl")).ok(),
+            ledger_before
+        );
+        assert_eq!(
+            onebot
+                .finish()
+                .iter()
+                .filter(|r| r.path == "/send_group_msg")
+                .count(),
+            2
+        );
         let outbox = fs::read_to_string(root.join("data/send-outbox.jsonl")).unwrap();
-        assert!(!outbox.lines().any(|line|serde_json::from_str::<Value>(line).unwrap()["k"] == "superseded"));
+        assert!(!outbox
+            .lines()
+            .any(|line| serde_json::from_str::<Value>(line).unwrap()["k"] == "superseded"));
     }
 }
 
@@ -2815,134 +3974,365 @@ fn hf123_fix1_owner_notice_claim_survives_restart_within_same_ledger_turn() {
 #[test]
 fn hf123_outbox_carries_repeats_across_timeout_and_console_restart() {
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-cross", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-cross",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     hf123_turn(&root, "old-turn", None);
     let console = ConsoleProcess::start(&root);
     for _ in 0..2 {
-        assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情28]"]})).status, 200);
+        assert_eq!(
+            post_send(
+                &console,
+                AGENT_A,
+                json!({"key":"group:70001","messages":["[表情28]"]})
+            )
+            .status,
+            200
+        );
     }
     hf123_turn(&root, "new-turn", Some("old-turn"));
     drop(console);
     let console = ConsoleProcess::start(&root);
-    let refused = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情028][表情:忽略]"]}));
-    assert_eq!(refused.status, 429, "a new turn cannot restart the same normalized loop: {}", refused.body);
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["a fresh reply"]})).status, 200);
-    hf123_config(&root, |cfg| cfg["socialV2"]["send"]["repeatWindowSends"] = json!(1));
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情28]"]})).status, 200, "last-N window is hot-read");
+    let refused = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["[表情028][表情:忽略]"]}),
+    );
+    assert_eq!(
+        refused.status, 429,
+        "a new turn cannot restart the same normalized loop: {}",
+        refused.body
+    );
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["a fresh reply"]})
+        )
+        .status,
+        200
+    );
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["send"]["repeatWindowSends"] = json!(1)
+    });
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["[表情28]"]})
+        )
+        .status,
+        200,
+        "last-N window is hot-read"
+    );
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_group_msg").count(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        4
+    );
 }
 
 #[test]
 fn hf123_resumed_old_batch_spends_the_current_turn_cap() {
     use sha2::{Digest, Sha256};
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-resume-scope", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-resume-scope",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     // Pins the cap the eight resumed bubbles exhaust; the default is covered by the engagement case.
-    hf123_config(&root, |cfg| cfg["socialV2"]["send"]["maxPerTurn"] = json!(8));
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["send"]["maxPerTurn"] = json!(8)
+    });
     hf123_turn(&root, "old-turn", None);
-    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
-    let messages: Vec<_> = (0..8).map(|i|format!("resumed-{i}")).collect();
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let messages: Vec<_> = (0..8).map(|i| format!("resumed-{i}")).collect();
     fs::write(root.join("data/send-outbox.jsonl"), format!("{}\n", json!({
         "k":"intent","batch":"old-pending","key":"group:70001","epoch":epoch,
         "turnScope":format!("{epoch}:old-turn"),"messages":messages,"delays":[0,0,0,0,0,0,0],"t":1001
     }))).unwrap();
     hf123_turn(&root, "new-turn", Some("old-turn"));
     let console = ConsoleProcess::start(&root);
-    let resumed = post_send(&console, AGENT_A, json!({"key":"group:70001","resumeBatchId":"old-pending"}));
+    let resumed = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","resumeBatchId":"old-pending"}),
+    );
     assert_eq!(resumed.status, 200, "{}", resumed.body);
     assert_eq!(resumed.body["sent"], 8);
-    let capped = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["ninth-current-turn"]}));
-    assert_eq!(capped.status, 429, "resumed sends belong to the submitting turn: {}", capped.body);
-    assert_eq!(onebot.finish().iter().filter(|r|r.path == "/send_group_msg").count(), 8);
+    let capped = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["ninth-current-turn"]}),
+    );
+    assert_eq!(
+        capped.status, 429,
+        "resumed sends belong to the submitting turn: {}",
+        capped.body
+    );
+    assert_eq!(
+        onebot
+            .finish()
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        8
+    );
 }
 
 #[test]
 fn hf123_last_n_window_uses_submission_order_after_an_old_batch_resume() {
     use sha2::{Digest, Sha256};
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-window-order", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-window-order",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     hf123_turn(&root, "old-turn", None);
-    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
-    fs::write(root.join("data/send-outbox.jsonl"), format!("{}\n", json!({
-        "k":"intent","batch":"old-face","key":"group:70001","epoch":epoch,
-        "turnScope":format!("{epoch}:old-turn"),"messages":["[表情28]"],"delays":[],"t":1001
-    }))).unwrap();
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    fs::write(
+        root.join("data/send-outbox.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "k":"intent","batch":"old-face","key":"group:70001","epoch":epoch,
+                "turnScope":format!("{epoch}:old-turn"),"messages":["[表情28]"],"delays":[],"t":1001
+            })
+        ),
+    )
+    .unwrap();
     hf123_turn(&root, "second-turn", Some("old-turn"));
     let console = ConsoleProcess::start(&root);
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情14]"]})).status, 200);
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","resumeBatchId":"old-face"})).status, 200);
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["[表情14]"]})
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","resumeBatchId":"old-face"})
+        )
+        .status,
+        200
+    );
     hf123_turn(&root, "third-turn", Some("second-turn"));
     hf123_config(&root, |cfg| {
         cfg["socialV2"]["send"]["repeatWindowSends"] = json!(1);
         cfg["socialV2"]["send"]["repeatLimit"] = json!(1);
     });
-    let refused = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情28]"]}));
-    assert_eq!(refused.status, 429, "the last actual send was the resumed face, not the newer intent: {}", refused.body);
-    assert_eq!(onebot.finish().iter().filter(|r|r.path == "/send_group_msg").count(), 2);
+    let refused = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["[表情28]"]}),
+    );
+    assert_eq!(
+        refused.status, 429,
+        "the last actual send was the resumed face, not the newer intent: {}",
+        refused.body
+    );
+    assert_eq!(
+        onebot
+            .finish()
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn hf123_last_n_window_includes_typed_bot_sends() {
     use sha2::{Digest, Sha256};
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-window-typed", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-window-typed",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     hf123_turn(&root, "old-turn", None);
     let console = ConsoleProcess::start(&root);
-    assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情28]"]})).status, 200);
+    assert_eq!(
+        post_send(
+            &console,
+            AGENT_A,
+            json!({"key":"group:70001","messages":["[表情28]"]})
+        )
+        .status,
+        200
+    );
     // A synthetic confirmed sticker is the last bot send; its typed liability is kept intact.
-    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
-    let mut outbox = fs::OpenOptions::new().append(true).open(root.join("data/send-outbox.jsonl")).unwrap();
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut outbox = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("data/send-outbox.jsonl"))
+        .unwrap();
     for row in [
         json!({"k":"intent","batch":"typed-last","kind":"sticker","key":"group:70001","epoch":epoch,"turnScope":format!("{epoch}:old-turn"),"messages":["[表情包:fixture]"],"t":1002}),
         json!({"k":"attempt","batch":"typed-last","idx":0,"t":1003}),
         json!({"k":"confirmed","batch":"typed-last","idx":0,"messageId":99123,"t":1004}),
-    ] { writeln!(outbox,"{row}").unwrap(); }
+    ] {
+        writeln!(outbox, "{row}").unwrap();
+    }
     drop(outbox);
     hf123_turn(&root, "new-turn", Some("old-turn"));
     hf123_config(&root, |cfg| {
         cfg["socialV2"]["send"]["repeatWindowSends"] = json!(1);
         cfg["socialV2"]["send"]["repeatLimit"] = json!(1);
     });
-    let sent = post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["[表情28]"]}));
-    assert_eq!(sent.status, 200, "last-N counts all bot sends, including typed ones: {}", sent.body);
-    assert_eq!(onebot.finish().iter().filter(|r|r.path == "/send_group_msg").count(), 2);
+    let sent = post_send(
+        &console,
+        AGENT_A,
+        json!({"key":"group:70001","messages":["[表情28]"]}),
+    );
+    assert_eq!(
+        sent.status, 200,
+        "last-N counts all bot sends, including typed ones: {}",
+        sent.body
+    );
+    assert_eq!(
+        onebot
+            .finish()
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn hf123_turn_epoch_does_not_reset_limits_or_owner_notice() {
     use sha2::{Digest, Sha256};
     let onebot = FakeOneBot::start(70001, false);
-    let root = fixture_root("hf123-turn-epoch", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
-        "group:70001", &[70001], &[], 100, json!([]));
+    let root = fixture_root(
+        "hf123-turn-epoch",
+        CONSOLE_A,
+        AGENT_A,
+        ONEBOT_A,
+        &onebot.url,
+        "group:70001",
+        &[70001],
+        &[],
+        100,
+        json!([]),
+    );
     hf123_config(&root, |_| {});
     hf123_turn(&root, "one-turn", None);
     let console = ConsoleProcess::start(&root);
-    for status in [200,200,429] {
-        assert_eq!(post_send(&console, AGENT_A, json!({"key":"group:70001","messages":["same-turn"]})).status, status);
+    for status in [200, 200, 429] {
+        assert_eq!(
+            post_send(
+                &console,
+                AGENT_A,
+                json!({"key":"group:70001","messages":["same-turn"]})
+            )
+            .status,
+            status
+        );
     }
     let path = root.join("data/social-v2.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     state["conversations"]["group:70001"]["agentToken"] = json!(AGENT_B);
     fs::write(path, state.to_string()).unwrap();
-    let epoch: String = Sha256::digest(AGENT_B.as_bytes())[..8].iter().map(|b|format!("{b:02x}")).collect();
-    let mut ledger = fs::OpenOptions::new().append(true).open(root.join("data/turn-ledger.jsonl")).unwrap();
-    writeln!(ledger,"{}",json!({"k":"epoch","turn":"one-turn","epoch":epoch,"t":1002})).unwrap();
+    let epoch: String = Sha256::digest(AGENT_B.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut ledger = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("data/turn-ledger.jsonl"))
+        .unwrap();
+    writeln!(
+        ledger,
+        "{}",
+        json!({"k":"epoch","turn":"one-turn","epoch":epoch,"t":1002})
+    )
+    .unwrap();
     drop(ledger);
-    let refused = post_send(&console, AGENT_B, json!({"key":"group:70001","messages":["same-turn"]}));
-    assert_eq!(refused.status, 429, "a backend epoch change is not a fresh turn: {}", refused.body);
-    let deadline = Instant::now()+Duration::from_secs(3);
-    while onebot.request_count.load(std::sync::atomic::Ordering::Relaxed) < 3 && Instant::now() < deadline {
+    let refused = post_send(
+        &console,
+        AGENT_B,
+        json!({"key":"group:70001","messages":["same-turn"]}),
+    );
+    assert_eq!(
+        refused.status, 429,
+        "a backend epoch change is not a fresh turn: {}",
+        refused.body
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while onebot
+        .request_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 3
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(10));
     }
     let requests = onebot.finish();
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_group_msg").count(), 2);
-    assert_eq!(requests.iter().filter(|r|r.path == "/send_private_msg").count(), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_group_msg")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path == "/send_private_msg")
+            .count(),
+        1
+    );
 }

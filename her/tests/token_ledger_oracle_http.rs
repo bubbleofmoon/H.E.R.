@@ -27,7 +27,8 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn fixture_json(name: &str) -> Value {
-    serde_json::from_slice(&fs::read(fixture_path(name)).expect("fixture readable")).expect("fixture is JSON")
+    serde_json::from_slice(&fs::read(fixture_path(name)).expect("fixture readable"))
+        .expect("fixture is JSON")
 }
 
 /// Config in the isolated-runtime shape (`allow.private`, `dsh`) with the fixture pricing override.
@@ -71,10 +72,16 @@ impl Console {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             if let Ok((200, body)) = get(port, "/api/health", None) {
-                assert_eq!(body["runtime"]["mode"], "isolated", "console must run isolated");
+                assert_eq!(
+                    body["runtime"]["mode"], "isolated",
+                    "console must run isolated"
+                );
                 break;
             }
-            assert!(Instant::now() < deadline, "isolated console did not become healthy");
+            assert!(
+                Instant::now() < deadline,
+                "isolated console did not become healthy"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         console.port = port;
@@ -92,9 +99,15 @@ impl Drop for Console {
 fn get(port: u16, path: &str, token: Option<&str>) -> Result<(u16, Value), String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let token_header = token.map(|t| format!("X-Console-Token: {t}\r\n")).unwrap_or_default();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{token_header}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let token_header = token
+        .map(|t| format!("X-Console-Token: {t}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{token_header}Connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
     let (head, body) = raw.split_once("\r\n\r\n").ok_or("no header/body split")?;
@@ -104,7 +117,8 @@ fn get(port: u16, path: &str, token: Option<&str>) -> Result<(u16, Value), Strin
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or("no status")?;
-    let json = serde_json::from_str(body.trim()).map_err(|e| format!("body is not JSON ({e}): {body}"))?;
+    let json =
+        serde_json::from_str(body.trim()).map_err(|e| format!("body is not JSON ({e}): {body}"))?;
     Ok((status, json))
 }
 
@@ -117,7 +131,9 @@ fn compare(path: &str, actual: &Value, expected: &Value, skip: &[&str], diffs: &
             let ak: std::collections::BTreeSet<&String> = a.keys().filter(keep).collect();
             let ek: std::collections::BTreeSet<&String> = e.keys().filter(keep).collect();
             if ak != ek {
-                diffs.push(format!("keys differ at {path}: rust-only={ak:?}... js-only={ek:?}"));
+                diffs.push(format!(
+                    "keys differ at {path}: rust-only={ak:?}... js-only={ek:?}"
+                ));
             }
             for k in ak.intersection(&ek) {
                 compare(&format!("{path}.{k}"), &a[*k], &e[*k], skip, diffs);
@@ -125,7 +141,11 @@ fn compare(path: &str, actual: &Value, expected: &Value, skip: &[&str], diffs: &
         }
         (Value::Array(a), Value::Array(e)) => {
             if a.len() != e.len() {
-                diffs.push(format!("length differs at {path}: rust={} js={}", a.len(), e.len()));
+                diffs.push(format!(
+                    "length differs at {path}: rust={} js={}",
+                    a.len(),
+                    e.len()
+                ));
             }
             for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
                 compare(&format!("{path}[{i}]"), x, y, skip, diffs);
@@ -139,7 +159,9 @@ fn compare(path: &str, actual: &Value, expected: &Value, skip: &[&str], diffs: &
         }
         _ => {
             if actual != expected {
-                diffs.push(format!("value differs at {path}: rust={actual} js={expected}"));
+                diffs.push(format!(
+                    "value differs at {path}: rust={actual} js={expected}"
+                ));
             }
         }
     }
@@ -148,30 +170,63 @@ fn compare(path: &str, actual: &Value, expected: &Value, skip: &[&str], diffs: &
 fn assert_same(label: &str, actual: &Value, expected: &Value, skip: &[&str]) {
     let mut diffs = Vec::new();
     compare(label, actual, expected, skip, &mut diffs);
-    assert!(diffs.is_empty(), "{label}: {} difference(s)\n{}", diffs.len(), diffs.join("\n"));
+    assert!(
+        diffs.is_empty(),
+        "{label}: {} difference(s)\n{}",
+        diffs.len(),
+        diffs.join("\n")
+    );
 }
 
 /// Summary, per-conversation turns and recent samples from the console must equal the JS ledger outputs.
 fn check_ledger_routes(console: &Console) {
     let expected = fixture_json("expected.json");
-    let (status, summary) = get(console.port, "/api/tokens/summary?limit=20", Some(CONSOLE_TOKEN)).expect("summary");
+    let (status, summary) = get(
+        console.port,
+        "/api/tokens/summary?limit=20",
+        Some(CONSOLE_TOKEN),
+    )
+    .expect("summary");
     assert_eq!(status, 200, "summary: {summary}");
     // generatedAt/nowTier depend on the clock; `ledger` is the store-health block the JS route adds.
-    assert_same("summary", &summary, &expected["summary"], &["generatedAt", "nowTier", "ledger", "file"]);
+    assert_same(
+        "summary",
+        &summary,
+        &expected["summary"],
+        &["generatedAt", "nowTier", "ledger", "file"],
+    );
 
-    let (status, turns) = get(console.port, "/api/tokens/turns?key=group:7003&limit=50", Some(CONSOLE_TOKEN)).expect("turns");
+    let (status, turns) = get(
+        console.port,
+        "/api/tokens/turns?key=group:7003&limit=50",
+        Some(CONSOLE_TOKEN),
+    )
+    .expect("turns");
     assert_eq!(status, 200, "turns: {turns}");
-    assert_same("turns", &turns, &expected["conversation"]["group:7003"], &["generatedAt"]);
+    assert_same(
+        "turns",
+        &turns,
+        &expected["conversation"]["group:7003"],
+        &["generatedAt"],
+    );
 
-    let (status, recent) = get(console.port, "/api/tokens/recent?limit=10", Some(CONSOLE_TOKEN)).expect("recent");
+    let (status, recent) = get(
+        console.port,
+        "/api/tokens/recent?limit=10",
+        Some(CONSOLE_TOKEN),
+    )
+    .expect("recent");
     assert_eq!(status, 200, "recent: {recent}");
     assert_same("recent", &recent["entries"], &expected["recent"], &[]);
 
     // Candidate-backend attribution: the reference is computed from the JS-written file with the JS price table only.
-    let (status, by_provider) = get(console.port, "/api/tokens/by-provider", Some(CONSOLE_TOKEN)).expect("by-provider");
+    let (status, by_provider) =
+        get(console.port, "/api/tokens/by-provider", Some(CONSOLE_TOKEN)).expect("by-provider");
     assert_eq!(status, 200, "by-provider: {by_provider}");
     let want = &expected["byProvider"];
-    let rows = by_provider["providers"].as_array().expect("providers array");
+    let rows = by_provider["providers"]
+        .as_array()
+        .expect("providers array");
     let want_rows = want["providers"].as_array().expect("reference providers");
     assert_eq!(rows.len(), want_rows.len(), "provider rows: {by_provider}");
     for w in want_rows {
@@ -181,12 +236,37 @@ fn check_ledger_routes(console: &Console) {
             .find(|r| r["provider"] == name)
             .unwrap_or_else(|| panic!("provider {name} missing from {by_provider}"));
         assert_eq!(got["samples"], w["samples"], "{name}: samples");
-        assert_same(&format!("provider[{name}].cost"), &got["cost"], &w["cost"], &[]);
-        assert_same(&format!("provider[{name}].tokens.in"), &got["tokens"]["in"], &w["tokensIn"], &[]);
-        assert_same(&format!("provider[{name}].tokens.out"), &got["tokens"]["out"], &w["tokensOut"], &[]);
+        assert_same(
+            &format!("provider[{name}].cost"),
+            &got["cost"],
+            &w["cost"],
+            &[],
+        );
+        assert_same(
+            &format!("provider[{name}].tokens.in"),
+            &got["tokens"]["in"],
+            &w["tokensIn"],
+            &[],
+        );
+        assert_same(
+            &format!("provider[{name}].tokens.out"),
+            &got["tokens"]["out"],
+            &w["tokensOut"],
+            &[],
+        );
     }
-    assert_same("totalCost", &by_provider["totalCost"], &want["totalCost"], &[]);
-    assert_same("totalSamples", &by_provider["totalSamples"], &want["totalSamples"], &[]);
+    assert_same(
+        "totalCost",
+        &by_provider["totalCost"],
+        &want["totalCost"],
+        &[],
+    );
+    assert_same(
+        "totalSamples",
+        &by_provider["totalSamples"],
+        &want["totalSamples"],
+        &[],
+    );
 }
 
 #[test]
@@ -196,11 +276,29 @@ fn isolated_console_serves_the_js_ledger_outputs_for_the_fixture() {
     for dir in ["config", "data", "user/dsh", "resources/roles"] {
         fs::create_dir_all(path.join(dir)).expect("create runtime dir");
     }
-    fs::write(path.join("config/config.json"), serde_json::to_vec_pretty(&isolated_config()).unwrap()).unwrap();
-    crate::support::write_dependencies(path, crate::support::CLOSED, crate::support::CLOSED, crate::support::CLOSED, None);
+    fs::write(
+        path.join("config/config.json"),
+        serde_json::to_vec_pretty(&isolated_config()).unwrap(),
+    )
+    .unwrap();
+    crate::support::write_dependencies(
+        path,
+        crate::support::CLOSED,
+        crate::support::CLOSED,
+        crate::support::CLOSED,
+        None,
+    );
     fs::write(path.join("data/social-v2.json"), b"{}").unwrap();
-    fs::copy(fixture_path("token-usage.jsonl"), path.join("data/token-usage.jsonl")).unwrap();
-    fs::copy(fixture_path("sessions.json"), path.join("data/sessions.json")).unwrap();
+    fs::copy(
+        fixture_path("token-usage.jsonl"),
+        path.join("data/token-usage.jsonl"),
+    )
+    .unwrap();
+    fs::copy(
+        fixture_path("sessions.json"),
+        path.join("data/sessions.json"),
+    )
+    .unwrap();
     let dsh_home = root.path().join("dsh-home");
     fs::create_dir_all(&dsh_home).unwrap();
     let console = Console::start(path, &dsh_home);

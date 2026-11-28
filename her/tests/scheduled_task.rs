@@ -216,10 +216,7 @@ impl Fixture {
 }
 
 // Login polling is independent of administrator notices, including when no task drifts.
-fn answer_login_status(
-    reader: &mut std::io::BufReader<std::net::TcpStream>,
-    first: &str,
-) -> bool {
+fn answer_login_status(reader: &mut std::io::BufReader<std::net::TcpStream>, first: &str) -> bool {
     use std::io::{BufRead, Read, Write};
     if !first.starts_with("POST /get_status ") {
         return false;
@@ -413,9 +410,7 @@ fn supervisor_reports_drift_to_the_administrator_and_keeps_a_matching_task_quiet
         let mut first = String::new();
         // The retained supervisor also performs TCP-only dependency reachability probes.
         // A closed probe carries no HTTP request and is not an administrator message.
-        if reader.read_line(&mut first).unwrap() == 0
-            || answer_login_status(&mut reader, &first)
-        {
+        if reader.read_line(&mut first).unwrap() == 0 || answer_login_status(&mut reader, &first) {
             return None;
         }
         Some((reader, first))

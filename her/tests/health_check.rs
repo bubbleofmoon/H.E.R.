@@ -3,9 +3,9 @@ use support::http_mock::{ConcurrentMockServer, MockAction, MockResponse};
 use support::install_root;
 use support::ports::{start_console, OwnedChild};
 use support::wait::{assert_eventually, wait_until};
-mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
+mod support;
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -53,7 +53,9 @@ impl Drain {
         Self { bytes, reader }
     }
     fn closed(&self) -> bool {
-        self.reader.as_ref().map_or(true, |reader| reader.is_finished())
+        self.reader
+            .as_ref()
+            .map_or(true, |reader| reader.is_finished())
     }
     fn bytes(&self) -> Vec<u8> {
         self.bytes
@@ -675,7 +677,12 @@ impl Drop for Rig {
             ),
             (
                 "stop-supervisor",
-                &["lifecycle", "stop-supervisor", "--confirm", "--runtime-root"],
+                &[
+                    "lifecycle",
+                    "stop-supervisor",
+                    "--confirm",
+                    "--runtime-root",
+                ],
             ),
         ];
         for (label, args) in stops {
@@ -1251,9 +1258,8 @@ fn restore_with_fake_peers(never_ready: bool) {
             restore
                 .arg("--confirm")
                 .arg(p["preview"]["confirmation"].as_str().unwrap());
-            let output = run_bounded(&mut restore, Duration::from_secs(150)).unwrap_or_else(
-                |error| panic!("restore exceeded health/rollback budget: {error}"),
-            );
+            let output = run_bounded(&mut restore, Duration::from_secs(150))
+                .unwrap_or_else(|error| panic!("restore exceeded health/rollback budget: {error}"));
             if never_ready {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1412,7 +1418,9 @@ fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change(
     // The supervisor notices the new revision on its one-second scheduler pass and only starts the
     // console owner after that: measured at ~5 s of supervisor delay and ~7 s to a healthy
     // console on the Windows host, so this check outlives the shared 12-second CLI bound.
-    let (code, verdict) = rig.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
+    let (code, verdict) = rig
+        .fixture
+        .check_bounded(&["--wait", "30s"], Duration::from_secs(40));
     assert_eq!(code, 0, "a new running revision must reconcile: {verdict}");
 }
 
@@ -1483,11 +1491,16 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
     let (code, verdict) = rig
         .fixture
         .check_bounded(&["--wait", "30s"], Duration::from_secs(40));
-    assert_eq!(code, 0, "the supervisor-started console never answered health: {verdict}");
+    assert_eq!(
+        code, 0,
+        "the supervisor-started console never answered health: {verdict}"
+    );
     let reread = std::fs::read(&marker)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
+        .and_then(|value| {
+            serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok()
+        });
     assert_eq!(
         reread.as_ref(),
         Some(&identity),
@@ -1679,7 +1692,11 @@ fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_g
     set.args(["lifecycle", "set", "running", "--runtime-root"])
         .arg(&root);
     let running = run_bounded(&mut set, Duration::from_secs(12)).unwrap();
-    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
 
     // Supervisor must start the live bridge cleanly while the gateway is down and wait in
     // `waiting-for-gateway` without killing it at the 15s deadline.
@@ -1699,7 +1716,15 @@ fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_g
         || {
             let mut runs_cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
             runs_cmd
-                .args(["tasks", "runs", "--task", "watchdog", "--limit", "5", "--runtime-root"])
+                .args([
+                    "tasks",
+                    "runs",
+                    "--task",
+                    "watchdog",
+                    "--limit",
+                    "5",
+                    "--runtime-root",
+                ])
                 .arg(&root);
             let Ok(out) = run_bounded(&mut runs_cmd, Duration::from_secs(10)) else {
                 return false;
@@ -1748,8 +1773,14 @@ fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_g
 
     let (code, waiting_verdict) = rig.fixture.check(&[]);
     assert_eq!(code, 0, "{waiting_verdict}");
-    assert_eq!(waiting_verdict["live"]["state"], "waiting-for-gateway", "{waiting_verdict}");
-    assert_eq!(waiting_verdict["live"]["pid"], live_identity.pid, "{waiting_verdict}");
+    assert_eq!(
+        waiting_verdict["live"]["state"], "waiting-for-gateway",
+        "{waiting_verdict}"
+    );
+    assert_eq!(
+        waiting_verdict["live"]["pid"], live_identity.pid,
+        "{waiting_verdict}"
+    );
 
     // Bring the gateway up: the running live bridge connects automatically without a restart.
     gateway.up.store(true, Ordering::SeqCst);
@@ -1765,7 +1796,12 @@ fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_g
                         && hb["live"] == true
                 })
         },
-        || format!("live bridge did not transition to ready; hb={:?}", read_hb()),
+        || {
+            format!(
+                "live bridge did not transition to ready; hb={:?}",
+                read_hb()
+            )
+        },
     );
     assert_eq!(
         read_live_identity().as_ref(),
@@ -1776,5 +1812,8 @@ fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_g
     let (code, ready_verdict) = rig.fixture.check(&[]);
     assert_eq!(code, 0, "{ready_verdict}");
     assert_eq!(ready_verdict["live"]["state"], "ready", "{ready_verdict}");
-    assert_eq!(ready_verdict["live"]["pid"], live_identity.pid, "{ready_verdict}");
+    assert_eq!(
+        ready_verdict["live"]["pid"], live_identity.pid,
+        "{ready_verdict}"
+    );
 }

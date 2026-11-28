@@ -28,7 +28,10 @@ struct Root(PathBuf, Option<Vec<(PathBuf, Vec<u8>)>>);
 impl Root {
     fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = crate::install_root::development_root(std::env::temp_dir().join(format!(
             "ticket23-feedback-{label}-{}-{stamp}-{}",
             std::process::id(),
@@ -80,7 +83,11 @@ fn fixture(label: &str, onebot_url: &str, social_extra: Value, extra: Value) -> 
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         config[&k] = v;
     }
-    fs::write(root.p("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    fs::write(
+        root.p("config/config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
     let state = json!({ "paused": false, "conversations": {
         KEY_A: { "agentToken": AGENT_A, "sendTimes": [], "recentMessages": [], "unread": [] },
         KEY_B: { "agentToken": AGENT_B, "sendTimes": [], "recentMessages": [], "unread": [] },
@@ -88,7 +95,13 @@ fn fixture(label: &str, onebot_url: &str, social_extra: Value, extra: Value) -> 
     }});
     fs::write(root.p("data/social-v2.json"), state.to_string()).unwrap();
     fs::write(root.p("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
-    crate::support::write_dependencies(&root.0, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
+    crate::support::write_dependencies(
+        &root.0,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:2",
+        onebot_url,
+        None,
+    );
     install_legacy_decoy(&root);
     let mut root = root;
     root.1 = Some(legacy_snapshot(&root));
@@ -150,8 +163,14 @@ impl Console {
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            assert!(console.child.try_wait().unwrap().is_none(), "console exited early");
-            if http(port, "GET", "/api/health", None, None, &Value::Null).map(|r| r.0 == 200).unwrap_or(false) {
+            assert!(
+                console.child.try_wait().unwrap().is_none(),
+                "console exited early"
+            );
+            if http(port, "GET", "/api/health", None, None, &Value::Null)
+                .map(|r| r.0 == 200)
+                .unwrap_or(false)
+            {
                 return console;
             }
             assert!(Instant::now() < deadline, "console did not become healthy");
@@ -185,8 +204,14 @@ fn http(
     body: &Value,
 ) -> Result<(u16, Value), String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-    let body = if body.is_null() { String::new() } else { body.to_string() };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
     let mut headers = String::new();
     if let Some(v) = console {
         headers += &format!("X-Console-Token: {v}\r\n");
@@ -204,8 +229,16 @@ fn http(
     stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
     let raw = String::from_utf8(raw).map_err(|e| e.to_string())?;
     let (head, body) = raw.split_once("\r\n\r\n").ok_or("no header separator")?;
-    let status = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse().ok()).ok_or("bad status")?;
-    Ok((status, serde_json::from_str(body).map_err(|e| format!("{e}: {body}"))?))
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or("bad status")?;
+    Ok((
+        status,
+        serde_json::from_str(body).map_err(|e| format!("{e}: {body}"))?,
+    ))
 }
 
 type OneBot = crate::support::FakeGateway;
@@ -224,11 +257,17 @@ fn history() -> Value {
 }
 
 fn id_shape_ok(id: &str) -> bool {
-    let Some((head, tail)) = id.split_once('-') else { return false };
+    let Some((head, tail)) = id.split_once('-') else {
+        return false;
+    };
     !head.is_empty()
-        && head.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && head
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
         && tail.len() == 6
-        && tail.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && tail
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
 #[test]
@@ -238,45 +277,95 @@ fn history_stays_visible_and_new_feedback_appends_per_session() {
     fs::write(root.p("data/feedback.json"), history().to_string()).unwrap();
     let console = Console::start(&root);
 
-    assert_eq!(entries(&console), history().as_array().cloned().unwrap(), "imported history is returned unchanged");
+    assert_eq!(
+        entries(&console),
+        history().as_array().cloned().unwrap(),
+        "imported history is returned unchanged"
+    );
 
-    let (status, body) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "level": "warning", "message": "  needs help  "}));
+    let (status, body) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "level": "warning", "message": "  needs help  "}),
+    );
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, json!({"ok": true, "key": KEY_A, "level": "warning", "message": "needs help"}));
+    assert_eq!(
+        body,
+        json!({"ok": true, "key": KEY_A, "level": "warning", "message": "needs help"})
+    );
 
-    let (status, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "level": "weird", "message": "other"}));
+    let (status, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "level": "weird", "message": "other"}),
+    );
     assert_eq!(status, 200);
-    let (status, body) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "from console"}));
+    let (status, body) = console.admin(
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "from console"}),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["level"], "info");
 
     let all = entries(&console);
     assert_eq!(all.len(), 5);
-    assert_eq!(&all[..2], history().as_array().unwrap().as_slice(), "history is kept in front, in order");
+    assert_eq!(
+        &all[..2],
+        history().as_array().unwrap().as_slice(),
+        "history is kept in front, in order"
+    );
     let tail: Vec<(String, String, String)> = all[2..]
         .iter()
-        .map(|e| (e["key"].as_str().unwrap().to_string(), e["level"].as_str().unwrap().to_string(), e["message"].as_str().unwrap().to_string()))
+        .map(|e| {
+            (
+                e["key"].as_str().unwrap().to_string(),
+                e["level"].as_str().unwrap().to_string(),
+                e["message"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     assert_eq!(
         tail,
         vec![
-            (KEY_A.to_string(), "warning".to_string(), "needs help".to_string()),
+            (
+                KEY_A.to_string(),
+                "warning".to_string(),
+                "needs help".to_string()
+            ),
             (KEY_B.to_string(), "info".to_string(), "other".to_string()),
-            (KEY_A.to_string(), "info".to_string(), "from console".to_string()),
+            (
+                KEY_A.to_string(),
+                "info".to_string(),
+                "from console".to_string()
+            ),
         ]
     );
     for e in &all[2..] {
         assert!(id_shape_ok(e["id"].as_str().unwrap()), "id shape: {e}");
-        assert!(e["time"].as_str().unwrap().ends_with('Z') && e["time"].as_str().unwrap().contains('T'));
+        assert!(
+            e["time"].as_str().unwrap().ends_with('Z') && e["time"].as_str().unwrap().contains('T')
+        );
     }
-    assert_eq!(root.json("data/feedback.json").as_array().unwrap().len(), 5, "persisted in the selected root");
+    assert_eq!(
+        root.json("data/feedback.json").as_array().unwrap().len(),
+        5,
+        "persisted in the selected root"
+    );
     drop(console);
 }
 
 #[test]
 fn feedback_rules_follow_the_js_checks_in_order() {
     let ob = OneBot::start();
-    let root = fixture("rules", &ob.url, json!({ "feedback": { "maxLength": 12 }, "tools": { "feedback": true } }), json!({}));
+    let root = fixture(
+        "rules",
+        &ob.url,
+        json!({ "feedback": { "maxLength": 12 }, "tools": { "feedback": true } }),
+        json!({}),
+    );
     let console = Console::start(&root);
     let post = |token: Option<&str>, body: Value| match token {
         Some(t) => console.agent(t, "POST", "/api/socialV2/feedback", body),
@@ -284,9 +373,15 @@ fn feedback_rules_follow_the_js_checks_in_order() {
     };
 
     let (s, b) = post(Some(AGENT_A), json!({"key": KEY_A, "message": "   "}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (400, "key 和 message 不能为空"));
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (400, "key 和 message 不能为空")
+    );
     let (s, b) = post(None, json!({"message": "x"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (400, "key 和 message 不能为空"));
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (400, "key 和 message 不能为空")
+    );
     // A token of another session is not valid for this key, and neither is an unknown key.
     let (s, b) = post(Some(AGENT_B), json!({"key": KEY_A, "message": "x"}));
     assert_eq!((s, b["error"].as_str().unwrap()), (403, "agent token 无效"));
@@ -295,22 +390,45 @@ fn feedback_rules_follow_the_js_checks_in_order() {
     assert!(entries(&console).is_empty(), "refused calls write nothing");
 
     // maxLength truncates the stored and the returned text.
-    let (s, b) = post(Some(AGENT_A), json!({"key": KEY_A, "message": "abcdefghijabcdefghij"}));
+    let (s, b) = post(
+        Some(AGENT_A),
+        json!({"key": KEY_A, "message": "abcdefghijabcdefghij"}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["message"], "abcdefghijab");
     assert_eq!(entries(&console)[0]["message"], "abcdefghijab");
 
     // Operator setting changes take effect on the next call (maxLength 5, then tool off).
-    let (s, b) = console.admin("POST", "/api/socialV2/config", json!({"feedback": {"maxLength": 5}}));
+    let (s, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"feedback": {"maxLength": 5}}),
+    );
     assert_eq!(s, 200, "{b}");
-    let (_, b) = post(Some(AGENT_A), json!({"key": KEY_A, "message": "abcdefghij"}));
+    let (_, b) = post(
+        Some(AGENT_A),
+        json!({"key": KEY_A, "message": "abcdefghij"}),
+    );
     assert_eq!(b["message"], "abcde");
-    let (s, _) = console.admin("POST", "/api/socialV2/config", json!({"tools": {"feedback": false}}));
+    let (s, _) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"tools": {"feedback": false}}),
+    );
     assert_eq!(s, 200);
     let (s, b) = post(Some(AGENT_A), json!({"key": KEY_A, "message": "x"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "工具未启用：qq_report_feedback"));
-    let (s, _) = post(None, json!({"key": KEY_A, "message": "operator can still file"}));
-    assert_eq!(s, 200, "the console channel is not gated by the model tool switch");
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (403, "工具未启用：qq_report_feedback")
+    );
+    let (s, _) = post(
+        None,
+        json!({"key": KEY_A, "message": "operator can still file"}),
+    );
+    assert_eq!(
+        s, 200,
+        "the console channel is not gated by the model tool switch"
+    );
     assert_eq!(entries(&console).len(), 3);
     drop(console);
 }
@@ -321,13 +439,31 @@ fn feedback_is_rate_limited_per_session_and_the_sixth_in_a_minute_is_refused() {
     let root = fixture("rate", &ob.url, json!({}), json!({}));
     let console = Console::start(&root);
     for i in 0..5 {
-        let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": format!("m{i}")}));
+        let (s, b) = console.agent(
+            AGENT_A,
+            "POST",
+            "/api/socialV2/feedback",
+            json!({"key": KEY_A, "message": format!("m{i}")}),
+        );
         assert_eq!(s, 200, "{b}");
     }
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "sixth"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (429, "触发反馈频率上限，请稍后再试"));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "sixth"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (429, "触发反馈频率上限，请稍后再试")
+    );
     // Another session's quota is separate.
-    let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "fresh"}));
+    let (s, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "message": "fresh"}),
+    );
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 6);
     drop(console);
@@ -343,14 +479,24 @@ fn sensitive_text_is_stored_redacted_but_returned_as_sent_and_history_is_capped(
     fs::write(root.p("data/feedback.json"), Value::Array(old).to_string()).unwrap();
     let console = Console::start(&root);
     let secret = format!("path /root/secret/file and token=abcdef123 and {AGENT_A} end");
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": secret}));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": secret}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["message"], secret, "JS answers with the unredacted text");
     let stored = entries(&console);
     assert_eq!(stored.len(), 500);
     assert_eq!(stored[499]["message"], "path *** and *** and *** end");
     // One more entry evicts the oldest.
-    let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "newest"}));
+    let (s, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "message": "newest"}),
+    );
     assert_eq!(s, 200);
     let stored = entries(&console);
     assert_eq!(stored.len(), 500);
@@ -366,9 +512,15 @@ fn clear_is_console_only_and_agents_cannot_read_the_list() {
     fs::write(root.p("data/feedback.json"), history().to_string()).unwrap();
     let console = Console::start(&root);
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback-clear", json!({}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (403, "此操作仅开放给控制台访问")
+    );
     let (s, b) = console.agent(AGENT_A, "GET", "/api/socialV2/feedback", Value::Null);
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "此操作仅开放给控制台访问"));
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (403, "此操作仅开放给控制台访问")
+    );
     assert_eq!(entries(&console).len(), 2, "refused calls change nothing");
     let (s, b) = console.admin("POST", "/api/socialV2/feedback-clear", json!({}));
     assert_eq!((s, b), (200, json!({"ok": true})));
@@ -390,7 +542,15 @@ fn concurrent_writers_lose_no_feedback() {
             thread::spawn(move || {
                 let key = if i % 2 == 0 { KEY_A } else { KEY_B };
                 let token = if i % 2 == 0 { AGENT_A } else { AGENT_B };
-                http(port, "POST", "/api/socialV2/feedback", Some(CONSOLE), Some(token), &json!({"key": key, "message": format!("concurrent {i}")})).unwrap()
+                http(
+                    port,
+                    "POST",
+                    "/api/socialV2/feedback",
+                    Some(CONSOLE),
+                    Some(token),
+                    &json!({"key": key, "message": format!("concurrent {i}")}),
+                )
+                .unwrap()
             })
         })
         .collect();
@@ -399,8 +559,15 @@ fn concurrent_writers_lose_no_feedback() {
         assert_eq!(s, 200, "{b}");
     }
     let all = entries(&console);
-    assert_eq!(all.len(), 12, "two history entries plus ten concurrent writes");
-    let mut messages: Vec<String> = all[2..].iter().map(|e| e["message"].as_str().unwrap().to_string()).collect();
+    assert_eq!(
+        all.len(),
+        12,
+        "two history entries plus ten concurrent writes"
+    );
+    let mut messages: Vec<String> = all[2..]
+        .iter()
+        .map(|e| e["message"].as_str().unwrap().to_string())
+        .collect();
     messages.sort();
     let mut want: Vec<String> = (0..10).map(|i| format!("concurrent {i}")).collect();
     want.sort();
@@ -415,7 +582,8 @@ fn backups(root: &Root) -> Vec<(String, Vec<u8>)> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            name.starts_with("feedback.json.corrupt-").then(|| (name, fs::read(e.path()).unwrap()))
+            name.starts_with("feedback.json.corrupt-")
+                .then(|| (name, fs::read(e.path()).unwrap()))
         })
         .collect();
     found.sort();
@@ -437,22 +605,45 @@ fn a_damaged_store_is_renamed_to_a_backup_and_then_behaves_like_js_empty() {
     let kept = backups(&root);
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert_eq!(kept[0].1, b"{not json, partly written");
-    assert!(!root.p("data/feedback.json").exists(), "the damaged file was renamed away, not copied");
+    assert!(
+        !root.p("data/feedback.json").exists(),
+        "the damaged file was renamed away, not copied"
+    );
 
     // Append after damage: a new list starts (JS `appendFeedbackEntry`).
-    fs::write(root.p("data/feedback.json"), b"{\"valid\":\"json but not an array\"}").unwrap();
-    let (s, b) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_P, "message": "after damage"}));
+    fs::write(
+        root.p("data/feedback.json"),
+        b"{\"valid\":\"json but not an array\"}",
+    )
+    .unwrap();
+    let (s, b) = console.admin(
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_P, "message": "after damage"}),
+    );
     assert_eq!(s, 200, "{b}");
     let all = entries(&console);
     assert_eq!(all.len(), 1);
     assert_eq!(all[0]["message"], "after damage");
     let kept = backups(&root);
-    assert_eq!(kept.len(), 2, "a second damaged file gets its own backup: {kept:?}");
-    assert!(kept.iter().any(|(_, bytes)| bytes == b"{\"valid\":\"json but not an array\"}"));
-    assert!(kept.iter().any(|(_, bytes)| bytes == b"{not json, partly written"));
+    assert_eq!(
+        kept.len(),
+        2,
+        "a second damaged file gets its own backup: {kept:?}"
+    );
+    assert!(kept
+        .iter()
+        .any(|(_, bytes)| bytes == b"{\"valid\":\"json but not an array\"}"));
+    assert!(kept
+        .iter()
+        .any(|(_, bytes)| bytes == b"{not json, partly written"));
 
     // Healthy store: no backup is made.
-    let (s, _) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_P, "message": "second"}));
+    let (s, _) = console.admin(
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_P, "message": "second"}),
+    );
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 2);
     assert_eq!(backups(&root).len(), 2);
@@ -464,43 +655,94 @@ fn one_conversation_cannot_post_under_another_and_feedback_survives_restart() {
     let ob = OneBot::start();
     let root = fixture("restart", &ob.url, json!({}), json!({}));
     let console = Console::start(&root);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "before restart"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "before restart"}),
+    );
     assert_eq!(s, 200);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "spoof"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "message": "spoof"}),
+    );
     assert_eq!(s, 403);
     console.stop();
     let console = Console::start(&root);
     let all = entries(&console);
     assert_eq!(all.len(), 1);
-    assert_eq!((all[0]["key"].as_str().unwrap(), all[0]["message"].as_str().unwrap()), (KEY_A, "before restart"));
+    assert_eq!(
+        (
+            all[0]["key"].as_str().unwrap(),
+            all[0]["message"].as_str().unwrap()
+        ),
+        (KEY_A, "before restart")
+    );
     drop(console);
 }
 
 #[test]
 fn error_feedback_notifies_the_owner_once_per_window_only_when_enabled() {
     let ob = OneBot::start();
-    let root = fixture("notify", &ob.url, json!({ "feedback": { "notifyOwnerOnError": true } }), json!({}));
+    let root = fixture(
+        "notify",
+        &ob.url,
+        json!({ "feedback": { "notifyOwnerOnError": true } }),
+        json!({}),
+    );
     let console = Console::start(&root);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "level": "info", "message": "just info"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "level": "info", "message": "just info"}),
+    );
     assert_eq!(s, 200);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "level": "error", "message": "broken tool"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "level": "error", "message": "broken tool"}),
+    );
     assert_eq!(s, 200);
     let sent = ob.wait_for("send_private_msg", 1);
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["user_id"], OWNER);
-    assert!(sent[0].to_string().contains("[group:70001] 对话端上报异常：broken tool"), "{}", sent[0]);
+    assert!(
+        sent[0]
+            .to_string()
+            .contains("[group:70001] 对话端上报异常：broken tool"),
+        "{}",
+        sent[0]
+    );
     // Same dedupe key within 60 s: recorded, not pushed again.
-    let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "level": "error", "message": "second error"}));
+    let (s, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "level": "error", "message": "second error"}),
+    );
     assert_eq!(s, 200);
     thread::sleep(Duration::from_millis(400));
     assert_eq!(ob.seen("send_private_msg").len(), 1, "60 s dedupe");
     assert_eq!(entries(&console).len(), 3);
     // Setting off: a fresh process (empty dedupe) sends nothing.
-    let (s, _) = console.admin("POST", "/api/socialV2/config", json!({"feedback": {"notifyOwnerOnError": false}}));
+    let (s, _) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"feedback": {"notifyOwnerOnError": false}}),
+    );
     assert_eq!(s, 200);
     console.stop();
     let console = Console::start(&root);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "level": "error", "message": "quiet now"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "level": "error", "message": "quiet now"}),
+    );
     assert_eq!(s, 200);
     thread::sleep(Duration::from_millis(400));
     assert_eq!(ob.seen("send_private_msg").len(), 1);
@@ -514,13 +756,30 @@ fn feedback_is_refused_for_the_model_while_paused_but_not_for_the_operator() {
     let console = Console::start(&root);
     let (s, _) = console.admin("POST", "/api/socialV2/activity", json!({"paused": true}));
     assert_eq!(s, 200);
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "x"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "当前已暂停，不允许执行 v2 工具"));
-    let (s, _) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "operator note"}));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "x"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str().unwrap()),
+        (403, "当前已暂停，不允许执行 v2 工具")
+    );
+    let (s, _) = console.admin(
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "operator note"}),
+    );
     assert_eq!(s, 200);
     let (s, _) = console.admin("POST", "/api/socialV2/activity", json!({"paused": false}));
     assert_eq!(s, 200);
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "back"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "back"}),
+    );
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 2);
     drop(console);
@@ -529,13 +788,24 @@ fn feedback_is_refused_for_the_model_while_paused_but_not_for_the_operator() {
 fn status_activity(console: &Console) -> Vec<String> {
     let (s, b) = console.admin("GET", "/api/status", Value::Null);
     assert_eq!(s, 200, "{b}");
-    b["activity"].as_str().expect("status carries the activity tail").lines().map(str::to_string).collect()
+    b["activity"]
+        .as_str()
+        .expect("status carries the activity tail")
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// `[HH:MM:SS] text` -> text.
 fn unclocked(line: &str) -> &str {
     let (clock, rest) = line.split_once("] ").expect(line);
-    assert!(clock.len() == 9 && clock.starts_with('[') && clock.as_bytes()[3] == b':' && clock.as_bytes()[6] == b':', "{line}");
+    assert!(
+        clock.len() == 9
+            && clock.starts_with('[')
+            && clock.as_bytes()[3] == b':'
+            && clock.as_bytes()[6] == b':',
+        "{line}"
+    );
     rest
 }
 
@@ -544,20 +814,53 @@ fn sends_feedback_and_pokes_leave_activity_lines_the_status_shows_to_the_operato
     let ob = OneBot::start();
     let root = fixture("activity", &ob.url, json!({}), json!({}));
     let console = Console::start(&root);
-    assert_eq!(status_activity(&console), Vec::<String>::new(), "no log yet: empty tail");
+    assert_eq!(
+        status_activity(&console),
+        Vec::<String>::new(),
+        "no log yet: empty tail"
+    );
 
-    let (s, _) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "hello\r\nthere"}));
+    let (s, _) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "hello\r\nthere"}),
+    );
     assert_eq!(s, 200);
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/send-message", json!({"key": KEY_A, "messages": ["alpha"]}));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/send-message",
+        json!({"key": KEY_A, "messages": ["alpha"]}),
+    );
     assert_eq!(s, 200, "{b}");
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/send-burst", json!({"key": KEY_A, "messages": ["beta"]}));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/send-burst",
+        json!({"key": KEY_A, "messages": ["beta"]}),
+    );
     assert_eq!(s, 200, "{b}");
-    let (s, b) = console.admin("POST", "/api/send/group", json!({"groupId": 70001, "token": AGENT_A, "message": "gamma"}));
+    let (s, b) = console.admin(
+        "POST",
+        "/api/send/group",
+        json!({"groupId": 70001, "token": AGENT_A, "message": "gamma"}),
+    );
     assert_eq!(s, 200, "{b}");
-    let (s, b) = console.agent(AGENT_P, "POST", "/api/socialV2/send-poke", json!({"key": KEY_P}));
+    let (s, b) = console.agent(
+        AGENT_P,
+        "POST",
+        "/api/socialV2/send-poke",
+        json!({"key": KEY_P}),
+    );
     assert_eq!(s, 200, "{b}");
     // Refused calls leave nothing behind.
-    let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/send-message", json!({"key": KEY_A, "messages": ["denied"]}));
+    let (s, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/send-message",
+        json!({"key": KEY_A, "messages": ["denied"]}),
+    );
     assert_eq!(s, 403);
 
     let lines = status_activity(&console);
@@ -572,22 +875,40 @@ fn sends_feedback_and_pokes_leave_activity_lines_the_status_shows_to_the_operato
             "private:9002 [reserved2] 工具拍一拍",
         ]
     );
-    assert_eq!(root.text("data/qq-activity.log").lines().count(), 5, "persisted in the selected root's data dir");
+    assert_eq!(
+        root.text("data/qq-activity.log").lines().count(),
+        5,
+        "persisted in the selected root's data dir"
+    );
     // A session token (agent) never sees the cross-session summary.
     let (s, b) = console.agent(AGENT_A, "GET", "/api/status", Value::Null);
     assert_eq!(s, 200);
-    assert!(b.get("activity").is_none() && b.get("ownerQQ").is_none(), "{b}");
+    assert!(
+        b.get("activity").is_none() && b.get("ownerQQ").is_none(),
+        "{b}"
+    );
     drop(console);
 }
 
 #[test]
 fn activity_text_is_redacted_and_the_log_rotates_at_five_hundred_lines() {
     let ob = OneBot::start();
-    let root = fixture("rotate", &ob.url, json!({ "feedback": { "maxLength": 400 } }), json!({}));
-    let seed: String = (0..500).map(|i| format!("[00:00:00] seeded {i}\n")).collect();
+    let root = fixture(
+        "rotate",
+        &ob.url,
+        json!({ "feedback": { "maxLength": 400 } }),
+        json!({}),
+    );
+    let seed: String = (0..500)
+        .map(|i| format!("[00:00:00] seeded {i}\n"))
+        .collect();
     fs::write(root.p("data/qq-activity.log"), seed).unwrap();
     let console = Console::start(&root);
-    let (s, _) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": format!("see /root/private/file and {AGENT_A}")}));
+    let (s, _) = console.admin(
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": format!("see /root/private/file and {AGENT_A}")}),
+    );
     assert_eq!(s, 200);
     // 500 seeded lines + this one is 501 > 500: the file moved to the backup, the new file is empty.
     assert_eq!(root.text("data/qq-activity.log"), "");
@@ -725,13 +1046,32 @@ fn a_failed_write_is_reported_not_shown_as_success_and_nothing_is_lost_or_half_a
     let console = Console::start(&root);
 
     let mut blocked_feedback = Unwritable::new(&root.p("data/feedback.json"));
-    let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "cannot be stored"}));
+    let (s, b) = console.agent(
+        AGENT_A,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_A, "message": "cannot be stored"}),
+    );
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["ok"], false);
     blocked_feedback.restore();
-    assert_eq!(entries(&console), history().as_array().cloned().unwrap(), "history intact, the failed report is not listed");
-    assert!(!root.text("data/qq-activity.log").contains("对话端发来运行情况反馈记录"), "no activity line for a report that was not stored");
-    let (s, _) = console.agent(AGENT_B, "POST", "/api/socialV2/feedback", json!({"key": KEY_B, "message": "stored after recovery"}));
+    assert_eq!(
+        entries(&console),
+        history().as_array().cloned().unwrap(),
+        "history intact, the failed report is not listed"
+    );
+    assert!(
+        !root
+            .text("data/qq-activity.log")
+            .contains("对话端发来运行情况反馈记录"),
+        "no activity line for a report that was not stored"
+    );
+    let (s, _) = console.agent(
+        AGENT_B,
+        "POST",
+        "/api/socialV2/feedback",
+        json!({"key": KEY_B, "message": "stored after recovery"}),
+    );
     assert_eq!(s, 200);
     assert_eq!(entries(&console).len(), 3);
 
@@ -746,7 +1086,11 @@ fn a_failed_write_is_reported_not_shown_as_success_and_nothing_is_lost_or_half_a
     assert_eq!(s, 200);
     let (_, b) = console.admin("GET", "/api/status", Value::Null);
     assert_eq!(b["socialV2Paused"], true);
-    assert_eq!(root.json("data/social-v2.json")["paused"], true, "persisted");
+    assert_eq!(
+        root.json("data/social-v2.json")["paused"],
+        true,
+        "persisted"
+    );
     drop(console);
 }
 
@@ -763,7 +1107,10 @@ fn pause_changes_persist_across_restart_without_touching_sessions_or_feedback() 
     let (_, b) = console.admin("GET", "/api/socialV2/activity", Value::Null);
     assert_eq!(b, json!({"ok": true, "paused": true}));
     let state = root.json("data/social-v2.json");
-    assert_eq!(state["conversations"][KEY_A]["agentToken"], AGENT_A, "the toggle keeps every session as it was");
+    assert_eq!(
+        state["conversations"][KEY_A]["agentToken"], AGENT_A,
+        "the toggle keeps every session as it was"
+    );
     assert_eq!(state["conversations"][KEY_B]["agentToken"], AGENT_B);
     assert_eq!(entries(&console), history().as_array().cloned().unwrap());
     let (s, b) = console.admin("POST", "/api/socialV2/activity", json!({"paused": false}));
@@ -782,23 +1129,56 @@ fn feedback_settings_read_back_with_their_defaults_and_normalize_on_write() {
 
     let (s, b) = console.admin("GET", "/api/socialV2/config", Value::Null);
     assert_eq!(s, 200);
-    assert_eq!(feedback_of(&b), json!({"maxLength": 500, "notifyOwnerOnError": false}), "a config without the section shows the JS defaults");
+    assert_eq!(
+        feedback_of(&b),
+        json!({"maxLength": 500, "notifyOwnerOnError": false}),
+        "a config without the section shows the JS defaults"
+    );
     assert_eq!(b["config"]["tools"]["feedback"], true);
 
-    let (s, b) = console.admin("POST", "/api/socialV2/config", json!({"feedback": {"maxLength": "12.4"}}));
+    let (s, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"feedback": {"maxLength": "12.4"}}),
+    );
     assert_eq!(s, 200, "{b}");
     // JS merges into the section the file has (none yet), so only the written member is stored.
     assert_eq!(feedback_of(&b), json!({"maxLength": 12}));
-    assert_eq!(root.json("config/config.json")["socialV2"]["feedback"], json!({"maxLength": 12}));
+    assert_eq!(
+        root.json("config/config.json")["socialV2"]["feedback"],
+        json!({"maxLength": 12})
+    );
     // Only the boolean true switches the owner push on; a truthy non-boolean does not.
-    let (_, b) = console.admin("POST", "/api/socialV2/config", json!({"feedback": {"notifyOwnerOnError": 1}}));
-    assert_eq!(feedback_of(&b), json!({"maxLength": 12, "notifyOwnerOnError": false}));
-    let (_, b) = console.admin("POST", "/api/socialV2/config", json!({"feedback": {"notifyOwnerOnError": true, "maxLength": 0}}));
-    assert_eq!(feedback_of(&b), json!({"maxLength": 1, "notifyOwnerOnError": true}), "the limit never drops below one character");
+    let (_, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"feedback": {"notifyOwnerOnError": 1}}),
+    );
+    assert_eq!(
+        feedback_of(&b),
+        json!({"maxLength": 12, "notifyOwnerOnError": false})
+    );
+    let (_, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"feedback": {"notifyOwnerOnError": true, "maxLength": 0}}),
+    );
+    assert_eq!(
+        feedback_of(&b),
+        json!({"maxLength": 1, "notifyOwnerOnError": true}),
+        "the limit never drops below one character"
+    );
     let (_, b) = console.admin("POST", "/api/socialV2/config", json!({"feedback": "nope"}));
-    assert_eq!(feedback_of(&b), json!({"maxLength": 1, "notifyOwnerOnError": true}), "a non-object keeps the current section");
+    assert_eq!(
+        feedback_of(&b),
+        json!({"maxLength": 1, "notifyOwnerOnError": true}),
+        "a non-object keeps the current section"
+    );
     let (_, b) = console.admin("GET", "/api/socialV2/config", Value::Null);
-    assert_eq!(feedback_of(&b), json!({"maxLength": 1, "notifyOwnerOnError": true}));
+    assert_eq!(
+        feedback_of(&b),
+        json!({"maxLength": 1, "notifyOwnerOnError": true})
+    );
     drop(console);
 }
 
@@ -819,24 +1199,58 @@ fn changing_a_default_wake_setting_reaches_only_conversations_still_on_the_defau
     });
     fs::write(root.p("data/social-v2.json"), state.to_string()).unwrap();
     let console = Console::start(&root);
-    let wake = |key: &str| -> Value { root.json("data/social-v2.json")["conversations"][key]["wakeConfig"].clone() };
+    let wake = |key: &str| -> Value {
+        root.json("data/social-v2.json")["conversations"][key]["wakeConfig"].clone()
+    };
 
     // A setting that does not touch the defaults leaves every wake plan alone.
-    let (s, b) = console.admin("POST", "/api/socialV2/config", json!({"send": {"maxSendPerMinute": 9}}));
+    let (s, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"send": {"maxSendPerMinute": 9}}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(wake(KEY_A)["marker"], "default-conversation");
 
-    let (s, b) = console.admin("POST", "/api/socialV2/config", json!({"wake": {"batchWindowMs": 4500}}));
+    let (s, b) = console.admin(
+        "POST",
+        "/api/socialV2/config",
+        json!({"wake": {"batchWindowMs": 4500}}),
+    );
     assert_eq!(s, 200, "{b}");
     let a = wake(KEY_A);
     assert_eq!(a["batchWindowMs"], 4500, "{a}");
     assert_eq!(a["confirmedBy"], "default");
-    assert_eq!(a["marker"], "default-conversation", "refresh changes only stale inherited fields");
-    assert_eq!((a["lastWakeAt"].clone(), a["wakeCount"].clone(), a["noActionCount"].clone(), a["confirmedAt"].clone()), (json!(111), json!(7), json!(2), json!(222)), "counters stay");
-    assert_eq!(a["triggers"]["keywords"], json!(["k1"]), "the operator's keywords stay");
+    assert_eq!(
+        a["marker"], "default-conversation",
+        "refresh changes only stale inherited fields"
+    );
+    assert_eq!(
+        (
+            a["lastWakeAt"].clone(),
+            a["wakeCount"].clone(),
+            a["noActionCount"].clone(),
+            a["confirmedAt"].clone()
+        ),
+        (json!(111), json!(7), json!(2), json!(222)),
+        "counters stay"
+    );
+    assert_eq!(
+        a["triggers"]["keywords"],
+        json!(["k1"]),
+        "the operator's keywords stay"
+    );
     let b_conv = wake(KEY_B);
-    assert_eq!((b_conv["batchWindowMs"].clone(), b_conv["marker"].clone()), (json!(3000), json!("model-set-conversation")), "a confirmed plan is not touched");
-    let (_, state) = console.admin("GET", &format!("/api/socialV2/state?key={KEY_A}"), Value::Null);
+    assert_eq!(
+        (b_conv["batchWindowMs"].clone(), b_conv["marker"].clone()),
+        (json!(3000), json!("model-set-conversation")),
+        "a confirmed plan is not touched"
+    );
+    let (_, state) = console.admin(
+        "GET",
+        &format!("/api/socialV2/state?key={KEY_A}"),
+        Value::Null,
+    );
     assert_eq!(state["wakeConfig"]["batchWindowMs"], 4500);
     drop(console);
 }
@@ -845,19 +1259,36 @@ fn changing_a_default_wake_setting_reaches_only_conversations_still_on_the_defau
 fn hotfix128_fix1_feedback_cut_keeps_token_fragments_out_of_activity_and_storage() {
     for limit in [80, 200] {
         let ob = OneBot::start();
-        let root = fixture("token-preview-fix1", &ob.url,
+        let root = fixture(
+            "token-preview-fix1",
+            &ob.url,
             json!({"feedback":{"maxLength":limit},"tools":{"feedback":true}}),
-            json!({"security":{"outboundGuard":false}}));
+            json!({"security":{"outboundGuard":false}}),
+        );
         let console = Console::start(&root);
         for token in [AGENT_A, "0123456789abcdef0123456789abcdef0123456789abcdef"] {
             let text = format!("{}{token} trailing", "x ".repeat((limit - 10) / 2));
-            let (status, body) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback",
-                json!({"key":KEY_A,"message":text,"level":"info"}));
+            let (status, body) = console.agent(
+                AGENT_A,
+                "POST",
+                "/api/socialV2/feedback",
+                json!({"key":KEY_A,"message":text,"level":"info"}),
+            );
             assert_eq!(status, 200, "{body}");
-            assert_eq!(body["message"], text.chars().take(limit).collect::<String>(), "HTTP response text keeps its existing contract");
-            for (name, saved) in [("activity", root.text("data/qq-activity.log")),
-                ("feedback", root.text("data/feedback.json")), ("stdout", root.text("console.stdout.log"))] {
-                assert!(!saved.contains(&token[..8]), "{limit}/{name}: truncated token leaked: {saved}");
+            assert_eq!(
+                body["message"],
+                text.chars().take(limit).collect::<String>(),
+                "HTTP response text keeps its existing contract"
+            );
+            for (name, saved) in [
+                ("activity", root.text("data/qq-activity.log")),
+                ("feedback", root.text("data/feedback.json")),
+                ("stdout", root.text("console.stdout.log")),
+            ] {
+                assert!(
+                    !saved.contains(&token[..8]),
+                    "{limit}/{name}: truncated token leaked: {saved}"
+                );
                 if name == "feedback" || limit == 80 {
                     assert!(saved.contains("***"), "missing token mask: {saved}");
                 }

@@ -1106,7 +1106,10 @@ fn two_isolated_console_and_mcp_instances_interleave_without_crossing_roots() {
         "memory_search",
         json!({ "query": "alphaonlyfact", "token": b.agent_token }),
     );
-    assert!(foreign_mcp_error, "MCP must mark the refusal as an error: {foreign_mcp_text}");
+    assert!(
+        foreign_mcp_error,
+        "MCP must mark the refusal as an error: {foreign_mcp_text}"
+    );
     assert_eq!(
         foreign_mcp_text, "检索失败：会话令牌校验失败（须附上该对话的专属 token）",
         "A MCP accepted B token"

@@ -16,8 +16,12 @@ use std::process::Command;
 
 fn run_case(case: &str) {
     let candidate = env!("CARGO_BIN_EXE_her");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dependency-recovery-cases.mjs");
-    let out = crate::install_root::development_root(std::env::temp_dir().join(format!("her-dependency-recovery-{}-{case}", std::process::id())));
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dependency-recovery-cases.mjs");
+    let out = crate::install_root::development_root(std::env::temp_dir().join(format!(
+        "her-dependency-recovery-{}-{case}",
+        std::process::id()
+    )));
     let output = Command::new("node")
         .arg(&script)
         .args(["--candidate", candidate, "--case", case, "--out"])
@@ -27,7 +31,10 @@ fn run_case(case: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success() && stdout.lines().any(|l| l.starts_with(&format!("PASS {case}"))),
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|l| l.starts_with(&format!("PASS {case}"))),
         "case {case} did not pass (exit {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status.code()
     );

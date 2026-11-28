@@ -33,18 +33,34 @@ const FAKE_TOOL_MODE: &str = "FAKE_TOOL_MODE";
 #[test]
 #[ignore = "entry point of the generated fake ffmpeg/ffprobe wrappers, not a test"]
 fn fake_tool_entry() {
-    let Ok(mode) = std::env::var(FAKE_TOOL_MODE) else { return };
+    let Ok(mode) = std::env::var(FAKE_TOOL_MODE) else {
+        return;
+    };
     let args: Vec<String> = std::env::args().skip_while(|a| a != "--").skip(1).collect();
     let log = std::env::var("FAKE_TOOL_LOG").expect("FAKE_TOOL_LOG");
-    let mut log_file = fs::OpenOptions::new().create(true).append(true).open(format!("{log}.{mode}")).expect("tool log");
+    let mut log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{log}.{mode}"))
+        .expect("tool log");
     writeln!(log_file, "{}", args.join(" ")).unwrap();
     let last = args.last().cloned().unwrap_or_default();
-    let value_after = |flag: &str| args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).last().unwrap_or_default();
+    let value_after = |flag: &str| {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .last()
+            .unwrap_or_default()
+    };
     let code = match mode.as_str() {
         "ffprobe" => {
             let duration = if last.contains("broken") {
                 None
-            } else if let Some(duration) = Path::new(&last).file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("duration-")) {
+            } else if let Some(duration) = Path::new(&last)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("duration-"))
+            {
                 Some(duration)
             } else if last.contains("long") {
                 Some("400")
@@ -65,7 +81,11 @@ fn fake_tool_entry() {
                         json
                     };
                     fs::write(value_after("-o"), json).expect("write probe output");
-                    if last.contains("probe-failed") { 7 } else { 0 }
+                    if last.contains("probe-failed") {
+                        7
+                    } else {
+                        0
+                    }
                 }
             }
         }
@@ -76,7 +96,11 @@ fn fake_tool_entry() {
             } else {
                 match fs::copy(&input, &last) {
                     Ok(_) => {
-                        fs::OpenOptions::new().append(true).open(&last).and_then(|mut f| f.write_all(b"X")).expect("append marker");
+                        fs::OpenOptions::new()
+                            .append(true)
+                            .open(&last)
+                            .and_then(|mut f| f.write_all(b"X"))
+                            .expect("append marker");
                         0
                     }
                     Err(_) => 1,
@@ -104,7 +128,10 @@ fn write_fake_tool(dir: &Path, tool: &str) -> PathBuf {
         path
     } else {
         let path = dir.join(tool);
-        let body = format!("#!/bin/sh\n{FAKE_TOOL_MODE}={tool} exec '{}' {entry} -- \"$@\"\n", exe.replace('\'', r"'\''"));
+        let body = format!(
+            "#!/bin/sh\n{FAKE_TOOL_MODE}={tool} exec '{}' {entry} -- \"$@\"\n",
+            exe.replace('\'', r"'\''")
+        );
         fs::write(&path, body).expect("write fake tool wrapper");
         #[cfg(unix)]
         {
@@ -152,7 +179,10 @@ impl Default for Options {
 
 fn fixture(label: &str, onebot_url: &str, options: Options) -> Fixture {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -170,18 +200,41 @@ fn fixture(label: &str, onebot_url: &str, options: Options) -> Fixture {
         "snowluma": { "httpUrl": "http://127.0.0.1:1", "accessToken": "onebot-token" },
         "socialV2": { "tools": options.tools, "voice": options.voice, "send": { "maxSendPerMinute": 20, "maxSendPerHour": 100, "firstGapEnabled": false } }
     });
-    fs::write(root.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    fs::write(
+        root.join("config/config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
     let state = json!({ "paused": false, "conversations": {
         "group:111": { "agentToken": AGENT, "sendTimes": [], "recentMessages": [], "wakeConfig": { "noActionCount": 3 } },
         "private:222": { "agentToken": "voice-agent-token-private-222", "sendTimes": [], "recentMessages": [] }
     } });
-    fs::write(root.join("data/social-v2.json"), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-    fs::write(root.join("data/mode.json"), json!({ "mode": options.mode }).to_string()).unwrap();
-    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
+    fs::write(
+        root.join("data/social-v2.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("data/mode.json"),
+        json!({ "mode": options.mode }).to_string(),
+    )
+    .unwrap();
+    crate::support::write_dependencies(
+        &root,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:2",
+        onebot_url,
+        None,
+    );
     let tools = root.join("tools");
     let ffprobe = write_fake_tool(&tools, "ffprobe");
     let ffmpeg = write_fake_tool(&tools, "ffmpeg");
-    Fixture { root, tools, ffprobe, ffmpeg }
+    Fixture {
+        root,
+        tools,
+        ffprobe,
+        ffmpeg,
+    }
 }
 
 impl Fixture {
@@ -200,7 +253,8 @@ impl Fixture {
             .collect()
     }
     fn state(&self) -> Value {
-        serde_json::from_str(&fs::read_to_string(self.root.join("data/social-v2.json")).unwrap()).unwrap()
+        serde_json::from_str(&fs::read_to_string(self.root.join("data/social-v2.json")).unwrap())
+            .unwrap()
     }
     fn tool_log(&self, which: &str) -> Vec<String> {
         fs::read_to_string(self.tools.join(format!("log.{which}")))
@@ -230,15 +284,22 @@ impl Console {
                 .env("FFPROBE_PATH", &fx.ffprobe)
                 .env("FFMPEG_PATH", &fx.ffmpeg)
                 .env("FAKE_TOOL_LOG", fx.tools.join("log"))
-                .stdout(Stdio::from(fs::File::create(fx.root.join("console.out")).unwrap()))
-                .stderr(Stdio::from(fs::File::create(fx.root.join("console.err")).unwrap()));
+                .stdout(Stdio::from(
+                    fs::File::create(fx.root.join("console.out")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    fs::File::create(fx.root.join("console.err")).unwrap(),
+                ));
             crate::support::hide_window(&mut command);
             command.spawn().expect("start console")
         });
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            assert!(console.child.try_wait().unwrap().is_none(), "console exited early");
+            assert!(
+                console.child.try_wait().unwrap().is_none(),
+                "console exited early"
+            );
             if let Ok((200, _)) = request(port, "GET", "/api/health", None, None, &Value::Null) {
                 return console;
             }
@@ -270,8 +331,14 @@ fn request(
     body: &Value,
 ) -> Result<(u16, Value), String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_secs(90))).map_err(|e| e.to_string())?;
-    let body = if body.is_null() { String::new() } else { body.to_string() };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(90)))
+        .map_err(|e| e.to_string())?;
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
     let mut headers = String::new();
     if let Some(v) = console {
         headers.push_str(&format!("X-Console-Token: {v}\r\n"));
@@ -288,7 +355,11 @@ fn request(
     let mut raw = String::new();
     stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
     let (head, body) = raw.split_once("\r\n\r\n").ok_or("no separator")?;
-    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or("bad status")?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or("bad status")?;
     Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
 }
 
@@ -331,7 +402,11 @@ impl FakeOneBot {
     fn start() -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let script = Arc::new(Mutex::new(Script { next_id: 5000, readback_has_record: true, ..Script::default() }));
+        let script = Arc::new(Mutex::new(Script {
+            next_id: 5000,
+            readback_has_record: true,
+            ..Script::default()
+        }));
         let shared = script.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -348,7 +423,14 @@ impl FakeOneBot {
         self.script.lock().unwrap().events.clone()
     }
     fn requests(&self, action: &str) -> Vec<Value> {
-        self.script.lock().unwrap().requests.iter().filter(|(a, _)| a == action).map(|(_, b)| b.clone()).collect()
+        self.script
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(a, _)| a == action)
+            .map(|(_, b)| b.clone())
+            .collect()
     }
 }
 
@@ -359,7 +441,12 @@ fn handle(stream: TcpStream, script: Arc<Mutex<Script>>) {
     if reader.read_line(&mut line).unwrap_or(0) == 0 {
         return;
     }
-    let action = line.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+    let action = line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .trim_start_matches('/')
+        .to_string();
     let mut length = 0usize;
     loop {
         let mut header = String::new();
@@ -382,12 +469,20 @@ fn handle(stream: TcpStream, script: Arc<Mutex<Script>>) {
     };
     let mut s = script.lock().unwrap();
     s.requests.push((action.clone(), body.clone()));
-    let send_kind = if body.to_string().contains("\"record\"") { "voice" } else { "text" };
+    let send_kind = if body.to_string().contains("\"record\"") {
+        "voice"
+    } else {
+        "text"
+    };
     if action.starts_with("send_") {
         s.events.push(format!("request:{send_kind}"));
     }
     match action.as_str() {
-        "get_login_info" => reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"user_id":SELF_ID,"nickname":"bot"}})),
+        "get_login_info" => reply(
+            &mut stream,
+            200,
+            json!({"status":"ok","retcode":0,"data":{"user_id":SELF_ID,"nickname":"bot"}}),
+        ),
         "send_group_msg" | "send_private_msg" => {
             let step = s.sends.pop_front().unwrap_or(Send::Ok);
             if let Send::Slow(ms) = step {
@@ -397,41 +492,82 @@ fn handle(stream: TcpStream, script: Arc<Mutex<Script>>) {
                 s.next_id += 1;
                 let id = s.next_id;
                 s.events.push(format!("reply:{send_kind}"));
-                reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"message_id":id}}));
+                reply(
+                    &mut stream,
+                    200,
+                    json!({"status":"ok","retcode":0,"data":{"message_id":id}}),
+                );
                 return;
             }
             match step {
                 Send::Ok => {
                     s.next_id += 1;
                     let id = s.next_id;
-                    reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"message_id":id}}));
+                    reply(
+                        &mut stream,
+                        200,
+                        json!({"status":"ok","retcode":0,"data":{"message_id":id}}),
+                    );
                 }
-                Send::Refuse => reply(&mut stream, 200, json!({"status":"failed","retcode":1404,"wording":"not allowed","data":null})),
-                Send::Muted => reply(&mut stream, 200, json!({"status":"failed","retcode":100,"message":"sendMsg failed: result=120","wording":"muted","data":null})),
+                Send::Refuse => reply(
+                    &mut stream,
+                    200,
+                    json!({"status":"failed","retcode":1404,"wording":"not allowed","data":null}),
+                ),
+                Send::Muted => reply(
+                    &mut stream,
+                    200,
+                    json!({"status":"failed","retcode":100,"message":"sendMsg failed: result=120","wording":"muted","data":null}),
+                ),
                 Send::Lost => {}
                 Send::Slow(_) => unreachable!(),
                 Send::LostButDelivered => {
                     s.next_id += 1;
                     let id = s.next_id;
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                    s.history.push(json!({"message_id": id, "time": now + 1, "sender": {"user_id": SELF_ID},
-                        "message": [{"type":"record","data":{"file":"x.silk"}}]}));
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    s.history.push(
+                        json!({"message_id": id, "time": now + 1, "sender": {"user_id": SELF_ID},
+                        "message": [{"type":"record","data":{"file":"x.silk"}}]}),
+                    );
                 }
             }
         }
         "get_msg" => {
             if s.readback_has_record {
-                reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"message":[{"type":"record","data":{"file":"/secret/path.mp3","url":"/secret/path.mp3","duration":12}}]}}));
+                reply(
+                    &mut stream,
+                    200,
+                    json!({"status":"ok","retcode":0,"data":{"message":[{"type":"record","data":{"file":"/secret/path.mp3","url":"/secret/path.mp3","duration":12}}]}}),
+                );
             } else {
-                reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"message":[{"type":"text","data":{"text":"x"}}]}}));
+                reply(
+                    &mut stream,
+                    200,
+                    json!({"status":"ok","retcode":0,"data":{"message":[{"type":"text","data":{"text":"x"}}]}}),
+                );
             }
         }
-        "fetch_ptt_text" => reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"text":"转写"}})),
+        "fetch_ptt_text" => reply(
+            &mut stream,
+            200,
+            json!({"status":"ok","retcode":0,"data":{"text":"转写"}}),
+        ),
         "get_group_msg_history" | "get_friend_msg_history" => {
             let messages = s.history.clone();
-            reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"messages":messages}}));
+            reply(
+                &mut stream,
+                200,
+                json!({"status":"ok","retcode":0,"data":{"messages":messages}}),
+            );
         }
-        _ => reply(&mut stream, 200, json!({"status":"failed","retcode":1404,"data":null})),
+        _ => reply(
+            &mut stream,
+            200,
+            json!({"status":"failed","retcode":1404,"data":null}),
+        ),
     }
 }
 
@@ -440,7 +576,12 @@ fn bytes(n: usize) -> Vec<u8> {
 }
 
 fn list_names(value: &Value) -> Vec<String> {
-    value["voices"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap().to_string()).collect()
+    value["voices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 // ----- AC1: formats, parameters, library, invocation --------------------------------------------------
@@ -468,9 +609,26 @@ fn library_listing_follows_baseline_formats_hidden_files_and_probe() {
     // not the case: Han sorts first), so the Han directory comes first.
     assert_eq!(
         list_names(&list),
-        ["子目录/a.WAV", "b.mp3", "broken.mp3", "c.silk", "d.spx", "e.wma", "l1/l2/l3/l4/ok4.mp3", "too-long.mp3"]
+        [
+            "子目录/a.WAV",
+            "b.mp3",
+            "broken.mp3",
+            "c.silk",
+            "d.spx",
+            "e.wma",
+            "l1/l2/l3/l4/ok4.mp3",
+            "too-long.mp3"
+        ]
     );
-    let by_name = |name: &str| list["voices"].as_array().unwrap().iter().find(|v| v["name"] == name).unwrap().clone();
+    let by_name = |name: &str| {
+        list["voices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap()
+            .clone()
+    };
     let b = by_name("b.mp3");
     assert_eq!(b["ok"], true);
     assert_eq!(b["bytes"], 2048);
@@ -489,8 +647,14 @@ fn library_listing_follows_baseline_formats_hidden_files_and_probe() {
     let broken = by_name("broken.mp3");
     assert_eq!(broken["ok"], false);
     assert_eq!(broken["seconds"], Value::Null);
-    assert!(broken["error"].as_str().unwrap().contains("ffprobe 执行失败"));
-    assert_eq!(list["limits"], json!({"maxSeconds": 60, "maxBytes": 20971520, "maxPerMinute": 2, "maxPerHour": 10}));
+    assert!(broken["error"]
+        .as_str()
+        .unwrap()
+        .contains("ffprobe 执行失败"));
+    assert_eq!(
+        list["limits"],
+        json!({"maxSeconds": 60, "maxBytes": 20971520, "maxPerMinute": 2, "maxPerHour": 10})
+    );
     // probe=0 lists names only.
     let (_, quick) = console.operator("GET", "/api/voice/list?probe=0", Value::Null);
     assert!(quick["voices"][0].get("ok").is_none());
@@ -500,11 +664,23 @@ fn library_listing_follows_baseline_formats_hidden_files_and_probe() {
 fn ai_channel_listing_is_gated_by_voice_switch_and_tool_flag_with_baseline_defaults() {
     let bot = FakeOneBot::start();
     // No voice section and no sendVoice flag: the JS config merge defaults both to off.
-    let fx = fixture("defaults", &bot.url, Options { voice: Value::Null, tools: json!({}), ..Options::default() });
+    let fx = fixture(
+        "defaults",
+        &bot.url,
+        Options {
+            voice: Value::Null,
+            tools: json!({}),
+            ..Options::default()
+        },
+    );
     fx.audio("a.mp3", &bytes(10));
     let console = Console::start(&fx);
     let (status, body) = console.agent("GET", "/api/socialV2/voices?key=group%3A111", Value::Null);
-    assert_eq!((status, body["error"].as_str()), (403, Some("语音功能已关闭")), "{body}");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (403, Some("语音功能已关闭")),
+        "{body}"
+    );
     // The operator panel still lists the library (voice.enabled only closes the AI channel).
     let (status, body) = console.operator("GET", "/api/voice/list", Value::Null);
     assert_eq!(status, 200, "{body}");
@@ -523,10 +699,36 @@ fn ai_send_route_checks_follow_the_baseline_order_and_messages() {
     let post = |body: Value| console.agent("POST", "/api/socialV2/send-voice", body);
     let key = "group:111";
     let (s, b) = post(json!({"voice": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("请求体缺少会话标识（须按群组或私聊规范写明）")));
-    let (s, b) = request(console.port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), None, &json!({"key": key, "voice": "a.mp3"})).unwrap();
-    assert_eq!((s, b["error"].as_str()), (403, Some("处于二代仿真态调用该动作时，必须附带对应会话口令")), "{b}");
-    let (s, b) = request(console.port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), Some("wrong"), &json!({"key": key, "voice": "a.mp3"})).unwrap();
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (400, Some("请求体缺少会话标识（须按群组或私聊规范写明）"))
+    );
+    let (s, b) = request(
+        console.port,
+        "POST",
+        "/api/socialV2/send-voice",
+        Some(CONSOLE),
+        None,
+        &json!({"key": key, "voice": "a.mp3"}),
+    )
+    .unwrap();
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (
+            403,
+            Some("处于二代仿真态调用该动作时，必须附带对应会话口令")
+        ),
+        "{b}"
+    );
+    let (s, b) = request(
+        console.port,
+        "POST",
+        "/api/socialV2/send-voice",
+        Some(CONSOLE),
+        Some("wrong"),
+        &json!({"key": key, "voice": "a.mp3"}),
+    )
+    .unwrap();
     assert_eq!(s, 403, "{b}");
     for (voice, expect) in [
         ("", "音频文件名不可为空，请填入曲库里存在的条目名称（可先列出曲库查名）"),
@@ -541,7 +743,10 @@ fn ai_send_route_checks_follow_the_baseline_order_and_messages() {
         let (s, b) = post(json!({"key": key, "voice": voice}));
         assert_eq!((s, b["error"].as_str()), (400, Some(expect)), "voice {voice:?}: {b}");
     }
-    assert!(bot.requests("send_group_msg").is_empty(), "a refused reference never reaches the gateway");
+    assert!(
+        bot.requests("send_group_msg").is_empty(),
+        "a refused reference never reaches the gateway"
+    );
 }
 
 #[test]
@@ -551,20 +756,37 @@ fn ai_send_posts_a_record_segment_verifies_by_readback_and_records_it_in_the_con
     let file = fx.audio("sub/a.mp3", &bytes(64));
     // An earlier observation left pre-sleep progress behind; her send starts a new one (as text sends do).
     let mut seeded = fx.state();
-    for (field, value) in [("preSleepWaitSatisfiedAt", 111), ("preSleepWaitObservedAt", 222), ("preSleepWaitAccumMs", 333)] {
+    for (field, value) in [
+        ("preSleepWaitSatisfiedAt", 111),
+        ("preSleepWaitObservedAt", 222),
+        ("preSleepWaitAccumMs", 333),
+    ] {
         seeded["conversations"]["group:111"][field] = json!(value);
     }
-    fs::write(fx.root.join("data/social-v2.json"), serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+    fs::write(
+        fx.root.join("data/social-v2.json"),
+        serde_json::to_vec_pretty(&seeded).unwrap(),
+    )
+    .unwrap();
     let console = Console::start(&fx);
     let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "sub/a", "label": "说了句晚安", "verify": true, "token": AGENT}));
     assert_eq!(s, 200, "{b}");
     let sends = bot.requests("send_group_msg");
     assert_eq!(sends.len(), 1);
     let sent_file = sends[0]["message"][0]["data"]["file"].as_str().unwrap();
-    assert!(Path::new(sent_file).is_absolute(), "the gateway receives an absolute local file path");
-    assert_eq!(fs::canonicalize(sent_file).unwrap(), fs::canonicalize(&file).unwrap(),
-        "the exact library file is sent, including on Windows with a plain gateway path");
-    assert_eq!(sends[0], json!({"group_id": 111, "message": [{"type": "record", "data": {"file": sent_file}}]}));
+    assert!(
+        Path::new(sent_file).is_absolute(),
+        "the gateway receives an absolute local file path"
+    );
+    assert_eq!(
+        fs::canonicalize(sent_file).unwrap(),
+        fs::canonicalize(&file).unwrap(),
+        "the exact library file is sent, including on Windows with a plain gateway path"
+    );
+    assert_eq!(
+        sends[0],
+        json!({"group_id": 111, "message": [{"type": "record", "data": {"file": sent_file}}]})
+    );
     assert_eq!(b["ok"], true);
     assert_eq!(b["key"], "group:111");
     assert_eq!(b["messageId"], 5001);
@@ -574,12 +796,20 @@ fn ai_send_posts_a_record_segment_verifies_by_readback_and_records_it_in_the_con
     assert_eq!(b["verified"], true, "get_msg returned a record segment");
     assert_eq!(b["readback"], Value::Null);
     assert_eq!(b["warnings"], json!([]));
-    assert!(!b.to_string().contains("secret"), "gateway file paths never reach the model: {b}");
+    assert!(
+        !b.to_string().contains("secret"),
+        "gateway file paths never reach the model: {b}"
+    );
     assert_eq!(bot.requests("get_msg"), vec![json!({"message_id": 5001})]);
     // The conversation record sees what was said (bridge.js recordVoiceSentV2).
     let state = fx.state();
     let conv = &state["conversations"]["group:111"];
-    let last = conv["recentMessages"].as_array().unwrap().last().unwrap().clone();
+    let last = conv["recentMessages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
     assert_eq!(last["sender"], "我");
     assert_eq!(last["text"], "说了句晚安");
     assert_eq!(last["messageId"], "5001");
@@ -587,26 +817,47 @@ fn ai_send_posts_a_record_segment_verifies_by_readback_and_records_it_in_the_con
     assert!(conv["lastAiReplyAt"].as_i64().unwrap() > 0);
     // A delivered voice message is her send: it starts her engagement window (review fix 4).
     assert_eq!(conv["engagedAt"], conv["lastAiReplyAt"], "{conv}");
-    for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] {
-        assert_eq!(conv[field], 0, "a delivered voice message resets {field} like a text send: {conv}");
+    for field in [
+        "preSleepWaitSatisfiedAt",
+        "preSleepWaitObservedAt",
+        "preSleepWaitAccumMs",
+    ] {
+        assert_eq!(
+            conv[field], 0,
+            "a delivered voice message resets {field} like a text send: {conv}"
+        );
     }
     assert_eq!(conv["wakeConfig"]["noActionCount"], 0);
 }
 
 #[test]
-fn ai_send_without_label_records_the_audio_summary_and_readback_asks_for_transcription_only_on_request() {
+fn ai_send_without_label_records_the_audio_summary_and_readback_asks_for_transcription_only_on_request(
+) {
     let bot = FakeOneBot::start();
     let fx = fixture("ai-readback", &bot.url, Options::default());
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "readback": true, "verify": false}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3", "readback": true, "verify": false}),
+    );
     assert_eq!(s, 200, "{b}");
-    assert_eq!(b["verified"], false, "verify=false skips the get_msg readback");
+    assert_eq!(
+        b["verified"], false,
+        "verify=false skips the get_msg readback"
+    );
     assert_eq!(b["readback"], "转写");
     assert!(bot.requests("get_msg").is_empty());
-    assert_eq!(bot.requests("fetch_ptt_text"), vec![json!({"message_id": "5001"})]);
+    assert_eq!(
+        bot.requests("fetch_ptt_text"),
+        vec![json!({"message_id": "5001"})]
+    );
     let state = fx.state();
-    let text = state["conversations"]["group:111"]["recentMessages"][0]["text"].as_str().unwrap().to_string();
+    let text = state["conversations"]["group:111"]["recentMessages"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(text, "[语音 13秒 · 64 B · mp3 · 24.0kHz · 单声道]");
 }
 
@@ -617,13 +868,25 @@ fn ai_dry_run_validates_without_sending_and_over_limit_audio_is_refused() {
     fx.audio("a.mp3", &bytes(64));
     fx.audio("too-long.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "dryRun": true}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3", "dryRun": true}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["dryRun"], true);
     assert_eq!(b["detail"], "13秒 · 64 B · mp3 · 24.0kHz · 单声道");
     assert!(bot.requests("send_group_msg").is_empty());
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "too-long.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (500, Some("音频不可发送：时长 6分40秒 超过上限 1分00秒")), "{b}");
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "too-long.mp3"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (500, Some("音频不可发送：时长 6分40秒 超过上限 1分00秒")),
+        "{b}"
+    );
     assert!(bot.requests("send_group_msg").is_empty());
 }
 
@@ -641,24 +904,50 @@ fn silk_packets(packets: usize, qq_header: bool) -> Vec<u8> {
     data
 }
 
-fn assert_audio_refused(console: &Console, fx: &Fixture, bot: &FakeOneBot, name: &str, cause: &str) {
+fn assert_audio_refused(
+    console: &Console,
+    fx: &Fixture,
+    bot: &FakeOneBot,
+    name: &str,
+    cause: &str,
+) {
     for dry_run in [false, true] {
-        let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({
-            "key": "group:111", "voice": name, "volume": 2, "dryRun": dry_run
-        }));
+        let (status, body) = console.agent(
+            "POST",
+            "/api/socialV2/send-voice",
+            json!({
+                "key": "group:111", "voice": name, "volume": 2, "dryRun": dry_run
+            }),
+        );
         assert_eq!(status, if dry_run { 400 } else { 500 }, "{name}: {body}");
-        assert!(body["error"].as_str().unwrap().contains(cause), "{name}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains(cause),
+            "{name}: {body}"
+        );
         for route in ["/api/voice/send", "/api/send/voice"] {
-            let (status, body) = console.operator("POST", route, json!({
-                "target": "private:222", "file": name, "volume": 2, "dryRun": dry_run
-            }));
+            let (status, body) = console.operator(
+                "POST",
+                route,
+                json!({
+                    "target": "private:222", "file": name, "volume": 2, "dryRun": dry_run
+                }),
+            );
             assert_eq!(status, 400, "{name}: {body}");
-            assert!(body["error"].as_str().unwrap().contains(cause), "{name}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(cause),
+                "{name}: {body}"
+            );
         }
         assert!(bot.requests("send_group_msg").is_empty(), "{name}");
         assert!(bot.requests("send_private_msg").is_empty(), "{name}");
-        assert!(fx.outbox().is_empty(), "{name}: refusal precedes any send intent");
-        assert!(fx.tool_log("ffmpeg").is_empty(), "{name}: refusal precedes processing");
+        assert!(
+            fx.outbox().is_empty(),
+            "{name}: refusal precedes any send intent"
+        );
+        assert!(
+            fx.tool_log("ffmpeg").is_empty(),
+            "{name}: refusal precedes processing"
+        );
     }
 }
 
@@ -666,9 +955,8 @@ fn silk_multiframe_packets(packets: usize, qq_header: bool) -> Vec<u8> {
     // One 60 ms packet (three frames), encoded from 1440 silent samples at 24 kHz
     // by the SILK v3 SDK. Generator and SDK TOC verification: ticket 56 fix2 evidence.
     const PAYLOAD: &[u8] = &[
-        0xe9, 0xb7, 0x03, 0x81, 0x44, 0xfe, 0x03, 0x74, 0x2c, 0xfd,
-        0x03, 0x02, 0x9a, 0x91, 0xdc, 0x48, 0xe8, 0xfb, 0x28, 0xfd,
-        0x22, 0x0d, 0xbc, 0xc1, 0x5c, 0xac, 0xcf, 0xff, 0x26, 0x17,
+        0xe9, 0xb7, 0x03, 0x81, 0x44, 0xfe, 0x03, 0x74, 0x2c, 0xfd, 0x03, 0x02, 0x9a, 0x91, 0xdc,
+        0x48, 0xe8, 0xfb, 0x28, 0xfd, 0x22, 0x0d, 0xbc, 0xc1, 0x5c, 0xac, 0xcf, 0xff, 0x26, 0x17,
     ];
     let mut data = silk_packets(0, qq_header);
     for _ in 0..packets {
@@ -705,19 +993,33 @@ fn assert_silk_packet_upper_bound(configured: Option<Value>, qq_header: bool) {
     let mut audio = silk_multiframe_packets(599, qq_header);
     audio.extend_from_slice(&0_i16.to_le_bytes());
     fx.audio(&short, &audio);
-    let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({
-        "key": "group:111", "voice": short, "verify": false
-    }));
+    let (status, body) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({
+            "key": "group:111", "voice": short, "verify": false
+        }),
+    );
     assert_eq!(status, 200, "{body}");
-    assert!(body["detail"].as_str().unwrap().contains("1分00秒"), "{body}");
-    let (status, body) = console.operator("POST", "/api/voice/send", json!({
-        "target": "private:222", "file": short, "verify": false
-    }));
+    assert!(
+        body["detail"].as_str().unwrap().contains("1分00秒"),
+        "{body}"
+    );
+    let (status, body) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({
+            "target": "private:222", "file": short, "verify": false
+        }),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(bot.requests("send_group_msg").len(), 1);
     assert_eq!(bot.requests("send_private_msg").len(), 1);
     assert_eq!(fx.outbox().iter().filter(|r| r["k"] == "intent").count(), 2);
-    assert!(fx.tool_log("ffprobe").is_empty(), "SILK uses a local packet upper bound");
+    assert!(
+        fx.tool_log("ffprobe").is_empty(),
+        "SILK uses a local packet upper bound"
+    );
 }
 
 #[test]
@@ -752,20 +1054,37 @@ fn silk_packet_upper_bound_is_checked_before_sending() {
         }
         fx.audio(&short, &short_audio);
         let console = Console::start(&fx);
-        assert_audio_refused(&console, &fx, &bot, &long, "SILK 文件时长无法确认，请改用 mp3/wav/ogg 等常见格式");
-        let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({
-            "key": "group:111", "voice": short, "verify": false
-        }));
+        assert_audio_refused(
+            &console,
+            &fx,
+            &bot,
+            &long,
+            "SILK 文件时长无法确认，请改用 mp3/wav/ogg 等常见格式",
+        );
+        let (status, body) = console.agent(
+            "POST",
+            "/api/socialV2/send-voice",
+            json!({
+                "key": "group:111", "voice": short, "verify": false
+            }),
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body["detail"].as_str().unwrap().contains("30秒"), "{body}");
-        let (status, body) = console.operator("POST", "/api/voice/send", json!({
-            "target": "private:222", "file": short, "verify": false
-        }));
+        let (status, body) = console.operator(
+            "POST",
+            "/api/voice/send",
+            json!({
+                "target": "private:222", "file": short, "verify": false
+            }),
+        );
         assert_eq!(status, 200, "{body}");
         assert_eq!(bot.requests("send_group_msg").len(), 1);
         assert_eq!(bot.requests("send_private_msg").len(), 1);
         assert_eq!(fx.outbox().iter().filter(|r| r["k"] == "intent").count(), 2);
-        assert!(fx.tool_log("ffprobe").is_empty(), "SILK uses a local packet upper bound");
+        assert!(
+            fx.tool_log("ffprobe").is_empty(),
+            "SILK uses a local packet upper bound"
+        );
     }
 }
 
@@ -850,32 +1169,57 @@ fn assert_duration_limit(configured: Option<Value>, limit: f64) {
     fx.audio(&over_limit, &bytes(64));
     let console = Console::start(&fx);
     for dry_run in [false, true] {
-        let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({
-            "key": "group:111", "voice": over_limit, "volume": 2, "dryRun": dry_run
-        }));
+        let (status, body) = console.agent(
+            "POST",
+            "/api/socialV2/send-voice",
+            json!({
+                "key": "group:111", "voice": over_limit, "volume": 2, "dryRun": dry_run
+            }),
+        );
         assert_eq!(status, if dry_run { 400 } else { 500 }, "{body}");
-        assert!(body["error"].as_str().unwrap().contains("超过上限"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("超过上限"),
+            "{body}"
+        );
         for route in ["/api/voice/send", "/api/send/voice"] {
-            let (status, body) = console.operator("POST", route, json!({
-                "target": "private:222", "file": over_limit, "volume": 2, "dryRun": dry_run
-            }));
+            let (status, body) = console.operator(
+                "POST",
+                route,
+                json!({
+                    "target": "private:222", "file": over_limit, "volume": 2, "dryRun": dry_run
+                }),
+            );
             assert_eq!(status, 400, "{route}: {body}");
-            assert!(body["error"].as_str().unwrap().contains("超过上限"), "{body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("超过上限"),
+                "{body}"
+            );
         }
     }
     assert!(bot.requests("send_group_msg").is_empty());
     assert!(bot.requests("send_private_msg").is_empty());
     assert!(fx.outbox().is_empty(), "refusal precedes any send intent");
-    assert!(fx.tool_log("ffmpeg").is_empty(), "refusal precedes processing");
+    assert!(
+        fx.tool_log("ffmpeg").is_empty(),
+        "refusal precedes processing"
+    );
 
     // The exact boundary is allowed and the refusals have not spent either channel's budget.
-    let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({
-        "key": "group:111", "voice": at_limit, "verify": false
-    }));
+    let (status, body) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({
+            "key": "group:111", "voice": at_limit, "verify": false
+        }),
+    );
     assert_eq!(status, 200, "{body}");
-    let (status, body) = console.operator("POST", "/api/voice/send", json!({
-        "target": "private:222", "file": at_limit, "verify": false
-    }));
+    let (status, body) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({
+            "target": "private:222", "file": at_limit, "verify": false
+        }),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(bot.requests("send_group_msg").len(), 1);
     assert_eq!(bot.requests("send_private_msg").len(), 1);
@@ -890,27 +1234,62 @@ fn default_voice_limit_accepts_sixty_seconds_and_refuses_even_slightly_longer_re
 fn settings_batch_voice_ceiling_applies_to_the_next_send() {
     let bot = FakeOneBot::start();
     let fx = fixture("settings-voice-ceiling", &bot.url, Options::default());
-    for name in ["duration-30.5.mp3", "duration-60.mp3", "duration-60.001.mp3"] {
+    for name in [
+        "duration-30.5.mp3",
+        "duration-60.mp3",
+        "duration-60.001.mp3",
+    ] {
         fx.audio(name, &bytes(64));
     }
     let console = Console::start(&fx);
-    let set = |value| console.operator("POST", "/api/settings/set", json!({
-        "setting": "socialV2.voice.maxSeconds", "value": value
-    }));
-    let send = |name| console.operator("POST", "/api/voice/send", json!({
-        "target": "private:222", "file": name, "verify": false
-    }));
+    let set = |value| {
+        console.operator(
+            "POST",
+            "/api/settings/set",
+            json!({
+                "setting": "socialV2.voice.maxSeconds", "value": value
+            }),
+        )
+    };
+    let send = |name| {
+        console.operator(
+            "POST",
+            "/api/voice/send",
+            json!({
+                "target": "private:222", "file": name, "verify": false
+            }),
+        )
+    };
     let (status, answer) = set(30.5);
     assert_eq!(status, 200, "{answer}");
-    assert_eq!(send("duration-30.5.mp3").0, 200, "a fractional limit admits its exact boundary");
-    assert_eq!(send("duration-60.mp3").0, 400, "the next send must use the stricter stored limit");
+    assert_eq!(
+        send("duration-30.5.mp3").0,
+        200,
+        "a fractional limit admits its exact boundary"
+    );
+    assert_eq!(
+        send("duration-60.mp3").0,
+        400,
+        "the next send must use the stricter stored limit"
+    );
     let (status, answer) = set(60.0);
     assert_eq!(status, 200, "{answer}");
     assert_eq!(set(0.0).0, 400, "the limit is positive");
     let (status, answer) = set(60.001);
-    assert_eq!(status, 400, "the settings route must refuse above 60 seconds: {answer}");
-    assert_eq!(send("duration-60.001.mp3").0, 400, "the refused edit must leave the QQ ceiling in effect");
-    assert_eq!(send("duration-60.mp3").0, 200, "the QQ ceiling itself is allowed");
+    assert_eq!(
+        status, 400,
+        "the settings route must refuse above 60 seconds: {answer}"
+    );
+    assert_eq!(
+        send("duration-60.001.mp3").0,
+        400,
+        "the refused edit must leave the QQ ceiling in effect"
+    );
+    assert_eq!(
+        send("duration-60.mp3").0,
+        200,
+        "the QQ ceiling itself is allowed"
+    );
     assert_eq!(bot.requests("send_private_msg").len(), 2);
 }
 
@@ -923,12 +1302,20 @@ fn legacy_and_stricter_voice_limits_are_enforced_before_sending() {
 
 #[test]
 fn legacy_voice_limits_are_clamped_and_logged_in_console_views() {
-    for (configured, expected, clamped) in [(json!(300), 60, true), (json!("300"), 60, true), (json!(30), 30, false)] {
+    for (configured, expected, clamped) in [
+        (json!(300), 60, true),
+        (json!("300"), 60, true),
+        (json!(30), 30, false),
+    ] {
         let bot = FakeOneBot::start();
-        let fx = fixture("clamped-config", &bot.url, Options {
-            voice: json!({"enabled": true, "dir": "audio", "maxSeconds": configured}),
-            ..Options::default()
-        });
+        let fx = fixture(
+            "clamped-config",
+            &bot.url,
+            Options {
+                voice: json!({"enabled": true, "dir": "audio", "maxSeconds": configured}),
+                ..Options::default()
+            },
+        );
         let console = Console::start(&fx);
         let (status, body) = console.operator("GET", "/api/socialV2/config", Value::Null);
         assert_eq!(status, 200, "{body}");
@@ -936,14 +1323,23 @@ fn legacy_voice_limits_are_clamped_and_logged_in_console_views() {
         let (status, body) = console.operator("GET", "/api/voice/list?probe=0", Value::Null);
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["limits"]["maxSeconds"], expected, "{body}");
-        let (status, body) = console.agent("GET", "/api/socialV2/prompt?key=group%3A111", Value::Null);
+        let (status, body) =
+            console.agent("GET", "/api/socialV2/prompt?key=group%3A111", Value::Null);
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["voices"]["maxSeconds"], expected, "{body}");
         let log = fs::read_to_string(fx.root.join("console.out")).unwrap();
         if clamped {
-            assert!(log.contains("[voice] socialV2.voice.maxSeconds=300 exceeds QQ limit; clamped to 60s"), "{log}");
+            assert!(
+                log.contains(
+                    "[voice] socialV2.voice.maxSeconds=300 exceeds QQ limit; clamped to 60s"
+                ),
+                "{log}"
+            );
         } else {
-            assert!(!log.contains("clamped to"), "a stricter valid limit needs no clamp: {log}");
+            assert!(
+                !log.contains("clamped to"),
+                "a stricter valid limit needs no clamp: {log}"
+            );
         }
         assert!(bot.requests("send_group_msg").is_empty());
         assert!(bot.requests("send_private_msg").is_empty());
@@ -955,15 +1351,22 @@ fn console_voice_saves_cannot_raise_the_sixty_second_upper_bound() {
     let bot = FakeOneBot::start();
     let fx = fixture("save-voice-limit", &bot.url, Options::default());
     let console = Console::start(&fx);
-    let (status, body) = console.operator("POST", "/api/socialV2/config", json!({
-        "voice": {"enabled": true, "dir": "audio", "maxSeconds": 600}
-    }));
+    let (status, body) = console.operator(
+        "POST",
+        "/api/socialV2/config",
+        json!({
+            "voice": {"enabled": true, "dir": "audio", "maxSeconds": 600}
+        }),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["config"]["voice"]["maxSeconds"], 60, "{body}");
     let (_, body) = console.operator("GET", "/api/socialV2/config", Value::Null);
     assert_eq!(body["config"]["voice"]["maxSeconds"], 60, "{body}");
     let log = fs::read_to_string(fx.root.join("console.out")).unwrap();
-    assert!(log.contains("[voice] socialV2.voice.maxSeconds=600 exceeds QQ limit; clamped to 60s"), "{log}");
+    assert!(
+        log.contains("[voice] socialV2.voice.maxSeconds=600 exceeds QQ limit; clamped to 60s"),
+        "{log}"
+    );
     assert!(bot.requests("send_group_msg").is_empty());
     assert!(bot.requests("send_private_msg").is_empty());
 }
@@ -971,23 +1374,55 @@ fn console_voice_saves_cannot_raise_the_sixty_second_upper_bound() {
 #[test]
 fn volume_and_loudness_are_applied_locally_with_ffmpeg_and_the_temp_file_is_removed() {
     let bot = FakeOneBot::start();
-    let fx = fixture("volume", &bot.url, Options { voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 50}), ..Options::default() });
+    let fx = fixture(
+        "volume",
+        &bot.url,
+        Options {
+            voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 50}),
+            ..Options::default()
+        },
+    );
     let file = fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "volume": 2}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3", "volume": 2}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["audioProcessing"], "音量提升至 200%");
     let sends = bot.requests("send_group_msg");
-    let sent_file = sends[0]["message"][0]["data"]["file"].as_str().unwrap().to_string();
-    assert_ne!(Path::new(&sent_file), fs::canonicalize(&file).unwrap(), "the processed copy is sent, not the library file");
-    assert!(sent_file.contains("voice-processed") && sent_file.ends_with(".mp3"), "{sent_file}");
-    assert!(!Path::new(&sent_file).exists(), "processed temp file is removed after the send");
+    let sent_file = sends[0]["message"][0]["data"]["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        Path::new(&sent_file),
+        fs::canonicalize(&file).unwrap(),
+        "the processed copy is sent, not the library file"
+    );
+    assert!(
+        sent_file.contains("voice-processed") && sent_file.ends_with(".mp3"),
+        "{sent_file}"
+    );
+    assert!(
+        !Path::new(&sent_file).exists(),
+        "processed temp file is removed after the send"
+    );
     let args = fx.tool_log("ffmpeg");
     assert_eq!(args.len(), 1);
-    assert!(args[0].starts_with("-hide_banner -loglevel error -y -i "), "{}", args[0]);
+    assert!(
+        args[0].starts_with("-hide_banner -loglevel error -y -i "),
+        "{}",
+        args[0]
+    );
     assert!(args[0].contains(" -af volume=2 -ac 1 "), "{}", args[0]);
     // Smart loudness.
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "normalize": true, "loudness": "loud"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3", "normalize": true, "loudness": "loud"}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["audioProcessing"], "响度均衡模式（目标 -13 LUFS）");
     assert!(fx.tool_log("ffmpeg")[1].contains("-af loudnorm=I=-13:TP=-1.5:LRA=11 -ac 1 "));
@@ -1013,7 +1448,11 @@ fn ffmpeg_failure_is_reported_and_nothing_is_sent() {
     let fx = fixture("ffmpeg-fail", &bot.url, Options::default());
     fx.audio("nofmpeg.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "nofmpeg.mp3", "volume": 2}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "nofmpeg.mp3", "volume": 2}),
+    );
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["error"], "音量处理失败：ffmpeg 音量转码异常（退出码 3）");
     // JS retries a non-wav input once as wav before giving up.
@@ -1027,9 +1466,16 @@ fn sensitive_file_names_are_blocked_before_sending() {
     let fx = fixture("audit", &bot.url, Options::default());
     fx.audio("token=abcdef.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "token=abcdef.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "token=abcdef.mp3"}),
+    );
     assert_eq!(s, 500, "{b}");
-    assert_eq!(b["error"], "检测到音频文件名含敏感内容（路径、凭据或会话密钥），已拦截，请更名后再试");
+    assert_eq!(
+        b["error"],
+        "检测到音频文件名含敏感内容（路径、凭据或会话密钥），已拦截，请更名后再试"
+    );
     assert!(bot.requests("send_group_msg").is_empty());
 }
 
@@ -1039,9 +1485,17 @@ fn outbound_guard_false_allows_a_sensitive_voice_file_name() {
     let fx = fixture("audit-off", &bot.url, Options::default());
     fx.audio("token=abcdef.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (status, body) = console.operator("POST", "/api/security", json!({"outboundGuard":false,"confirm":true}));
+    let (status, body) = console.operator(
+        "POST",
+        "/api/security",
+        json!({"outboundGuard":false,"confirm":true}),
+    );
     assert_eq!(status, 200, "{body}");
-    let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({"key":"group:111", "voice":"token=abcdef.mp3", "verify":false}));
+    let (status, body) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key":"group:111", "voice":"token=abcdef.mp3", "verify":false}),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(bot.requests("send_group_msg").len(), 1);
 }
@@ -1052,34 +1506,79 @@ fn outbound_guard_false_allows_a_sensitive_voice_file_name() {
 fn voice_budget_is_spent_only_by_a_confirmed_send_and_reports_the_baseline_limit_message() {
     // JS voiceBudgetCommit runs only after a delivered send: a refused or an unknown send spends nothing.
     let bot = FakeOneBot::start();
-    let fx = fixture("budget", &bot.url, Options { voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 1}), ..Options::default() });
+    let fx = fixture(
+        "budget",
+        &bot.url,
+        Options {
+            voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 1}),
+            ..Options::default()
+        },
+    );
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let send = || console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "verify": false}));
+    let send = || {
+        console.agent(
+            "POST",
+            "/api/socialV2/send-voice",
+            json!({"key": "group:111", "voice": "a.mp3", "verify": false}),
+        )
+    };
     bot.script(vec![Send::Refuse, Send::Lost, Send::Ok, Send::Ok]);
     let (s, b) = send();
-    assert_eq!((s, b["outcome"].as_str()), (500, Some("not_committed")), "{b}");
+    assert_eq!(
+        (s, b["outcome"].as_str()),
+        (500, Some("not_committed")),
+        "{b}"
+    );
     let (s, b) = send();
     assert_eq!((s, b["outcome"].as_str()), (500, Some("unknown")), "{b}");
     let (s, b) = send();
-    assert_eq!(s, 200, "neither the refused nor the unknown send used the quota: {b}");
+    assert_eq!(
+        s, 200,
+        "neither the refused nor the unknown send used the quota: {b}"
+    );
     let (s, b) = send();
-    assert_eq!((s, b["error"].as_str()), (500, Some("已达每分钟语音配额上限（1 条），请稍后重试")), "{b}");
-    assert_eq!(bot.requests("send_group_msg").len(), 3, "the limited call never reached the gateway");
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (500, Some("已达每分钟语音配额上限（1 条），请稍后重试")),
+        "{b}"
+    );
+    assert_eq!(
+        bot.requests("send_group_msg").len(),
+        3,
+        "the limited call never reached the gateway"
+    );
 }
 
 #[test]
 fn an_unknown_send_that_history_proves_delivered_spends_the_budget() {
     let bot = FakeOneBot::start();
-    let fx = fixture("budget-proven", &bot.url, Options { voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 1}), ..Options::default() });
+    let fx = fixture(
+        "budget-proven",
+        &bot.url,
+        Options {
+            voice: json!({"enabled": true, "dir": "audio", "maxPerMinute": 1}),
+            ..Options::default()
+        },
+    );
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::LostButDelivered]);
-    let send = || console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "verify": false}));
+    let send = || {
+        console.agent(
+            "POST",
+            "/api/socialV2/send-voice",
+            json!({"key": "group:111", "voice": "a.mp3", "verify": false}),
+        )
+    };
     let (s, b) = send();
     assert_eq!(s, 200, "{b}");
     let (s, b) = send();
-    assert_eq!((s, b["error"].as_str()), (500, Some("已达每分钟语音配额上限（1 条），请稍后重试")), "{b}");
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (500, Some("已达每分钟语音配额上限（1 条），请稍后重试")),
+        "{b}"
+    );
 }
 
 #[test]
@@ -1089,17 +1588,35 @@ fn definite_refusal_is_reported_as_not_committed_with_an_outbox_trail() {
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::Refuse]);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["ok"], false);
     assert_eq!(b["outcome"], "not_committed");
-    assert!(b["error"].as_str().unwrap().starts_with("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=1404"), "{b}");
-    let kinds: Vec<String> = fx.outbox().iter().map(|r| r["k"].as_str().unwrap().to_string()).collect();
+    assert!(
+        b["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("OneBot 网关退回并拒绝了此次发信请求，返回状态码 retcode=1404"),
+        "{b}"
+    );
+    let kinds: Vec<String> = fx
+        .outbox()
+        .iter()
+        .map(|r| r["k"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(kinds, ["intent", "attempt", "not_committed"]);
     assert_eq!(fx.outbox()[0]["kind"], "voice");
     assert_eq!(fx.outbox()[0]["messages"], json!(["[语音:a.mp3]"]));
     let recent = fx.state()["conversations"]["group:111"]["recentMessages"].clone();
-    assert_eq!(recent, json!([]), "nothing was said, so nothing is recorded");
+    assert_eq!(
+        recent,
+        json!([]),
+        "nothing was said, so nothing is recorded"
+    );
 }
 
 #[test]
@@ -1109,18 +1626,43 @@ fn a_result_120_voice_refusal_is_a_definite_403_and_teaches_the_mute() {
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::Muted]);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 403, "{b}");
     assert_eq!(b["ok"], false);
-    assert!(b["error"].as_str().unwrap_or_default().contains("禁言"), "{b}");
-    assert!(b.get("outcome").is_none(), "a mute refusal is not an unknown outcome: {b}");
-    let kinds: Vec<String> = fx.outbox().iter().map(|r| r["k"].as_str().unwrap().to_string()).collect();
+    assert!(
+        b["error"].as_str().unwrap_or_default().contains("禁言"),
+        "{b}"
+    );
+    assert!(
+        b.get("outcome").is_none(),
+        "a mute refusal is not an unknown outcome: {b}"
+    );
+    let kinds: Vec<String> = fx
+        .outbox()
+        .iter()
+        .map(|r| r["k"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(kinds, ["intent", "attempt", "not_committed"]);
-    let store: Value = serde_json::from_slice(&fs::read(fx.root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    let store: Value = serde_json::from_slice(
+        &fs::read(fx.root.join("data/group-mutes.json")).expect("the refusal wrote the mute state"),
+    )
+    .unwrap();
     assert_eq!(store["groups"]["group:111"]["personalUntil"], json!(-1));
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 403, "{b}");
-    assert_eq!(bot.requests("send_group_msg").len(), 1, "the second send stayed local");
+    assert_eq!(
+        bot.requests("send_group_msg").len(),
+        1,
+        "the second send stayed local"
+    );
 }
 
 #[test]
@@ -1128,18 +1670,39 @@ fn a_muted_group_voice_send_is_refused_locally() {
     let bot = FakeOneBot::start();
     let fx = fixture("muted", &bot.url, Options::default());
     fx.audio("a.mp3", &bytes(64));
-    let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 600_000;
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 600_000;
     let mut groups = serde_json::Map::new();
-    groups.insert("group:111".to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
-    fs::write(fx.root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    groups.insert(
+        "group:111".to_string(),
+        json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}),
+    );
+    fs::write(
+        fx.root.join("data/group-mutes.json"),
+        json!({"v": 1, "groups": groups}).to_string(),
+    )
+    .unwrap();
     let console = Console::start(&fx);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 403, "{b}");
     assert_eq!(b["ok"], false);
-    assert!(b["error"].as_str().unwrap_or_default().contains("禁言"), "{b}");
+    assert!(
+        b["error"].as_str().unwrap_or_default().contains("禁言"),
+        "{b}"
+    );
     assert!(bot.requests("send_group_msg").is_empty(), "no gateway send");
     assert!(bot.requests("get_msg").is_empty(), "no readback");
-    assert!(fx.outbox().iter().all(|r| r["k"] != "intent"), "no send intent is recorded");
+    assert!(
+        fx.outbox().iter().all(|r| r["k"] != "intent"),
+        "no send intent is recorded"
+    );
 }
 
 #[test]
@@ -1149,27 +1712,55 @@ fn lost_reply_is_unknown_and_never_resent_until_verified() {
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::Lost]);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["ok"], false);
     assert_eq!(b["outcome"], "unknown");
-    assert!(b["error"].as_str().unwrap().contains("结果未知") && b["error"].as_str().unwrap().contains("不会自动重发"), "{b}");
+    assert!(
+        b["error"].as_str().unwrap().contains("结果未知")
+            && b["error"].as_str().unwrap().contains("不会自动重发"),
+        "{b}"
+    );
     assert_eq!(b["verified"], false);
     let batch = b["batchId"].as_str().unwrap().to_string();
-    let kinds: Vec<String> = fx.outbox().iter().map(|r| r["k"].as_str().unwrap().to_string()).collect();
+    let kinds: Vec<String> = fx
+        .outbox()
+        .iter()
+        .map(|r| r["k"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(kinds, ["intent", "attempt", "unknown"]);
     // The gateway was asked exactly once; the bridge looked for evidence in history instead of resending.
     assert_eq!(bot.requests("send_group_msg").len(), 1);
     assert_eq!(bot.requests("get_group_msg_history").len(), 1);
     // The unresolved item is visible to operators and carries no resend path through send-message.
-    let (s, view) = console.operator("GET", &format!("/api/socialV2/send-outbox?key=group%3A111"), Value::Null);
+    let (s, view) = console.operator(
+        "GET",
+        &format!("/api/socialV2/send-outbox?key=group%3A111"),
+        Value::Null,
+    );
     assert_eq!(s, 200, "{view}");
     assert_eq!(view["batches"][0]["unknown"], json!([0]));
-    let (s, resume) = console.agent("POST", "/api/socialV2/send-message", json!({"key": "group:111", "resumeBatchId": batch}));
+    let (s, resume) = console.agent(
+        "POST",
+        "/api/socialV2/send-message",
+        json!({"key": "group:111", "resumeBatchId": batch}),
+    );
     assert_ne!(s, 200, "a voice batch is never resumed as text: {resume}");
-    assert_eq!(bot.requests("send_group_msg").len(), 1, "resume did not resend");
+    assert_eq!(
+        bot.requests("send_group_msg").len(),
+        1,
+        "resume did not resend"
+    );
     let recent = fx.state()["conversations"]["group:111"]["recentMessages"].clone();
-    assert_eq!(recent, json!([]), "an unknown send is not claimed in the conversation");
+    assert_eq!(
+        recent,
+        json!([]),
+        "an unknown send is not claimed in the conversation"
+    );
 }
 
 #[test]
@@ -1179,7 +1770,11 @@ fn lost_reply_with_history_evidence_is_confirmed_as_verified() {
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::LostButDelivered]);
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3", "verify": false}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3", "verify": false}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["ok"], true);
     assert_eq!(b["messageId"], 5001);
@@ -1199,7 +1794,11 @@ fn a_paused_ai_cannot_send_voice() {
     let mut state = fx.state();
     state["paused"] = json!(true);
     fs::write(fx.root.join("data/social-v2.json"), state.to_string()).unwrap();
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 403, "{b}");
     assert!(bot.requests("send_group_msg").is_empty());
 }
@@ -1215,19 +1814,58 @@ fn operator_send_validates_target_allow_list_and_previews_with_dry_run() {
     fs::write(&outside, bytes(32)).unwrap();
     let console = Console::start(&fx);
     let post = |path: &str, body: Value| console.operator("POST", path, body);
-    let (s, b) = post("/api/voice/send", json!({"target": "nonsense", "file": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("收件对象标识写得不对，须按群号或好友号标准格式给出")));
-    let (s, b) = post("/api/voice/send", json!({"target": "group:999", "file": "a.mp3"}));
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "nonsense", "file": "a.mp3"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (
+            400,
+            Some("收件对象标识写得不对，须按群号或好友号标准格式给出")
+        )
+    );
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "group:999", "file": "a.mp3"}),
+    );
     assert_eq!(s, 403);
     assert_eq!(b["error"], "所选会话 group:999 不在放行白名单里（请核对配置中的允许群组与好友清单；群：111；私聊：222）");
-    let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "missing.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("找不到音频「missing.mp3」")));
-    let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "http://x/a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("本接口只接受本机磁盘文件路径，禁止传入网址或内联编码数据")));
-    let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "volume": 99}));
-    assert_eq!((s, b["error"].as_str()), (400, Some("音量倍率限制为 0.1~4（1.0 表示原音量），当前收到 99")));
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "missing.mp3"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (400, Some("找不到音频「missing.mp3」"))
+    );
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "http://x/a.mp3"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (
+            400,
+            Some("本接口只接受本机磁盘文件路径，禁止传入网址或内联编码数据")
+        )
+    );
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3", "volume": 99}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (
+            400,
+            Some("音量倍率限制为 0.1~4（1.0 表示原音量），当前收到 99")
+        )
+    );
     // Dry run previews the resolved file, limits and warnings.
-    let (s, b) = post("/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "dryRun": true}));
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3", "dryRun": true}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["dryRun"], true);
     assert_eq!(b["key"], "group:111");
@@ -1236,10 +1874,16 @@ fn operator_send_validates_target_allow_list_and_previews_with_dry_run() {
     assert_eq!(b["duration"], 12.5);
     assert_eq!(b["codec"], "mp3");
     assert_eq!(b["warnings"], json!([]));
-    assert_eq!(b["limits"], json!({"maxSeconds": 60, "maxBytes": 20971520, "maxPerMinute": 2, "maxPerHour": 10}));
+    assert_eq!(
+        b["limits"],
+        json!({"maxSeconds": 60, "maxBytes": 20971520, "maxPerMinute": 2, "maxPerHour": 10})
+    );
     assert!(bot.requests("send_group_msg").is_empty());
     // Operators may name a file outside the library by absolute path (the AI channel may not).
-    let (s, b) = post("/api/voice/send", json!({"target": "private:222", "file": outside.to_string_lossy(), "dryRun": true}));
+    let (s, b) = post(
+        "/api/voice/send",
+        json!({"target": "private:222", "file": outside.to_string_lossy(), "dryRun": true}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["via"], "absolute");
 }
@@ -1250,12 +1894,20 @@ fn operator_send_works_even_when_the_ai_voice_switch_is_off_and_does_not_need_a_
     let fx = fixture(
         "operator-send",
         &bot.url,
-        Options { voice: json!({"enabled": false, "dir": "audio"}), tools: json!({}), ..Options::default() },
+        Options {
+            voice: json!({"enabled": false, "dir": "audio"}),
+            tools: json!({}),
+            ..Options::default()
+        },
     );
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     for path in ["/api/voice/send", "/api/send/voice"] {
-        let (s, b) = console.operator("POST", path, json!({"target": "private:222", "file": "a.mp3"}));
+        let (s, b) = console.operator(
+            "POST",
+            path,
+            json!({"target": "private:222", "file": "a.mp3"}),
+        );
         assert_eq!(s, 200, "{path}: {b}");
         assert_eq!(b["ok"], true);
         assert_eq!(b["key"], "private:222");
@@ -1269,10 +1921,22 @@ fn operator_send_works_even_when_the_ai_voice_switch_is_off_and_does_not_need_a_
     assert_eq!(sends.len(), 2);
     assert_eq!(sends[0]["user_id"], 222);
     // The operator scope has its own two-per-minute budget.
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "private:222", "file": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (500, Some("已达每分钟语音配额上限（2 条），请稍后重试")), "{b}");
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "private:222", "file": "a.mp3"}),
+    );
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (500, Some("已达每分钟语音配额上限（2 条），请稍后重试")),
+        "{b}"
+    );
     // The AI is told to use its own route.
-    let (s, b) = console.agent("POST", "/api/send/voice", json!({"target": "private:222", "file": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/send/voice",
+        json!({"target": "private:222", "file": "a.mp3"}),
+    );
     assert_eq!((s, b["error"].as_str()), (403, Some("这个接口口令仅限发起二代仿真语音投递时使用，填报参数请写齐目标对话和口令密码后再递交")), "{b}");
 }
 
@@ -1283,11 +1947,22 @@ fn operator_readback_and_unverified_gateway_answer_are_reported_truthfully() {
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script.lock().unwrap().readback_has_record = false;
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "readback": true}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3", "readback": true}),
+    );
     assert_eq!(s, 200, "{b}");
-    assert_eq!(b["verified"], false, "get_msg did not show a record segment");
+    assert_eq!(
+        b["verified"], false,
+        "get_msg did not show a record segment"
+    );
     assert_eq!(b["readback"], "转写");
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "verify": false}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3", "verify": false}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["verified"], false);
 }
@@ -1299,7 +1974,11 @@ fn operator_unknown_outcome_is_reported_and_the_batch_is_not_resumable_as_text()
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::Lost]);
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "a.mp3"}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3"}),
+    );
     assert_eq!(s, 500, "{b}");
     assert_eq!(b["outcome"], "unknown");
     assert_eq!(bot.requests("send_group_msg").len(), 1);
@@ -1318,20 +1997,43 @@ fn wait_for_event(bot: &FakeOneBot, event: &str) {
 #[test]
 fn a_voice_send_occupies_the_shared_send_chain_so_a_later_text_send_waits_behind_it() {
     let bot = FakeOneBot::start();
-    let fx = fixture("chain", &bot.url, Options { tools: json!({"sendVoice": true, "sendMessage": true}), ..Options::default() });
+    let fx = fixture(
+        "chain",
+        &bot.url,
+        Options {
+            tools: json!({"sendVoice": true, "sendMessage": true}),
+            ..Options::default()
+        },
+    );
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
     bot.script(vec![Send::Slow(1500)]);
     let port = console.port;
     let voice = thread::spawn(move || {
-        request(port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), Some(AGENT), &json!({"key": "group:111", "voice": "a.mp3", "verify": false})).unwrap()
+        request(
+            port,
+            "POST",
+            "/api/socialV2/send-voice",
+            Some(CONSOLE),
+            Some(AGENT),
+            &json!({"key": "group:111", "voice": "a.mp3", "verify": false}),
+        )
+        .unwrap()
     });
     wait_for_event(&bot, "request:voice");
-    let (s, text) = console.agent("POST", "/api/socialV2/send-message", json!({"key": "group:111", "messages": ["hi"]}));
+    let (s, text) = console.agent(
+        "POST",
+        "/api/socialV2/send-message",
+        json!({"key": "group:111", "messages": ["hi"]}),
+    );
     assert_eq!(s, 200, "{text}");
     let (s, v) = voice.join().unwrap();
     assert_eq!(s, 200, "{v}");
-    assert_eq!(bot.events(), ["request:voice", "reply:voice", "request:text"], "JS sendChain: the text bubble is sent after the voice completed");
+    assert_eq!(
+        bot.events(),
+        ["request:voice", "reply:voice", "request:text"],
+        "JS sendChain: the text bubble is sent after the voice completed"
+    );
 }
 
 #[test]
@@ -1342,7 +2044,17 @@ fn the_per_item_guard_treats_a_missing_send_voice_flag_as_off_after_a_config_rel
     let console = Console::start(&fx);
     bot.script(vec![Send::Slow(1500)]);
     let port = console.port;
-    let send = move || request(port, "POST", "/api/socialV2/send-voice", Some(CONSOLE), Some(AGENT), &json!({"key": "group:111", "voice": "a.mp3", "verify": false})).unwrap();
+    let send = move || {
+        request(
+            port,
+            "POST",
+            "/api/socialV2/send-voice",
+            Some(CONSOLE),
+            Some(AGENT),
+            &json!({"key": "group:111", "voice": "a.mp3", "verify": false}),
+        )
+        .unwrap()
+    };
     let first = thread::spawn(send);
     wait_for_event(&bot, "request:voice");
     let second = thread::spawn(send);
@@ -1354,8 +2066,16 @@ fn the_per_item_guard_treats_a_missing_send_voice_flag_as_off_after_a_config_rel
     fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     assert_eq!(first.join().unwrap().0, 200);
     let (s, b) = second.join().unwrap();
-    assert_eq!((s, b["error"].as_str()), (500, Some("发送中止：会话状态、运行模式或访问名单已变动")), "{b}");
-    assert_eq!(bot.requests("send_group_msg").len(), 1, "the cancelled voice never reached the gateway");
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (500, Some("发送中止：会话状态、运行模式或访问名单已变动")),
+        "{b}"
+    );
+    assert_eq!(
+        bot.requests("send_group_msg").len(),
+        1,
+        "the cancelled voice never reached the gateway"
+    );
 }
 
 #[test]
@@ -1368,16 +2088,34 @@ fn a_missing_voice_library_is_an_empty_library_and_the_operator_can_still_send_a
     let console = Console::start(&fx);
     let (s, list) = console.operator("GET", "/api/voice/list", Value::Null);
     assert_eq!(s, 200, "{list}");
-    assert_eq!((list["count"].clone(), list["voices"].clone()), (json!(0), json!([])), "{list}");
-    assert!(list["hint"].as_str().unwrap().starts_with("语音列表为空"), "{list}");
+    assert_eq!(
+        (list["count"].clone(), list["voices"].clone()),
+        (json!(0), json!([])),
+        "{list}"
+    );
+    assert!(
+        list["hint"].as_str().unwrap().starts_with("语音列表为空"),
+        "{list}"
+    );
     let (s, list) = console.agent("GET", "/api/socialV2/voices?key=group%3A111", Value::Null);
     assert_eq!((s, list["count"].clone()), (200, json!(0)), "{list}");
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": elsewhere.to_string_lossy()}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": elsewhere.to_string_lossy()}),
+    );
     assert_eq!(s, 200, "{b}");
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "a.mp3"}),
+    );
     assert_eq!(s, 400, "{b}");
     let error = b["error"].as_str().unwrap();
-    assert!(error.contains("未在语音库找到「a.mp3」") && error.contains("目前无音频"), "{b}");
+    assert!(
+        error.contains("未在语音库找到「a.mp3」") && error.contains("目前无音频"),
+        "{b}"
+    );
     assert_eq!(bot.requests("send_group_msg").len(), 1);
 }
 
@@ -1397,8 +2135,16 @@ fn links_in_the_voice_library_are_skipped_without_hiding_the_other_files() {
     let console = Console::start(&fx);
     let (s, list) = console.operator("GET", "/api/voice/list?probe=0", Value::Null);
     assert_eq!(s, 200, "{list}");
-    assert_eq!(list_names(&list), ["ok.mp3", "sub/inner.mp3"], "JS lists only regular files (Dirent.isFile)");
-    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "ok.mp3", "verify": false}));
+    assert_eq!(
+        list_names(&list),
+        ["ok.mp3", "sub/inner.mp3"],
+        "JS lists only regular files (Dirent.isFile)"
+    );
+    let (s, b) = console.agent(
+        "POST",
+        "/api/socialV2/send-voice",
+        json!({"key": "group:111", "voice": "ok.mp3", "verify": false}),
+    );
     assert_eq!(s, 200, "{b}");
 }
 
@@ -1408,15 +2154,26 @@ fn operator_relative_paths_resolve_against_the_resources_root_like_the_js_cwd() 
     let fx = fixture("relative", &bot.url, Options::default());
     fx.audio("a.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "audio/a.mp3", "verify": false}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "audio/a.mp3", "verify": false}),
+    );
     assert_eq!(s, 200, "{b}");
     assert_eq!(b["via"], "cwd");
     let sends = bot.requests("send_group_msg");
     let sent = sends[0]["message"][0]["data"]["file"].as_str().unwrap();
-    assert_eq!(fs::canonicalize(sent).unwrap(), fs::canonicalize(fx.root.join("resources/audio/a.mp3")).unwrap(),
-        "the exact resources-root file is sent, with native path separators: {sends:?}");
+    assert_eq!(
+        fs::canonicalize(sent).unwrap(),
+        fs::canonicalize(fx.root.join("resources/audio/a.mp3")).unwrap(),
+        "the exact resources-root file is sent, with native path separators: {sends:?}"
+    );
     // The voice directory is still tried second.
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "a.mp3", "dryRun": true}));
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "a.mp3", "dryRun": true}),
+    );
     assert_eq!((s, b["via"].as_str()), (200, Some("voice-dir")), "{b}");
 }
 
@@ -1438,7 +2195,10 @@ fn prompt_summarises_the_library_for_the_model_when_voice_is_enabled() {
     assert_eq!(voices["names"].as_array().unwrap().len(), 12);
     assert_eq!(voices["names"][0], "v00.mp3");
     assert_eq!(voices["maxSeconds"], 60);
-    assert_eq!(voices["hint"], "请先调用曲库列表接口挑选合规文件名，再交给发语音工具传入对应条目名播发");
+    assert_eq!(
+        voices["hint"],
+        "请先调用曲库列表接口挑选合规文件名，再交给发语音工具传入对应条目名播发"
+    );
 }
 
 #[test]
@@ -1446,20 +2206,42 @@ fn voice_routes_are_open_in_the_selected_runtime_with_exact_methods() {
     let bot = FakeOneBot::start();
     let fx = fixture("routes", &bot.url, Options::default());
     let console = Console::start(&fx);
-    for (method, path) in [("GET", "/api/voice/send"), ("GET", "/api/send/voice"), ("GET", "/api/socialV2/send-voice")] {
+    for (method, path) in [
+        ("GET", "/api/voice/send"),
+        ("GET", "/api/send/voice"),
+        ("GET", "/api/socialV2/send-voice"),
+    ] {
         let (s, b) = console.operator(method, path, Value::Null);
         assert_eq!(s, 503, "{method} {path} stays closed: {b}");
-        assert!(b["error"].as_str().unwrap().contains("not available in the selected runtime"));
+        assert!(b["error"]
+            .as_str()
+            .unwrap()
+            .contains("not available in the selected runtime"));
     }
-    let (s, b) = console.operator("POST", "/api/voice/send", json!({"target": "group:111", "file": "x", "dryRun": true}));
-    assert_ne!(s, 503, "POST /api/voice/send is served by the selected runtime: {b}");
+    let (s, b) = console.operator(
+        "POST",
+        "/api/voice/send",
+        json!({"target": "group:111", "file": "x", "dryRun": true}),
+    );
+    assert_ne!(
+        s, 503,
+        "POST /api/voice/send is served by the selected runtime: {b}"
+    );
 }
 
 #[test]
 fn config_view_reports_the_merged_voice_defaults_so_the_console_never_shows_voice_as_on() {
     let bot = FakeOneBot::start();
     // The file sets only `enabled`; the JS loader fills the rest and keeps sendVoice off.
-    let fx = fixture("config-view", &bot.url, Options { voice: json!({"enabled": true, "maxPerMinute": 5}), tools: json!({}), ..Options::default() });
+    let fx = fixture(
+        "config-view",
+        &bot.url,
+        Options {
+            voice: json!({"enabled": true, "maxPerMinute": 5}),
+            tools: json!({}),
+            ..Options::default()
+        },
+    );
     let console = Console::start(&fx);
     let (s, b) = console.operator("GET", "/api/socialV2/config", Value::Null);
     assert_eq!(s, 200, "{b}");
@@ -1468,7 +2250,10 @@ fn config_view_reports_the_merged_voice_defaults_so_the_console_never_shows_voic
         json!({"enabled": true, "dir": "audio", "maxSeconds": 60, "maxBytes": 20971520, "maxPerMinute": 5, "maxPerHour": 10,
                "allowAbsolutePath": false, "defaultVolume": 1, "loudness": "normal", "ffmpegPath": "", "autoReadback": true})
     );
-    assert_eq!(b["config"]["tools"]["sendVoice"], false, "the console checkbox reads `!== false`");
+    assert_eq!(
+        b["config"]["tools"]["sendVoice"], false,
+        "the console checkbox reads `!== false`"
+    );
     // An explicit true stays true.
     let fx2 = fixture("config-view-on", &bot.url, Options::default());
     let console2 = Console::start(&fx2);

@@ -10,7 +10,10 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -174,7 +177,9 @@ fn start_console(root: &Path, port: u16, via_env_root: bool) -> ChildGuard {
         command.arg("--runtime-root").arg(root);
     }
     hide_process_window(&mut command);
-    ChildGuard(Some(command.spawn().expect("start isolated console candidate")))
+    ChildGuard(Some(
+        command.spawn().expect("start isolated console candidate"),
+    ))
 }
 
 fn start_console_without_port(root: &Path) -> ChildGuard {
@@ -187,9 +192,11 @@ fn start_console_without_port(root: &Path) -> ChildGuard {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_process_window(&mut command);
-    ChildGuard(Some(command
-        .spawn()
-        .expect("start isolated console without a port")))
+    ChildGuard(Some(
+        command
+            .spawn()
+            .expect("start isolated console without a port"),
+    ))
 }
 fn wait_for_health(child: &mut Child, port: u16) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -350,7 +357,10 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
     let onebot = OneBotServer::start(onebot_listener);
 
     let (child, port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
-        start_console(&root, port, false).0.take().expect("spawned console")
+        start_console(&root, port, false)
+            .0
+            .take()
+            .expect("spawned console")
     });
     let mut child = ChildGuard(Some(child));
     let health = wait_for_health(&mut child, port).unwrap_or_else(|error| {
@@ -395,7 +405,10 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
 
     // Selecting the runtime root via `HER_RUNTIME_ROOT` remains equivalent to `--runtime-root`.
     let (child, env_port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
-        start_console(&root, port, true).0.take().expect("spawned console")
+        start_console(&root, port, true)
+            .0
+            .take()
+            .expect("spawned console")
     });
     let mut child = ChildGuard(Some(child));
     let health = wait_for_health(&mut child, env_port).unwrap_or_else(|error| {
@@ -478,7 +491,9 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_process_window(&mut command);
-    let mut blank_root = ChildGuard(Some(command.spawn().expect("start with an empty runtime root")));
+    let mut blank_root = ChildGuard(Some(
+        command.spawn().expect("start with an empty runtime root"),
+    ));
     require_exit_within(&mut blank_root, "empty-root");
     let output = blank_root
         .wait_with_output()
@@ -513,7 +528,10 @@ fn isolated_status_rejects_data_directory_reparse_replacement() {
     write_dependencies(&root, &onebot_url, &dsh_url, &model_url);
 
     let (child, port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
-        start_console(&root, port, false).0.take().expect("spawned console")
+        start_console(&root, port, false)
+            .0
+            .take()
+            .expect("spawned console")
     });
     let mut child = ChildGuard(Some(child));
     let health = wait_for_health(&mut child, port).unwrap_or_else(|error| {
@@ -528,7 +546,11 @@ fn isolated_status_rejects_data_directory_reparse_replacement() {
     // Windows refuses a directory rename with an open descendant. Park only the
     // synthetic owner's file first; its handle and byte-range lock stay held.
     // No process is started against this root during the replacement.
-    fs::rename(selected_data.join("logs/rbridge-console.lock"), root.join("parked-console.lock")).unwrap();
+    fs::rename(
+        selected_data.join("logs/rbridge-console.lock"),
+        root.join("parked-console.lock"),
+    )
+    .unwrap();
     fs::rename(&selected_data, &parked_data).expect("move selected fixture data aside");
     let junction = create_test_junction(&selected_data, &outside_root.join("data"));
 

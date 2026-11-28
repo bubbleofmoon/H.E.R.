@@ -35,11 +35,15 @@ impl FakeQqLogin {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
-        let state = Arc::new(std::sync::Mutex::new((200, json!({"list":[{
-            "pid":123,"name":"QQ.exe","path":"C:/synthetic/QQ.exe", "injected":true,
-            "connected":true,"loggedIn":true,"uin":"sensitive-uin","status":"online",
-            "error":"sensitive-error","method":"hook"
-        }]}), json!({"status":"ok","retcode":0,"data":{"online":true,"good":true,"time":1}}))));
+        let state = Arc::new(std::sync::Mutex::new((
+            200,
+            json!({"list":[{
+                "pid":123,"name":"QQ.exe","path":"C:/synthetic/QQ.exe", "injected":true,
+                "connected":true,"loggedIn":true,"uin":"sensitive-uin","status":"online",
+                "error":"sensitive-error","method":"hook"
+            }]}),
+            json!({"status":"ok","retcode":0,"data":{"online":true,"good":true,"time":1}}),
+        )));
         let alerts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let clock = Arc::new(std::sync::Mutex::new(None));
@@ -47,58 +51,98 @@ impl FakeQqLogin {
         let (s, a, done) = (state.clone(), alerts.clone(), stop.clone());
         let sent = attempts.clone();
         let delivery_clock = clock.clone();
-        let worker = thread::spawn(move || while !done.load(Ordering::SeqCst) {
-            let Ok((mut stream, _)) = listener.accept() else { thread::sleep(Duration::from_millis(5)); continue; };
-            stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new(); reader.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_string();
-            let path = line.split_whitespace().nth(1).unwrap().to_string();
-            let mut size = 0;
-            let mut auth = String::new();
-            loop {
-                line.clear(); reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() { break; }
-                if let Some((key, value)) = line.split_once(':') {
-                    if key.eq_ignore_ascii_case("content-length") { size = value.trim().parse().unwrap(); }
-                    if key.eq_ignore_ascii_case("authorization") { auth = value.trim().into(); }
-                }
-            }
-            let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).unwrap();
-            let (code, body) = if path == "/api/processes" {
-                assert_eq!(method, "GET");
-                assert_eq!(auth, "Bearer fixture-webui-session");
-                let state = s.lock().unwrap(); (state.0, state.1.clone())
-            } else {
-                assert_eq!(method, "POST");
-                assert!(matches!(path.as_str(), "/get_status" | "/send_private_msg" | "/fetch_custom_face_detail"), "unexpected fake OneBot request: {method} {path}");
-                assert_eq!(auth, "Bearer fixture-onebot-token");
-                let state = s.lock().unwrap();
-                let reply = if path == "/get_status" { state.2.clone() }
-                else if path == "/fetch_custom_face_detail" { json!({"status":"ok","retcode":0,"data":[]}) }
-                else {
-                    let message: Value = serde_json::from_slice(&bytes).unwrap();
-                    let now = Self::clock_ms(&delivery_clock.lock().unwrap());
-                    sent.lock().unwrap().push((now, message.clone()));
-                    if state.2["data"]["online"] == true {
-                        a.lock().unwrap().push(message);
-                        json!({"status":"ok","retcode":0,"data":{"message_id":1}})
-                    } else {
-                        json!({"status":"failed","retcode":100,"wording":"QQ is offline"})
-                    }
+        let worker = thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
                 };
-                (200, reply)
-            };
-            let body = body.to_string();
-            let _ = write!(stream, "HTTP/1.1 {code} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let method = line.split_whitespace().next().unwrap().to_string();
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                let mut size = 0;
+                let mut auth = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            size = value.trim().parse().unwrap();
+                        }
+                        if key.eq_ignore_ascii_case("authorization") {
+                            auth = value.trim().into();
+                        }
+                    }
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).unwrap();
+                let (code, body) = if path == "/api/processes" {
+                    assert_eq!(method, "GET");
+                    assert_eq!(auth, "Bearer fixture-webui-session");
+                    let state = s.lock().unwrap();
+                    (state.0, state.1.clone())
+                } else {
+                    assert_eq!(method, "POST");
+                    assert!(
+                        matches!(
+                            path.as_str(),
+                            "/get_status" | "/send_private_msg" | "/fetch_custom_face_detail"
+                        ),
+                        "unexpected fake OneBot request: {method} {path}"
+                    );
+                    assert_eq!(auth, "Bearer fixture-onebot-token");
+                    let state = s.lock().unwrap();
+                    let reply = if path == "/get_status" {
+                        state.2.clone()
+                    } else if path == "/fetch_custom_face_detail" {
+                        json!({"status":"ok","retcode":0,"data":[]})
+                    } else {
+                        let message: Value = serde_json::from_slice(&bytes).unwrap();
+                        let now = Self::clock_ms(&delivery_clock.lock().unwrap());
+                        sent.lock().unwrap().push((now, message.clone()));
+                        if state.2["data"]["online"] == true {
+                            a.lock().unwrap().push(message);
+                            json!({"status":"ok","retcode":0,"data":{"message_id":1}})
+                        } else {
+                            json!({"status":"failed","retcode":100,"wording":"QQ is offline"})
+                        }
+                    };
+                    (200, reply)
+                };
+                let body = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
         });
-        Self { port, state, alerts, attempts, clock, stop, worker: Some(worker) }
+        Self {
+            port,
+            state,
+            alerts,
+            attempts,
+            clock,
+            stop,
+            worker: Some(worker),
+        }
     }
     fn clock_ms(clock: &Option<(i64, Instant)>) -> i64 {
         match clock {
             Some((epoch, started)) => epoch + started.elapsed().as_millis() as i64,
-            None => SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            None => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
         }
     }
     fn configure(&self, root: &Path) {
@@ -106,7 +150,11 @@ impl FakeQqLogin {
         let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         config["snowluma"] = json!({"webuiUrl":format!("http://127.0.0.1:{}",self.port),"accessToken":"fixture-onebot-token"});
         fs::write(path, config.to_string()).unwrap();
-        fs::write(root.join("data/snowluma-webui-token"), "fixture-webui-session").unwrap();
+        fs::write(
+            root.join("data/snowluma-webui-token"),
+            "fixture-webui-session",
+        )
+        .unwrap();
         fs::write(root.join("dependencies.json"), json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":format!("http://127.0.0.1:{}",self.port)}).to_string()).unwrap();
     }
 }
@@ -114,7 +162,9 @@ impl Drop for FakeQqLogin {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let result = self.worker.take().unwrap().join();
-        if !thread::panicking() { assert!(result.is_ok(), "fake SnowLuma worker failed"); }
+        if !thread::panicking() {
+            assert!(result.is_ok(), "fake SnowLuma worker failed");
+        }
     }
 }
 
@@ -122,45 +172,126 @@ impl Drop for FakeQqLogin {
 fn qq_login_route_reports_safe_state_and_requires_administrator() {
     let workspace = FixtureWorkspace::new("qq-login");
     let root = workspace.root("runtime");
-    let home = prepare_runtime_root(&root,"qq-console","qq-agent","http://127.0.0.1:1","http://127.0.0.1:1",None,None);
-    let fake = FakeQqLogin::new(); fake.configure(&root);
+    let home = prepare_runtime_root(
+        &root,
+        "qq-console",
+        "qq-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let fake = FakeQqLogin::new();
+    fake.configure(&root);
     let (port, _) = reserve_distinct_ports();
-    let _console = ConsoleProcess::start(&root,port,&home);
-    let response = expect_json(http_request(port,"GET","/api/qq/login",Some("qq-console"),None,None).unwrap(),200,"QQ login state");
-    assert_eq!(response, json!({"ok":true,"state":"logged-in","processes":[]}));
+    let _console = ConsoleProcess::start(&root, port, &home);
+    let response = expect_json(
+        http_request(port, "GET", "/api/qq/login", Some("qq-console"), None, None).unwrap(),
+        200,
+        "QQ login state",
+    );
+    assert_eq!(
+        response,
+        json!({"ok":true,"state":"logged-in","processes":[]})
+    );
     #[cfg(windows)]
     {
-        private_token_file(&root,"qq-console");
-        let signed = expect_json(http_request(port,"POST","/api/desktop/sign-in",Some("qq-console"),None,Some(&json!({}))).unwrap(),200,"desktop sign-in");
+        private_token_file(&root, "qq-console");
+        let signed = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/desktop/sign-in",
+                Some("qq-console"),
+                None,
+                Some(&json!({})),
+            )
+            .unwrap(),
+            200,
+            "desktop sign-in",
+        );
         let session = signed["session"].as_str().unwrap();
-        let desktop = expect_json(http_request(port,"GET","/api/qq/login",Some(session),None,None).unwrap(),200,"desktop QQ login state");
-        assert_eq!(desktop,response);
-        expect_json(http_request(port,"GET","/api/qq/login",Some(session),Some("qq-agent"),None).unwrap(),403,"desktop session cannot confer agent access");
+        let desktop = expect_json(
+            http_request(port, "GET", "/api/qq/login", Some(session), None, None).unwrap(),
+            200,
+            "desktop QQ login state",
+        );
+        assert_eq!(desktop, response);
+        expect_json(
+            http_request(
+                port,
+                "GET",
+                "/api/qq/login",
+                Some(session),
+                Some("qq-agent"),
+                None,
+            )
+            .unwrap(),
+            403,
+            "desktop session cannot confer agent access",
+        );
     }
-    expect_json(http_request(port,"GET","/api/qq/login",None,None,None).unwrap(),401,"anonymous refused");
-    expect_json(http_request(port,"GET","/api/qq/login",None,Some("qq-agent"),None).unwrap(),401,"agent token alone refused");
-    expect_json(http_request(port,"GET","/api/qq/login",Some("qq-console"),Some("qq-agent"),None).unwrap(),403,"agent refused");
+    expect_json(
+        http_request(port, "GET", "/api/qq/login", None, None, None).unwrap(),
+        401,
+        "anonymous refused",
+    );
+    expect_json(
+        http_request(port, "GET", "/api/qq/login", None, Some("qq-agent"), None).unwrap(),
+        401,
+        "agent token alone refused",
+    );
+    expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/qq/login",
+            Some("qq-console"),
+            Some("qq-agent"),
+            None,
+        )
+        .unwrap(),
+        403,
+        "agent refused",
+    );
     {
         let mut state = fake.state.lock().unwrap();
         state.1["list"][0]["loggedIn"] = json!(false);
         state.1["list"][0]["status"] = json!("loaded");
         state.2["data"]["online"] = json!(false);
     }
-    let response = expect_json(http_request(port,"GET","/api/qq/login",Some("qq-console"),None,None).unwrap(),200,"QQ needs login");
-    assert_eq!(response["state"],"needs-login");
+    let response = expect_json(
+        http_request(port, "GET", "/api/qq/login", Some("qq-console"), None, None).unwrap(),
+        200,
+        "QQ needs login",
+    );
+    assert_eq!(response["state"], "needs-login");
 }
 
 #[test]
 fn qq_login_webui_transitions_and_unknown_states() {
     let workspace = FixtureWorkspace::new("qq-login-transitions");
     let root = workspace.root("runtime");
-    let home = prepare_runtime_root(&root,"qq-console","qq-agent","http://127.0.0.1:1","http://127.0.0.1:1",None,None);
-    let fake = FakeQqLogin::new(); fake.configure(&root);
+    let home = prepare_runtime_root(
+        &root,
+        "qq-console",
+        "qq-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let fake = FakeQqLogin::new();
+    fake.configure(&root);
     let (port, _) = reserve_distinct_ports();
-    let _console = ConsoleProcess::start(&root,port,&home);
+    let _console = ConsoleProcess::start(&root, port, &home);
     let check = |state: &str| {
-        let response = expect_json(http_request(port,"GET","/api/qq/login",Some("qq-console"),None,None).unwrap(),200,"QQ login state");
-        assert_eq!(response,json!({"ok":true,"state":state,"processes":[]}));
+        let response = expect_json(
+            http_request(port, "GET", "/api/qq/login", Some("qq-console"), None, None).unwrap(),
+            200,
+            "QQ login state",
+        );
+        assert_eq!(response, json!({"ok":true,"state":state,"processes":[]}));
     };
     check("logged-in");
     let loaded = {
@@ -174,28 +305,72 @@ fn qq_login_webui_transitions_and_unknown_states() {
     // This fixture reports no live matching QQ process, so the route must not
     // trust its PID or leak its path, UIN, error or credentials as an action target.
     for (code, webui, onebot) in [
-        (200, json!({"list":[]}), json!({"status":"ok","retcode":0,"data":{"online":false,"good":true}})),
-        (200, json!({"list":[{"connected":false,"injected":true,"loggedIn":false,"status":"loaded"}]}), json!({"status":"ok","retcode":0,"data":{"online":false}})),
-        (200, json!({"list":[{"connected":true,"injected":true,"loggedIn":null,"status":"loaded"}]}), json!({"status":"ok","retcode":0,"data":{}})),
-        (200, json!({"list":[{"connected":true,"injected":true,"loggedIn":false,"status":"error"}]}), json!({"status":"failed","retcode":1,"data":{"online":false}})),
-        (401, json!({"message":"sensitive-auth-error"}), json!({"status":"ok","retcode":0,"data":{"online":false}})),
-        (500, json!({"list":[],"message":"sensitive-error"}), json!({"status":"ok","retcode":0,"data":{"online":null}})),
-        (200, loaded.clone(), json!({"status":"ok","retcode":0,"data":{"online":true}})),
-        (200, json!({"list":[loaded["list"][0].clone(),{"connected":true,"injected":true,"loggedIn":true,"status":"online"}]}), json!({"status":"ok","retcode":0,"data":{"online":true}})),
+        (
+            200,
+            json!({"list":[]}),
+            json!({"status":"ok","retcode":0,"data":{"online":false,"good":true}}),
+        ),
+        (
+            200,
+            json!({"list":[{"connected":false,"injected":true,"loggedIn":false,"status":"loaded"}]}),
+            json!({"status":"ok","retcode":0,"data":{"online":false}}),
+        ),
+        (
+            200,
+            json!({"list":[{"connected":true,"injected":true,"loggedIn":null,"status":"loaded"}]}),
+            json!({"status":"ok","retcode":0,"data":{}}),
+        ),
+        (
+            200,
+            json!({"list":[{"connected":true,"injected":true,"loggedIn":false,"status":"error"}]}),
+            json!({"status":"failed","retcode":1,"data":{"online":false}}),
+        ),
+        (
+            401,
+            json!({"message":"sensitive-auth-error"}),
+            json!({"status":"ok","retcode":0,"data":{"online":false}}),
+        ),
+        (
+            500,
+            json!({"list":[],"message":"sensitive-error"}),
+            json!({"status":"ok","retcode":0,"data":{"online":null}}),
+        ),
+        (
+            200,
+            loaded.clone(),
+            json!({"status":"ok","retcode":0,"data":{"online":true}}),
+        ),
+        (
+            200,
+            json!({"list":[loaded["list"][0].clone(),{"connected":true,"injected":true,"loggedIn":true,"status":"online"}]}),
+            json!({"status":"ok","retcode":0,"data":{"online":true}}),
+        ),
     ] {
-        *fake.state.lock().unwrap() = (code,webui,onebot);
+        *fake.state.lock().unwrap() = (code, webui, onebot);
         check("unknown");
     }
     // A successful OneBot online verdict works without WebUI credentials;
     // receive-chain good:false does not mean that QQ needs login.
-    *fake.state.lock().unwrap() = (401,json!({}),json!({"status":"ok","retcode":0,"data":{"online":true,"good":false}}));
+    *fake.state.lock().unwrap() = (
+        401,
+        json!({}),
+        json!({"status":"ok","retcode":0,"data":{"online":true,"good":false}}),
+    );
     check("logged-in");
     fs::remove_file(root.join("data/snowluma-webui-token")).unwrap();
     fake.state.lock().unwrap().2["data"]["online"] = json!(false);
     check("unknown");
     // Restore the credentials and prove the complete recovery transition.
-    fs::write(root.join("data/snowluma-webui-token"),"fixture-webui-session").unwrap();
-    *fake.state.lock().unwrap() = (200,loaded,json!({"status":"ok","retcode":0,"data":{"online":false}}));
+    fs::write(
+        root.join("data/snowluma-webui-token"),
+        "fixture-webui-session",
+    )
+    .unwrap();
+    *fake.state.lock().unwrap() = (
+        200,
+        loaded,
+        json!({"status":"ok","retcode":0,"data":{"online":false}}),
+    );
     check("needs-login");
     {
         let mut state = fake.state.lock().unwrap();
@@ -207,12 +382,15 @@ fn qq_login_webui_transitions_and_unknown_states() {
     // No configured WebUI means no guessed default endpoint.
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
-    config["snowluma"].as_object_mut().unwrap().remove("webuiUrl");
-    fs::write(config_file,config.to_string()).unwrap();
+    config["snowluma"]
+        .as_object_mut()
+        .unwrap()
+        .remove("webuiUrl");
+    fs::write(config_file, config.to_string()).unwrap();
     fake.state.lock().unwrap().2["data"]["online"] = json!(false);
     check("unknown");
-    config["snowluma"]["webuiUrl"] = json!(format!("http://127.0.0.1:{}",fake.port));
-    fs::write(root.join("config/config.json"),config.to_string()).unwrap();
+    config["snowluma"]["webuiUrl"] = json!(format!("http://127.0.0.1:{}", fake.port));
+    fs::write(root.join("config/config.json"), config.to_string()).unwrap();
     drop(fake);
     check("unknown"); // Both configured services are now unreachable.
 }
@@ -222,26 +400,56 @@ fn qq_login_webui_transitions_and_unknown_states() {
 fn qq_login_verifies_reported_native_process() {
     let workspace = FixtureWorkspace::new("qq-login-native-identity");
     let root = workspace.root("runtime");
-    let home = prepare_runtime_root(&root,"qq-console","qq-agent","http://127.0.0.1:1","http://127.0.0.1:1",None,None);
-    let fake = FakeQqLogin::new(); fake.configure(&root);
+    let home = prepare_runtime_root(
+        &root,
+        "qq-console",
+        "qq-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let fake = FakeQqLogin::new();
+    fake.configure(&root);
     let (port, native_port) = reserve_distinct_ports();
-    let _console = ConsoleProcess::start(&root,port,&home);
+    let _console = ConsoleProcess::start(&root, port, &home);
     let native_root = workspace.root("fake-qq-runtime");
-    let native_home = prepare_runtime_root(&native_root,"native-fixture","native-agent","http://127.0.0.1:1","http://127.0.0.1:1",None,None);
+    let native_home = prepare_runtime_root(
+        &native_root,
+        "native-fixture",
+        "native-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let image = native_root.join("resources/QQ.exe");
     fs::copy(env!("CARGO_BIN_EXE_her-cli"), &image).unwrap();
     let mut command = Command::new(&image);
-    command.args(["--console-serve","--runtime-root"]).arg(&native_root)
-        .args(["--console-port", &native_port.to_string()]).env_remove("HER_RUNTIME_ROOT")
-        .env_remove("HOME").env_remove("APPDATA").env_remove("LOCALAPPDATA")
-        .env("USERPROFILE",native_root.join("synthetic-profile"))
-        .env("DSH_HOME",native_home).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(["--console-serve", "--runtime-root"])
+        .arg(&native_root)
+        .args(["--console-port", &native_port.to_string()])
+        .env_remove("HER_RUNTIME_ROOT")
+        .env_remove("HOME")
+        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
+        .env("USERPROFILE", native_root.join("synthetic-profile"))
+        .env("DSH_HOME", native_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_process_window(&mut command);
-    let mut native = ConsoleProcess { child: command.spawn().unwrap(), port: native_port };
+    let mut native = ConsoleProcess {
+        child: command.spawn().unwrap(),
+        port: native_port,
+    };
     wait_for_health(&mut native).unwrap();
     let mut identify = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-    identify.args(["process","identify","--runtime-root"]).arg(&native_root)
-        .args(["--pid", &native.child.id().to_string()]).env_remove("HER_RUNTIME_ROOT");
+    identify
+        .args(["process", "identify", "--runtime-root"])
+        .arg(&native_root)
+        .args(["--pid", &native.child.id().to_string()])
+        .env_remove("HER_RUNTIME_ROOT");
     hide_process_window(&mut identify);
     let identified = identify.output().unwrap();
     assert!(identified.status.success());
@@ -258,30 +466,61 @@ fn qq_login_verifies_reported_native_process() {
         state.1["list"][0]["status"] = json!("loaded");
         state.2["data"]["online"] = json!(false);
     }
-    let read = || expect_json(http_request(port,"GET","/api/qq/login",Some("qq-console"),None,None).unwrap(),200,"native QQ target");
-    assert_eq!(read(),json!({"ok":true,"state":"needs-login","processes":[{"pid":identity["pid"],"start":identity["start"]}]}));
+    let read = || {
+        expect_json(
+            http_request(port, "GET", "/api/qq/login", Some("qq-console"), None, None).unwrap(),
+            200,
+            "native QQ target",
+        )
+    };
+    assert_eq!(
+        read(),
+        json!({"ok":true,"state":"needs-login","processes":[{"pid":identity["pid"],"start":identity["start"]}]})
+    );
     fake.state.lock().unwrap().1["list"][0]["path"] = json!(root.join("resources/QQ.exe"));
-    assert_eq!(read()["processes"],json!([]),"a live PID with a mismatched reported image must not be actionable");
+    assert_eq!(
+        read()["processes"],
+        json!([]),
+        "a live PID with a mismatched reported image must not be actionable"
+    );
     fake.state.lock().unwrap().1["list"][0]["path"] = json!(image);
     drop(native);
-    assert_eq!(read()["processes"],json!([]),"an exited instance must not be actionable");
+    assert_eq!(
+        read()["processes"],
+        json!([]),
+        "an exited instance must not be actionable"
+    );
 }
 
 #[test]
 fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() {
     let workspace = FixtureWorkspace::new("qq-login-episodes");
     let root = workspace.root("runtime");
-    let home = prepare_runtime_root(&root,"qq-console","qq-agent","http://127.0.0.1:1","http://127.0.0.1:1",None,None);
-    let fake = FakeQqLogin::new(); fake.configure(&root);
+    let home = prepare_runtime_root(
+        &root,
+        "qq-console",
+        "qq-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let fake = FakeQqLogin::new();
+    fake.configure(&root);
     let install = workspace.root("protected-install");
     let scheduler = workspace.root("scheduler.xml");
     let mut install_task = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-    install_task.arg("install")
-        .env("HER_INSTALL_ROOT", &install).env("HER_TASK_SCHEDULER_FILE", &scheduler)
+    install_task
+        .arg("install")
+        .env("HER_INSTALL_ROOT", &install)
+        .env("HER_TASK_SCHEDULER_FILE", &scheduler)
         .env_remove("HER_RUNTIME_ROOT");
     hide_process_window(&mut install_task);
     let installed = install_task.output().unwrap();
-    assert!(installed.status.success(), "install matching fixture task: {installed:?}");
+    assert!(
+        installed.status.success(),
+        "install matching fixture task: {installed:?}"
+    );
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
     for task in [
@@ -296,27 +535,45 @@ fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() 
     ] {
         config["tasks"][task] = json!({"enabled":false});
     }
-    fs::write(config_file,config.to_string()).unwrap();
+    fs::write(config_file, config.to_string()).unwrap();
     let online = fake.state.lock().unwrap().clone();
     let mut needed = online.clone();
     needed.1["list"][0]["loggedIn"] = json!(false);
     needed.1["list"][0]["status"] = json!("loaded");
     needed.2["data"]["online"] = json!(false);
-    let unknown = (401,json!({"message":"expired"}),json!({"status":"ok","retcode":0,"data":{"online":false}}));
+    let unknown = (
+        401,
+        json!({"message":"expired"}),
+        json!({"status":"ok","retcode":0,"data":{"online":false}}),
+    );
     let episode_file = root.join("data/qq-login-episode.json");
-    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     let assert_spacing = || {
         let attempts = fake.attempts.lock().unwrap();
         for pair in attempts.windows(2) {
             let spacing = pair[1].0 - pair[0].0;
-            assert!(spacing >= 60_000, "QQ login delivery attempts must be at least 60 s apart: {spacing} ms");
+            assert!(
+                spacing >= 60_000,
+                "QQ login delivery attempts must be at least 60 s apart: {spacing} ms"
+            );
         }
     };
     for (state, expected, attempts, advance) in [
-        (online.clone(),0,0,0),(needed.clone(),0,1,120),(needed.clone(),0,1,120),
-        (needed.clone(),0,1,165),(unknown,0,1,165),(needed.clone(),0,1,165),(online.clone(),1,2,240),
-        (online.clone(),1,2,240),(needed.clone(),1,3,360),(online.clone(),2,4,480),
-        (online,2,4,480),(needed,2,5,600),
+        (online.clone(), 0, 0, 0),
+        (needed.clone(), 0, 1, 120),
+        (needed.clone(), 0, 1, 120),
+        (needed.clone(), 0, 1, 165),
+        (unknown, 0, 1, 165),
+        (needed.clone(), 0, 1, 165),
+        (online.clone(), 1, 2, 240),
+        (online.clone(), 1, 2, 240),
+        (needed.clone(), 1, 3, 360),
+        (online.clone(), 2, 4, 480),
+        (online, 2, 4, 480),
+        (needed, 2, 5, 600),
     ] {
         let notified = expected > 0 && state.2["data"]["online"] == true;
         *fake.state.lock().unwrap() = state;
@@ -336,20 +593,37 @@ fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() 
         if !cfg!(feature = "parity-clock") && attempts > fake.attempts.lock().unwrap().len() {
             if let Some(bytes) = &previous {
                 let pending: Value = serde_json::from_slice(bytes).unwrap();
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-                let wait_ms = pending["retry_after_ms"].as_i64().unwrap().saturating_sub(now);
-                assert!(wait_ms <= 60_000, "QQ login retry exceeded the one-minute schedule");
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                let wait_ms = pending["retry_after_ms"]
+                    .as_i64()
+                    .unwrap()
+                    .saturating_sub(now);
+                assert!(
+                    wait_ms <= 60_000,
+                    "QQ login retry exceeded the one-minute schedule"
+                );
                 if wait_ms > 0 {
                     thread::sleep(Duration::from_millis(wait_ms as u64));
                 }
             }
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command.args(["supervise","--runtime-root"]).arg(&root)
-            .env("HER_INSTALL_ROOT", &install).env("HER_TASK_SCHEDULER_FILE", &scheduler)
-            .env_remove("HER_RUNTIME_ROOT").env_remove("APPDATA").env_remove("LOCALAPPDATA").env_remove("HOME")
-            .env("DSH_HOME",&home).env("USERPROFILE",home.join("synthetic-profile"))
-            .stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .args(["supervise", "--runtime-root"])
+            .arg(&root)
+            .env("HER_INSTALL_ROOT", &install)
+            .env("HER_TASK_SCHEDULER_FILE", &scheduler)
+            .env_remove("HER_RUNTIME_ROOT")
+            .env_remove("APPDATA")
+            .env_remove("LOCALAPPDATA")
+            .env_remove("HOME")
+            .env("DSH_HOME", &home)
+            .env("USERPROFILE", home.join("synthetic-profile"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if cfg!(feature = "parity-clock") {
             let step_epoch = epoch + advance * 1000;
             command.env("HER_PARITY_EPOCH_MS", step_epoch.to_string());
@@ -358,51 +632,92 @@ fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() 
             *fake.clock.lock().unwrap() = Some((step_epoch, Instant::now()));
         }
         if advance == 165 {
-            let elapsed = FakeQqLogin::clock_ms(&fake.clock.lock().unwrap()) - fake.attempts.lock().unwrap()[0].0;
-            assert!((30_000..60_000).contains(&elapsed), "restart must probe a shortened retry before one minute: {elapsed} ms");
+            let elapsed = FakeQqLogin::clock_ms(&fake.clock.lock().unwrap())
+                - fake.attempts.lock().unwrap()[0].0;
+            assert!(
+                (30_000..60_000).contains(&elapsed),
+                "restart must probe a shortened retry before one minute: {elapsed} ms"
+            );
             println!("early supervisor restart: {elapsed} ms after first attempt; must stay at one attempt");
         }
         hide_process_window(&mut command);
-        let mut supervisor = ConsoleProcess { child: command.spawn().unwrap(), port: 0 };
+        let mut supervisor = ConsoleProcess {
+            child: command.spawn().unwrap(),
+            port: 0,
+        };
         let mut identify = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-        identify.args(["process","identify","--runtime-root"]).arg(&root)
-            .args(["--pid",&supervisor.child.id().to_string()]).env_remove("HER_RUNTIME_ROOT");
+        identify
+            .args(["process", "identify", "--runtime-root"])
+            .arg(&root)
+            .args(["--pid", &supervisor.child.id().to_string()])
+            .env_remove("HER_RUNTIME_ROOT");
         hide_process_window(&mut identify);
         let identity = identify.output().unwrap();
         assert!(identity.status.success());
         let identity: Value = serde_json::from_slice(&identity.stdout).unwrap();
-        assert_eq!(identity["process"]["pid"],supervisor.child.id());
+        assert_eq!(identity["process"]["pid"], supervisor.child.id());
         assert!(identity["process"]["start"].as_u64().unwrap() > 0);
-        println!("owned supervisor identity={}",identity["process"]);
-        let deadline = Instant::now()+Duration::from_secs(10);
-        while fs::read(&episode_file).ok().is_none_or(|bytes| Some(bytes) == previous) {
-            assert!(supervisor.child.try_wait().unwrap().is_none(),"supervisor exited");
-            assert!(Instant::now()<deadline,"supervisor did not publish a QQ login observation");
+        println!("owned supervisor identity={}", identity["process"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read(&episode_file)
+            .ok()
+            .is_none_or(|bytes| Some(bytes) == previous)
+        {
+            assert!(
+                supervisor.child.try_wait().unwrap().is_none(),
+                "supervisor exited"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "supervisor did not publish a QQ login observation"
+            );
             thread::sleep(Duration::from_millis(20));
         }
         let read = || serde_json::from_slice::<Value>(&fs::read(&episode_file).unwrap()).unwrap();
-        let deadline = Instant::now()+Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while fake.alerts.lock().unwrap().len() < expected
             || fake.attempts.lock().unwrap().len() < attempts
             || read()["notified"] != notified
         {
-            assert!(supervisor.child.try_wait().unwrap().is_none(),"supervisor exited before delivery completed");
-            assert!(Instant::now()<deadline,"QQ login delivery did not complete: {}",read());
+            assert!(
+                supervisor.child.try_wait().unwrap().is_none(),
+                "supervisor exited before delivery completed"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "QQ login delivery did not complete: {}",
+                read()
+            );
             thread::sleep(Duration::from_millis(20));
         }
         // Keep a quiet window after completion to catch duplicate/rapid sends.
         thread::sleep(Duration::from_millis(500));
         assert_spacing();
-        assert_eq!(fake.alerts.lock().unwrap().len(),expected,"one alert per confirmed re-login episode");
-        assert_eq!(fake.attempts.lock().unwrap().len(),attempts,"delivery attempts at epoch +{advance}s");
+        assert_eq!(
+            fake.alerts.lock().unwrap().len(),
+            expected,
+            "one alert per confirmed re-login episode"
+        );
+        assert_eq!(
+            fake.attempts.lock().unwrap().len(),
+            attempts,
+            "delivery attempts at epoch +{advance}s"
+        );
         println!("QQ login step: parity-clock={}, advance={advance}s, delivered={expected}, attempts={attempts}",cfg!(feature = "parity-clock"));
         if advance == 120 {
-            assert_eq!(fake.attempts.lock().unwrap().len(),1,"failed delivery stays pending without rapid retries across restarts");
+            assert_eq!(
+                fake.attempts.lock().unwrap().len(),
+                1,
+                "failed delivery stays pending without rapid retries across restarts"
+            );
         }
         if advance == 600 {
             let pending: Value = serde_json::from_slice(&fs::read(&episode_file).unwrap()).unwrap();
-            assert_eq!(pending["notified"],false,"an offline refusal must not acknowledge the episode");
-            assert_eq!(fake.attempts.lock().unwrap().len(),5);
+            assert_eq!(
+                pending["notified"], false,
+                "an offline refusal must not acknowledge the episode"
+            );
+            assert_eq!(fake.attempts.lock().unwrap().len(), 5);
             {
                 let mut state = fake.state.lock().unwrap();
                 state.1["list"][0]["loggedIn"] = json!(true);
@@ -411,30 +726,60 @@ fn qq_login_alert_episode_survives_supervisor_restarts_and_rearms_after_login() 
             }
             // Keep this supervisor alive: recovery must deliver on later 30 s
             // polls, not depend on restarting the observer. No test-only poll knob.
-            let deadline = Instant::now()+Duration::from_secs(100);
+            let deadline = Instant::now() + Duration::from_secs(100);
             while fake.alerts.lock().unwrap().len() < 3 {
-                assert!(supervisor.child.try_wait().unwrap().is_none(),"supervisor exited before retry");
-                assert!(Instant::now()<deadline,"pending QQ notice was lost after recovery");
+                assert!(
+                    supervisor.child.try_wait().unwrap().is_none(),
+                    "supervisor exited before retry"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "pending QQ notice was lost after recovery"
+                );
                 thread::sleep(Duration::from_millis(20));
             }
             let checks = read()["checks"].as_u64().unwrap();
             while read()["checks"].as_u64().unwrap() <= checks {
-                assert!(Instant::now()<deadline,"supervisor did not poll after successful delivery");
+                assert!(
+                    Instant::now() < deadline,
+                    "supervisor did not poll after successful delivery"
+                );
                 thread::sleep(Duration::from_millis(20));
             }
-            assert_eq!(read()["notified"],true);
-            assert_eq!(fake.alerts.lock().unwrap().len(),3,"successful delivery suppresses later polls");
-            assert_eq!(fake.attempts.lock().unwrap().len(),6,"three offline refusals and three successful notices");
+            assert_eq!(read()["notified"], true);
+            assert_eq!(
+                fake.alerts.lock().unwrap().len(),
+                3,
+                "successful delivery suppresses later polls"
+            );
+            assert_eq!(
+                fake.attempts.lock().unwrap().len(),
+                6,
+                "three offline refusals and three successful notices"
+            );
             assert_spacing();
             println!("same-supervisor recovery: 3 delivered, 6 attempts; next poll stayed quiet");
         }
         drop(supervisor);
     }
-    println!("QQ login attempt times (ms): {:?}", fake.attempts.lock().unwrap().iter().map(|(at, _)| at).collect::<Vec<_>>());
+    println!(
+        "QQ login attempt times (ms): {:?}",
+        fake.attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
+    );
     for notice in fake.alerts.lock().unwrap().iter() {
-        assert_eq!(notice["user_id"],OWNER_ID);
+        assert_eq!(notice["user_id"], OWNER_ID);
         assert!(notice.to_string().contains("QQ needs login"));
-        for secret in ["sensitive-uin","fixture-webui-session","fixture-onebot-token","sensitive-error"] {
+        for secret in [
+            "sensitive-uin",
+            "fixture-webui-session",
+            "fixture-onebot-token",
+            "sensitive-error",
+        ] {
             assert!(!notice.to_string().contains(secret));
         }
     }
@@ -606,19 +951,42 @@ impl ConsoleProcess {
         Self::start_with(root, port, dsh_home, None, None)
     }
 
-    fn start_with_peer_sid(root: &Path, port: u16, dsh_home: &Path, peer_sid: Option<&str>) -> Self {
+    fn start_with_peer_sid(
+        root: &Path,
+        port: u16,
+        dsh_home: &Path,
+        peer_sid: Option<&str>,
+    ) -> Self {
         Self::start_with(root, port, dsh_home, peer_sid, None)
     }
 
-    fn start_with_install_root(root: &Path, port: u16, dsh_home: &Path, install: Option<&Path>) -> Self {
+    fn start_with_install_root(
+        root: &Path,
+        port: u16,
+        dsh_home: &Path,
+        install: Option<&Path>,
+    ) -> Self {
         Self::start_with(root, port, dsh_home, None, install)
     }
 
-    fn start_with(root: &Path, port: u16, dsh_home: &Path, peer_sid: Option<&str>, install: Option<&Path>) -> Self {
+    fn start_with(
+        root: &Path,
+        port: u16,
+        dsh_home: &Path,
+        peer_sid: Option<&str>,
+        install: Option<&Path>,
+    ) -> Self {
         Self::start_with_env(root, port, dsh_home, peer_sid, install, &[])
     }
 
-    fn start_with_env(root: &Path, port: u16, dsh_home: &Path, peer_sid: Option<&str>, install: Option<&Path>, env: &[(&str, &str)]) -> Self {
+    fn start_with_env(
+        root: &Path,
+        port: u16,
+        dsh_home: &Path,
+        peer_sid: Option<&str>,
+        install: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
         command
             .arg("--console-serve")
@@ -635,8 +1003,12 @@ impl ConsoleProcess {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command.envs(env.iter().copied());
-        if let Some(sid) = peer_sid { command.env("HER_TEST_DESKTOP_PEER_SID_HEX", sid); }
-        if let Some(install) = install { command.env("HER_INSTALL_ROOT", install); }
+        if let Some(sid) = peer_sid {
+            command.env("HER_TEST_DESKTOP_PEER_SID_HEX", sid);
+        }
+        if let Some(install) = install {
+            command.env("HER_INSTALL_ROOT", install);
+        }
         hide_process_window(&mut command);
         let child = command.spawn().expect("start isolated console candidate");
         let mut process = Self { child, port };
@@ -680,12 +1052,36 @@ fn desktop_sign_in_refuses_configured_token_without_a_token_file() {
     let workspace = FixtureWorkspace::new("desktop-missing-token-file");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     assert!(!root.join("data/console-token").exists());
-    expect_json(http_request(port, "GET", "/api/status", Some(token), None, None).unwrap(), 200, "configured console token still works");
-    let denied = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(), 403, "desktop requires the protected file");
+    expect_json(
+        http_request(port, "GET", "/api/status", Some(token), None, None).unwrap(),
+        200,
+        "configured console token still works",
+    );
+    let denied = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        403,
+        "desktop requires the protected file",
+    );
     assert!(denied.get("session").is_none());
 }
 
@@ -694,7 +1090,9 @@ fn token_file_acl(path: &Path, args: &[&str]) {
     let mut command = Command::new("icacls.exe");
     command.arg(path).args(args);
     hide_process_window(&mut command);
-    let output = command.output().expect("configure synthetic token file ACL");
+    let output = command
+        .output()
+        .expect("configure synthetic token file ACL");
     assert!(output.status.success(), "fixture ACL: {output:?}");
 }
 
@@ -703,7 +1101,16 @@ fn private_token_file(root: &Path, token: &str) {
     let path = root.join("data/console-token");
     fs::write(&path, token).unwrap();
     let user = format!("{}:(F)", std::env::var("USERNAME").unwrap());
-    token_file_acl(&path, &["/inheritance:r", "/grant:r", &user, "*S-1-5-18:(F)", "*S-1-5-32-544:(F)"]);
+    token_file_acl(
+        &path,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            &user,
+            "*S-1-5-18:(F)",
+            "*S-1-5-32-544:(F)",
+        ],
+    );
 }
 
 #[cfg(windows)]
@@ -712,12 +1119,35 @@ fn desktop_sign_in_refuses_broad_token_file_acl() {
     let workspace = FixtureWorkspace::new("desktop-broad-token-file");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     private_token_file(&root, token);
-    token_file_acl(&root.join("data/console-token"), &["/grant", "*S-1-1-0:(R)"]);
-    let denied = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(), 403, "broad token file ACL refuses sign-in");
+    token_file_acl(
+        &root.join("data/console-token"),
+        &["/grant", "*S-1-1-0:(R)"],
+    );
+    let denied = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        403,
+        "broad token file ACL refuses sign-in",
+    );
     assert!(denied.get("session").is_none());
 }
 
@@ -728,12 +1158,36 @@ fn desktop_sign_in_refuses_unreadable_token_file() {
     let workspace = FixtureWorkspace::new("desktop-unreadable-token-file");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     private_token_file(&root, token);
-    let _exclusive = fs::OpenOptions::new().read(true).share_mode(0).open(root.join("data/console-token")).unwrap();
-    let denied = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(), 403, "unreadable token file refuses sign-in");
+    let _exclusive = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(root.join("data/console-token"))
+        .unwrap();
+    let denied = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        403,
+        "unreadable token file refuses sign-in",
+    );
     assert!(denied.get("session").is_none());
 }
 
@@ -744,19 +1198,83 @@ fn desktop_session_never_revives_after_token_rotation_a_b_a() {
     let root = workspace.root("runtime");
     let token_a = "fixture-desktop-console-token-a";
     let token_b = "fixture-desktop-console-token-b";
-    let home = prepare_runtime_root(&root, token_a, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token_a,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     private_token_file(&root, token_a);
-    let signed_in = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token_a), None, Some(&json!({}))).unwrap(), 200, "initial desktop sign-in");
+    let signed_in = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token_a),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "initial desktop sign-in",
+    );
     let session = signed_in["session"].as_str().unwrap();
-    expect_json(http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(), 200, "initial session works");
+    expect_json(
+        http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(),
+        200,
+        "initial session works",
+    );
     for (old, new) in [(token_a, token_b), (token_b, token_a)] {
-        expect_json(http_request(port, "POST", "/api/console/token", Some(old), None, Some(&json!({"token":new}))).unwrap(), 200, "successful rotation");
-        expect_json(http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(), 401, "rotation permanently revokes the old session");
+        expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/console/token",
+                Some(old),
+                None,
+                Some(&json!({"token":new})),
+            )
+            .unwrap(),
+            200,
+            "successful rotation",
+        );
+        expect_json(
+            http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(),
+            401,
+            "rotation permanently revokes the old session",
+        );
     }
-    let fresh = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token_a), None, Some(&json!({}))).unwrap(), 200, "new desktop sign-in works after rotation");
-    expect_json(http_request(port, "GET", "/api/status", fresh["session"].as_str(), None, None).unwrap(), 200, "new session works");
+    let fresh = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token_a),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "new desktop sign-in works after rotation",
+    );
+    expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/status",
+            fresh["session"].as_str(),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "new session works",
+    );
 }
 
 #[cfg(windows)]
@@ -765,19 +1283,48 @@ fn desktop_sign_in_issues_a_console_session_to_the_installing_user() {
     let workspace = FixtureWorkspace::new("desktop-sign-in");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     private_token_file(&root, token);
-    expect_json(http_request(port, "GET", "/api/status", None, None, None).unwrap(), 401, "console requires authentication");
+    expect_json(
+        http_request(port, "GET", "/api/status", None, None, None).unwrap(),
+        401,
+        "console requires authentication",
+    );
     let signed_in = expect_json(
-        http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(),
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
         200,
         "same-user desktop sign-in",
     );
-    let session = signed_in["session"].as_str().expect("desktop session credential");
-    assert_ne!(session, token, "sign-in issues a session rather than exposing the stored credential");
-    expect_json(http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(), 200, "desktop session authenticates console");
+    let session = signed_in["session"]
+        .as_str()
+        .expect("desktop session credential");
+    assert_ne!(
+        session, token,
+        "sign-in issues a session rather than exposing the stored credential"
+    );
+    expect_json(
+        http_request(port, "GET", "/api/status", Some(session), None, None).unwrap(),
+        200,
+        "desktop session authenticates console",
+    );
 }
 
 #[cfg(windows)]
@@ -786,15 +1333,43 @@ fn desktop_sign_in_refuses_a_different_caller_identity_even_with_the_console_cre
     let workspace = FixtureWorkspace::new("desktop-foreign-user");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     // Null SID S-1-0-0 simulates a caller identity outside the installing user.
     // This rejection fixture cannot grant authority to a real foreign peer.
-    let _console = ConsoleProcess::start_with_peer_sid(&root, port, &home, Some("010100000000000000000000"));
+    let _console =
+        ConsoleProcess::start_with_peer_sid(&root, port, &home, Some("010100000000000000000000"));
     private_token_file(&root, token);
-    expect_json(http_request(port, "GET", "/api/status", Some(token), None, None).unwrap(), 200, "console credential is valid");
-    let denied = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(), 403, "different-user desktop sign-in");
-    assert!(denied.get("session").is_none(), "a refused identity must receive no session");
+    expect_json(
+        http_request(port, "GET", "/api/status", Some(token), None, None).unwrap(),
+        200,
+        "console credential is valid",
+    );
+    let denied = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        403,
+        "different-user desktop sign-in",
+    );
+    assert!(
+        denied.get("session").is_none(),
+        "a refused identity must receive no session"
+    );
 }
 
 #[cfg(windows)]
@@ -803,15 +1378,43 @@ fn desktop_session_reaches_console_memory_administration() {
     let workspace = FixtureWorkspace::new("desktop-memory-administration");
     let root = workspace.root("runtime");
     let token = "fixture-desktop-console-token";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     private_token_file(&root, token);
-    expect_json(http_request(port, "GET", "/api/memory/acl", Some(token), None, None).unwrap(), 200, "console memory administration is available");
-    let signed_in = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(token), None, Some(&json!({}))).unwrap(), 200, "desktop sign-in");
+    expect_json(
+        http_request(port, "GET", "/api/memory/acl", Some(token), None, None).unwrap(),
+        200,
+        "console memory administration is available",
+    );
+    let signed_in = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "desktop sign-in",
+    );
     let session = signed_in["session"].as_str().unwrap();
-    expect_json(http_request(port, "GET", "/api/memory/acl", Some(session), None, None).unwrap(), 200, "desktop session has the console's memory-administration authority");
+    expect_json(
+        http_request(port, "GET", "/api/memory/acl", Some(session), None, None).unwrap(),
+        200,
+        "desktop session has the console's memory-administration authority",
+    );
 }
 
 #[test]
@@ -819,18 +1422,42 @@ fn memory_administration_refuses_the_raw_generated_file_token() {
     let workspace = FixtureWorkspace::new("memory-generated-token");
     let root = workspace.root("runtime");
     let configured = "fixture-memory-configured-token";
-    let home = prepare_runtime_root(&root, configured, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        configured,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
     let rotated = expect_json(
-        http_request(port, "POST", "/api/console/token", Some(configured), None, Some(&json!({}))).unwrap(),
+        http_request(
+            port,
+            "POST",
+            "/api/console/token",
+            Some(configured),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
         200,
         "generate a file-backed console token",
     );
     let generated = rotated["token"].as_str().unwrap();
-    expect_json(http_request(port, "GET", "/api/status", Some(generated), None, None).unwrap(), 200, "generated token still authenticates ordinary console routes");
-    expect_json(http_request(port, "GET", "/api/memory/acl", Some(generated), None, None).unwrap(), 403, "raw generated token has no memory-administration authority");
+    expect_json(
+        http_request(port, "GET", "/api/status", Some(generated), None, None).unwrap(),
+        200,
+        "generated token still authenticates ordinary console routes",
+    );
+    expect_json(
+        http_request(port, "GET", "/api/memory/acl", Some(generated), None, None).unwrap(),
+        403,
+        "raw generated token has no memory-administration authority",
+    );
 }
 
 #[cfg(windows)]
@@ -839,21 +1466,105 @@ fn desktop_session_with_a_generated_token_reaches_memory_administration() {
     let workspace = FixtureWorkspace::new("desktop-generated-memory-administration");
     let root = workspace.root("runtime");
     let configured = "fixture-desktop-configured-token";
-    let home = prepare_runtime_root(&root, configured, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        configured,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let (port, _) = reserve_distinct_ports();
     let _console = ConsoleProcess::start(&root, port, &home);
-    let rotated = expect_json(http_request(port, "POST", "/api/console/token", Some(configured), None, Some(&json!({}))).unwrap(), 200, "generate the protected-file credential");
+    let rotated = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/console/token",
+            Some(configured),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "generate the protected-file credential",
+    );
     let generated = rotated["token"].as_str().unwrap();
-    let signed_in = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(generated), None, Some(&json!({}))).unwrap(), 200, "sign in through the protected file with an empty configured token");
+    let signed_in = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(generated),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "sign in through the protected file with an empty configured token",
+    );
     let session = signed_in["session"].as_str().unwrap();
-    expect_json(http_request(port, "GET", "/api/memory/acl", Some(session), None, None).unwrap(), 200, "generated-token desktop session has memory authority");
+    expect_json(
+        http_request(port, "GET", "/api/memory/acl", Some(session), None, None).unwrap(),
+        200,
+        "generated-token desktop session has memory authority",
+    );
 
-    expect_json(http_request(port, "POST", "/api/console/token", Some(generated), None, Some(&json!({"token":generated}))).unwrap(), 200, "rotate to the same credential value");
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/console/token",
+            Some(generated),
+            None,
+            Some(&json!({"token":generated})),
+        )
+        .unwrap(),
+        200,
+        "rotate to the same credential value",
+    );
     // A nonempty invalid agent header reaches the memory handler even after session revocation.
-    expect_json(http_request(port, "GET", "/api/memory/acl", Some(session), Some("invalid-memory-agent"), None).unwrap(), 403, "the memory handler rejects the session from the previous generation");
-    let fresh = expect_json(http_request(port, "POST", "/api/desktop/sign-in", Some(generated), None, Some(&json!({}))).unwrap(), 200, "sign in to the current generation");
-    expect_json(http_request(port, "GET", "/api/memory/acl", fresh["session"].as_str(), None, None).unwrap(), 200, "a current-generation desktop session regains memory authority");
+    expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/memory/acl",
+            Some(session),
+            Some("invalid-memory-agent"),
+            None,
+        )
+        .unwrap(),
+        403,
+        "the memory handler rejects the session from the previous generation",
+    );
+    let fresh = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(generated),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "sign in to the current generation",
+    );
+    expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/memory/acl",
+            fresh["session"].as_str(),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "a current-generation desktop session regains memory authority",
+    );
 }
 
 fn http_request(
@@ -871,7 +1582,11 @@ fn http_request(
     let agent_header = agent_token
         .map(|token| format!("X-Agent-Token: {token}\r\n"))
         .unwrap_or_default();
-    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") { "her.localhost" } else { "127.0.0.1" };
+    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") {
+        "her.localhost"
+    } else {
+        "127.0.0.1"
+    };
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{console_header}{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.as_bytes().len()
@@ -920,19 +1635,42 @@ impl BrowserFixture {
     fn new(label: &str) -> Self {
         let workspace = FixtureWorkspace::new(label);
         let root = workspace.root("runtime");
-        let home = prepare_runtime_root(&root, BROWSER_MACHINE, "fixture-browser-agent",
-            "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+        let home = prepare_runtime_root(
+            &root,
+            BROWSER_MACHINE,
+            "fixture-browser-agent",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            None,
+            None,
+        );
         let (port, _) = reserve_distinct_ports();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-        cmd.args(["console", "set-password", "--runtime-root"]).arg(&root)
-            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.args(["console", "set-password", "--runtime-root"])
+            .arg(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         hide_process_window(&mut cmd);
         let mut child = cmd.spawn().unwrap();
-        writeln!(child.stdin.take().unwrap(), "{BROWSER_MACHINE}\nfixture account password\nfixture account password").unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{BROWSER_MACHINE}\nfixture account password\nfixture account password"
+        )
+        .unwrap();
         let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "create schema v3: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "create schema v3: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::write(root.join("data/console-auth-generation"), [119; 32]).unwrap();
-        Self { workspace, root, home, port }
+        Self {
+            workspace,
+            root,
+            home,
+            port,
+        }
     }
 
     fn db(&self) -> rusqlite::Connection {
@@ -951,42 +1689,94 @@ impl BrowserFixture {
              (SELECT coalesce(max(issued_seq),0)+1 FROM console_browser_sessions) FROM console_auth_state WHERE id=1",
             rusqlite::params![digest.as_slice(), origin, token_digest.as_slice(), restore, last, last + BROWSER_WEEK_MS],
         ).unwrap();
-        format!("her_browser_{}_{}={}", self.port, URL_SAFE_NO_PAD.encode(digest), URL_SAFE_NO_PAD.encode(id))
+        format!(
+            "her_browser_{}_{}={}",
+            self.port,
+            URL_SAFE_NO_PAD.encode(digest),
+            URL_SAFE_NO_PAD.encode(id)
+        )
     }
 
     fn start(&self) -> ConsoleProcess {
         ConsoleProcess::start(&self.root, self.port, &self.home)
     }
 
-    fn request(&self, method: &str, path: &str, cookie: &str, body: Option<Value>) -> (HttpResponse, String) {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: &str,
+        body: Option<Value>,
+    ) -> (HttpResponse, String) {
         let host = format!("her.localhost:{}", self.port);
         let origin = format!("http://{host}");
-        raw_browser_http(self.port, method, path, &host, &[
-            ("Cookie", cookie), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin"),
-            ("Content-Type", "application/json; charset=utf-8"),
-        ], &body.map(|value| value.to_string()).unwrap_or_default()).unwrap()
+        raw_browser_http(
+            self.port,
+            method,
+            path,
+            &host,
+            &[
+                ("Cookie", cookie),
+                ("Origin", &origin),
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Content-Type", "application/json; charset=utf-8"),
+            ],
+            &body.map(|value| value.to_string()).unwrap_or_default(),
+        )
+        .unwrap()
     }
 }
 
 fn fixture_wall_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn raw_browser_http(
-    port: u16, method: &str, path: &str, host: &str, headers: &[(&str, &str)], body: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[(&str, &str)],
+    body: &str,
 ) -> Result<(HttpResponse, String), String> {
     let mut socket = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    socket.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
-    for (name, value) in headers { request.push_str(&format!("{name}: {value}\r\n")); }
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
     request.push_str("\r\n");
     request.push_str(body);
-    socket.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    socket
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut response = String::new();
-    socket.read_to_string(&mut response).map_err(|e| e.to_string())?;
-    let (headers, body) = response.split_once("\r\n\r\n").ok_or("incomplete response")?;
-    let status = headers.split_whitespace().nth(1).and_then(|code| code.parse().ok()).ok_or("invalid HTTP status")?;
-    Ok((HttpResponse { status, body: body.into() }, headers.into()))
+    socket
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("incomplete response")?;
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or("invalid HTTP status")?;
+    Ok((
+        HttpResponse {
+            status,
+            body: body.into(),
+        },
+        headers.into(),
+    ))
 }
 
 #[test]
@@ -996,16 +1786,58 @@ fn browser_admin_can_set_backup_destination_and_rotate_token() {
     let dest = fixture.workspace.root("chosen backups");
     let cookie = fixture.cookie([21; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
     let _console = fixture.start();
-    expect_json(fixture.request("POST", "/api/backups/settings", &cookie, Some(json!({"dir":dest,"keepDays":3}))).0,
-        200, "a browser administrator can change the backup destination");
-    fixture.db().execute("DELETE FROM console_browser_sessions", []).unwrap();
-    assert_eq!(fixture.request("GET", "/api/backups/settings", &cookie, None).0.status, 401);
-    let triggered = expect_json(http_request(fixture.port, "POST", "/api/tasks/backup/run", Some(BROWSER_MACHINE), None,
-        Some(&json!({"requestId":"fixture-browser-backup"}))).unwrap(), 202, "backup starts with native authority");
+    expect_json(
+        fixture
+            .request(
+                "POST",
+                "/api/backups/settings",
+                &cookie,
+                Some(json!({"dir":dest,"keepDays":3})),
+            )
+            .0,
+        200,
+        "a browser administrator can change the backup destination",
+    );
+    fixture
+        .db()
+        .execute("DELETE FROM console_browser_sessions", [])
+        .unwrap();
+    assert_eq!(
+        fixture
+            .request("GET", "/api/backups/settings", &cookie, None)
+            .0
+            .status,
+        401
+    );
+    let triggered = expect_json(
+        http_request(
+            fixture.port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({"requestId":"fixture-browser-backup"})),
+        )
+        .unwrap(),
+        202,
+        "backup starts with native authority",
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     let id = triggered["runId"].as_str().unwrap();
     loop {
-        let run = expect_json(http_request(fixture.port, "GET", &format!("/api/tasks/runs/{id}"), Some(BROWSER_MACHINE), None, None).unwrap(), 200, "backup receipt");
+        let run = expect_json(
+            http_request(
+                fixture.port,
+                "GET",
+                &format!("/api/tasks/runs/{id}"),
+                Some(BROWSER_MACHINE),
+                None,
+                None,
+            )
+            .unwrap(),
+            200,
+            "backup receipt",
+        );
         if run["run"]["endedAt"].is_i64() {
             assert_eq!(run["run"]["state"], "succeeded", "{run}");
             break;
@@ -1013,34 +1845,83 @@ fn browser_admin_can_set_backup_destination_and_rotate_token() {
         assert!(Instant::now() < deadline, "backup did not finish");
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(fs::read_dir(&dest).unwrap().filter_map(Result::ok).any(|file| file.path().extension().is_some_and(|ext| ext == "zip")));
+    assert!(fs::read_dir(&dest)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|file| file.path().extension().is_some_and(|ext| ext == "zip")));
     let mut token = BROWSER_MACHINE.to_owned();
-    for (id, body, generated) in [([22; 32], json!({"token":BROWSER_CHOSEN}), false), ([23; 32], json!({}), true)] {
+    for (id, body, generated) in [
+        ([22; 32], json!({"token":BROWSER_CHOSEN}), false),
+        ([23; 32], json!({}), true),
+    ] {
         let cookie = fixture.cookie(id, &token, fixture_wall_ms() - 200);
-        let (response, headers) = fixture.request("POST", "/api/console/token", &cookie, Some(body));
-        let reply = expect_json(response, 200, "browser authority can rotate the machine credential");
+        let (response, headers) =
+            fixture.request("POST", "/api/console/token", &cookie, Some(body));
+        let reply = expect_json(
+            response,
+            200,
+            "browser authority can rotate the machine credential",
+        );
         assert_eq!(reply["generated"], generated);
         token = reply["token"].as_str().unwrap().to_owned();
         assert!(!token.is_empty());
-        if !generated { assert_eq!(token, BROWSER_CHOSEN); }
-        assert_eq!(fs::read_to_string(fixture.root.join("data/console-token")).unwrap(), token);
-        let cfg: Value = serde_json::from_slice(&fs::read(fixture.root.join("config/config.json")).unwrap()).unwrap();
+        if !generated {
+            assert_eq!(token, BROWSER_CHOSEN);
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("data/console-token")).unwrap(),
+            token
+        );
+        let cfg: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join("config/config.json")).unwrap())
+                .unwrap();
         assert_eq!(cfg["consoleToken"], if generated { "" } else { &token });
         let name = cookie.split_once('=').unwrap().0;
-        assert!(headers.contains(&format!("Set-Cookie: {name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")));
-        assert_eq!(fixture.request("GET", "/api/status", &cookie, None).0.status, 401);
-        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(&token), None, None).unwrap().status, 200);
+        assert!(headers.contains(&format!(
+            "Set-Cookie: {name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+        )));
+        assert_eq!(
+            fixture
+                .request("GET", "/api/status", &cookie, None)
+                .0
+                .status,
+            401
+        );
+        assert_eq!(
+            http_request(fixture.port, "GET", "/api/status", Some(&token), None, None)
+                .unwrap()
+                .status,
+            200
+        );
     }
 }
 
 #[cfg(feature = "parity-clock")]
 #[test]
 fn console_token_rotation_recovers_between_publications() {
-    for (cut, live) in [("after-token", BROWSER_CHOSEN), ("before-token", BROWSER_MACHINE), ("after-config", BROWSER_CHOSEN)] {
+    for (cut, live) in [
+        ("after-token", BROWSER_CHOSEN),
+        ("before-token", BROWSER_MACHINE),
+        ("after-config", BROWSER_CHOSEN),
+    ] {
         let fixture = BrowserFixture::new("rotation-publication-cut");
         let cookie = fixture.cookie([19; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
-        let mut console = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None, &[("HER_TEST_ROTATION_CUT", cut)]);
-        let response = http_request(fixture.port, "POST", "/api/console/token", Some(BROWSER_MACHINE), None, Some(&json!({"token":BROWSER_CHOSEN})));
+        let mut console = ConsoleProcess::start_with_env(
+            &fixture.root,
+            fixture.port,
+            &fixture.home,
+            None,
+            None,
+            &[("HER_TEST_ROTATION_CUT", cut)],
+        );
+        let response = http_request(
+            fixture.port,
+            "POST",
+            "/api/console/token",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({"token":BROWSER_CHOSEN})),
+        );
         assert!(response.is_err(), "fixture must cut the rotating response");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1054,16 +1935,67 @@ fn console_token_rotation_recovers_between_publications() {
         assert!(fixture.root.join("data/console-token-rotation").is_file());
         drop(console);
         let _console = fixture.start();
-        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(live), None, None).unwrap().status, 200,
-            "reconciled machine proof must work after the console restarts");
-        let obsolete = if live == BROWSER_MACHINE { BROWSER_CHOSEN } else { BROWSER_MACHINE };
-        assert_eq!(http_request(fixture.port, "GET", "/api/status", Some(obsolete), None, None).unwrap().status, 401);
+        assert_eq!(
+            http_request(fixture.port, "GET", "/api/status", Some(live), None, None)
+                .unwrap()
+                .status,
+            200,
+            "reconciled machine proof must work after the console restarts"
+        );
+        let obsolete = if live == BROWSER_MACHINE {
+            BROWSER_CHOSEN
+        } else {
+            BROWSER_MACHINE
+        };
+        assert_eq!(
+            http_request(
+                fixture.port,
+                "GET",
+                "/api/status",
+                Some(obsolete),
+                None,
+                None
+            )
+            .unwrap()
+            .status,
+            401
+        );
         assert!(!fixture.root.join("data/console-token-rotation").exists());
-        assert_eq!(fixture.request("GET", "/api/status", &cookie, None).0.status, 401);
+        assert_eq!(
+            fixture
+                .request("GET", "/api/status", &cookie, None)
+                .0
+                .status,
+            401
+        );
         #[cfg(windows)]
         if cut != "before-token" {
-            let issued = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(live), None, Some(&json!({}))).unwrap(), 200, "native proof uses the reconciled token file");
-            assert_eq!(http_request(fixture.port, "GET", "/api/status", issued["session"].as_str(), None, None).unwrap().status, 200);
+            let issued = expect_json(
+                http_request(
+                    fixture.port,
+                    "POST",
+                    "/api/desktop/sign-in",
+                    Some(live),
+                    None,
+                    Some(&json!({})),
+                )
+                .unwrap(),
+                200,
+                "native proof uses the reconciled token file",
+            );
+            assert_eq!(
+                http_request(
+                    fixture.port,
+                    "GET",
+                    "/api/status",
+                    issued["session"].as_str(),
+                    None,
+                    None
+                )
+                .unwrap()
+                .status,
+                200
+            );
         }
     }
 }
@@ -1077,31 +2009,107 @@ fn day_zero_grant_cannot_replay_on_day_six_after_day_eight() {
     let retained = fixture.cookie([11; 32], BROWSER_MACHINE, epoch);
     let _control = fixture.cookie([12; 32], BROWSER_MACHINE, epoch + 6 * day);
     let start = |at: i64| {
-        ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
-            &[("HER_PARITY_EPOCH_MS", &at.to_string())])
+        ConsoleProcess::start_with_env(
+            &fixture.root,
+            fixture.port,
+            &fixture.home,
+            None,
+            None,
+            &[("HER_PARITY_EPOCH_MS", &at.to_string())],
+        )
     };
     let original = start(epoch);
-    let clock = || fixture.db().query_row("SELECT clock_high_water_ms FROM console_auth_state", [], |row| row.get::<_, i64>(0)).unwrap();
-    assert_eq!(fixture.db().query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    let clock = || {
+        fixture
+            .db()
+            .query_row(
+                "SELECT clock_high_water_ms FROM console_auth_state",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        fixture
+            .db()
+            .query_row("SELECT count(*) FROM console_browser_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
     let advance = fixture.workspace.root("clock");
     drop(original);
-    let console = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
-        &[("HER_PARITY_EPOCH_MS", &epoch.to_string()), ("HER_PARITY_ADVANCE_FILE", advance.to_str().unwrap())]);
+    let console = ConsoleProcess::start_with_env(
+        &fixture.root,
+        fixture.port,
+        &fixture.home,
+        None,
+        None,
+        &[
+            ("HER_PARITY_EPOCH_MS", &epoch.to_string()),
+            ("HER_PARITY_ADVANCE_FILE", advance.to_str().unwrap()),
+        ],
+    );
     fs::write(advance, (8 * day).to_string()).unwrap();
     let absent_id = [13; 32];
     let absent: [u8; 32] = Sha256::digest(absent_id).into();
-    let absent = format!("her_browser_{}_{}={}", fixture.port, URL_SAFE_NO_PAD.encode(absent), URL_SAFE_NO_PAD.encode(absent_id));
-    assert_eq!(fixture.request("GET", "/api/status", &absent, None).0.status, 401);
-    assert!(clock() >= epoch + 8 * day, "a missing grant must still advance the durable clock");
-    let rows = || fixture.db().query_row("SELECT count(*) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap();
-    assert_eq!(rows(), 2, "validation of an unrelated grant leaves the retained row alone");
-    assert_eq!(fixture.db().query_row("SELECT min(expires_ms) FROM console_browser_sessions", [], |row| row.get::<_, i64>(0)).unwrap(),
-        epoch + BROWSER_WEEK_MS);
+    let absent = format!(
+        "her_browser_{}_{}={}",
+        fixture.port,
+        URL_SAFE_NO_PAD.encode(absent),
+        URL_SAFE_NO_PAD.encode(absent_id)
+    );
+    assert_eq!(
+        fixture
+            .request("GET", "/api/status", &absent, None)
+            .0
+            .status,
+        401
+    );
+    assert!(
+        clock() >= epoch + 8 * day,
+        "a missing grant must still advance the durable clock"
+    );
+    let rows = || {
+        fixture
+            .db()
+            .query_row("SELECT count(*) FROM console_browser_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        rows(),
+        2,
+        "validation of an unrelated grant leaves the retained row alone"
+    );
+    assert_eq!(
+        fixture
+            .db()
+            .query_row(
+                "SELECT min(expires_ms) FROM console_browser_sessions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        epoch + BROWSER_WEEK_MS
+    );
     drop(console);
     let _restarted = start(epoch + 6 * day);
-    assert_eq!(rows(), 0, "startup must revoke every grant before the first cookie is used");
+    assert_eq!(
+        rows(),
+        0,
+        "startup must revoke every grant before the first cookie is used"
+    );
     assert!((epoch + 6 * day..epoch + 7 * day).contains(&clock()));
-    assert_eq!(fixture.request("GET", "/api/status", &retained, None).0.status, 401);
+    assert_eq!(
+        fixture
+            .request("GET", "/api/status", &retained, None)
+            .0
+            .status,
+        401
+    );
 }
 
 #[cfg(windows)]
@@ -1111,31 +2119,98 @@ fn desktop_sign_in_admits_browser_session_with_installing_user_peer() {
     private_token_file(&fixture.root, BROWSER_MACHINE);
     let cookie = fixture.cookie([72; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
     let console = fixture.start();
-    let reply = expect_json(fixture.request("POST", "/api/desktop/sign-in", &cookie, Some(json!({}))).0, 200,
-        "browser desktop issuance requires a live cookie and the verified Windows peer");
+    let reply = expect_json(
+        fixture
+            .request("POST", "/api/desktop/sign-in", &cookie, Some(json!({})))
+            .0,
+        200,
+        "browser desktop issuance requires a live cookie and the verified Windows peer",
+    );
     let host = format!("127.0.0.1:{}", fixture.port);
     let origin = format!("http://her.localhost:{}", fixture.port);
     let canonical = format!("her.localhost:{}", fixture.port);
     let issued = reply["session"].as_str().unwrap();
-    assert_eq!(raw_browser_http(fixture.port, "GET", "/settings", &host, &[("x-console-token", issued), ("Sec-Fetch-Mode", "navigate")], "").unwrap().0.status, 200);
+    assert_eq!(
+        raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &host,
+            &[("x-console-token", issued), ("Sec-Fetch-Mode", "navigate")],
+            ""
+        )
+        .unwrap()
+        .0
+        .status,
+        200
+    );
     for marker in [
         ("Origin", origin.as_str()),
         ("Sec-Fetch-Site", "same-origin"),
         ("Referer", origin.as_str()),
         ("Cookie", ""),
     ] {
-        let (response, _) = raw_browser_http(fixture.port, "POST", "/api/desktop/sign-in", &canonical,
-            &[("x-console-token", BROWSER_MACHINE), ("Content-Type", "application/json"), marker], "{}").unwrap();
-        assert!(matches!(response.status, 401 | 403), "browser marker {} must refuse a raw-only proof", marker.0);
+        let (response, _) = raw_browser_http(
+            fixture.port,
+            "POST",
+            "/api/desktop/sign-in",
+            &canonical,
+            &[
+                ("x-console-token", BROWSER_MACHINE),
+                ("Content-Type", "application/json"),
+                marker,
+            ],
+            "{}",
+        )
+        .unwrap();
+        assert!(
+            matches!(response.status, 401 | 403),
+            "browser marker {} must refuse a raw-only proof",
+            marker.0
+        );
     }
-    let native = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(BROWSER_MACHINE), None, Some(&json!({}))).unwrap(), 200,
-        "the native file proof retains its transport");
-    assert_eq!(http_request(fixture.port, "GET", "/api/status", native["session"].as_str(), None, None).unwrap().status, 200);
+    let native = expect_json(
+        http_request(
+            fixture.port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "the native file proof retains its transport",
+    );
+    assert_eq!(
+        http_request(
+            fixture.port,
+            "GET",
+            "/api/status",
+            native["session"].as_str(),
+            None,
+            None
+        )
+        .unwrap()
+        .status,
+        200
+    );
     drop(console);
     let foreign_sid = format!("0101{}", "0".repeat(20));
-    let _other = ConsoleProcess::start_with_peer_sid(&fixture.root, fixture.port, &fixture.home, Some(&foreign_sid));
-    assert_eq!(fixture.request("POST", "/api/desktop/sign-in", &cookie, Some(json!({}))).0.status, 403,
-        "a browser cookie must still pass the installing-user peer check");
+    let _other = ConsoleProcess::start_with_peer_sid(
+        &fixture.root,
+        fixture.port,
+        &fixture.home,
+        Some(&foreign_sid),
+    );
+    assert_eq!(
+        fixture
+            .request("POST", "/api/desktop/sign-in", &cookie, Some(json!({})))
+            .0
+            .status,
+        403,
+        "a browser cookie must still pass the installing-user peer check"
+    );
 }
 
 #[test]
@@ -1164,7 +2239,10 @@ fn served_pages_select_browser_or_desktop_transport() {
                 && response_headers.contains("style-src 'self'"),
             "{page} missing strict CSP header: {response_headers}"
         );
-        assert!(!served.body.contains("<script>"), "{page} must not inline script");
+        assert!(
+            !served.body.contains("<script>"),
+            "{page} must not inline script"
+        );
         let redirected = raw_browser_http(
             port,
             "GET",
@@ -1176,7 +2254,10 @@ fn served_pages_select_browser_or_desktop_transport() {
         .unwrap();
         assert_eq!(redirected.0.status, 302, "{page} on old host redirects");
         let location = format!("Location: http://{canonical}{page}");
-        assert!(redirected.1.lines().any(|header| header == location.as_str()));
+        assert!(redirected
+            .1
+            .lines()
+            .any(|header| header == location.as_str()));
         assert!(!redirected.1.contains(BROWSER_MACHINE));
     }
     for (legacy, target) in [
@@ -1186,9 +2267,17 @@ fn served_pages_select_browser_or_desktop_transport() {
         ("/settings/models", "/models"),
     ] {
         let (canonical_redirect, headers) = fixture.request("GET", legacy, &cookie, None);
-        assert_eq!(canonical_redirect.status, 302, "{legacy} redirects on canonical host");
+        assert_eq!(
+            canonical_redirect.status, 302,
+            "{legacy} redirects on canonical host"
+        );
         let path_location = format!("Location: {target}");
-        assert!(headers.lines().any(|header| header == path_location.as_str()), "{headers}");
+        assert!(
+            headers
+                .lines()
+                .any(|header| header == path_location.as_str()),
+            "{headers}"
+        );
 
         let (alias_redirect, alias_headers) = raw_browser_http(
             port,
@@ -1199,35 +2288,111 @@ fn served_pages_select_browser_or_desktop_transport() {
             "",
         )
         .unwrap();
-        assert_eq!(alias_redirect.status, 302, "{legacy} redirects from alias host");
+        assert_eq!(
+            alias_redirect.status, 302,
+            "{legacy} redirects from alias host"
+        );
         let canonical_location = format!("Location: http://{canonical}{target}");
         assert!(
-            alias_headers.lines().any(|header| header == canonical_location.as_str()),
+            alias_headers
+                .lines()
+                .any(|header| header == canonical_location.as_str()),
             "{alias_headers}"
         );
         assert!(!alias_headers.contains(BROWSER_MACHINE));
     }
-    let duplicate = |headers: &[(&str, &str)]| raw_browser_http(port, "GET", "/api/status", &canonical, headers, "").unwrap().0.status;
+    let duplicate = |headers: &[(&str, &str)]| {
+        raw_browser_http(port, "GET", "/api/status", &canonical, headers, "")
+            .unwrap()
+            .0
+            .status
+    };
     let origin = format!("http://{canonical}");
     assert_eq!(duplicate(&[("Cookie", &cookie), ("Cookie", &cookie)]), 401);
-    assert_eq!(duplicate(&[("Cookie", &cookie), ("Origin", &origin), ("Origin", &origin)]), 403);
+    assert_eq!(
+        duplicate(&[
+            ("Cookie", &cookie),
+            ("Origin", &origin),
+            ("Origin", &origin)
+        ]),
+        403
+    );
     assert_eq!(duplicate(&[("Cookie", &cookie), ("Host", &canonical)]), 403);
-    assert_eq!(duplicate(&[("Cookie", &cookie), ("x-console-token", "")]), 401);
+    assert_eq!(
+        duplicate(&[("Cookie", &cookie), ("x-console-token", "")]),
+        401
+    );
     assert_eq!(duplicate(&[("Cookie", &cookie), ("x-agent-call", "")]), 401);
-    assert_eq!(raw_browser_http(port, "GET", "/api/status?token=", &canonical, &[("Cookie", &cookie)], "").unwrap().0.status, 401);
-    assert_eq!(raw_browser_http(port, "GET", "/api/status", &alias, &[("x-console-token", BROWSER_MACHINE)], "").unwrap().0.status, 200);
-    assert_eq!(raw_browser_http(port, "GET", "/api/status", &alias, &[("x-console-token", BROWSER_MACHINE), ("Sec-Fetch-Mode", "cors")], "").unwrap().0.status,
-        401, "a browser may not use a raw machine token");
+    assert_eq!(
+        raw_browser_http(
+            port,
+            "GET",
+            "/api/status?token=",
+            &canonical,
+            &[("Cookie", &cookie)],
+            ""
+        )
+        .unwrap()
+        .0
+        .status,
+        401
+    );
+    assert_eq!(
+        raw_browser_http(
+            port,
+            "GET",
+            "/api/status",
+            &alias,
+            &[("x-console-token", BROWSER_MACHINE)],
+            ""
+        )
+        .unwrap()
+        .0
+        .status,
+        200
+    );
+    assert_eq!(
+        raw_browser_http(
+            port,
+            "GET",
+            "/api/status",
+            &alias,
+            &[
+                ("x-console-token", BROWSER_MACHINE),
+                ("Sec-Fetch-Mode", "cors")
+            ],
+            ""
+        )
+        .unwrap()
+        .0
+        .status,
+        401,
+        "a browser may not use a raw machine token"
+    );
     if std::env::var_os("CI").is_some() || std::env::var_os("HER_TEST_CHROMIUM").is_some() {
         let mut cmd = Command::new("node");
-        cmd.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/console-browser-origin.mjs"))
-            .arg(port.to_string()).arg(fixture.workspace.root("chromium-profile"))
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.arg(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/console-browser-origin.mjs"),
+        )
+        .arg(port.to_string())
+        .arg(fixture.workspace.root("chromium-profile"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         hide_process_window(&mut cmd);
         let mut child = cmd.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(cookie.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(cookie.as_bytes())
+            .unwrap();
         let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "Chromium console origin fixture: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "Chromium console origin fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -1239,8 +2404,17 @@ fn browser_release_banner_opens_schedule_with_cookie() {
     let (served, headers) = fixture.request("GET", "/", &cookie, None);
     assert_eq!(served.status, 200);
     assert!(headers.contains("Content-Security-Policy:") && headers.contains("script-src 'self'"));
-    assert_eq!(fixture.request("GET", "/schedule", &cookie, None).0.status, 200);
-    assert_eq!(fixture.request("GET", "/api/releases", &cookie, None).0.status, 200);
+    assert_eq!(
+        fixture.request("GET", "/schedule", &cookie, None).0.status,
+        200
+    );
+    assert_eq!(
+        fixture
+            .request("GET", "/api/releases", &cookie, None)
+            .0
+            .status,
+        200
+    );
 }
 
 #[cfg(feature = "parity-clock")]
@@ -1265,41 +2439,89 @@ impl<'a> RestartFixture<'a> {
         fs::write(config, cfg.to_string()).unwrap();
         let pause = fixture.workspace.root("pause-restart");
         let cut = fixture.workspace.root("cut-restart-queue");
-        let original = ConsoleProcess::start_with_env(&fixture.root, fixture.port, &fixture.home, None, None,
-            &[("HER_TEST_RESTART_QUEUE_CUT", cut.to_str().unwrap())]);
+        let original = ConsoleProcess::start_with_env(
+            &fixture.root,
+            fixture.port,
+            &fixture.home,
+            None,
+            None,
+            &[("HER_TEST_RESTART_QUEUE_CUT", cut.to_str().unwrap())],
+        );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_her"));
-        cmd.args(["supervise", "--runtime-root"]).arg(&fixture.root)
+        cmd.args(["supervise", "--runtime-root"])
+            .arg(&fixture.root)
             .env("HER_TEST_RESTART_PAUSE_FILE", &pause)
             .env_remove("HER_RUNTIME_ROOT")
             .env("HER_INSTALL_ROOT", fixture.workspace.root("test-install"))
             .env("DSH_HOME", &fixture.home)
-            .stdout(Stdio::null()).stderr(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         hide_process_window(&mut cmd);
-        let mut supervisor = ConsoleProcess { child: cmd.spawn().unwrap(), port: 0 };
-        let marker = fixture.root.join("data/logs/rbridge-supervisor.lock.owner.json");
+        let mut supervisor = ConsoleProcess {
+            child: cmd.spawn().unwrap(),
+            port: 0,
+        };
+        let marker = fixture
+            .root
+            .join("data/logs/rbridge-supervisor.lock.owner.json");
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
-            if marker.is_file() { break; }
-            assert!(supervisor.child.try_wait().unwrap().is_none(), "supervisor quit before acquiring ownership");
-            assert!(Instant::now() < deadline, "supervisor owner marker never published");
+            if marker.is_file() {
+                break;
+            }
+            assert!(
+                supervisor.child.try_wait().unwrap().is_none(),
+                "supervisor quit before acquiring ownership"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "supervisor owner marker never published"
+            );
             thread::sleep(Duration::from_millis(25));
         }
-        Self { fixture, supervisor, original, pause, cut }
+        Self {
+            fixture,
+            supervisor,
+            original,
+            pause,
+            cut,
+        }
     }
 
     fn request(&self, id: &str, token: &str) -> HttpResponse {
-        http_request(self.fixture.port, "POST", "/api/restart", Some(token), None,
-            Some(&json!({"requestId":id,"confirm":true}))).unwrap()
+        http_request(
+            self.fixture.port,
+            "POST",
+            "/api/restart",
+            Some(token),
+            None,
+            Some(&json!({"requestId":id,"confirm":true})),
+        )
+        .unwrap()
     }
 
-    fn queued(&self) -> PathBuf { self.fixture.root.join("data/lifecycle/console-restart.json") }
+    fn queued(&self) -> PathBuf {
+        self.fixture
+            .root
+            .join("data/lifecycle/console-restart.json")
+    }
 
     fn receipt(&self, id: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
-            if let Ok(response) = http_request(self.fixture.port, "GET", "/api/tasks/runs", Some(BROWSER_MACHINE), None, None) {
+            if let Ok(response) = http_request(
+                self.fixture.port,
+                "GET",
+                "/api/tasks/runs",
+                Some(BROWSER_MACHINE),
+                None,
+                None,
+            ) {
                 if let Ok(value) = serde_json::from_str::<Value>(&response.body) {
-                    if let Some(run) = value["runs"].as_array().into_iter().flatten()
+                    if let Some(run) = value["runs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
                         .find(|run| run["requestId"] == id && run["endedAt"].is_i64())
                     {
                         return run.clone();
@@ -1312,8 +2534,13 @@ impl<'a> RestartFixture<'a> {
     }
 
     fn pid(&self) -> u64 {
-        expect_json(http_request(self.fixture.port, "GET", "/api/health", None, None, None).unwrap(), 200, "owned console liveness")
-            ["pid"].as_u64().unwrap()
+        expect_json(
+            http_request(self.fixture.port, "GET", "/api/health", None, None, None).unwrap(),
+            200,
+            "owned console liveness",
+        )["pid"]
+            .as_u64()
+            .unwrap()
     }
 }
 
@@ -1321,9 +2548,14 @@ impl<'a> RestartFixture<'a> {
 impl Drop for RestartFixture<'_> {
     fn drop(&mut self) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-        cmd.args(["stop", "--confirm", "--runtime-root"]).arg(&self.fixture.root)
-            .env("HER_INSTALL_ROOT", self.fixture.workspace.root("test-install"))
-            .stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.args(["stop", "--confirm", "--runtime-root"])
+            .arg(&self.fixture.root)
+            .env(
+                "HER_INSTALL_ROOT",
+                self.fixture.workspace.root("test-install"),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         hide_process_window(&mut cmd);
         let _ = cmd.status();
         let _ = self.supervisor.child.try_wait();
@@ -1338,15 +2570,28 @@ fn supervised_restart_releases_config_gate_before_readiness() {
     let cookie = fixture.cookie([43; 32], BROWSER_MACHINE, fixture_wall_ms() - 200);
     let restart = RestartFixture::start(&fixture);
     let mut pid = restart.pid();
-    for (id, browser) in [("fixture-raw-restart", false), ("fixture-cookie-restart", true)] {
+    for (id, browser) in [
+        ("fixture-raw-restart", false),
+        ("fixture-cookie-restart", true),
+    ] {
         let response = if browser {
-            fixture.request("POST", "/api/restart", &cookie, Some(json!({"confirm":true,"requestId":id}))).0
+            fixture
+                .request(
+                    "POST",
+                    "/api/restart",
+                    &cookie,
+                    Some(json!({"confirm":true,"requestId":id})),
+                )
+                .0
         } else {
             restart.request(id, BROWSER_MACHINE)
         };
         expect_json(response, 202, "enqueue supervised restart");
         let receipt = restart.receipt(id);
-        assert_eq!(receipt["state"], "succeeded", "replacement must finish startup after taking the config gate: {receipt}");
+        assert_eq!(
+            receipt["state"], "succeeded",
+            "replacement must finish startup after taking the config gate: {receipt}"
+        );
         let replacement = restart.pid();
         assert_ne!(replacement, pid);
         pid = replacement;
@@ -1365,14 +2610,50 @@ fn queued_desktop_restart_is_revoked_by_same_value_rotation() {
     private_token_file(&fixture.root, BROWSER_MACHINE);
     let restart = RestartFixture::start(&fixture);
     fs::write(&restart.pause, []).unwrap();
-    let issued = expect_json(http_request(fixture.port, "POST", "/api/desktop/sign-in", Some(BROWSER_MACHINE), None, Some(&json!({}))).unwrap(), 200, "real Windows desktop handshake");
+    let issued = expect_json(
+        http_request(
+            fixture.port,
+            "POST",
+            "/api/desktop/sign-in",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "real Windows desktop handshake",
+    );
     let old = restart.pid();
     let id = "fixture-desktop-restart";
-    expect_json(restart.request(id, issued["session"].as_str().unwrap()), 202, "queue a desktop restart");
-    expect_json(http_request(fixture.port, "POST", "/api/console/token", Some(BROWSER_MACHINE), None, Some(&json!({"token":BROWSER_MACHINE}))).unwrap(), 200, "same-value rotation revokes queued desktop grant");
+    expect_json(
+        restart.request(id, issued["session"].as_str().unwrap()),
+        202,
+        "queue a desktop restart",
+    );
+    expect_json(
+        http_request(
+            fixture.port,
+            "POST",
+            "/api/console/token",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({"token":BROWSER_MACHINE})),
+        )
+        .unwrap(),
+        200,
+        "same-value rotation revokes queued desktop grant",
+    );
     fs::remove_file(&restart.pause).unwrap();
-    assert_eq!(restart.receipt(id)["state"], "failed", "revoked queued desktop proof must refuse at execution");
-    assert_eq!(restart.pid(), old, "revoked desktop proof must leave the original console running");
+    assert_eq!(
+        restart.receipt(id)["state"],
+        "failed",
+        "revoked queued desktop proof must refuse at execution"
+    );
+    assert_eq!(
+        restart.pid(),
+        old,
+        "revoked desktop proof must leave the original console running"
+    );
 }
 
 #[cfg(feature = "parity-clock")]
@@ -1383,20 +2664,42 @@ fn deferred_restart_publishes_and_recovers_queue_record() {
     fs::write(&restart.pause, []).unwrap();
     fs::write(&restart.cut, []).unwrap();
     let id = "fixture-atomic-restart";
-    expect_json(restart.request(id, BROWSER_MACHINE), 503, "a staged queue cut never publishes");
-    assert!(!restart.queued().exists(), "the final restart path must have no partial record at the publication cut");
+    expect_json(
+        restart.request(id, BROWSER_MACHINE),
+        503,
+        "a staged queue cut never publishes",
+    );
+    assert!(
+        !restart.queued().exists(),
+        "the final restart path must have no partial record at the publication cut"
+    );
     fs::remove_file(&restart.cut).unwrap();
     fs::write(restart.queued(), b"{torn").unwrap();
-    expect_json(restart.request(id, BROWSER_MACHINE), 503, "fresh torn queue refuses reuse");
+    expect_json(
+        restart.request(id, BROWSER_MACHINE),
+        503,
+        "fresh torn queue refuses reuse",
+    );
     assert_eq!(fs::read(restart.queued()).unwrap().as_slice(), b"{torn");
-    fs::OpenOptions::new().write(true).open(restart.queued()).unwrap().set_modified(
-        SystemTime::now() - Duration::from_secs(301),
-    ).unwrap();
-    expect_json(restart.request(id, BROWSER_MACHINE), 202, "expired unreadable record may be replaced");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(restart.queued())
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(301))
+        .unwrap();
+    expect_json(
+        restart.request(id, BROWSER_MACHINE),
+        202,
+        "expired unreadable record may be replaced",
+    );
     let queue: Value = serde_json::from_slice(&fs::read(restart.queued()).unwrap()).unwrap();
     assert_eq!(queue["v"], 2);
     assert_eq!(queue["requestId"], id);
-    let duplicate = expect_json(restart.request(id, BROWSER_MACHINE), 202, "preserve valid queue dedupe");
+    let duplicate = expect_json(
+        restart.request(id, BROWSER_MACHINE),
+        202,
+        "preserve valid queue dedupe",
+    );
     assert_eq!(duplicate["duplicate"], true);
     fs::remove_file(&restart.pause).unwrap();
     assert_eq!(restart.receipt(id)["state"], "succeeded");
@@ -1442,8 +2745,10 @@ fn wait_for_sticker_warmup(port: u16, token: &str, store: &Path, seeded: &[u8]) 
             match http_request(port, "GET", "/api/stickers", Some(token), None, None) {
                 Ok(response) => {
                     let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
-                    if response.status == 200 && body["fromCache"] == true
-                        && body["syncedAt"].as_i64().is_some_and(|at| at > 0) {
+                    if response.status == 200
+                        && body["fromCache"] == true
+                        && body["syncedAt"].as_i64().is_some_and(|at| at > 0)
+                    {
                         return;
                     }
                     last = format!("status {}: {}", response.status, response.body);
@@ -1462,36 +2767,102 @@ fn backup_install_root_destination_defaults_and_relative_paths_stay_outside_runt
     let install = workspace.root("install");
     let root = install.join("runtime");
     let token = "fixture-installed-backup-console";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let release = install.join("releases/fixture");
     fs::create_dir_all(&release).unwrap();
     let image = release.join(if cfg!(windows) { "her.exe" } else { "her" });
     fs::copy(env!("CARGO_BIN_EXE_her"), &image).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_her-cli"), release.join(if cfg!(windows) { "her-cli.exe" } else { "her-cli" })).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_her-cli"),
+        release.join(if cfg!(windows) {
+            "her-cli.exe"
+        } else {
+            "her-cli"
+        }),
+    )
+    .unwrap();
     let (port, _) = reserve_distinct_ports();
     let mut command = Command::new(&image);
-    command.args(["--console-serve", "--console-port", &port.to_string(), "--runtime-root"])
-        .arg(&root).env("HER_INSTALL_ROOT", &install).env_remove("HER_RUNTIME_ROOT")
-        .env_remove("HOME").env_remove("APPDATA").env_remove("LOCALAPPDATA")
-        .env("DSH_HOME", &home).env("USERPROFILE", home.join("synthetic-profile"))
-        .stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args([
+            "--console-serve",
+            "--console-port",
+            &port.to_string(),
+            "--runtime-root",
+        ])
+        .arg(&root)
+        .env("HER_INSTALL_ROOT", &install)
+        .env_remove("HER_RUNTIME_ROOT")
+        .env_remove("HOME")
+        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
+        .env("DSH_HOME", &home)
+        .env("USERPROFILE", home.join("synthetic-profile"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_process_window(&mut command);
-    let mut console = ConsoleProcess { child: command.spawn().unwrap(), port };
+    let mut console = ConsoleProcess {
+        child: command.spawn().unwrap(),
+        port,
+    };
     wait_for_health(&mut console).expect("throwaway installed console must start");
     let run = |request: &str| {
-        let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":request}))).unwrap(), 202, "installed backup trigger");
+        let started = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/tasks/backup/run",
+                Some(token),
+                None,
+                Some(&json!({"requestId":request})),
+            )
+            .unwrap(),
+            202,
+            "installed backup trigger",
+        );
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "installed backup result");
-            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) { break result["run"].clone(); }
-            assert!(Instant::now() < deadline, "installed backup did not finish: {result}");
+            let result = expect_json(
+                http_request(
+                    port,
+                    "GET",
+                    &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                    Some(token),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                200,
+                "installed backup result",
+            );
+            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) {
+                break result["run"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "installed backup did not finish: {result}"
+            );
             thread::sleep(Duration::from_millis(20));
         }
     };
     assert_eq!(run("backup-installed-default-01")["state"], "succeeded");
-    assert!(install.join("backups").is_dir(), "backup must default to the install root's backups directory");
-    assert!(!root.join("backups").exists(), "installed backups must be outside runtime");
+    assert!(
+        install.join("backups").is_dir(),
+        "backup must default to the install root's backups directory"
+    );
+    assert!(
+        !root.join("backups").exists(),
+        "installed backups must be outside runtime"
+    );
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
     config["backup"] = json!({"dir":"custom backups"});
@@ -1502,25 +2873,61 @@ fn backup_install_root_destination_defaults_and_relative_paths_stay_outside_runt
     for area in ["releases", "deps", "runtime"] {
         config["backup"] = json!({"dir":install.join(area).join("forbidden backups")});
         fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
-        let mut check = Command::new(release.join(if cfg!(windows) { "her-cli.exe" } else { "her-cli" }));
+        let mut check = Command::new(release.join(if cfg!(windows) {
+            "her-cli.exe"
+        } else {
+            "her-cli"
+        }));
         let (probe_port, _) = reserve_distinct_ports();
-        check.args(["--console-serve", "--console-port", &probe_port.to_string(), "--runtime-root"]).arg(&root)
-            .env("HER_INSTALL_ROOT", &install).env_remove("HER_RUNTIME_ROOT")
-            .env_remove("HOME").env_remove("APPDATA").env_remove("LOCALAPPDATA")
-            .env("DSH_HOME", &home).env("USERPROFILE", home.join("synthetic-profile"))
-            .stdout(Stdio::null()).stderr(Stdio::piped());
+        check
+            .args([
+                "--console-serve",
+                "--console-port",
+                &probe_port.to_string(),
+                "--runtime-root",
+            ])
+            .arg(&root)
+            .env("HER_INSTALL_ROOT", &install)
+            .env_remove("HER_RUNTIME_ROOT")
+            .env_remove("HOME")
+            .env_remove("APPDATA")
+            .env_remove("LOCALAPPDATA")
+            .env("DSH_HOME", &home)
+            .env("USERPROFILE", home.join("synthetic-profile"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         hide_process_window(&mut check);
-        let mut probe = ConsoleProcess { child: check.spawn().expect("load probe must start"), port: probe_port };
+        let mut probe = ConsoleProcess {
+            child: check.spawn().expect("load probe must start"),
+            port: probe_port,
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
-            if let Some(status) = probe.child.try_wait().unwrap() { break status; }
-            assert!(Instant::now() < deadline, "invalid backup destination must refuse startup");
+            if let Some(status) = probe.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "invalid backup destination must refuse startup"
+            );
             thread::sleep(Duration::from_millis(20));
         };
         let mut reason = String::new();
-        probe.child.stderr.take().unwrap().read_to_string(&mut reason).unwrap();
-        assert!(!status.success(), "backup destination inside {area} must be refused at load");
-        assert!(reason.contains("backup destination"), "load refusal must explain the destination: {reason}");
+        probe
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut reason)
+            .unwrap();
+        assert!(
+            !status.success(),
+            "backup destination inside {area} must be refused at load"
+        );
+        assert!(
+            reason.contains("backup destination"),
+            "load refusal must explain the destination: {reason}"
+        );
         drop(probe);
         assert!(!install.join(area).join("forbidden backups").exists());
     }
@@ -1534,7 +2941,15 @@ fn backup_console_settings_preserve_raw_config_and_apply_to_the_next_run() {
     let install = workspace.root("protected-install");
     let token = "fixture-backup-settings-console";
     let agent = "fixture-backup-settings-agent";
-    let home = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
@@ -1545,63 +2960,200 @@ fn backup_console_settings_preserve_raw_config_and_apply_to_the_next_run() {
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start_with_install_root(&root, port, &home, Some(&install));
-    assert_eq!(http_request(port, "GET", "/api/backups/settings", None, None, None).unwrap().status, 401);
-    assert_eq!(http_request(port, "GET", "/api/backups/settings", Some(token), Some(agent), None).unwrap().status, 403);
-    let settings = expect_json(http_request(port, "GET", "/api/backups/settings", Some(token), None, None).unwrap(), 200, "backup settings")["settings"].clone();
+    assert_eq!(
+        http_request(port, "GET", "/api/backups/settings", None, None, None)
+            .unwrap()
+            .status,
+        401
+    );
+    assert_eq!(
+        http_request(
+            port,
+            "GET",
+            "/api/backups/settings",
+            Some(token),
+            Some(agent),
+            None
+        )
+        .unwrap()
+        .status,
+        403
+    );
+    let settings = expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/backups/settings",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "backup settings",
+    )["settings"]
+        .clone();
     assert_eq!(settings["keepDays"], 7);
     assert_eq!(settings["time"], "04:00");
     assert_eq!(settings["includeState"], true);
     assert!(settings["dir"].is_null());
-    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    assert_eq!(
+        http_request(port, "GET", "/tasks", Some(token), None, None)
+            .unwrap()
+            .status,
+        302
+    );
     let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
     assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
-    let posted = json!({"dir":"next backup's output","keepDays":2,"time":"06:30","includeState":false});
-    let saved = expect_json(http_request(port, "POST", "/api/backups/settings", Some(token), None, Some(&posted)).unwrap(), 200, "save backup settings");
+    let posted =
+        json!({"dir":"next backup's output","keepDays":2,"time":"06:30","includeState":false});
+    let saved = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/backups/settings",
+            Some(token),
+            None,
+            Some(&posted),
+        )
+        .unwrap(),
+        200,
+        "save backup settings",
+    );
     assert_eq!(saved["settings"]["keepDays"], 2);
     assert_eq!(saved["settings"]["time"], "06:30");
     assert_eq!(saved["settings"]["includeState"], false);
     let raw: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
-    assert!(raw["backup"].get("keep").is_none(), "saving retires the old count key");
+    assert!(
+        raw["backup"].get("keep").is_none(),
+        "saving retires the old count key"
+    );
     assert_eq!(raw["backup"]["keepDays"], 2);
     assert_eq!(raw["ticket23Sentinel"], json!({"preserve":"raw spelling"}));
-    assert_eq!(raw["dsh"], original_dsh, "saving backup settings must preserve unrelated raw config");
+    assert_eq!(
+        raw["dsh"], original_dsh,
+        "saving backup settings must preserve unrelated raw config"
+    );
     for invalid in [
-        json!({"keepDays":0}), json!({"keepDays":1.5}), json!({"time":"24:00"}),
-        json!({"includeState":"false"}), json!({"dir":123}), json!({"unknown":true}),
+        json!({"keepDays":0}),
+        json!({"keepDays":1.5}),
+        json!({"time":"24:00"}),
+        json!({"includeState":"false"}),
+        json!({"dir":123}),
+        json!({"unknown":true}),
     ] {
-        assert_eq!(http_request(port, "POST", "/api/backups/settings", Some(token), None, Some(&invalid)).unwrap().status, 400, "{invalid}");
-        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&config_file).unwrap()).unwrap(), raw);
+        assert_eq!(
+            http_request(
+                port,
+                "POST",
+                "/api/backups/settings",
+                Some(token),
+                None,
+                Some(&invalid)
+            )
+            .unwrap()
+            .status,
+            400,
+            "{invalid}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&config_file).unwrap()).unwrap(),
+            raw
+        );
     }
     for area in ["releases", "deps", "runtime"] {
         let forbidden = install.join(area).join("forbidden backups");
-        let refused = expect_json(http_request(port, "POST", "/api/backups/settings", Some(token), None, Some(&json!({"dir":forbidden}))).unwrap(), 400, "forbidden backup destination");
-        assert!(refused["error"].as_str().unwrap().contains("backup destination"));
+        let refused = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/backups/settings",
+                Some(token),
+                None,
+                Some(&json!({"dir":forbidden})),
+            )
+            .unwrap(),
+            400,
+            "forbidden backup destination",
+        );
+        assert!(refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("backup destination"));
         assert!(!forbidden.exists());
-        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&config_file).unwrap()).unwrap(), raw);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&config_file).unwrap()).unwrap(),
+            raw
+        );
     }
-    assert_eq!(http_request(port, "POST", "/api/backups/settings", Some(token), Some(agent), Some(&posted)).unwrap().status, 403);
-    let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":"backup-settings-api-01"}))).unwrap(), 202, "backup now");
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/backups/settings",
+            Some(token),
+            Some(agent),
+            Some(&posted)
+        )
+        .unwrap()
+        .status,
+        403
+    );
+    let started = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&json!({"requestId":"backup-settings-api-01"})),
+        )
+        .unwrap(),
+        202,
+        "backup now",
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "configured backup result");
+        let result = expect_json(
+            http_request(
+                port,
+                "GET",
+                &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                Some(token),
+                None,
+                None,
+            )
+            .unwrap(),
+            200,
+            "configured backup result",
+        );
         if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) {
             assert_eq!(result["run"]["state"], "succeeded", "{result}");
             break;
         }
-        assert!(Instant::now() < deadline, "configured backup did not finish: {result}");
+        assert!(
+            Instant::now() < deadline,
+            "configured backup did not finish: {result}"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     let destination = root.join("next backup's output");
-    let archive = fs::read_dir(&destination).unwrap().map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "zip")).unwrap();
+    let archive = fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "zip"))
+        .unwrap();
     let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
     assert!(!zip.file_names().any(|name| name.starts_with("state/")));
     let archived: Value = serde_json::from_reader(zip.by_name("config.json").unwrap()).unwrap();
     assert_eq!(archived["backup"]["time"], "06:30");
     assert_eq!(archived["backup"]["keepDays"], 2);
     assert!(archived["backup"].get("keep").is_none());
-    assert!(!root.join("backups").exists(), "next run must use the saved destination without restart");
+    assert!(
+        !root.join("backups").exists(),
+        "next run must use the saved destination without restart"
+    );
     drop(zip);
     drop(console);
 }
@@ -1612,7 +3164,15 @@ fn backup_destination_aliases_are_resolved_at_save_and_run_but_load_stays_lexica
     let root = workspace.root("runtime");
     let install = workspace.root("protected-install");
     let token = "fixture-backup-alias-console";
-    let home = prepare_runtime_root(&root, token, "fixture-backup-alias-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-backup-alias-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let protected = install.join("runtime/aliased target");
     fs::create_dir_all(&protected).unwrap();
@@ -1626,25 +3186,101 @@ fn backup_destination_aliases_are_resolved_at_save_and_run_but_load_stays_lexica
     // Loading the configuration only checks the destination by path; it never resolves the alias.
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start_with_install_root(&root, port, &home, Some(&install));
-    let settings = expect_json(http_request(port, "GET", "/api/backups/settings", Some(token), None, None).unwrap(), 200, "lexically valid settings")["settings"].clone();
+    let settings = expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/backups/settings",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "lexically valid settings",
+    )["settings"]
+        .clone();
     assert_eq!(settings["dir"], json!(alias));
     let raw = fs::read(&config_file).unwrap();
-    let refused = expect_json(http_request(port, "POST", "/api/backups/settings", Some(token), None, Some(&json!({"dir":alias}))).unwrap(), 400, "aliased destination save");
-    assert!(refused["error"].as_str().unwrap().contains("backup destination"), "{refused}");
-    assert_eq!(fs::read(&config_file).unwrap(), raw, "a refused save leaves config unchanged");
-    let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":"backup-alias-run-01"}))).unwrap(), 202, "aliased backup trigger");
+    let refused = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/backups/settings",
+            Some(token),
+            None,
+            Some(&json!({"dir":alias})),
+        )
+        .unwrap(),
+        400,
+        "aliased destination save",
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("backup destination"),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read(&config_file).unwrap(),
+        raw,
+        "a refused save leaves config unchanged"
+    );
+    let started = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&json!({"requestId":"backup-alias-run-01"})),
+        )
+        .unwrap(),
+        202,
+        "aliased backup trigger",
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let run = loop {
-        let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "aliased backup result");
-        if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) { break result["run"].clone(); }
-        assert!(Instant::now() < deadline, "aliased backup did not finish: {result}");
+        let result = expect_json(
+            http_request(
+                port,
+                "GET",
+                &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                Some(token),
+                None,
+                None,
+            )
+            .unwrap(),
+            200,
+            "aliased backup result",
+        );
+        if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) {
+            break result["run"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "aliased backup did not finish: {result}"
+        );
         thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(run["state"], "failed", "{run}");
-    assert!(run["reason"].as_str().unwrap().contains("backup destination"), "{run}");
-    assert_eq!(fs::read_dir(&protected).unwrap().count(), 0, "nothing may be written inside install-root runtime");
+    assert!(
+        run["reason"]
+            .as_str()
+            .unwrap()
+            .contains("backup destination"),
+        "{run}"
+    );
+    assert_eq!(
+        fs::read_dir(&protected).unwrap().count(),
+        0,
+        "nothing may be written inside install-root runtime"
+    );
     drop(console);
-    fs::remove_file(&alias).or_else(|_| fs::remove_dir(&alias)).unwrap();
+    fs::remove_file(&alias)
+        .or_else(|_| fs::remove_dir(&alias))
+        .unwrap();
 }
 
 #[test]
@@ -1654,7 +3290,15 @@ fn backup_console_list_reports_archive_time_size_verification_and_failed_attempt
     let install = workspace.root("protected-install");
     let token = "fixture-backup-list-console";
     let agent = "fixture-backup-list-agent";
-    let home = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
@@ -1662,47 +3306,119 @@ fn backup_console_list_reports_archive_time_size_verification_and_failed_attempt
     fs::write(config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start_with_install_root(&root, port, &home, Some(&install));
-    assert_eq!(http_request(port, "GET", "/api/backups", None, None, None).unwrap().status, 401);
-    assert_eq!(http_request(port, "GET", "/api/backups", Some(token), Some(agent), None).unwrap().status, 403);
-    let empty = expect_json(http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(), 200, "initial backup list");
+    assert_eq!(
+        http_request(port, "GET", "/api/backups", None, None, None)
+            .unwrap()
+            .status,
+        401
+    );
+    assert_eq!(
+        http_request(port, "GET", "/api/backups", Some(token), Some(agent), None)
+            .unwrap()
+            .status,
+        403
+    );
+    let empty = expect_json(
+        http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(),
+        200,
+        "initial backup list",
+    );
     assert!(empty["backups"].as_array().unwrap().is_empty());
-    assert!(!root.join("backups").exists(), "listing an unused destination must not create it");
+    assert!(
+        !root.join("backups").exists(),
+        "listing an unused destination must not create it"
+    );
     let run = |request: &str| {
-        let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":request}))).unwrap(), 202, "list fixture backup");
+        let started = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/tasks/backup/run",
+                Some(token),
+                None,
+                Some(&json!({"requestId":request})),
+            )
+            .unwrap(),
+            202,
+            "list fixture backup",
+        );
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "list fixture result");
-            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) { break result["run"].clone(); }
+            let result = expect_json(
+                http_request(
+                    port,
+                    "GET",
+                    &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                    Some(token),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                200,
+                "list fixture result",
+            );
+            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) {
+                break result["run"].clone();
+            }
             assert!(Instant::now() < deadline, "backup did not finish: {result}");
             thread::sleep(Duration::from_millis(20));
         }
     };
     assert_eq!(run("backup-list-success-01")["state"], "succeeded");
     let destination = root.join("backups");
-    let archive = fs::read_dir(&destination).unwrap().map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "zip")).unwrap();
+    let archive = fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "zip"))
+        .unwrap();
     let name = archive.file_name().unwrap().to_str().unwrap().to_owned();
     let size = fs::metadata(&archive).unwrap().len();
     fs::write(destination.join("personal.zip"), b"unrelated").unwrap();
     fs::create_dir(destination.join("qqbot-1999-01-01T00-00-00.zip")).unwrap();
-    fs::write(destination.join("qqbot-2000-01-01T00-00-00.zip"), b"not a zip").unwrap();
+    fs::write(
+        destination.join("qqbot-2000-01-01T00-00-00.zip"),
+        b"not a zip",
+    )
+    .unwrap();
     fs::write(root.join("data/memory.db"), b"corrupt database").unwrap();
     let failed = run("backup-list-failure-02");
     assert_eq!(failed["state"], "failed");
-    let listed = expect_json(http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(), 200, "backup list");
+    let listed = expect_json(
+        http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(),
+        200,
+        "backup list",
+    );
     let archives = listed["backups"].as_array().unwrap();
-    assert_eq!(archives.len(), 2, "only HER-named regular archives belong in the list");
+    assert_eq!(
+        archives.len(),
+        2,
+        "only HER-named regular archives belong in the list"
+    );
     let verified = archives.iter().find(|entry| entry["name"] == name).unwrap();
     assert_eq!(verified["size"], size);
     assert!(verified["time"].as_i64().unwrap() > 0);
     assert_eq!(verified["result"], "verified");
-    assert_eq!(archives.iter().find(|entry| entry["name"] == "qqbot-2000-01-01T00-00-00.zip").unwrap()["result"], "failed");
+    assert_eq!(
+        archives
+            .iter()
+            .find(|entry| entry["name"] == "qqbot-2000-01-01T00-00-00.zip")
+            .unwrap()["result"],
+        "failed"
+    );
     let attempts = listed["failedAttempts"].as_array().unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0]["runId"], failed["runId"]);
     assert_eq!(attempts[0]["state"], "failed");
-    assert_eq!(fs::read(destination.join("personal.zip")).unwrap(), b"unrelated");
-    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    assert_eq!(
+        fs::read(destination.join("personal.zip")).unwrap(),
+        b"unrelated"
+    );
+    assert_eq!(
+        http_request(port, "GET", "/tasks", Some(token), None, None)
+            .unwrap()
+            .status,
+        302
+    );
     let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
     assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
@@ -1720,7 +3436,9 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
     impl Drop for Alerts {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
-            if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1728,7 +3446,8 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
     let mut alerts = Alerts {
         url: format!("http://{}", listener.local_addr().unwrap()),
         messages: Arc::new(std::sync::Mutex::new(Vec::new())),
-        stop: Arc::new(AtomicBool::new(false)), worker: None,
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: None,
     };
     let (messages, stop) = (alerts.messages.clone(), alerts.stop.clone());
     alerts.worker = Some(thread::spawn(move || {
@@ -1736,12 +3455,19 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
             let (stream, _) = match listener.accept() {
                 Ok(socket) => socket,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { thread::sleep(Duration::from_millis(10)); continue; }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 Err(error) => panic!("fake alert accept: {error}"),
             };
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut reader = BufReader::new(stream);
             let mut first = String::new();
             if reader.read_line(&mut first).unwrap() == 0 {
@@ -1751,16 +3477,23 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
                 if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse::<usize>().unwrap(); }
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
                 }
             }
             assert!(length < 64 * 1024);
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             if first.split_whitespace().nth(1) == Some("/send_private_msg") {
-                messages.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                messages
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
             }
             let body = if first.starts_with("POST /get_status ") {
                 r#"{"status":"ok","retcode":0,"data":{"online":true,"good":true}}"#
@@ -1774,22 +3507,41 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
     let root = workspace.root("runtime");
     let install = workspace.root("protected-install");
     let token = "fixture-backup-alert-console";
-    let home = prepare_runtime_root(&root, token, "fixture-backup-alert-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
-    let dependencies = json!({"onebot":alerts.url,"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1"});
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-backup-alert-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let dependencies =
+        json!({"onebot":alerts.url,"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1"});
     fs::write(root.join("dependencies.json"), dependencies.to_string()).unwrap();
     // A missing HER task legitimately alerts at startup. Keep this backup-only fixture
     // healthy at the Scheduler boundary without filtering any administrator notices.
     let scheduler = workspace.root("scheduler.xml");
     let mut install_task = Command::new(env!("CARGO_BIN_EXE_her-cli"));
-    install_task.arg("install")
-        .env("HER_INSTALL_ROOT", &install).env("HER_TASK_SCHEDULER_FILE", &scheduler)
+    install_task
+        .arg("install")
+        .env("HER_INSTALL_ROOT", &install)
+        .env("HER_TASK_SCHEDULER_FILE", &scheduler)
         .env_remove("HER_RUNTIME_ROOT");
     hide_process_window(&mut install_task);
     let installed = install_task.output().unwrap();
-    assert!(installed.status.success(), "install matching fixture task: {installed:?}");
+    assert!(
+        installed.status.success(),
+        "install matching fixture task: {installed:?}"
+    );
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
-    let now_ms = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let now_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
     // The next daily slot is 20-80 s away, so the first supervisor can observe and stop before it.
     // Yesterday's slot lies after the day-old config mtime: the first observation must not alert it.
     let slot = (now_ms() + 20_000).div_euclid(60_000) * 60_000 + 60_000;
@@ -1808,23 +3560,62 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
     }
     config["tasks"]["backup"] = json!({"enabled":true});
     fs::write(&config_file, config.to_string()).unwrap();
-    fs::File::options().write(true).open(&config_file).unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(86_400 + 120)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&config_file)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(86_400 + 120))
+        .unwrap();
     fs::write(root.join("data/memory.db"), b"corrupt database").unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start_with_install_root(&root, port, &home, Some(&install));
     let wait = |expected: usize| {
         let deadline = Instant::now() + Duration::from_secs(8);
-        while alerts.messages.lock().unwrap().len() < expected && Instant::now() < deadline { thread::sleep(Duration::from_millis(20)); }
-        assert_eq!(alerts.messages.lock().unwrap().len(), expected, "each failed/missed occurrence must send one private alert");
+        while alerts.messages.lock().unwrap().len() < expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            alerts.messages.lock().unwrap().len(),
+            expected,
+            "each failed/missed occurrence must send one private alert"
+        );
     };
     for request in ["backup-alert-failure-01", "backup-alert-failure-02"] {
-        let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":request}))).unwrap(), 202, "failed backup trigger");
+        let started = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/tasks/backup/run",
+                Some(token),
+                None,
+                Some(&json!({"requestId":request})),
+            )
+            .unwrap(),
+            202,
+            "failed backup trigger",
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let run = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "failed backup result");
-            if run["run"]["state"] == "failed" { break; }
-            assert!(Instant::now() < deadline, "failed backup did not finish: {run}");
+            let run = expect_json(
+                http_request(
+                    port,
+                    "GET",
+                    &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                    Some(token),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                200,
+                "failed backup result",
+            );
+            if run["run"]["state"] == "failed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed backup did not finish: {run}"
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1834,26 +3625,46 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
         // Capture before spawning: a fast first notice check must not be missed.
         let previous_check = fs::metadata(&notice_state).unwrap().modified().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command.args(["supervise", "--runtime-root"]).arg(&root)
-            .env("HER_INSTALL_ROOT", &install).env("TZ", "UTC").env_remove("HER_PARITY_EPOCH_MS")
+        command
+            .args(["supervise", "--runtime-root"])
+            .arg(&root)
+            .env("HER_INSTALL_ROOT", &install)
+            .env("TZ", "UTC")
+            .env_remove("HER_PARITY_EPOCH_MS")
             .env("HER_TASK_SCHEDULER_FILE", &scheduler)
-            .env_remove("HER_RUNTIME_ROOT").env_remove("APPDATA").env_remove("LOCALAPPDATA").env_remove("HOME")
-            .env("DSH_HOME", &home).env("USERPROFILE", home.join("synthetic-user-profile"))
-            .stdout(Stdio::null()).stderr(Stdio::null());
+            .env_remove("HER_RUNTIME_ROOT")
+            .env_remove("APPDATA")
+            .env_remove("LOCALAPPDATA")
+            .env_remove("HOME")
+            .env("DSH_HOME", &home)
+            .env("USERPROFILE", home.join("synthetic-user-profile"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         hide_process_window(&mut command);
-        (ConsoleProcess { child: command.spawn().unwrap(), port: 0 }, previous_check)
+        (
+            ConsoleProcess {
+                child: command.spawn().unwrap(),
+                port: 0,
+            },
+            previous_check,
+        )
     };
     let poll = |supervisor: &mut ConsoleProcess, previous_check: SystemTime| {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut observed_check = None;
         loop {
-            assert!(Instant::now() < deadline, "supervisor did not finish a backup notice check");
+            assert!(
+                Instant::now() < deadline,
+                "supervisor did not finish a backup notice check"
+            );
             assert!(supervisor.child.try_wait().unwrap().is_none());
             // Every notice check atomically rewrites this file, even with no new claims.
             // Allow two more loop periods for sends after the durable claims are saved.
             if fs::metadata(&notice_state).unwrap().modified().unwrap() != previous_check {
                 let observed = observed_check.get_or_insert_with(Instant::now);
-                if observed.elapsed() >= Duration::from_secs(2) { break; }
+                if observed.elapsed() >= Duration::from_secs(2) {
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1865,17 +3676,32 @@ fn backup_failures_and_missed_daily_slot_alert_once_across_supervisor_restarts()
         assert_eq!(messages.len(), 2, "the first observation must not alert old history or slots since the config mtime: {messages:?}");
     }
     drop(supervisor);
-    assert!(now_ms() < slot - 1_000, "the first supervisor must stop before the next slot");
+    assert!(
+        now_ms() < slot - 1_000,
+        "the first supervisor must stop before the next slot"
+    );
     // Stay down across the slot and its minute of grace: the next supervisor finds it missed.
-    while now_ms() < slot + 62_000 { thread::sleep(Duration::from_millis(200)); }
+    while now_ms() < slot + 62_000 {
+        thread::sleep(Duration::from_millis(200));
+    }
     let (mut supervisor, _) = start_supervisor();
     wait(3);
     assert!(supervisor.child.try_wait().unwrap().is_none());
-    assert!(alerts.messages.lock().unwrap()[2].to_string().contains("Backup missed"), "{:?}", alerts.messages.lock().unwrap()[2]);
+    assert!(
+        alerts.messages.lock().unwrap()[2]
+            .to_string()
+            .contains("Backup missed"),
+        "{:?}",
+        alerts.messages.lock().unwrap()[2]
+    );
     drop(supervisor);
     let (mut supervisor, previous_check) = start_supervisor();
     poll(&mut supervisor, previous_check);
-    assert_eq!(alerts.messages.lock().unwrap().len(), 3, "restart must not repeat failed or missed alerts");
+    assert_eq!(
+        alerts.messages.lock().unwrap().len(),
+        3,
+        "restart must not repeat failed or missed alerts"
+    );
     for message in alerts.messages.lock().unwrap().iter() {
         assert_eq!(message["user_id"], OWNER_ID);
     }
@@ -1888,11 +3714,21 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     let workspace = FixtureWorkspace::new("backup's-process-seam");
     let root = workspace.root("runtime");
     let token = "fixture-backup-console";
-    let home = prepare_runtime_root(&root, token, "fixture-agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let db = rusqlite::Connection::open(root.join("data/memory.db")).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO memory(owner_type,owner_id,scope,kind,content,source,created_at) VALUES('session','private:7001','private','fact','committed WAL snapshot','manual',1);").unwrap();
-    for directory in ["resources/patches/nested", "resources/docs"] { fs::create_dir_all(root.join(directory)).unwrap(); }
+    for directory in ["resources/patches/nested", "resources/docs"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
     fs::write(root.join("resources/roles/main.md"), "selected role").unwrap();
     fs::write(root.join("resources/patches/nested/fix.txt"), "patch").unwrap();
     fs::write(root.join("resources/docs/guide.md"), "guide").unwrap();
@@ -1901,10 +3737,14 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     fs::write(root.join("data/ignored.jsonl"), "not state").unwrap();
     let destination = root.join("backups");
     fs::create_dir(&destination).unwrap();
-    let legacy = ["qqbot-2026-01-01T04-00-00.zip", "qqbot-2026-01-02T04-00-00.zip"];
+    let legacy = [
+        "qqbot-2026-01-01T04-00-00.zip",
+        "qqbot-2026-01-02T04-00-00.zip",
+    ];
     for (i, name) in legacy.iter().enumerate() {
         let file = fs::File::create(destination.join(name)).unwrap();
-        file.set_modified(UNIX_EPOCH + Duration::from_secs(100 + i as u64)).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(100 + i as u64))
+            .unwrap();
     }
     fs::write(destination.join("qqbot-personal.zip"), "unrelated").unwrap();
     let config_file = root.join("config/config.json");
@@ -1915,18 +3755,57 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &home);
-    let selected_now = expect_json(http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(), 200, "selected backup clock")["now"].as_i64().unwrap();
+    let selected_now = expect_json(
+        http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(),
+        200,
+        "selected backup clock",
+    )["now"]
+        .as_i64()
+        .unwrap();
     for (index, age) in [8, 1].into_iter().enumerate() {
-        fs::OpenOptions::new().write(true).open(destination.join(legacy[index])).unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_millis(selected_now.max(0) as u64) - Duration::from_secs(age * 86_400)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(destination.join(legacy[index]))
+            .unwrap()
+            .set_modified(
+                UNIX_EPOCH + Duration::from_millis(selected_now.max(0) as u64)
+                    - Duration::from_secs(age * 86_400),
+            )
+            .unwrap();
     }
     let run = |request: &str| {
-        let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":request}))).unwrap(), 202, "backup trigger");
+        let started = expect_json(
+            http_request(
+                port,
+                "POST",
+                "/api/tasks/backup/run",
+                Some(token),
+                None,
+                Some(&json!({"requestId":request})),
+            )
+            .unwrap(),
+            202,
+            "backup trigger",
+        );
         let id = started["runId"].as_str().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{id}"), Some(token), None, None).unwrap(), 200, "backup result");
-            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) { break result["run"].clone(); }
+            let result = expect_json(
+                http_request(
+                    port,
+                    "GET",
+                    &format!("/api/tasks/runs/{id}"),
+                    Some(token),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                200,
+                "backup result",
+            );
+            if !matches!(result["run"]["state"].as_str(), Some("queued" | "running")) {
+                break result["run"].clone();
+            }
             assert!(Instant::now() < deadline, "backup did not finish: {result}");
             thread::sleep(Duration::from_millis(20));
         }
@@ -1934,23 +3813,58 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     let done = run("backup-process-default-01");
     assert_eq!(done["state"], "succeeded", "{done}");
     assert_eq!(done["exitCode"], 0);
-    assert!(done["pid"].is_null(), "the backup must not start an external job");
+    assert!(
+        done["pid"].is_null(),
+        "the backup must not start an external job"
+    );
     assert!(!destination.join(legacy[0]).exists());
     assert!(destination.join(legacy[1]).exists());
-    assert_eq!(fs::read_to_string(destination.join("qqbot-personal.zip")).unwrap(), "unrelated");
-    let path = fs::read_dir(&destination).unwrap().map(|e| e.unwrap().path()).find(|p| p.file_name().unwrap() != legacy[1] && p.file_name().unwrap() != "qqbot-personal.zip" && p.file_name().unwrap() != ".her-backup.lock").unwrap();
+    assert_eq!(
+        fs::read_to_string(destination.join("qqbot-personal.zip")).unwrap(),
+        "unrelated"
+    );
+    let path = fs::read_dir(&destination)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name().unwrap() != legacy[1]
+                && p.file_name().unwrap() != "qqbot-personal.zip"
+                && p.file_name().unwrap() != ".her-backup.lock"
+        })
+        .unwrap();
     let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
-    let manifest: Value = serde_json::from_reader(archive.by_name("manifest.json").unwrap()).unwrap();
+    let manifest: Value =
+        serde_json::from_reader(archive.by_name("manifest.json").unwrap()).unwrap();
     assert_eq!(manifest["version"], 1);
-    for name in ["memory.db", "config.json", "state/social-v2.json", "roles/main.md", "patches/nested/fix.txt", "docs/guide.md", "说明.md"] { assert!(manifest["files"].get(name).is_some(), "missing {name}: {manifest}"); }
+    for name in [
+        "memory.db",
+        "config.json",
+        "state/social-v2.json",
+        "roles/main.md",
+        "patches/nested/fix.txt",
+        "docs/guide.md",
+        "说明.md",
+    ] {
+        assert!(
+            manifest["files"].get(name).is_some(),
+            "missing {name}: {manifest}"
+        );
+    }
     assert!(archive.by_name("state/ignored.jsonl").is_err());
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).unwrap();
         let name = file.name().to_string();
-        if name == "manifest.json" { continue; }
-        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        if name == "manifest.json" {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
         assert_eq!(manifest["files"][&name]["size"], bytes.len());
-        assert_eq!(manifest["files"][&name]["sha256"], format!("{:x}", Sha256::digest(&bytes)), "{name}");
+        assert_eq!(
+            manifest["files"][&name]["sha256"],
+            format!("{:x}", Sha256::digest(&bytes)),
+            "{name}"
+        );
         match name.as_str() {
             "说明.md" => assert_eq!(bytes, readme),
             "roles/main.md" => assert_eq!(bytes, b"selected role"),
@@ -1958,18 +3872,32 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
                 let copy_path = workspace.root("copied-memory.db");
                 fs::write(&copy_path, bytes).unwrap();
                 let copy = rusqlite::Connection::open(copy_path).unwrap();
-                assert_eq!(copy.query_row("SELECT content FROM memory", [], |row| row.get::<_, String>(0)).unwrap(), "committed WAL snapshot");
-                assert_eq!(copy.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+                assert_eq!(
+                    copy.query_row("SELECT content FROM memory", [], |row| row
+                        .get::<_, String>(0))
+                        .unwrap(),
+                    "committed WAL snapshot"
+                );
+                assert_eq!(
+                    copy.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "ok"
+                );
             }
             _ => {}
         }
     }
     drop(archive);
     let relative = root.join("backup's relative destination");
-    config["backup"] = json!({"dir":"backup's relative destination", "keepDays":1, "includeState":false});
+    config["backup"] =
+        json!({"dir":"backup's relative destination", "keepDays":1, "includeState":false});
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     assert_eq!(run("backup-process-relative-02")["state"], "succeeded");
-    let relative_zip = fs::read_dir(&relative).unwrap().map(|e| e.unwrap().path()).find(|p| p.file_name().unwrap() != ".her-backup.lock").unwrap();
+    let relative_zip = fs::read_dir(&relative)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap() != ".her-backup.lock")
+        .unwrap();
     let archive = zip::ZipArchive::new(fs::File::open(&relative_zip).unwrap()).unwrap();
     assert!(!archive.file_names().any(|name| name.starts_with("state/")));
     drop(archive);
@@ -1977,7 +3905,11 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     config["backup"] = json!({"dir":absolute, "keepDays":1});
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     assert_eq!(run("backup-process-absolute-03")["state"], "succeeded");
-    let previous = fs::read_dir(&absolute).unwrap().map(|e| e.unwrap().path()).find(|p| p.file_name().unwrap() != ".her-backup.lock").unwrap();
+    let previous = fs::read_dir(&absolute)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap() != ".her-backup.lock")
+        .unwrap();
     let previous_bytes = fs::read(&previous).unwrap();
     drop(db);
     fs::write(root.join("data/memory.db"), "corrupt database").unwrap();
@@ -1985,7 +3917,14 @@ fn backup_job_through_real_console_preserves_selected_wal_contents_settings_and_
     assert_eq!(failed["state"], "failed", "{failed}");
     assert_eq!(failed["exitCode"], 1);
     assert_eq!(fs::read(previous).unwrap(), previous_bytes);
-    assert_eq!(fs::read_dir(&absolute).unwrap().filter(|e| e.as_ref().unwrap().file_name() != ".her-backup.lock").count(), 1, "failed backup left an archive or staging directory");
+    assert_eq!(
+        fs::read_dir(&absolute)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".her-backup.lock")
+            .count(),
+        1,
+        "failed backup left an archive or staging directory"
+    );
     drop(console); // Kill and reap the only process this fixture starts, including on assertion unwinding.
 }
 
@@ -1995,43 +3934,167 @@ fn task_page_and_history_are_available_only_to_the_current_administrator() {
     let root = workspace.root("runtime");
     let token = "fixture-task-console-token-abcdefghij";
     let agent = "fixture-task-agent-token-abcdefghij";
-    let legacy = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &legacy);
 
     let no_token = http_request(port, "GET", "/api/tasks", None, None, None).unwrap();
     assert_eq!(no_token.status, 401);
-    let tasks = expect_json(http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(), 200, "task list");
-    assert!(tasks["tasks"].as_array().unwrap().iter().any(|task| task["id"] == "watchdog"));
-    assert_eq!(tasks["tasks"].as_array().unwrap().iter().find(|task| task["id"] == "upstream-check").unwrap()["enabled"], false);
-    assert!(!tasks["tasks"].as_array().unwrap().iter().any(|task| task["id"] == "ab-report"));
-    assert_eq!(tasks["legacy"].as_array().unwrap().iter().find(|task| task["name"] == "QQBot-ABReport").unwrap()["disposition"], "retired");
-    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
-    assert_eq!(http_request(port, "GET", "/schedule", Some(token), None, None).unwrap().status, 200);
-    assert_eq!(http_request(port, "GET", "/api/tasks", Some(token), Some(agent), None).unwrap().status, 403);
+    let tasks = expect_json(
+        http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(),
+        200,
+        "task list",
+    );
+    assert!(tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|task| task["id"] == "watchdog"));
+    assert_eq!(
+        tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "upstream-check")
+            .unwrap()["enabled"],
+        false
+    );
+    assert!(!tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|task| task["id"] == "ab-report"));
+    assert_eq!(
+        tasks["legacy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["name"] == "QQBot-ABReport")
+            .unwrap()["disposition"],
+        "retired"
+    );
+    assert_eq!(
+        http_request(port, "GET", "/tasks", Some(token), None, None)
+            .unwrap()
+            .status,
+        302
+    );
+    assert_eq!(
+        http_request(port, "GET", "/schedule", Some(token), None, None)
+            .unwrap()
+            .status,
+        200
+    );
+    assert_eq!(
+        http_request(port, "GET", "/api/tasks", Some(token), Some(agent), None)
+            .unwrap()
+            .status,
+        403
+    );
     let run = json!({"requestId":"fixture-request-01"});
-    assert_eq!(http_request(port, "POST", "/api/tasks/not-a-task/run", Some(token), None, Some(&run)).unwrap().status, 404);
-    assert_eq!(http_request(port, "POST", "/api/tasks/ab-report/run", Some(token), None, Some(&run)).unwrap().status, 404);
-    let audit = expect_json(http_request(port, "GET", "/api/audit/recent", Some(token), None, None).unwrap(), 200, "audit");
-    assert!(audit["entries"].as_array().unwrap().iter().any(|entry| entry.to_string().contains("/api/tasks/not-a-task/run")));
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/not-a-task/run",
+            Some(token),
+            None,
+            Some(&run)
+        )
+        .unwrap()
+        .status,
+        404
+    );
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/ab-report/run",
+            Some(token),
+            None,
+            Some(&run)
+        )
+        .unwrap()
+        .status,
+        404
+    );
+    let audit = expect_json(
+        http_request(port, "GET", "/api/audit/recent", Some(token), None, None).unwrap(),
+        200,
+        "audit",
+    );
+    assert!(audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.to_string().contains("/api/tasks/not-a-task/run")));
 
     let config_path = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     config["consoleToken"] = json!("replacement-console-token-abcdefghij");
     config["tasks"] = json!({"upstream-check":{"enabled":true}});
     fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    assert_eq!(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&run)).unwrap().status, 401);
-    let tasks = expect_json(http_request(port, "GET", "/api/tasks", Some("replacement-console-token-abcdefghij"), None, None).unwrap(), 200, "reconfigured tasks");
-    assert_eq!(tasks["tasks"].as_array().unwrap().iter().find(|task| task["id"] == "upstream-check").unwrap()["enabled"], true);
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&run)
+        )
+        .unwrap()
+        .status,
+        401
+    );
+    let tasks = expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/tasks",
+            Some("replacement-console-token-abcdefghij"),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "reconfigured tasks",
+    );
+    assert_eq!(
+        tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "upstream-check")
+            .unwrap()["enabled"],
+        true
+    );
     drop(console);
 }
 
 fn schedule_list(port: u16, token: &str) -> Value {
-    expect_json(http_request(port, "GET", "/api/schedule", Some(token), None, None).unwrap(), 200, "schedule list")
+    expect_json(
+        http_request(port, "GET", "/api/schedule", Some(token), None, None).unwrap(),
+        200,
+        "schedule list",
+    )
 }
 
 fn schedule_entry(list: &Value, id: &str) -> Option<Value> {
-    list["entries"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned()
+    list["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .cloned()
 }
 
 #[test]
@@ -2056,7 +4119,8 @@ fn schedule_page_lists_nightly_backup_and_monthly_restore_drill() {
         ("system:memory-backup", "每天 04:00"),
         ("system:memory-restore-test", "每月 1 日 05:30"),
     ] {
-        let entry = schedule_entry(&list, id).expect("memory recovery job is missing from Schedule");
+        let entry =
+            schedule_entry(&list, id).expect("memory recovery job is missing from Schedule");
         assert_eq!(entry["repeat"], repeat);
         assert!(entry["nextRunAt"].is_i64());
     }
@@ -2068,7 +4132,15 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     let root = workspace.root("runtime");
     let token = "fixture-schedule-console-token-abcdefghij";
     let agent = "fixture-schedule-agent-token-abcdefghij";
-    let legacy = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     fs::write(root.join("data/mode.json"), br#"{"mode":"reserved2"}"#).unwrap();
     let social_path = root.join("data/social-v2.json");
     let mut social: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
@@ -2085,8 +4157,18 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &legacy);
 
-    assert_eq!(http_request(port, "GET", "/api/schedule", None, None, None).unwrap().status, 401);
-    assert_eq!(http_request(port, "GET", "/api/schedule", Some(token), Some(agent), None).unwrap().status, 403);
+    assert_eq!(
+        http_request(port, "GET", "/api/schedule", None, None, None)
+            .unwrap()
+            .status,
+        401
+    );
+    assert_eq!(
+        http_request(port, "GET", "/api/schedule", Some(token), Some(agent), None)
+            .unwrap()
+            .status,
+        403
+    );
     let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
     assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
@@ -2112,7 +4194,15 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
         "repeat": {"kind": "daily", "hour": 9, "minute": 0}
     });
     let created = expect_json(
-        http_request(port, "POST", "/api/schedule", Some(token), None, Some(&create)).unwrap(),
+        http_request(
+            port,
+            "POST",
+            "/api/schedule",
+            Some(token),
+            None,
+            Some(&create),
+        )
+        .unwrap(),
         200,
         "create reminder",
     );
@@ -2122,46 +4212,135 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     let list = schedule_list(port, token);
     let entries = list["entries"].as_array().unwrap();
     for kind in ["job", "reminder", "sleep", "replyCheck", "reachOut"] {
-        assert!(entries.iter().any(|entry| entry["kind"] == kind), "missing {kind}: {list}");
+        assert!(
+            entries.iter().any(|entry| entry["kind"] == kind),
+            "missing {kind}: {list}"
+        );
     }
     for entry in entries {
-        for field in ["id", "kind", "creator", "conversation", "nextRunAt", "repeat", "action", "status", "createdAt", "lastResult", "actions"] {
+        for field in [
+            "id",
+            "kind",
+            "creator",
+            "conversation",
+            "nextRunAt",
+            "repeat",
+            "action",
+            "status",
+            "createdAt",
+            "lastResult",
+            "actions",
+        ] {
             assert!(entry.get(field).is_some(), "{field} missing: {entry}");
         }
     }
     let too_often = json!({"conversation": SESSION_KEY, "text": "太频繁", "at": now + 3_600_000, "repeat": {"kind": "every", "minutes": 14}});
-    assert_eq!(http_request(port, "POST", "/api/schedule", Some(token), None, Some(&too_often)).unwrap().status, 400, "repeats under 15 minutes are refused");
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/schedule",
+            Some(token),
+            None,
+            Some(&too_often)
+        )
+        .unwrap()
+        .status,
+        400,
+        "repeats under 15 minutes are refused"
+    );
 
     let action = |target: &str, verb: &str, body: Value| {
-        http_request(port, "POST", &format!("/api/schedule/{target}/{verb}"), Some(token), None, Some(&body)).unwrap()
+        http_request(
+            port,
+            "POST",
+            &format!("/api/schedule/{target}/{verb}"),
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap()
     };
     expect_json(action(&item, "pause", json!({})), 200, "pause reminder");
-    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["status"], "paused");
+    assert_eq!(
+        schedule_entry(&schedule_list(port, token), &item).unwrap()["status"],
+        "paused"
+    );
     expect_json(action(&item, "resume", json!({})), 200, "resume reminder");
-    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["status"], "active");
-    expect_json(action(&item, "edit", json!({"text": "多喝水"})), 200, "edit reminder");
-    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["action"], "多喝水");
+    assert_eq!(
+        schedule_entry(&schedule_list(port, token), &item).unwrap()["status"],
+        "active"
+    );
+    expect_json(
+        action(&item, "edit", json!({"text": "多喝水"})),
+        200,
+        "edit reminder",
+    );
+    assert_eq!(
+        schedule_entry(&schedule_list(port, token), &item).unwrap()["action"],
+        "多喝水"
+    );
     let ran = expect_json(action(&item, "run", json!({})), 200, "run reminder");
     assert_eq!(ran["item"]["runNow"], true, "{ran}");
     expect_json(action(&item, "cancel", json!({})), 200, "cancel reminder");
-    assert!(schedule_entry(&schedule_list(port, token), &item).is_none(), "cancelled reminder left Upcoming");
+    assert!(
+        schedule_entry(&schedule_list(port, token), &item).is_none(),
+        "cancelled reminder left Upcoming"
+    );
 
-    assert_eq!(action("system:backup", "pause", json!({})).status, 400, "system pause needs confirm");
-    expect_json(action("system:backup", "pause", json!({"confirm": true})), 200, "pause backup");
+    assert_eq!(
+        action("system:backup", "pause", json!({})).status,
+        400,
+        "system pause needs confirm"
+    );
+    expect_json(
+        action("system:backup", "pause", json!({"confirm": true})),
+        200,
+        "pause backup",
+    );
     let backup = schedule_entry(&schedule_list(port, token), "system:backup").unwrap();
     assert_eq!(backup["status"], "paused");
     assert!(backup["nextRunAt"].is_null());
-    expect_json(action("system:backup", "resume", json!({"confirm": true})), 200, "resume backup");
-    assert_ne!(schedule_entry(&schedule_list(port, token), "system:backup").unwrap()["status"], "paused");
-    assert_eq!(action("system:watchdog", "pause", json!({"confirm": true})).status, 409);
-    assert_eq!(action("system:backup", "cancel", json!({"confirm": true})).status, 409);
-    assert_eq!(action("system:backup", "cancel", json!({})).status, 409, "an unsupported system action is refused before confirm");
-    assert_eq!(action("system:watchdog", "pause", json!({})).status, 409, "a job that cannot pause is refused before confirm");
+    expect_json(
+        action("system:backup", "resume", json!({"confirm": true})),
+        200,
+        "resume backup",
+    );
+    assert_ne!(
+        schedule_entry(&schedule_list(port, token), "system:backup").unwrap()["status"],
+        "paused"
+    );
+    assert_eq!(
+        action("system:watchdog", "pause", json!({"confirm": true})).status,
+        409
+    );
+    assert_eq!(
+        action("system:backup", "cancel", json!({"confirm": true})).status,
+        409
+    );
+    assert_eq!(
+        action("system:backup", "cancel", json!({})).status,
+        409,
+        "an unsupported system action is refused before confirm"
+    );
+    assert_eq!(
+        action("system:watchdog", "pause", json!({})).status,
+        409,
+        "a job that cannot pause is refused before confirm"
+    );
     let restart = action("system:console-restart", "run", json!({"confirm": true}));
-    assert_eq!(restart.status, 409, "system run goes through the task trigger: {}", restart.body);
+    assert_eq!(
+        restart.status, 409,
+        "system run goes through the task trigger: {}",
+        restart.body
+    );
     assert!(restart.body.contains("/api/restart"), "{}", restart.body);
 
-    let reply = expect_json(action("replyCheck:private:7001", "run", json!({})), 200, "run reply check");
+    let reply = expect_json(
+        action("replyCheck:private:7001", "run", json!({})),
+        200,
+        "run reply check",
+    );
     assert_eq!(reply["reason"], "replyCheck", "{reply}");
     let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
     assert!(social_after["conversations"][SESSION_KEY]["adminWakes"]
@@ -2169,36 +4348,106 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
         .unwrap()
         .iter()
         .any(|wake| wake["reason"] == "replyCheck"));
-    assert_eq!(action("reachOut:private:7001", "cancel", json!({})).status, 400, "a cancel names the timer the owner saw");
-    assert_eq!(action("reachOut:private:7001", "cancel", json!({"at": timer_at + 3})).status, 409, "a timer that changed is not cancelled");
-    expect_json(action("reachOut:private:7001", "cancel", json!({"at": timer_at + 2})), 200, "cancel reach out");
-    let schedule_file: Value = serde_json::from_slice(&fs::read(root.join("data/schedule.json")).unwrap()).unwrap();
+    assert_eq!(
+        action("reachOut:private:7001", "cancel", json!({})).status,
+        400,
+        "a cancel names the timer the owner saw"
+    );
+    assert_eq!(
+        action(
+            "reachOut:private:7001",
+            "cancel",
+            json!({"at": timer_at + 3})
+        )
+        .status,
+        409,
+        "a timer that changed is not cancelled"
+    );
+    expect_json(
+        action(
+            "reachOut:private:7001",
+            "cancel",
+            json!({"at": timer_at + 2}),
+        ),
+        200,
+        "cancel reach out",
+    );
+    let schedule_file: Value =
+        serde_json::from_slice(&fs::read(root.join("data/schedule.json")).unwrap()).unwrap();
     assert!(schedule_file["timerCancels"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|cancel| cancel["kind"] == "reachOut" && cancel["conversation"] == SESSION_KEY && cancel["timerAt"] == json!(timer_at + 2)));
-    let reach = expect_json(action("reachOut:private:7001", "run", json!({})), 200, "run reach out");
+        .any(|cancel| cancel["kind"] == "reachOut"
+            && cancel["conversation"] == SESSION_KEY
+            && cancel["timerAt"] == json!(timer_at + 2)));
+    let reach = expect_json(
+        action("reachOut:private:7001", "run", json!({})),
+        200,
+        "run reach out",
+    );
     assert_eq!(reach["reason"], "proactiveCheck", "{reach}");
     publish_timers(now - 3 * 60_000);
     let stale = schedule_entry(&schedule_list(port, token), "replyCheck:private:7001").unwrap();
     assert_eq!(stale["status"], "stale", "{stale}");
     assert_eq!(stale["actions"], json!([]));
-    assert_eq!(action("replyCheck:private:7001", "cancel", json!({"at": timer_at + 1})).status, 409, "nothing is cancelled against a stale snapshot");
+    assert_eq!(
+        action(
+            "replyCheck:private:7001",
+            "cancel",
+            json!({"at": timer_at + 1})
+        )
+        .status,
+        409,
+        "nothing is cancelled against a stale snapshot"
+    );
     publish_timers(now);
-    assert_eq!(action("replyCheck:private:7001", "pause", json!({})).status, 409);
-    expect_json(action("sleep:private:7001", "edit", json!({"at": timer_at + 3_600_000})), 200, "edit sleep");
+    assert_eq!(
+        action("replyCheck:private:7001", "pause", json!({})).status,
+        409
+    );
+    expect_json(
+        action(
+            "sleep:private:7001",
+            "edit",
+            json!({"at": timer_at + 3_600_000}),
+        ),
+        200,
+        "edit sleep",
+    );
     let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
-    assert_eq!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"], "2100-01-01T01:00:00.000Z");
-    let slept = expect_json(action("sleep:private:7001", "run", json!({})), 200, "run sleep");
+    assert_eq!(
+        social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"],
+        "2100-01-01T01:00:00.000Z"
+    );
+    let slept = expect_json(
+        action("sleep:private:7001", "run", json!({})),
+        200,
+        "run sleep",
+    );
     assert_eq!(slept["reason"], "timeout", "{slept}");
-    expect_json(action("sleep:private:7001", "cancel", json!({})), 200, "cancel sleep");
+    expect_json(
+        action("sleep:private:7001", "cancel", json!({})),
+        200,
+        "cancel sleep",
+    );
     let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
-    assert_eq!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["infinite"], true);
+    assert_eq!(
+        social_after["conversations"][SESSION_KEY]["wakeConfig"]["infinite"],
+        true
+    );
     assert!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"].is_null());
 
     let history = expect_json(
-        http_request(port, "GET", "/api/schedule/history", Some(token), None, None).unwrap(),
+        http_request(
+            port,
+            "GET",
+            "/api/schedule/history",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
         200,
         "schedule history",
     );
@@ -2207,10 +4456,23 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
         .unwrap()
         .iter()
         .any(|record| record["id"] == item_id && record["summary"] == "已取消"));
-    assert_eq!(http_request(port, "GET", "/api/tasks/runs", Some(token), None, None).unwrap().status, 200);
+    assert_eq!(
+        http_request(port, "GET", "/api/tasks/runs", Some(token), None, None)
+            .unwrap()
+            .status,
+        200
+    );
 
     let audit = expect_json(
-        http_request(port, "GET", "/api/audit/recent?limit=100", Some(token), None, None).unwrap(),
+        http_request(
+            port,
+            "GET",
+            "/api/audit/recent?limit=100",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
         200,
         "audit",
     );
@@ -2242,7 +4504,9 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     ];
     for (path, status) in &expected {
         assert!(
-            recorded.iter().any(|entry| entry["method"] == "POST" && entry["path"] == path.as_str() && entry["status"] == json!(status)),
+            recorded.iter().any(|entry| entry["method"] == "POST"
+                && entry["path"] == path.as_str()
+                && entry["status"] == json!(status)),
             "POST {path} {status} was not audited"
         );
     }
@@ -2254,23 +4518,54 @@ fn one_runtime_root_cannot_have_two_console_processes_even_on_different_ports() 
     let workspace = FixtureWorkspace::new("console-owner");
     let root = workspace.root("runtime");
     let token = "fixture-console-owner-token-abcdefghij";
-    let legacy = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (first_port, second_port) = reserve_distinct_ports();
     let first = ConsoleProcess::start(&root, first_port, &legacy);
     let child = Command::new(env!("CARGO_BIN_EXE_her"))
-        .args(["--console-serve", "--console-port", &second_port.to_string(), "--runtime-root"])
-        .arg(&root).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let mut second = ConsoleProcess { child, port: second_port };
+        .args([
+            "--console-serve",
+            "--console-port",
+            &second_port.to_string(),
+            "--runtime-root",
+        ])
+        .arg(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut second = ConsoleProcess {
+        child,
+        port: second_port,
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = second.child.try_wait().unwrap() {
-            assert!(!status.success(), "second console must fail to acquire ownership");
+            assert!(
+                !status.success(),
+                "second console must fail to acquire ownership"
+            );
             break;
         }
-        assert!(Instant::now() < deadline, "second console remained alive on another port");
+        assert!(
+            Instant::now() < deadline,
+            "second console remained alive on another port"
+        );
         thread::sleep(Duration::from_millis(25));
     }
-    assert_eq!(http_request(first_port, "GET", "/api/health", None, None, None).unwrap().status, 200);
+    assert_eq!(
+        http_request(first_port, "GET", "/api/health", None, None, None)
+            .unwrap()
+            .status,
+        200
+    );
     drop((first, second));
 }
 
@@ -2279,29 +4574,103 @@ fn task_lifecycle_actions_require_confirmation_and_are_audited() {
     let workspace = FixtureWorkspace::new("task-lifecycle");
     let root = workspace.root("runtime");
     let token = "fixture-task-lifecycle-token-abcdefghij";
-    let legacy = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &legacy);
-    let action = |body: Value| http_request(port, "POST", "/api/tasks/lifecycle", Some(token), None, Some(&body)).unwrap();
+    let action = |body: Value| {
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/lifecycle",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap()
+    };
     assert_eq!(action(json!({"state":"maintenance"})).status, 400);
-    let refused = expect_json(action(json!({"state":"maintenance", "confirm":true, "reason":"fixture"})), 503, "maintenance without supervisor");
+    let refused = expect_json(
+        action(json!({"state":"maintenance", "confirm":true, "reason":"fixture"})),
+        503,
+        "maintenance without supervisor",
+    );
     assert_eq!(refused["applied"], false);
-    let tasks = expect_json(http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(), 200, "unapplied task state");
+    let tasks = expect_json(
+        http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(),
+        200,
+        "unapplied task state",
+    );
     assert_eq!(tasks["desired"]["state"], "running");
     assert!(!root.join("data/lifecycle/desired-state.json").exists());
     // The confirmed local CLI remains available without a supervisor. Keep the
     // maintenance admission check as well as the HTTP refusal and audit checks.
     let maintenance = Command::new(env!("CARGO_BIN_EXE_her"))
-        .args(["lifecycle", "set", "maintenance", "--confirm", "--runtime-root"]).arg(&root).output().unwrap();
-    assert!(maintenance.status.success(), "{}", String::from_utf8_lossy(&maintenance.stderr));
-    let tasks = expect_json(http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(), 200, "task state");
+        .args([
+            "lifecycle",
+            "set",
+            "maintenance",
+            "--confirm",
+            "--runtime-root",
+        ])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        maintenance.status.success(),
+        "{}",
+        String::from_utf8_lossy(&maintenance.stderr)
+    );
+    let tasks = expect_json(
+        http_request(port, "GET", "/api/tasks", Some(token), None, None).unwrap(),
+        200,
+        "task state",
+    );
     assert_eq!(tasks["desired"]["state"], "maintenance");
     let run = json!({"requestId":"fixture-request-02"});
-    assert_eq!(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&run)).unwrap().status, 409);
-    assert_eq!(action(json!({"state":"running", "confirm":true})).status, 200);
-    let audit = expect_json(http_request(port, "GET", "/api/audit/recent", Some(token), None, None).unwrap(), 200, "lifecycle audit");
-    assert!(audit["entries"].as_array().unwrap().iter().filter(|entry| entry["path"] == "/api/tasks/lifecycle").count() >= 3);
-    assert!(audit["entries"].as_array().unwrap().iter().any(|entry| entry["path"] == "/api/tasks/lifecycle" && entry["status"] == 503));
+    assert_eq!(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&run)
+        )
+        .unwrap()
+        .status,
+        409
+    );
+    assert_eq!(
+        action(json!({"state":"running", "confirm":true})).status,
+        200
+    );
+    let audit = expect_json(
+        http_request(port, "GET", "/api/audit/recent", Some(token), None, None).unwrap(),
+        200,
+        "lifecycle audit",
+    );
+    assert!(
+        audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["path"] == "/api/tasks/lifecycle")
+            .count()
+            >= 3
+    );
+    assert!(audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "/api/tasks/lifecycle" && entry["status"] == 503));
     drop(console);
 }
 
@@ -2313,9 +4682,21 @@ fn task_front_guards_and_real_child_logs_protect_credentials() {
     let root = workspace.root("runtime");
     let token = "fixture-console-secret-sentinel";
     let agent = "fixture-agent-secret-sentinel";
-    let legacy = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let fake_node = root.join("fake-node");
-    fs::write(&fake_node, format!("#!/bin/sh\nprintf '%s\\n' '{token} {agent}' >&2\nexit 7\n")).unwrap();
+    fs::write(
+        &fake_node,
+        format!("#!/bin/sh\nprintf '%s\\n' '{token} {agent}' >&2\nexit 7\n"),
+    )
+    .unwrap();
     fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).unwrap();
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
@@ -2325,30 +4706,106 @@ fn task_front_guards_and_real_child_logs_protect_credentials() {
     let console = ConsoleProcess::start(&root, port, &legacy);
     let status = |raw: String| {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         stream.write_all(raw.as_bytes()).unwrap();
         let mut text = String::new();
         stream.read_to_string(&mut text).unwrap();
-        text.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse::<u16>().unwrap()
+        text.lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap()
     };
-    assert_eq!(status(format!("GET /api/tasks HTTP/1.1\r\nHost: evil.invalid:{port}\r\nConnection: close\r\n\r\n")), 403);
+    assert_eq!(
+        status(format!(
+            "GET /api/tasks HTTP/1.1\r\nHost: evil.invalid:{port}\r\nConnection: close\r\n\r\n"
+        )),
+        403
+    );
     assert_eq!(status(format!("POST /api/tasks/upstream-check/run HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Console-Token: {token}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")), 415);
     assert_eq!(status(format!("POST /api/tasks/upstream-check/run HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Console-Token: {token}\r\nContent-Type: application/json\r\nOrigin: https://evil.invalid\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")), 403);
     let body = json!({"requestId":"fixture-guard-run-01"});
-    let started = expect_json(http_request(port, "POST", "/api/tasks/upstream-check/run", Some(token), None, Some(&body)).unwrap(), 202, "task trigger");
+    let started = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/upstream-check/run",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        202,
+        "task trigger",
+    );
     let id = started["runId"].as_str().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let run = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{id}"), Some(token), None, None).unwrap(), 200, "task result");
-        if run["run"]["state"] == "failed" { assert_eq!(run["run"]["exitCode"], 7); break; }
+        let run = expect_json(
+            http_request(
+                port,
+                "GET",
+                &format!("/api/tasks/runs/{id}"),
+                Some(token),
+                None,
+                None,
+            )
+            .unwrap(),
+            200,
+            "task result",
+        );
+        if run["run"]["state"] == "failed" {
+            assert_eq!(run["run"]["exitCode"], 7);
+            break;
+        }
         assert!(Instant::now() < deadline, "child did not finish: {run}");
         thread::sleep(Duration::from_millis(30));
     }
-    let persisted = fs::read_to_string(root.join("data/tasks/logs").join(format!("{id}.jsonl"))).unwrap();
-    assert!(!persisted.contains(token) && !persisted.contains(agent), "credentials leaked into persisted task log: {persisted}");
-    let recovery = expect_json(http_request(port, "GET", "/api/recovery-record?component=process", Some(token), None, None).unwrap(), 200, "task recovery record");
-    assert!(recovery["records"].as_array().unwrap().iter().any(|r| r["runId"] == id && r["outcome"] == "failed"), "missing task failure record: {recovery}");
-    let duplicate = expect_json(http_request(port, "POST", "/api/tasks/upstream-check/run", Some(token), None, Some(&body)).unwrap(), 200, "task deduplication");
+    let persisted =
+        fs::read_to_string(root.join("data/tasks/logs").join(format!("{id}.jsonl"))).unwrap();
+    assert!(
+        !persisted.contains(token) && !persisted.contains(agent),
+        "credentials leaked into persisted task log: {persisted}"
+    );
+    let recovery = expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/recovery-record?component=process",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "task recovery record",
+    );
+    assert!(
+        recovery["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["runId"] == id && r["outcome"] == "failed"),
+        "missing task failure record: {recovery}"
+    );
+    let duplicate = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/upstream-check/run",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        200,
+        "task deduplication",
+    );
     assert_eq!(duplicate["runId"], id);
     drop(console);
 }
@@ -2360,10 +4817,22 @@ fn revoked_console_credential_cancels_a_queued_task_before_it_starts() {
     let workspace = FixtureWorkspace::new("task-revocation");
     let root = workspace.root("runtime");
     let token = "fixture-revoked-console-token";
-    let legacy = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let marker = root.join("started");
     let fake_node = root.join("fake-node");
-    fs::write(&fake_node, format!("#!/bin/sh\nprintf started > '{}'\n", marker.display())).unwrap();
+    fs::write(
+        &fake_node,
+        format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+    )
+    .unwrap();
     fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).unwrap();
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
@@ -2372,20 +4841,51 @@ fn revoked_console_credential_cancels_a_queued_task_before_it_starts() {
     let (port, _) = reserve_distinct_ports();
     let pause = workspace.root("task-admission-pause");
     fs::write(&pause, []).unwrap();
-    let console = ConsoleProcess::start_with_env(&root, port, &legacy, None, None,
-        &[("HER_TEST_TASK_ADMISSION_PAUSE", pause.to_str().unwrap())]);
+    let console = ConsoleProcess::start_with_env(
+        &root,
+        port,
+        &legacy,
+        None,
+        None,
+        &[("HER_TEST_TASK_ADMISSION_PAUSE", pause.to_str().unwrap())],
+    );
     let body = json!({"requestId":"fixture-revoked-request"});
-    let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&body)).unwrap(), 202, "queued task");
+    let started = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        202,
+        "queued task",
+    );
     let id = started["runId"].as_str().unwrap();
     config["consoleToken"] = json!("fixture-replacement-console-token");
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     fs::remove_file(pause).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let response = http_request(port, "GET", &format!("/api/tasks/runs/{id}"), Some("fixture-replacement-console-token"), None, None).unwrap();
+        let response = http_request(
+            port,
+            "GET",
+            &format!("/api/tasks/runs/{id}"),
+            Some("fixture-replacement-console-token"),
+            None,
+            None,
+        )
+        .unwrap();
         let run = expect_json(response, 200, "revoked task result");
-        if run["run"]["state"] == "cancelled" { break; }
-        assert!(Instant::now() < deadline, "revoked task did not cancel: {run}");
+        if run["run"]["state"] == "cancelled" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revoked task did not cancel: {run}"
+        );
         thread::sleep(Duration::from_millis(30));
     }
     assert!(!marker.exists(), "revoked queued task started its child");
@@ -3431,8 +5931,10 @@ fn preset_routes_use_selected_dsh_credentials_sources_backups_and_user_copies() 
     let (source_b, installed_b) = install_preset(&root_b, &original_b);
     let dsh_preset_copy_a = install_dsh_preset_decoy(&dsh_home_a, "dsh-installed-copy-A");
     let dsh_preset_copy_b = install_dsh_preset_decoy(&dsh_home_b, "dsh-installed-copy-B");
-    let dsh_preset_copy_a_before = fs::read_to_string(&dsh_preset_copy_a).expect("read synthetic A decoy");
-    let dsh_preset_copy_b_before = fs::read_to_string(&dsh_preset_copy_b).expect("read synthetic B decoy");
+    let dsh_preset_copy_a_before =
+        fs::read_to_string(&dsh_preset_copy_a).expect("read synthetic A decoy");
+    let dsh_preset_copy_b_before =
+        fs::read_to_string(&dsh_preset_copy_b).expect("read synthetic B decoy");
 
     let (port_a, port_b) = reserve_distinct_ports();
     let console_a = ConsoleProcess::start(&root_a, port_a, &dsh_home_a);
@@ -3831,8 +6333,13 @@ fn console_page_voice_and_tool_log_routes_stay_in_each_selected_root() {
             vec![format!("nested/{marker}.wav"), format!("{marker}.MP3")],
             "console lists only sorted selected-root audio names"
         );
-        let displayed_dir = voice_list["dir"].as_str().expect("console voice list includes dir");
-        assert!(!displayed_dir.starts_with(r"\\?\"), "displayed paths must work in PowerShell");
+        let displayed_dir = voice_list["dir"]
+            .as_str()
+            .expect("console voice list includes dir");
+        assert!(
+            !displayed_dir.starts_with(r"\\?\"),
+            "displayed paths must work in PowerShell"
+        );
         assert_eq!(
             fs::canonicalize(displayed_dir).expect("displayed directory resolves"),
             fs::canonicalize(root.join("resources/audio"))
@@ -4112,12 +6619,18 @@ fn console_page_voice_and_tool_log_routes_stay_in_each_selected_root() {
         "embedded SPA must not read disk console.html: {}",
         embedded_page_a.body
     );
-    assert!(embedded_page_a.body.to_ascii_lowercase().contains("<!doctype html>"));
+    assert!(embedded_page_a
+        .body
+        .to_ascii_lowercase()
+        .contains("<!doctype html>"));
     let b_page_after_a_missing =
         http_request(console_b.port, "GET", "/", Some(token_b), None, None)
             .expect("verify B page after selected A page removal");
     assert_eq!(b_page_after_a_missing.status, 200);
-    assert!(b_page_after_a_missing.body.to_ascii_lowercase().contains("<!doctype html>"));
+    assert!(b_page_after_a_missing
+        .body
+        .to_ascii_lowercase()
+        .contains("<!doctype html>"));
 }
 
 #[test]
@@ -4456,7 +6969,15 @@ fn self_image_public_http_reads_selected_portrait_for_agent_after_restart() {
     let root = workspace.root("selected");
     let token = "portrait-console-token";
     let agent = "portrait-agent-token";
-    let dsh_home = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let assets = root.join("resources/assets");
     fs::create_dir_all(&assets).unwrap();
     let portrait = assets.join("deepseek娘.png");
@@ -4468,20 +6989,33 @@ fn self_image_public_http_reads_selected_portrait_for_agent_after_restart() {
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &dsh_home);
     let path = "/api/socialV2/self-image?key=private%3A7001";
-    expect_json(http_request(port, "GET", path, Some(token), Some("wrong"), None).unwrap(), 403, "invalid portrait agent token");
+    expect_json(
+        http_request(port, "GET", path, Some(token), Some("wrong"), None).unwrap(),
+        403,
+        "invalid portrait agent token",
+    );
     drop(console);
     let console = ConsoleProcess::start(&root, port, &dsh_home);
-    let result = expect_json(http_request(port, "GET", path, Some(token), Some(agent), None).unwrap(), 200, "selected portrait after restart");
+    let result = expect_json(
+        http_request(port, "GET", path, Some(token), Some(agent), None).unwrap(),
+        200,
+        "selected portrait after restart",
+    );
     assert_eq!(result["ok"], true);
     assert_eq!(result["key"], SESSION_KEY);
     assert_eq!(result["image"]["mimeType"], "image/png");
     assert_eq!(result["images"][0], result["image"]);
-    let bytes = base64::engine::general_purpose::STANDARD.decode(result["image"]["data"].as_str().unwrap()).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result["image"]["data"].as_str().unwrap())
+        .unwrap();
     let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
     assert_eq!(decoded.dimensions(), (2, 1));
     assert_eq!(decoded.get_pixel(0, 0).0, [19, 123, 211]);
     assert_eq!(fs::read(&portrait).unwrap(), original);
-    assert_eq!(fs::read(&decoy).unwrap(), b"synthetic legacy portrait sentinel");
+    assert_eq!(
+        fs::read(&decoy).unwrap(),
+        b"synthetic legacy portrait sentinel"
+    );
     drop(console);
 }
 
@@ -4490,10 +7024,26 @@ fn missing_self_image_public_http_matches_js_not_found() {
     let workspace = FixtureWorkspace::new("missing-self-image");
     let root = workspace.root("selected");
     let token = "missing-self-image-console-token";
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &dsh_home);
-    let response = http_request(port, "GET", "/api/socialV2/self-image?key=private%3A7001", Some(token), None, None).unwrap();
+    let response = http_request(
+        port,
+        "GET",
+        "/api/socialV2/self-image?key=private%3A7001",
+        Some(token),
+        None,
+        None,
+    )
+    .unwrap();
     let body = expect_json(response, 404, "missing selected self image");
     assert_eq!(body["ok"], false);
     assert!(body["error"].as_str().unwrap().contains("未找到形象图片"));
@@ -4505,11 +7055,27 @@ fn selected_self_image_invalid_paths_return_unavailable() {
     let workspace = FixtureWorkspace::new("invalid-self-image");
     let root = workspace.root("selected");
     let token = "invalid-self-image-console-token";
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &dsh_home);
     let request = || {
-        let response = http_request(port, "GET", "/api/socialV2/self-image?key=private%3A7001", Some(token), None, None).unwrap();
+        let response = http_request(
+            port,
+            "GET",
+            "/api/socialV2/self-image?key=private%3A7001",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap();
         let body = expect_json(response, 503, "invalid selected self image path");
         assert_eq!(body["error"], "selected self image is unavailable");
     };
@@ -4530,7 +7096,10 @@ fn selected_self_image_invalid_paths_return_unavailable() {
     create_directory_reparse_point(&assets, &outside).expect("create synthetic resource junction");
     let _cleanup = DirectoryReparsePoint(assets);
     request();
-    assert_eq!(fs::read(outside.join("deepseek娘.png")).unwrap(), b"outside sentinel");
+    assert_eq!(
+        fs::read(outside.join("deepseek娘.png")).unwrap(),
+        b"outside sentinel"
+    );
     drop(console);
 }
 
@@ -4539,7 +7108,15 @@ fn sticker_model_send_and_collect_public_http_validate_required_fields() {
     let workspace = FixtureWorkspace::new("sticker-model-route-validation");
     let root = workspace.root("selected");
     let token = "sticker-model-route-console-token";
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let config_path = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     config["socialV2"] = json!({"sticker":{"enabled":true}});
@@ -4548,9 +7125,13 @@ fn sticker_model_send_and_collect_public_http_validate_required_fields() {
     let console = ConsoleProcess::start(&root, port, &dsh_home);
     for (path, error) in [
         ("/api/socialV2/send-sticker", "key 和 stickerId 不能为空"),
-        ("/api/socialV2/collect-sticker", "key 和 messageId/seq 不能为空"),
+        (
+            "/api/socialV2/collect-sticker",
+            "key 和 messageId/seq 不能为空",
+        ),
     ] {
-        let response = http_request(port, "POST", path, Some(token), None, Some(&json!({}))).unwrap();
+        let response =
+            http_request(port, "POST", path, Some(token), None, Some(&json!({}))).unwrap();
         let body = expect_json(response, 400, path);
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"], error);
@@ -4563,19 +7144,37 @@ fn sticker_note_public_http_persists_in_selected_root_after_restart() {
     let workspace = FixtureWorkspace::new("sticker-note-restart");
     let root = workspace.root("selected");
     let token = "sticker-note-console-token";
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     // Listing after a restart refreshes the gateway cache. A closed port has a
     // platform-dependent refusal delay; serve the selected dependency instead.
     let mut onebot = FakeStickerOneBot::bind(vec![json!({"emoji_id":"historic", "desc":"old"})]);
     let dependencies_path = root.join("dependencies.json");
-    let mut dependencies: Value = serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
+    let mut dependencies: Value =
+        serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
     dependencies["onebot"] = json!(onebot.base_url);
-    fs::write(dependencies_path, serde_json::to_vec(&dependencies).unwrap()).unwrap();
+    fs::write(
+        dependencies_path,
+        serde_json::to_vec(&dependencies).unwrap(),
+    )
+    .unwrap();
     onebot.start();
     let store = root.join("data/stickers.json");
-    fs::write(&store, serde_json::to_vec(&json!([{
-        "id":"historic", "desc":"old", "localNote":"before", "tags":["old"], "useCount":7
-    }])).unwrap()).unwrap();
+    fs::write(
+        &store,
+        serde_json::to_vec(&json!([{
+            "id":"historic", "desc":"old", "localNote":"before", "tags":["old"], "useCount":7
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
     let decoy = dsh_home.join("stickers.json");
     fs::write(&decoy, b"synthetic legacy sentinel").unwrap();
     let (port, _) = reserve_distinct_ports();
@@ -4584,15 +7183,43 @@ fn sticker_note_public_http_persists_in_selected_root_after_restart() {
     wait_for_sticker_warmup(port, token, &store, &seeded);
     let body = json!({"stickerId":"historic", "note":"after", "tags":["new"], "usage":"reply"});
     let before = fs::read(&store).unwrap();
-    expect_json(http_request(port, "POST", "/api/stickers/note", Some("wrong"), None, Some(&body)).unwrap(), 401, "unauthorized note");
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/note",
+            Some("wrong"),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        401,
+        "unauthorized note",
+    );
     assert_eq!(fs::read(&store).unwrap(), before);
-    let updated = expect_json(http_request(port, "POST", "/api/stickers/note", Some(token), None, Some(&body)).unwrap(), 200, "selected note");
+    let updated = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/note",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        200,
+        "selected note",
+    );
     assert_eq!(updated["sticker"]["localNote"], "after");
     assert_eq!(updated["sticker"]["tags"], json!(["new"]));
     assert_eq!(updated["sticker"]["useCount"], 7);
     drop(console);
     let console = ConsoleProcess::start(&root, port, &dsh_home);
-    let list = expect_json(http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(), 200, "list after restart");
+    let list = expect_json(
+        http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(),
+        200,
+        "list after restart",
+    );
     assert_eq!(list["stickers"][0]["localNote"], "after");
     assert_eq!(list["stickers"][0]["tags"], json!(["new"]));
     assert_eq!(list["stickers"][0]["useCount"], 7);
@@ -4606,11 +7233,24 @@ fn sticker_remark_public_http_updates_selected_history() {
     let root = workspace.root("selected");
     let token = "sticker-remark-console-token";
     let mut onebot = FakeStickerOneBot::bind(vec![json!({"emoji_id":"historic", "desc":"old"})]);
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let dependencies_path = root.join("dependencies.json");
-    let mut dependencies: Value = serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
+    let mut dependencies: Value =
+        serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
     dependencies["onebot"] = json!(onebot.base_url);
-    fs::write(&dependencies_path, serde_json::to_vec(&dependencies).unwrap()).unwrap();
+    fs::write(
+        &dependencies_path,
+        serde_json::to_vec(&dependencies).unwrap(),
+    )
+    .unwrap();
     let store = root.join("data/stickers.json");
     fs::write(&store, serde_json::to_vec(&json!([{
         "id":"historic", "source":"qq", "desc":"old", "localNote":"kept", "tags":["kept"], "useCount":7
@@ -4624,19 +7264,61 @@ fn sticker_remark_public_http_updates_selected_history() {
     wait_for_sticker_warmup(port, token, &store, &seeded);
     let body = json!({"stickerId":"historic", "remark":"new remark"});
     let before = fs::read(&store).unwrap();
-    expect_json(http_request(port, "POST", "/api/stickers/remark", Some("wrong"), None, Some(&body)).unwrap(), 401, "unauthorized remark");
-    expect_json(http_request(port, "POST", "/api/stickers/remark", Some(token), Some("foreign"), Some(&body)).unwrap(), 403, "agent remark denied");
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/remark",
+            Some("wrong"),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        401,
+        "unauthorized remark",
+    );
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/remark",
+            Some(token),
+            Some("foreign"),
+            Some(&body),
+        )
+        .unwrap(),
+        403,
+        "agent remark denied",
+    );
     assert_eq!(fs::read(&store).unwrap(), before);
-    let result = expect_json(http_request(port, "POST", "/api/stickers/remark", Some(token), None, Some(&body)).unwrap(), 200, "selected remark");
+    let result = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/remark",
+            Some(token),
+            None,
+            Some(&body),
+        )
+        .unwrap(),
+        200,
+        "selected remark",
+    );
     assert_eq!(result["sticker"]["desc"], "new remark");
     assert_eq!(result["sticker"]["localNote"], "kept");
     assert_eq!(result["sticker"]["tags"], json!(["kept"]));
     assert_eq!(result["sticker"]["useCount"], 7);
     drop(console);
     let requests = onebot.finish().unwrap();
-    let remarks: Vec<_> = requests.iter().filter(|request| request.path == "/modify_custom_face").collect();
+    let remarks: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/modify_custom_face")
+        .collect();
     assert_eq!(remarks.len(), 1);
-    assert_eq!(remarks[0].body, json!({"emoji_id":"historic", "desc":"new remark"}));
+    assert_eq!(
+        remarks[0].body,
+        json!({"emoji_id":"historic", "desc":"new remark"})
+    );
     let entries: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
     assert_eq!(entries[0]["desc"], "new remark");
     assert_eq!(entries[0]["localNote"], "kept");
@@ -4651,11 +7333,24 @@ fn sticker_force_sync_public_http_merges_selected_history() {
     let mut onebot = FakeStickerOneBot::bind(vec![json!({
         "emoji_id":"historic", "url":"https://example.invalid/new.png", "desc":"new"
     })]);
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let dependencies_path = root.join("dependencies.json");
-    let mut dependencies: Value = serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
+    let mut dependencies: Value =
+        serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
     dependencies["onebot"] = json!(onebot.base_url);
-    fs::write(&dependencies_path, serde_json::to_vec(&dependencies).unwrap()).unwrap();
+    fs::write(
+        &dependencies_path,
+        serde_json::to_vec(&dependencies).unwrap(),
+    )
+    .unwrap();
     let store = root.join("data/stickers.json");
     fs::write(&store, serde_json::to_vec(&json!([{
         "id":"historic", "source":"qq", "desc":"old", "localNote":"kept", "tags":["kept"], "useCount":7
@@ -4668,15 +7363,46 @@ fn sticker_force_sync_public_http_merges_selected_history() {
     let console = ConsoleProcess::start(&root, port, &dsh_home);
     wait_for_sticker_warmup(port, token, &store, &seeded);
     let before = fs::read(&store).unwrap();
-    expect_json(http_request(port, "POST", "/api/stickers/sync", None, None, Some(&json!({}))).unwrap(), 401, "unauthenticated force sync");
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/sync",
+            None,
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        401,
+        "unauthenticated force sync",
+    );
     assert_eq!(fs::read(&store).unwrap(), before);
-    let result = expect_json(http_request(port, "POST", "/api/stickers/sync", Some(token), None, Some(&json!({}))).unwrap(), 200, "force sync");
+    let result = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/sync",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "force sync",
+    );
     assert_eq!(result["ok"], true);
     drop(console);
     let requests = onebot.finish().unwrap();
-    assert!(requests.iter().any(|request| request.path == "/fetch_custom_face_detail"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/fetch_custom_face_detail"));
     let entries: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
-    let entry = entries.as_array().unwrap().iter().find(|entry| entry["id"] == "historic").unwrap();
+    let entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "historic")
+        .unwrap();
     assert_eq!(entry["desc"], "new");
     assert_eq!(entry["localNote"], "kept");
     assert_eq!(entry["tags"], json!(["kept"]));
@@ -4692,37 +7418,93 @@ fn sticker_public_http_cache_ignores_refresh_until_ttl_expires() {
     let mut onebot = FakeStickerOneBot::bind(vec![json!({
         "emoji_id":"historic", "url":"https://example.invalid/a.png", "desc":"favorite"
     })]);
-    let dsh_home = prepare_runtime_root(&root, token, "agent", "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let dsh_home = prepare_runtime_root(
+        &root,
+        token,
+        "agent",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     let config_path = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     config["socialV2"] = json!({"sticker":{"enabled":true,"syncTtlMs":5000}});
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let dependencies_path = root.join("dependencies.json");
-    let mut dependencies: Value = serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
+    let mut dependencies: Value =
+        serde_json::from_slice(&fs::read(&dependencies_path).unwrap()).unwrap();
     dependencies["onebot"] = json!(onebot.base_url);
-    fs::write(&dependencies_path, serde_json::to_vec(&dependencies).unwrap()).unwrap();
-    fs::write(root.join("data/stickers.json"), serde_json::to_vec(&json!([{
-        "id":"historic", "source":"qq", "localNote":"kept", "useCount":4
-    }])).unwrap()).unwrap();
+    fs::write(
+        &dependencies_path,
+        serde_json::to_vec(&dependencies).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("data/stickers.json"),
+        serde_json::to_vec(&json!([{
+            "id":"historic", "source":"qq", "localNote":"kept", "useCount":4
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
     onebot.start();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &dsh_home);
-    expect_json(http_request(port, "POST", "/api/stickers/sync", Some(token), None, Some(&json!({}))).unwrap(), 200, "prime cache");
-    let cached = expect_json(http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(), 200, "cached list");
-    let refresh = expect_json(http_request(port, "GET", "/api/stickers?refresh=true", Some(token), None, None).unwrap(), 200, "ignored refresh query");
+    expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/stickers/sync",
+            Some(token),
+            None,
+            Some(&json!({})),
+        )
+        .unwrap(),
+        200,
+        "prime cache",
+    );
+    let cached = expect_json(
+        http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(),
+        200,
+        "cached list",
+    );
+    let refresh = expect_json(
+        http_request(
+            port,
+            "GET",
+            "/api/stickers?refresh=true",
+            Some(token),
+            None,
+            None,
+        )
+        .unwrap(),
+        200,
+        "ignored refresh query",
+    );
     assert_eq!(cached["fromCache"], true);
     assert_eq!(refresh["fromCache"], true);
     assert_eq!(refresh["stickers"], cached["stickers"]);
     assert_eq!(cached["stickers"][0]["localNote"], "kept");
     assert_eq!(cached["stickers"][0]["useCount"], 4);
     thread::sleep(Duration::from_millis(5200));
-    let expired = expect_json(http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(), 200, "expired cache");
+    let expired = expect_json(
+        http_request(port, "GET", "/api/stickers", Some(token), None, None).unwrap(),
+        200,
+        "expired cache",
+    );
     assert_eq!(expired["fromCache"], false);
     assert_eq!(expired["stickers"][0]["localNote"], "kept");
     drop(console);
     let requests = onebot.finish().unwrap();
-    assert_eq!(requests.len(), 3, "startup warm-up, force and expired GET fetch favorites");
-    assert!(requests.iter().all(|request| request.path == "/fetch_custom_face_detail"));
+    assert_eq!(
+        requests.len(),
+        3,
+        "startup warm-up, force and expired GET fetch favorites"
+    );
+    assert!(requests
+        .iter()
+        .all(|request| request.path == "/fetch_custom_face_detail"));
 }
 
 #[test]
@@ -5149,7 +7931,10 @@ fn ordinary(path: impl AsRef<Path>) -> String {
     let text = path.as_ref().to_str().unwrap().to_string();
     match text.strip_prefix(r"\\?\UNC\") {
         Some(rest) => format!(r"\\{rest}"),
-        None => text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text),
+        None => text
+            .strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or(text),
     }
 }
 
@@ -5160,7 +7945,15 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     let install = workspace.root("protected-install");
     let token = "restore-preview-admin";
     let agent = "restore-preview-agent";
-    let home = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    let home = prepare_runtime_root(
+        &root,
+        token,
+        agent,
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
     initialize_memory_fixture(&root);
     let config_file = root.join("config/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
@@ -5168,47 +7961,143 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start_with_install_root(&root, port, &home, Some(&install));
-    let started = expect_json(http_request(port, "POST", "/api/tasks/backup/run", Some(token), None, Some(&json!({"requestId":"restore-fixture-backup"}))).unwrap(), 202, "create restore fixture");
+    let started = expect_json(
+        http_request(
+            port,
+            "POST",
+            "/api/tasks/backup/run",
+            Some(token),
+            None,
+            Some(&json!({"requestId":"restore-fixture-backup"})),
+        )
+        .unwrap(),
+        202,
+        "create restore fixture",
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let result = expect_json(http_request(port, "GET", &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()), Some(token), None, None).unwrap(), 200, "fixture backup status");
-        if result["run"]["state"] == "succeeded" { break; }
-        assert!(Instant::now() < deadline, "backup did not succeed: {result}");
+        let result = expect_json(
+            http_request(
+                port,
+                "GET",
+                &format!("/api/tasks/runs/{}", started["runId"].as_str().unwrap()),
+                Some(token),
+                None,
+                None,
+            )
+            .unwrap(),
+            200,
+            "fixture backup status",
+        );
+        if result["run"]["state"] == "succeeded" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backup did not succeed: {result}"
+        );
         thread::sleep(Duration::from_millis(20));
     }
-    let listed = expect_json(http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(), 200, "restorable archives");
+    let listed = expect_json(
+        http_request(port, "GET", "/api/backups", Some(token), None, None).unwrap(),
+        200,
+        "restorable archives",
+    );
     let name = listed["backups"][0]["name"].as_str().unwrap();
     let body = json!({"archive":name,"memoryOnly":true});
-    let call = |path: &str, token, agent, body: &Value| http_request(port, "POST", path, token, agent, Some(body)).unwrap();
-    assert_eq!(call("/api/backups/restore/preview", None, None, &body).status, 401);
-    assert_eq!(call("/api/backups/restore/preview", Some(token), Some(agent), &body).status, 403);
-    let p = expect_json(call("/api/backups/restore/preview", Some(token), None, &body), 200, "restore preview");
+    let call = |path: &str, token, agent, body: &Value| {
+        http_request(port, "POST", path, token, agent, Some(body)).unwrap()
+    };
+    assert_eq!(
+        call("/api/backups/restore/preview", None, None, &body).status,
+        401
+    );
+    assert_eq!(
+        call(
+            "/api/backups/restore/preview",
+            Some(token),
+            Some(agent),
+            &body
+        )
+        .status,
+        403
+    );
+    let p = expect_json(
+        call("/api/backups/restore/preview", Some(token), None, &body),
+        200,
+        "restore preview",
+    );
     let expected_archive = ordinary(fs::canonicalize(root.join("backups").join(name)).unwrap());
-    assert_eq!(p["preview"]["archive"], json!(expected_archive), "preview names the archive in ordinary spelling");
+    assert_eq!(
+        p["preview"]["archive"],
+        json!(expected_archive),
+        "preview names the archive in ordinary spelling"
+    );
     assert_eq!(p["preview"]["replaces"], json!(["data/memory.db"]));
-    assert!(p["preview"]["contents"].as_array().unwrap().iter().any(|p| p == "config.json"));
+    assert!(p["preview"]["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "config.json"));
     assert!(p["preview"]["time"].is_i64());
-    assert_eq!(call("/api/backups/restore", Some(token), None, &body).status, 400);
+    assert_eq!(
+        call("/api/backups/restore", Some(token), None, &body).status,
+        400
+    );
     let bad = json!({"archive":"../chosen.zip","memoryOnly":true});
-    assert_eq!(call("/api/backups/restore/preview", Some(token), None, &bad).status, 400);
+    assert_eq!(
+        call("/api/backups/restore/preview", Some(token), None, &bad).status,
+        400
+    );
     let mut confirmed = body.clone();
     confirmed["confirmation"] = p["preview"]["confirmation"].clone();
     fs::create_dir_all(root.join("data/locks")).unwrap();
-    let gate = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join("data/locks/update-restore.lock")).unwrap();
+    let gate = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("data/locks/update-restore.lock"))
+        .unwrap();
     gate.lock().unwrap();
-    assert_eq!(call("/api/backups/restore", Some(token), None, &confirmed).status, 409);
+    assert_eq!(
+        call("/api/backups/restore", Some(token), None, &confirmed).status,
+        409
+    );
     let audit = fs::read_to_string(root.join("data/audit/audit.jsonl")).unwrap_or_default();
-    let restore_audits: Vec<Value> = audit.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|event| event["action"] == "backup.restore").collect();
-    assert!(restore_audits.iter().any(|event| event["by"] == "console:administrator"
-        && event["archive"] == json!(expected_archive)
-        && event["scope"] == "memory" && event["result"] == "failed"), "busy console restore audit: {audit}");
+    let restore_audits: Vec<Value> = audit
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["action"] == "backup.restore")
+        .collect();
+    assert!(
+        restore_audits
+            .iter()
+            .any(|event| event["by"] == "console:administrator"
+                && event["archive"] == json!(expected_archive)
+                && event["scope"] == "memory"
+                && event["result"] == "failed"),
+        "busy console restore audit: {audit}"
+    );
     drop(gate);
     fs::write(root.join("backups").join(name), b"broken").unwrap();
-    assert_eq!(call("/api/backups/restore/preview", Some(token), None, &body).status, 400);
+    assert_eq!(
+        call("/api/backups/restore/preview", Some(token), None, &body).status,
+        400
+    );
     assert!(!root.join("data/lifecycle/desired-state.json").exists());
-    assert_eq!(http_request(port, "GET", "/api/health", None, None, None).unwrap().status, 200);
-    assert_eq!(http_request(port, "GET", "/tasks", Some(token), None, None).unwrap().status, 302);
+    assert_eq!(
+        http_request(port, "GET", "/api/health", None, None, None)
+            .unwrap()
+            .status,
+        200
+    );
+    assert_eq!(
+        http_request(port, "GET", "/tasks", Some(token), None, None)
+            .unwrap()
+            .status,
+        302
+    );
     let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
     assert_eq!(page.status, 200);
     assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
@@ -5422,7 +8311,11 @@ fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
         hasher.update(fixture.port.to_le_bytes());
         hasher.update(b":");
         hasher.update(BROWSER_MACHINE.as_bytes());
-        format!("her_legacy_{}={}", fixture.port, URL_SAFE_NO_PAD.encode(hasher.finalize()))
+        format!(
+            "her_legacy_{}={}",
+            fixture.port,
+            URL_SAFE_NO_PAD.encode(hasher.finalize())
+        )
     };
     let origin = format!("http://{canonical}");
     let _console = fixture.start();
@@ -5447,7 +8340,10 @@ fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
         "GET",
         "/api/settings",
         &canonical,
-        &[("Cookie", &legacy_cookie), ("Sec-Fetch-Site", "same-origin")],
+        &[
+            ("Cookie", &legacy_cookie),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
         "",
     )
     .unwrap();
@@ -5474,7 +8370,10 @@ fn stale_legacy_cookie_grants_zero_authority_while_public_probes_stay_open() {
         "GET",
         "/api/auth/status",
         &canonical,
-        &[("Cookie", &legacy_cookie), ("Sec-Fetch-Site", "same-origin")],
+        &[
+            ("Cookie", &legacy_cookie),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
         "",
     )
     .unwrap();

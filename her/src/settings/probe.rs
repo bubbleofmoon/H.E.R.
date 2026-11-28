@@ -22,8 +22,22 @@ pub(crate) struct AuditRow {
 
 impl AuditRow {
     /// A global row of `key` at time 0 with actor and source `test`.
-    pub(crate) fn test(key: &'static str, old: Option<String>, new: Option<String>, request: &str) -> Self {
-        AuditRow { at_ms: 0, actor: "test", source: "test", scope: "global", key, old, new, request: request.to_string() }
+    pub(crate) fn test(
+        key: &'static str,
+        old: Option<String>,
+        new: Option<String>,
+        request: &str,
+    ) -> Self {
+        AuditRow {
+            at_ms: 0,
+            actor: "test",
+            source: "test",
+            scope: "global",
+            key,
+            old,
+            new,
+            request: request.to_string(),
+        }
     }
 }
 
@@ -40,7 +54,8 @@ impl StoreProbe {
 
     /// A read-write connection to the existing store.
     pub(crate) fn open(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open_with_flags(&self.0, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap()
+        rusqlite::Connection::open_with_flags(&self.0, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .unwrap()
     }
 
     /// Builds a database at the store's path (created when missing) with `sql`, in rollback-journal mode; the
@@ -55,9 +70,15 @@ impl StoreProbe {
     pub(crate) fn build_wal(&self, sql: &str, keep_frames: bool) {
         let conn = rusqlite::Connection::open(&self.0).unwrap();
         if keep_frames {
-            conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
         }
-        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
         conn.execute_batch(sql).unwrap();
     }
@@ -69,17 +90,27 @@ impl StoreProbe {
 
     /// `PRAGMA user_version`.
     pub(crate) fn user_version(&self) -> i64 {
-        self.open().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
+        self.open()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
     }
 
     /// `PRAGMA journal_mode`.
     pub(crate) fn journal_mode(&self) -> String {
-        self.open().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap()
+        self.open()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap()
     }
 
     /// How many schema objects are named `name`.
     pub(crate) fn objects_named(&self, name: &str) -> i64 {
-        self.open().query_row("SELECT count(*) FROM sqlite_master WHERE name=?1", [name], |row| row.get(0)).unwrap()
+        self.open()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     /// The audit rows, oldest first: `actor`, `source`, `scope`, `key`, `old`, `new` (the stored text, `null` for none)
@@ -111,18 +142,27 @@ impl StoreProbe {
 
     /// How many audit rows the store holds.
     pub(crate) fn audit_count(&self) -> i64 {
-        self.open().query_row("SELECT count(*) FROM settings_audit", [], |row| row.get(0)).unwrap()
+        self.open()
+            .query_row("SELECT count(*) FROM settings_audit", [], |row| row.get(0))
+            .unwrap()
     }
 
     /// The raw text of a global setting, or none when it has no row.
     pub(crate) fn value(&self, key: &str) -> Option<String> {
         use rusqlite::OptionalExtension as _;
-        self.open().query_row("SELECT value FROM settings WHERE key=?1", [key], |row| row.get(0)).optional().unwrap()
+        self.open()
+            .query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .unwrap()
     }
 
     /// Replaces the stored text of `key` without an audit row.
     pub(crate) fn set_value(&self, key: &str, text: &str) {
-        self.open().execute("UPDATE settings SET value=?1 WHERE key=?2", [text, key]).unwrap();
+        self.open()
+            .execute("UPDATE settings SET value=?1 WHERE key=?2", [text, key])
+            .unwrap();
     }
 
     /// Adds a stored row for `key` (revision 1, by `test`) without an audit row.
@@ -145,7 +185,15 @@ impl StoreProbe {
             )
             .unwrap();
         let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

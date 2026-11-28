@@ -120,9 +120,15 @@ fn held_ports_stay_bound_until_this_thread_releases_them() {
     let reserved = ports::reserve();
     let port = reserved.port();
     ports::hold(reserved);
-    assert!(TcpListener::bind(("127.0.0.1", port)).is_err(), "a held port refuses other binders");
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "a held port refuses other binders"
+    );
     ports::release_held();
-    assert!(TcpListener::bind(("127.0.0.1", port)).is_ok(), "release_held frees the port for the next child");
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "release_held frees the port for the next child"
+    );
 }
 
 #[test]

@@ -780,21 +780,44 @@ fn memory_settings_mcp_classifies_refusals_and_action_errors() {
     );
 
     assert!(reloaded["result"].get("isError").is_none(), "{reloaded}");
-    assert!(reloaded["result"].get("structuredContent").is_none(), "{reloaded}");
+    assert!(
+        reloaded["result"].get("structuredContent").is_none(),
+        "{reloaded}"
+    );
 
-    let refused = mcp.call(4, "memory_search", json!({
-        "key":"private:9001", "token":"wrong-token", "query":"synthetic"
-    }));
-    assert_eq!(refused["result"]["isError"], true, "memory refusal must set the MCP error flag");
-    assert_eq!(refused["result"]["structuredContent"]["class"], "refusal", "{refused}");
+    let refused = mcp.call(
+        4,
+        "memory_search",
+        json!({
+            "key":"private:9001", "token":"wrong-token", "query":"synthetic"
+        }),
+    );
+    assert_eq!(
+        refused["result"]["isError"], true,
+        "memory refusal must set the MCP error flag"
+    );
+    assert_eq!(
+        refused["result"]["structuredContent"]["class"], "refusal",
+        "{refused}"
+    );
     assert!(result_text(&refused).starts_with("检索失败："), "{refused}");
 
-    let readonly = mcp.call(5, "settings_set", json!({
-        "key":"private:9001", "token":"agent-token", "settingKey":"not.writable", "value":123
-    }));
+    let readonly = mcp.call(
+        5,
+        "settings_set",
+        json!({
+            "key":"private:9001", "token":"agent-token", "settingKey":"not.writable", "value":123
+        }),
+    );
     assert!(is_tool_error(&readonly), "{readonly}");
-    assert_eq!(readonly["result"]["structuredContent"]["class"], "refusal", "{readonly}");
-    assert!(result_text(&readonly).starts_with("改配置失败："), "{readonly}");
+    assert_eq!(
+        readonly["result"]["structuredContent"]["class"], "refusal",
+        "{readonly}"
+    );
+    assert!(
+        result_text(&readonly).starts_with("改配置失败："),
+        "{readonly}"
+    );
 
     let initial_rows = memory_row_count(&selected_db);
     fs::remove_file(&selected_config).expect("remove selected config after MCP startup");
@@ -811,7 +834,10 @@ fn memory_settings_mcp_classifies_refusals_and_action_errors() {
         is_tool_error(&missing),
         "missing selected config must fail the tool"
     );
-    assert_eq!(missing["result"]["structuredContent"]["class"], "error", "{missing}");
+    assert_eq!(
+        missing["result"]["structuredContent"]["class"], "error",
+        "{missing}"
+    );
     assert!(result_text(&missing).starts_with("写入失败："), "{missing}");
     assert_eq!(
         memory_row_count(&selected_db),
@@ -833,7 +859,10 @@ fn memory_settings_mcp_classifies_refusals_and_action_errors() {
         is_tool_error(&invalid),
         "invalid selected config must fail the tool"
     );
-    assert_eq!(invalid["result"]["structuredContent"]["class"], "error", "{invalid}");
+    assert_eq!(
+        invalid["result"]["structuredContent"]["class"], "error",
+        "{invalid}"
+    );
     assert_eq!(
         memory_row_count(&selected_db),
         initial_rows,
