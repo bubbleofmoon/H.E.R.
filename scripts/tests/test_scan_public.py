@@ -156,6 +156,22 @@ class TextMode(unittest.TestCase):
         self.assertEqual(code, 3, out)
         self.assertIn('secret-scan', out)
 
+    def test_windows_tools_gitleaks_autodiscovery_when_unset(self):
+        import types
+        mod = types.ModuleType('scan_public')
+        mod.__file__ = str(SCAN)
+        exec(compile(SCAN.read_text(encoding='utf-8'), str(SCAN), 'exec'), mod.__dict__)
+        fake_root = Path(tempfile.mkdtemp(prefix='gitleaks-auto-'))
+        self.addCleanup(shutil.rmtree, fake_root, True)
+        exe = fake_root / 'gitleaks-8.30.0' / 'gitleaks.exe'
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b'stub')
+        fake_os = types.SimpleNamespace(name='nt', environ={})
+        with mock.patch.object(mod, 'os', fake_os), \
+             mock.patch.object(mod.shutil, 'which', return_value=None), \
+             mock.patch.object(mod, 'WINDOWS_TOOLS_GLOB', str(fake_root / 'gitleaks-*' / 'gitleaks.exe')):
+            self.assertEqual(mod.gitleaks_path(), str(exe))
+
 
 class TreeMode(unittest.TestCase):
     def tree(self, files):

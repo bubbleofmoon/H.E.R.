@@ -159,9 +159,10 @@ class CiWait(unittest.TestCase):
                 proc.wait()
 
     def make_run(self, run_id, sha=SHA_A, status='completed', conclusion='success', title=TITLE,
-                 event='workflow_dispatch', created=None):
+                 event='workflow_dispatch', created=None, run_attempt=1):
         return {'id': run_id, 'display_title': title, 'head_branch': 'her/1-x', 'head_sha': sha, 'event': event,
                 'status': status, 'conclusion': conclusion if status == 'completed' else None,
+                'run_attempt': run_attempt,
                 'html_url': f'https://github.example.invalid/runs/{run_id}',
                 'created_at': iso(self.began if created is None else created)}
 
@@ -723,6 +724,61 @@ class CiWait(unittest.TestCase):
         self.assertEqual(many[-1], '(100 more lines)')
         with mock.patch.object(module, 'MAX_LOG_BYTES', 4096):
             self.assertEqual(list(module.capped([b'x' * 1024] * 5))[-1], '(log truncated after 64 MiB)')
+
+    def test_rerun_wait_follows_second_attempt_and_fetches_fresh_log(self):
+        self.server.runs = lambda: [self.make_run(12, sha=SHA_B, conclusion='failure', run_attempt=1)]
+        self.server.jobs = [{'id': 22, 'name': 'job-attempt-1', 'conclusion': 'failure'}]
+        self.server.log = STAMPED + 'error[E0001]: attempt1 failure'
+        code, out, err = self.wait('--run', '12', '--timeout', '5')
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('job job-attempt-1:', out)
+
+        calls = {'n': 0}
+
+        def rerun_sequence():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return [self.make_run(12, sha=SHA_B, status='in_progress', run_attempt=2)]
+            return [self.make_run(12, sha=SHA_B, status='completed', conclusion='failure', run_attempt=2)]
+
+        self.server.runs = rerun_sequence
+        self.server.jobs = [{'id': 24, 'name': 'job-attempt-2', 'conclusion': 'failure'}]
+        self.server.log = STAMPED + 'error[E0002]: attempt2 failure'
+        # Launch immediately before REFRESH expires: wait_one must not blindly return stale attempt 1.
+        code, out, err = self.wait('--run', '12', '--timeout', '10')
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('(attempt 2)', out)
+        self.assertIn('job job-attempt-2:', out)
+        self.assertNotIn('job-attempt-1', out)
+
+        green = {'n': 0}
+
+        def attempt3_sequence():
+            green['n'] += 1
+            if green['n'] == 1:
+                return [self.make_run(12, sha=SHA_B, status='in_progress', run_attempt=3)]
+            return [self.make_run(12, sha=SHA_B, status='completed', conclusion='success', run_attempt=3)]
+
+        self.server.runs = attempt3_sequence
+        code, out, err = self.wait('--run', '12', '--timeout', '10')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('(attempt 3)', out)
+
+    def test_min_attempt_waits_for_requested_attempt(self):
+        calls = {'n': 0}
+
+        def runs():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return [self.make_run(15, status='completed', conclusion='success', run_attempt=1)]
+            return [self.make_run(15, status='completed', conclusion='success', run_attempt=2)]
+
+        self.server.runs = runs
+        code, out, err = self.wait('--run', '15', '--min-attempt', '2', '--timeout', '10')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('(attempt 2)', out)
+        code, out, err = self.wait('--run', '15', '--min-attempt', '0', '--timeout', '1')
+        self.assertEqual(code, 2, out + err)
 
 
 if __name__ == '__main__':

@@ -70,7 +70,7 @@ LABEL = re.compile(r"[A-Za-z0-9._:/-]{1,64}")
 MAX_TIMEOUT = 24 * 3600.0
 OUTCOMES = {0: "success", 1: "failure", 2: "not available (usage error, see stderr; not a result)", 3: "cancelled or another conclusion", 4: "still running (not a result)",
             5: "GitHub unavailable (not a result)"}
-RUN_FIELDS = ("id", "display_title", "head_branch", "head_sha", "event", "status", "conclusion", "html_url", "created_at")
+RUN_FIELDS = ("id", "display_title", "head_branch", "head_sha", "event", "status", "conclusion", "run_attempt", "html_url", "created_at")
 FAILED = ("failure", "timed_out", "startup_failure")
 KEEP = re.compile(r"test result:|^test \S+ \.\.\. FAILED|^EXIT |^UNLISTED FAILURES|^---- .+ stdout ----|^error(\[E[0-9]+\])?:|^\(log truncated")
 PANIC = re.compile(r"panicked at ")
@@ -431,13 +431,15 @@ def fetch_failed_log(ctx, budget, repo, run):
 
 
 def failed_log(ctx, repo, run):
-    """The failed jobs' names and the first one's filtered log, fetched once per run. A block or an error is
-    recorded (machine-wide budget, or retry_at beside the log), so no other waiter calls before it may succeed."""
+    """The failed jobs' names and the first one's filtered log, fetched once per run and attempt. A block or an error
+    is recorded (machine-wide budget, or retry_at beside the log), so no other waiter calls before it may succeed.
+    """
     path = os.path.join(ctx.directory, f"log-{run['id']}.json")
+    attempt = run.get("run_attempt") or 1
     url = run.get("html_url")
     with lock(ctx.directory, wait=True) as held:
         cached = read_json(path)
-        if cached and "lines" in cached:
+        if cached and "lines" in cached and cached.get("attempt", 1) == attempt:
             return cached["lines"]
         budget = read_json(ctx.budget_path)
         if not held or cached is None or budget is None:
@@ -446,14 +448,14 @@ def failed_log(ctx, repo, run):
         reason = blocked(budget, now)
         if reason:
             return [f"(log unavailable until {clock(budget['blocked_until'])}: {reason}; see {url})"]
-        if cached.get("retry_at", 0) > now:
+        if cached.get("attempt", 1) == attempt and cached.get("retry_at", 0) > now:
             return [f"(log unavailable until {clock(cached['retry_at'])}: {cached.get('reason')}; see {url})"]
         try:
             lines = fetch_failed_log(ctx, budget, repo, run)
         except Later as later:
-            write_json(path, {"retry_at": later.until, "reason": later.reason})
+            write_json(path, {"attempt": attempt, "retry_at": later.until, "reason": later.reason})
             return [f"(log unavailable until {clock(later.until)}: {later.reason}; see {url})"]
-        write_json(path, {"lines": lines})
+        write_json(path, {"attempt": attempt, "lines": lines})
         return lines
 
 
@@ -479,8 +481,10 @@ def remember(ctx, key, run):
 def report(ctx, repo, run, cached=False):
     """Print a known result and return its exit code; trouble fetching the log never changes the code."""
     conclusion = run.get("conclusion") or "unknown"
+    attempt = run.get("run_attempt") or 1
+    attempt_note = f" (attempt {attempt})" if attempt > 1 else ""
     print(f"CI {conclusion}: {run.get('display_title')} {run.get('event')} {(run.get('head_sha') or '')[:12]} "
-          f"{run.get('html_url')}" + (" (cached)" if cached else ""), flush=True)
+          f"{run.get('html_url')}{attempt_note}" + (" (cached)" if cached else ""), flush=True)
     if conclusion == "success":
         return 0
     if conclusion in FAILED:
@@ -550,6 +554,7 @@ def parse(argv):
     p.add_argument("--timeout", type=float, default=3600.0)
     p.add_argument("--once", action="store_true")
     p.add_argument("--label")
+    p.add_argument("--min-attempt", type=int)
     return p.parse_args(argv)
 
 
@@ -562,6 +567,8 @@ def checked(a):
         raise ValueError("--workflow must be a workflow file name such as quick.yml")
     if not 0 <= a.timeout <= MAX_TIMEOUT:
         raise ValueError("--timeout must be 0 to 86400 seconds")
+    if a.min_attempt is not None and a.min_attempt < 1:
+        raise ValueError("--min-attempt must be >= 1")
     if a.run is not None:
         if a.run < 1 or a.branch or a.sha or a.target or a.filter or a.event:
             raise ValueError("--run names one run by its id; give no --branch, --sha, --event, --target or --filter")
@@ -620,9 +627,18 @@ def wait_one(a):
         runs = (state or {}).get("runs") or []
         run = find_run(runs, a, title)
         stale = None
-        if run and run.get("status") != "completed":
+        attempt = (run.get("run_attempt") or 1) if run else 1
+        fetched_at = (state or {}).get("fetched_at") or 0
+        awaiting_rerun = (
+            run is not None
+            and (
+                (a.min_attempt is not None and attempt < a.min_attempt)
+                or (a.run is not None and not a.once and run.get("conclusion") in FAILED and fetched_at < start)
+            )
+        )
+        if run and (run.get("status") != "completed" or awaiting_rerun):
             watched.add(run.get("id"))
-        if run and run.get("status") == "completed":
+        if run and run.get("status") == "completed" and not awaiting_rerun:
             if (run.get("conclusion") == "success" or a.run is not None or title is None or fresh_enough(run, start)
                     or run.get("id") in watched):
                 if key:
@@ -671,7 +687,9 @@ def wait_one(a):
             elif run:
                 print(f"CI still running: {run.get('html_url')} (not a result){resume}", flush=True)
             else:
-                print("CI still running: no matching run yet (not a result)", flush=True)
+                hint = " (workflow quick.yml; pass --workflow checks.yml for checks runs)" if (
+                    a.run is not None and a.workflow == "quick.yml") else ""
+                print(f"CI still running: no matching run yet{hint} (not a result)", flush=True)
             return 4
         time.sleep(min(ctx.refresh / 10, deadline - now))
 

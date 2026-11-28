@@ -14,7 +14,7 @@ async function desktopEndpoint(profile, child) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
     const endpoint = await fs.readFile(endpointFile, 'utf8').catch(error => {
-      if (error.code !== 'ENOENT') throw error;
+      if (!['ENOENT', 'EBUSY', 'EPERM', 'EACCES'].includes(error.code)) throw error;
       return '';
     });
     const [port, socket] = endpoint.trim().split(/\r?\n/);

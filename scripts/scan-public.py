@@ -46,6 +46,7 @@ headers of an object (its tree, parents, hashes and timestamps) are not prose an
 scanned as if they were.
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -99,6 +100,7 @@ CHAT_PATTERNS = (
 
 
 MISSING_SCANNER = 'secret-scan <scan>:0: gitleaks not found (set HER_GITLEAKS or install it with scripts/ci/install-gitleaks.py)'
+WINDOWS_TOOLS_GLOB = r'C:\her-orch\tools\gitleaks-*\gitleaks.exe'
 
 
 def gitleaks_path():
@@ -106,7 +108,14 @@ def gitleaks_path():
     if override:
         candidate = Path(override)
         return candidate if candidate.is_file() else None
-    return shutil.which('gitleaks')
+    found = shutil.which('gitleaks')
+    if found:
+        return found
+    if os.name == 'nt':
+        matches = sorted(p for p in glob.glob(WINDOWS_TOOLS_GLOB) if Path(p).is_file())
+        if matches:
+            return matches[-1]
+    return None
 
 
 def secret_findings(source, config, scan_skipped=False):
