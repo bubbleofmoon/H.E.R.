@@ -57,7 +57,7 @@ import subprocess
 import sys
 import tempfile
 
-SKIP_PARTS = {'.git', 'target', 'node_modules', '__pycache__', 'ci-evidence', '.test-fixtures', 'graphify-out'}
+SKIP_PARTS = {'.git', 'target', 'node_modules', '__pycache__', 'ci-evidence', '.test-fixtures'}
 SKIP_PREFIXES = {('her-ui', 'dist')}
 CHAT_TREE_SUFFIXES = {'.md', '.txt'}
 

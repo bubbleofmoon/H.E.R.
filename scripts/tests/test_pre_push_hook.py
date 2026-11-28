@@ -22,7 +22,7 @@ COPY = ('.gitleaks.toml', '.public-scan.json', 'scripts/scan-public.py',
 
 DIRTY = 'session ' + '123456' + '789\n'
 DIRTY_PATH = '/Users' + '/fakeuser/x.txt\n'
-CACHE_DIRTY = 'graphify cache ' + '987654' + '321\n'
+CACHE_DIRTY = 'ci cache ' + '987654' + '321\n'
 
 FAKE_TOKEN = 'ghp_' + 'Ab1cD2eF3gH4iJ5kL6m' + 'N7oP8qR9sT0uV2wX3'  # invented token shape
 
@@ -276,7 +276,7 @@ class PushHook(unittest.TestCase):
     def test_tracked_blob_under_a_cache_like_path_is_scanned(self):
         # The tree scan skips this folder locally; committing a blob under it publishes it.
         self.write('docs/a.md', 'clean note\n')
-        self.write('graphify-out/notes.txt', CACHE_DIRTY)
+        self.write('ci-evidence/notes.txt', CACHE_DIRTY)
         self.commit('tracked blob under a cache-like path')
         code, out = self.push(self.ref('main'))
         self.assertEqual(code, 1, out)
