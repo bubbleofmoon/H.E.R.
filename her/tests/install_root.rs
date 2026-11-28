@@ -793,6 +793,7 @@ fn production_root_spellings_are_inside_and_siblings_are_outside() {
     std::fs::create_dir_all(root.join("runtime")).unwrap();
     let install = install_root::InstallRoot::new(&root).unwrap();
     let text = root.to_str().unwrap().to_string();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut inside = vec![
         root.join("runtime/data"),
         PathBuf::from(format!("{text}/runtime/../backups")),
