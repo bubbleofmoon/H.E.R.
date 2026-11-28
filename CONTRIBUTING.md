@@ -42,9 +42,9 @@ Fixtures use short synthetic account identifiers. Numeric scan exceptions must
 name a specific file/value and explain the non-account meaning. Secret scan
 exceptions must be limited to a documented public protocol constant.
 
-This project is source-available under PolyForm Noncommercial 1.0.0. Preserve
-LICENSE and the Required Notice in NOTICE when redistributing. Publishing a
-repository, release or production change requires the administrator's go-ahead.
+This project is licensed under GNU GPL-3.0-only. Preserve LICENSE and copyright notices in
+NOTICE when redistributing. Publishing a repository, release or production change requires
+the administrator's go-ahead.
 
 Reusing code:
 
@@ -53,5 +53,7 @@ Reusing code:
   BSD, ISC, Zlib, CC0), from any language, is allowed when no crate fits. The port
   keeps its license notice in `her/THIRD_PARTY_NOTICES.md`; for Apache-2.0 it also
   keeps the upstream NOTICE text and marks the changed files.
-- Never copy or port GPL-family, non-commercial or unlicensed code.
+- Never copy or port non-commercial, proprietary, or unlicensed code. GPL-3.0-compatible
+  code (including GPL-3.0, MIT, Apache-2.0, BSD, ISC, Zlib, CC0) is allowed when license
+  and attribution notices are preserved.
 - The qq-bridge upstream stays clean-room: features and bugs only.

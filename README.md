@@ -127,4 +127,4 @@ them, and the public rule they follow is in [docs/agents/production-ops.md](docs
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (decision: [ADR 0002](docs/adr/0002-public-repo-polyform-noncommercial.md)). Source-available, not open source: commercial use is not allowed, and redistribution must keep the license and the notices.
+[GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`, decision: [ADR 0011](docs/adr/0011-gpl-3-0-license.md), amending [ADR 0002](docs/adr/0002-public-repo-polyform-noncommercial.md)). Copyleft open source: redistribution and derivative works must remain under GPL-3.0 and preserve license and copyright notices.

@@ -43,6 +43,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - `her-ui/AGENTS.md`: Embedded console UI contracts and layout.
 - `docs/adr/0001-cleanup-retention.md`: Repository retention.
 - `docs/adr/0002-public-repo-polyform-noncommercial.md`: Public development repo, vault and license.
+- `docs/adr/0011-gpl-3-0-license.md`: GPL-3.0 license adoption.
 - `docs/agents/baton.md`: Single-coordinator operation, owner batons and shared ground rules.
 - `docs/agents/coordinator.md`: Coordinator workflow, model selection and GitHub API budget.
 - `docs/agents/issue-tracker.md`: GitHub Issues, claims, the scanned-text rule (published text versus numeric relation and state operations), wayfinding operations and ready queries.
